@@ -191,6 +191,29 @@ pub extern "C" fn rs_clear_commands() {
 }
 
 #[no_mangle]
+pub extern "C" fn rs_set_line_overflow(mode: *const c_char) {
+    emit(EditorCommand::SetLineOverflow(unsafe { str_or_empty(mode) }));
+}
+
+#[no_mangle]
+pub extern "C" fn rs_set_relative_line_numbers(on: c_int) {
+    emit(EditorCommand::SetRelativeLineNumbers(on != 0));
+}
+
+#[no_mangle]
+pub extern "C" fn rs_set_major_mode(name: *const c_char) {
+    emit(EditorCommand::SetMajorMode(unsafe { str_or_empty(name) }));
+}
+
+#[no_mangle]
+pub extern "C" fn rs_set_minor_mode(name: *const c_char, on: c_int) {
+    emit(EditorCommand::SetMinorMode(
+        unsafe { str_or_empty(name) },
+        on != 0,
+    ));
+}
+
+#[no_mangle]
 pub extern "C" fn rs_register_command(name: *const c_char) {
     emit(EditorCommand::RegisterCommand(unsafe { str_or_empty(name) }));
 }

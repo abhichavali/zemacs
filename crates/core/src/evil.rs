@@ -230,6 +230,13 @@ impl Editor {
         // 4. User keymap wins over the built-in grammar.
         self.pending.keys.push(key.token());
         let seq = self.pending.keys.join(" ");
+        // A binding made for this buffer's major or minor modes wins over the
+        // same key bound globally — `(define-key "org-mode" "<tab>" ...)` only
+        // applies in org buffers.
+        if let Some(cmd) = self.mode_binding(&seq) {
+            self.pending.clear();
+            return self.run_action(&cmd);
+        }
         if let Some(cmd) = self.keymap.get(&(self.mode, seq.clone())) {
             // Same namespace as a dashboard action: a built-in verb if it names
             // one, otherwise a Lisp call. Without this, binding a key to
@@ -239,10 +246,11 @@ impl Editor {
             self.pending.clear();
             return self.run_action(&action);
         }
-        if self
-            .keymap
-            .keys()
-            .any(|(m, k)| *m == self.mode && k.starts_with(&format!("{seq} ")))
+        if self.mode_prefix(&seq)
+            || self
+                .keymap
+                .keys()
+                .any(|(m, k)| *m == self.mode && k.starts_with(&format!("{seq} ")))
         {
             return vec![]; // a longer binding may still match
         }
@@ -445,6 +453,30 @@ impl Editor {
     }
 
     // --- motions ---------------------------------------------------------
+
+    /// A binding from the buffer's minor modes, then its major mode.
+    ///
+    /// Minor modes are checked first, and most recently enabled first, which is
+    /// the Emacs precedence: a minor mode is something you switched on *for*
+    /// this buffer, so it should be able to override the major mode's idea of a
+    /// key.
+    fn mode_binding(&self, seq: &str) -> Option<String> {
+        self.buffer
+            .minor_modes
+            .iter()
+            .rev()
+            .chain(std::iter::once(&self.buffer.major_mode))
+            .find_map(|m| self.mode_keymap.get(&(m.clone(), seq.to_string())).cloned())
+    }
+
+    /// True when some mode binding is still waiting on more keys.
+    fn mode_prefix(&self, seq: &str) -> bool {
+        let with_space = format!("{seq} ");
+        self.mode_keymap.keys().any(|(m, k)| {
+            k.starts_with(&with_space)
+                && (*m == self.buffer.major_mode || self.buffer.minor_modes.contains(m))
+        })
+    }
 
     /// The column a vertical run is aiming for: the one it started from, not
     /// wherever a short line clamped it to along the way.
@@ -1026,6 +1058,11 @@ impl Editor {
             // Magit. Core knows the verbs and nothing else; the app runs git.
             other if other.starts_with("magit-") => {
                 vec![EditorCommand::Git(other["magit-".len()..].to_string())]
+            }
+            // `M-x org-mode` sets the major mode, the way Emacs does. Anything
+            // ending in `-mode` that is not a Lisp command means this.
+            other if other.ends_with("-mode") && !self.commands.iter().any(|c| c == other) => {
+                vec![EditorCommand::SetMajorMode(other.to_string())]
             }
             "new-frame" => vec![EditorCommand::NewFrame],
             "delete-frame" => vec![EditorCommand::CloseFrame],
@@ -1732,6 +1769,104 @@ mod tests {
         // out of range is ignored rather than panicking
         ed.apply(EditorCommand::FocusFrame(99));
         assert_eq!(ed.focus_frame, 1);
+    }
+
+    #[test]
+    fn a_buffer_gets_a_major_mode_from_its_file_and_fires_the_hook() {
+        let mut ed = fresh("");
+        assert_eq!(ed.buffer.major_mode, crate::FUNDAMENTAL);
+
+        ed.pending_hooks.clear();
+        ed.load("* Heading\n", Some("/tmp/notes.org".into()), Some("org".into()));
+        assert_eq!(ed.buffer.major_mode, "org-mode");
+        assert!(ed.pending_hooks.contains(&"org-mode-hook".to_string()));
+
+        // and a file with no known language falls back rather than guessing
+        ed.load("plain\n", Some("/tmp/x.unknown".into()), None);
+        assert_eq!(ed.buffer.major_mode, crate::FUNDAMENTAL);
+    }
+
+    #[test]
+    fn a_major_mode_binding_only_applies_in_that_mode() {
+        let mut ed = fresh("hello world");
+        ed.apply(EditorCommand::BindKey {
+            mode: "org-mode".into(),
+            keys: "<tab>".into(),
+            command: "org-cycle".into(),
+        });
+        // not an org buffer: Tab is not hijacked
+        assert!(!ed
+            .handle_key(Key::Tab)
+            .contains(&EditorCommand::CallLisp("(org-cycle)".into())));
+
+        ed.load("* h\n", Some("/tmp/a.org".into()), Some("org".into()));
+        assert_eq!(
+            ed.handle_key(Key::Tab),
+            vec![EditorCommand::CallLisp("(org-cycle)".into())]
+        );
+    }
+
+    #[test]
+    fn a_minor_mode_overrides_the_major_one() {
+        let mut ed = fresh("x");
+        ed.apply(EditorCommand::SetMajorMode("org-mode".into()));
+        for (mode, cmd) in [("org-mode", "org-thing"), ("my-minor", "minor-thing")] {
+            ed.apply(EditorCommand::BindKey {
+                mode: mode.into(),
+                keys: "g z".into(),
+                command: cmd.into(),
+            });
+        }
+        let press = |ed: &mut Editor| {
+            ed.handle_key(Key::Char('g'));
+            ed.handle_key(Key::Char('z'))
+        };
+        assert_eq!(
+            press(&mut ed),
+            vec![EditorCommand::CallLisp("(org-thing)".into())]
+        );
+
+        ed.apply(EditorCommand::SetMinorMode("my-minor".into(), true));
+        assert_eq!(
+            press(&mut ed),
+            vec![EditorCommand::CallLisp("(minor-thing)".into())]
+        );
+        // ...and switching it off hands the key back
+        ed.apply(EditorCommand::SetMinorMode("my-minor".into(), false));
+        assert_eq!(
+            press(&mut ed),
+            vec![EditorCommand::CallLisp("(org-thing)".into())]
+        );
+    }
+
+    #[test]
+    fn m_x_org_mode_sets_the_major_mode() {
+        let mut ed = fresh("x");
+        assert_eq!(
+            ed.run_action("org-mode"),
+            vec![EditorCommand::SetMajorMode("org-mode".into())]
+        );
+        // but a Lisp command whose name ends in -mode still reaches Lisp
+        ed.commands = vec!["my-cute-mode".into()];
+        assert_eq!(
+            ed.run_action("my-cute-mode"),
+            vec![EditorCommand::CallLisp("(my-cute-mode)".into())]
+        );
+    }
+
+    #[test]
+    fn line_number_and_overflow_settings_are_configurable() {
+        let mut ed = fresh("");
+        ed.apply(EditorCommand::SetLineOverflow("wrap".into()));
+        assert_eq!(ed.settings.line_overflow, crate::LineOverflow::Wrap);
+        ed.apply(EditorCommand::SetLineOverflow("truncate".into()));
+        assert_eq!(ed.settings.line_overflow, crate::LineOverflow::Truncate);
+        ed.apply(EditorCommand::SetLineOverflow("sideways".into()));
+        assert!(ed.status.contains("unknown line overflow"));
+
+        assert!(!ed.settings.relative_line_numbers);
+        ed.apply(EditorCommand::SetRelativeLineNumbers(true));
+        assert!(ed.settings.relative_line_numbers);
     }
 
     #[test]

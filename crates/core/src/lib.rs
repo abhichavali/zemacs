@@ -133,6 +133,34 @@ impl Key {
 // Defined here (not in zemacs-syntax) so the renderer can consume highlights
 // without depending on tree-sitter.
 
+/// What a window does with a line wider than it is.
+///
+/// Emacs' `truncate-lines`, named for what you see rather than for a boolean
+/// nobody remembers the polarity of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LineOverflow {
+    /// Cut the line at the pane edge and mark it, so a hidden tail is visible
+    /// as a fact rather than as silence.
+    #[default]
+    Truncate,
+    /// Continue the line on the next row.
+    Wrap,
+}
+
+impl LineOverflow {
+    pub fn from_name(s: &str) -> Option<LineOverflow> {
+        match s.to_ascii_lowercase().as_str() {
+            "truncate" | "truncated" | "off" | "nil" => Some(LineOverflow::Truncate),
+            "wrap" | "wrapped" | "on" | "t" => Some(LineOverflow::Wrap),
+            _ => None,
+        }
+    }
+
+    /// Drawn in the last column of a truncated line. `→` rather than Emacs'
+    /// `$` because it says "there is more that way" without looking like text.
+    pub const MARKER: char = '→';
+}
+
 /// A highlight class. Deliberately small: a theme has to name every one of
 /// these, and tree-sitter capture names get folded down onto them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -153,10 +181,24 @@ pub enum HlKind {
     Modeline,
     ModelineInactive,
     ModelineText,
+    /// Markup faces, used by org mode. Emphasis is carried by *colour* rather
+    /// than by weight or slant: the renderer opens exactly one font face, so
+    /// real bold and italic would mean loading two more and a per-span face
+    /// switch. ponytail: colour-only until that is worth doing.
+    Heading1,
+    Heading2,
+    Heading3,
+    Bold,
+    Italic,
+    Link,
+    Code,
+    /// The `*`, `/` and `=` that delimit markup — dimmed, so the text stands
+    /// out from its own syntax.
+    Markup,
 }
 
 impl HlKind {
-    pub const ALL: [HlKind; 14] = [
+    pub const ALL: [HlKind; 22] = [
         HlKind::Keyword,
         HlKind::Function,
         HlKind::Type,
@@ -171,6 +213,14 @@ impl HlKind {
         HlKind::Modeline,
         HlKind::ModelineInactive,
         HlKind::ModelineText,
+        HlKind::Heading1,
+        HlKind::Heading2,
+        HlKind::Heading3,
+        HlKind::Bold,
+        HlKind::Italic,
+        HlKind::Link,
+        HlKind::Code,
+        HlKind::Markup,
     ];
 
     pub fn name(self) -> &'static str {
@@ -189,6 +239,14 @@ impl HlKind {
             HlKind::Modeline => "modeline",
             HlKind::ModelineInactive => "modeline-inactive",
             HlKind::ModelineText => "modeline-text",
+            HlKind::Heading1 => "heading-1",
+            HlKind::Heading2 => "heading-2",
+            HlKind::Heading3 => "heading-3",
+            HlKind::Bold => "bold",
+            HlKind::Italic => "italic",
+            HlKind::Link => "link",
+            HlKind::Code => "code",
+            HlKind::Markup => "markup",
         }
     }
 
@@ -295,6 +353,9 @@ pub enum EditorCommand {
     /// Negative sinks the modeline instead of raising it.
     SetModelineRelief(i32),
     SetModelinePad(i32),
+    /// `"truncate"` or `"wrap"`.
+    SetLineOverflow(String),
+    SetRelativeLineNumbers(bool),
 
     /// Names offered by `M-x`. The Lisp image publishes these at startup and
     /// after a config reload.
@@ -302,6 +363,12 @@ pub enum EditorCommand {
     RegisterCommand(String),
     /// Index into [`Editor::buffer_names`]; 0 is the current buffer.
     SwitchBuffer(usize),
+
+    // --- major and minor modes ---
+    /// Replace the current buffer's major mode. Fires `<name>-hook` in Lisp.
+    SetMajorMode(String),
+    /// Turn a minor mode on or off in the current buffer.
+    SetMinorMode(String, bool),
 
     // --- windows and frames ---
     /// Split the focused window; the new one shows the same buffer.
@@ -389,6 +456,11 @@ pub struct Settings {
     pub modeline_relief: i32,
     /// Padding inside the modeline, in pixels.
     pub modeline_pad: i32,
+    /// Truncate a too-wide line with a marker, or wrap it.
+    pub line_overflow: LineOverflow,
+    /// Count from the cursor rather than from the top of the file. Orthogonal
+    /// to `line_numbers`, which is whether the gutter is drawn at all.
+    pub relative_line_numbers: bool,
 }
 
 impl Default for Settings {
@@ -402,7 +474,21 @@ impl Default for Settings {
             completion_style: CompletionStyle::default(),
             modeline_relief: 2,
             modeline_pad: 8,
+            line_overflow: LineOverflow::default(),
+            relative_line_numbers: false,
         }
+    }
+}
+
+/// The major mode of a buffer nothing more specific applies to, as in Emacs.
+pub const FUNDAMENTAL: &str = "fundamental-mode";
+
+/// The major mode for a language id, by the same convention Emacs uses:
+/// `"rust"` -> `"rust-mode"`. `None` means [`FUNDAMENTAL`].
+pub fn major_mode_for(language: Option<&str>) -> String {
+    match language {
+        Some(l) => format!("{l}-mode"),
+        None => FUNDAMENTAL.to_string(),
     }
 }
 
@@ -447,6 +533,13 @@ pub struct Buffer {
     pub modified: bool,
     /// Language id for tree-sitter, e.g. `"rust"`, `"lisp"`. `None` = plain text.
     pub language: Option<String>,
+    /// The buffer's major mode: `"org-mode"`, `"rust-mode"`, … Exactly one,
+    /// derived from the file name unless Lisp sets it. This is a *different*
+    /// axis from [`Mode`], which is the modal editing state — a buffer is in
+    /// org-mode whether you are in Normal or Insert.
+    pub major_mode: String,
+    /// Minor modes, on top of the major one. Order is the order enabled.
+    pub minor_modes: Vec<String>,
     /// Scroll position, parked here while another buffer is on screen.
     pub saved_scroll: usize,
     /// Undo history lives with the buffer, not the editor: switching files
@@ -465,6 +558,8 @@ impl Buffer {
             path: None,
             modified: false,
             language: None,
+            major_mode: FUNDAMENTAL.into(),
+            minor_modes: Vec::new(),
             saved_scroll: 0,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -712,6 +807,10 @@ pub struct Editor {
     next_buffer_id: BufferId,
     /// Command names published by the Lisp image, for `M-x` completion.
     pub commands: Vec<String>,
+    /// Mode hooks waiting to be run. Core records that a hook is due; the app
+    /// drains this and asks the Lisp image to run each one, since core cannot
+    /// call Lisp itself.
+    pub pending_hooks: Vec<String>,
     pub mode: Mode,
     pub settings: Settings,
     pub theme: Theme,
@@ -720,6 +819,10 @@ pub struct Editor {
     /// User keymap: (mode, "g d") -> Lisp function name. Consulted before the
     /// built-in Evil grammar, which is how Lisp config wins.
     pub keymap: HashMap<(Mode, String), String>,
+    /// Bindings for a *major or minor* mode, keyed by its name. `define-key`
+    /// picks this map when the mode name is not an editing mode, so
+    /// `(define-key "org-mode" ...)` needs no new primitive.
+    pub mode_keymap: HashMap<(String, String), String>,
 
     /// `Some` while the `:` or `/` prompt is active.
     pub prompt: Option<Prompt>,
@@ -778,11 +881,13 @@ impl Editor {
             focus_frame: 0,
             next_buffer_id: 2,
             commands: Vec::new(),
+            pending_hooks: Vec::new(),
             mode: Mode::Dashboard,
             settings: Settings::default(),
             theme: Theme::default(),
             dashboard: Dashboard::default(),
             keymap: HashMap::new(),
+            mode_keymap: HashMap::new(),
             prompt: None,
             status: String::from("zemacs — Common Lisp inside."),
             should_quit: false,
@@ -1043,6 +1148,11 @@ impl Editor {
                 self.settings.modeline_relief = n.clamp(-16, 16)
             }
             EditorCommand::SetModelinePad(n) => self.settings.modeline_pad = n.clamp(0, 64),
+            EditorCommand::SetRelativeLineNumbers(on) => self.settings.relative_line_numbers = on,
+            EditorCommand::SetLineOverflow(name) => match LineOverflow::from_name(&name) {
+                Some(o) => self.settings.line_overflow = o,
+                None => self.status = format!("unknown line overflow: {name}"),
+            },
             EditorCommand::ClearCommands => self.commands.clear(),
             EditorCommand::RegisterCommand(name) => {
                 if !self.commands.contains(&name) {
@@ -1050,6 +1160,19 @@ impl Editor {
                 }
             }
             EditorCommand::SwitchBuffer(i) => self.switch_buffer(i),
+            EditorCommand::SetMajorMode(name) => {
+                self.buffer.major_mode = name.clone();
+                self.pending_hooks.push(format!("{name}-hook"));
+                self.status = format!("major mode: {name}");
+            }
+            EditorCommand::SetMinorMode(name, on) => {
+                self.buffer.minor_modes.retain(|m| *m != name);
+                if on {
+                    self.buffer.minor_modes.push(name.clone());
+                }
+                self.pending_hooks
+                    .push(format!("{name}-{}-hook", if on { "on" } else { "off" }));
+            }
             EditorCommand::SplitWindow(dir) => {
                 self.sync_window();
                 let id = self.frames[self.focus_frame].split(dir);
@@ -1125,7 +1248,13 @@ impl Editor {
                 Some(m) => {
                     self.keymap.insert((m, normalize_keys(&keys)), command);
                 }
-                None => self.status = format!("unknown mode in define-key: {mode}"),
+                // Not an editing mode, so it names a major or minor mode.
+                // Unknown names are *not* an error: a binding may be made
+                // before the mode it belongs to is ever entered.
+                None => {
+                    self.mode_keymap
+                        .insert((mode, normalize_keys(&keys)), command);
+                }
             },
             // The app intercepts these; reaching `apply` means nothing is listening.
             EditorCommand::CallLisp(name) => {
@@ -1175,6 +1304,13 @@ impl Editor {
         self.buffer.undo.clear();
         self.buffer.redo.clear();
         self.buffer.kind = BufferKind::Text;
+        // The major mode follows the file, and its hook fires so `init.lisp`
+        // can react — `(defun org-mode-hook () ...)` is the whole extension
+        // point, exactly as in Emacs.
+        let major = major_mode_for(self.buffer.language.as_deref());
+        self.buffer.major_mode = major.clone();
+        self.buffer.minor_modes.clear();
+        self.pending_hooks.push(format!("{major}-hook"));
         self.highlights.clear();
         self.revision += 1;
         self.scroll = 0;
@@ -1415,11 +1551,20 @@ impl Editor {
 
 /// Canonical spacing for a key sequence: `"g  d"` and `"gd"` both become `"g d"`.
 pub fn normalize_keys(s: &str) -> String {
-    if s.contains(' ') || s.contains('-') {
-        s.split_whitespace().collect::<Vec<_>>().join(" ")
-    } else {
-        s.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")
+    // Spaces already separate the tokens.
+    if s.contains(' ') {
+        return s.split_whitespace().collect::<Vec<_>>().join(" ");
     }
+    // A single token that merely *looks* like several characters: a bracketed
+    // name (`<tab>`), a modifier chord (`C-x`, `C-M-j`, `M-+`), or the leader.
+    // Splitting these per character turned `<tab>` into `< t a b >`, which no
+    // keystroke could ever produce.
+    if s.starts_with('<') || s.contains('-') || s == "SPC" {
+        return s.to_string();
+    }
+    // ponytail: `gg` means the sequence `g g`, so an unseparated mix like
+    // `g<tab>` is not supported — write `g <tab>`.
+    s.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")
 }
 
 fn line_col_of(buf: &Buffer, at: usize) -> (usize, usize) {
@@ -1492,6 +1637,16 @@ mod tests {
         assert_eq!(normalize_keys("gd"), "g d");
         assert_eq!(normalize_keys("SPC f f"), "SPC f f");
         assert_eq!(normalize_keys("C-x C-f"), "C-x C-f");
+        // Named keys are one token, not five characters.
+        for named in ["<tab>", "<ret>", "<esc>", "<bs>", "<left>"] {
+            assert_eq!(normalize_keys(named), named);
+        }
+        // ...and each still matches what the key actually produces.
+        assert_eq!(normalize_keys(&Key::Tab.token()), Key::Tab.token());
+        assert_eq!(normalize_keys("C-M-j"), "C-M-j");
+        assert_eq!(normalize_keys("M-+"), "M-+");
+        assert_eq!(normalize_keys("SPC"), "SPC");
+        assert_eq!(normalize_keys("-"), "-");
     }
 
     #[test]

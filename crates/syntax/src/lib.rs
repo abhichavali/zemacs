@@ -8,6 +8,9 @@
 //! (c) convert byte offsets to char offsets, which is what the rope and the
 //! renderer index by.
 //!
+//! The exception is org, which has no grammar we can use (see [`org`]) and is
+//! scanned by hand, a line at a time, straight into char offsets.
+//!
 //! Design rules:
 //!
 //! * **Never fail loudly.** An unknown language, a query that won't compile, a
@@ -22,6 +25,8 @@
 //! roughly "files you can still scroll comfortably" — a few hundred KB. Past
 //! that, keep the `Tree` per buffer and feed it to `Parser::parse` as the old
 //! tree, and only re-run the query over the changed ranges.
+
+mod org;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -62,7 +67,8 @@ const CAPTURES: &[(&str, HlKind)] = &[
 ///
 /// All the Lisps share one id: the Common Lisp grammar is happy enough with
 /// Elisp and Scheme for the purpose of coloring atoms, and one grammar is a lot
-/// less to carry than three.
+/// less to carry than three. `org` is the odd one out: it has no grammar at all,
+/// [`highlight`] routes it to the hand-rolled scanner in [`org`].
 const LANGS: &[(&str, &[&str])] = &[
     ("rust", &["rs"]),
     ("lisp", &["lisp", "cl", "lsp", "asd", "el", "scm", "ss", "sexp"]),
@@ -71,6 +77,7 @@ const LANGS: &[(&str, &[&str])] = &[
     ("toml", &["toml"]),
     ("c", &["c", "h"]),
     ("javascript", &["js", "mjs", "cjs", "jsx"]),
+    ("org", &["org"]),
 ];
 
 /// Language id for a path, from its extension. `None` = plain text.
@@ -93,6 +100,9 @@ pub fn languages() -> &'static [&'static str] {
 /// yields an empty `Vec`; runs with no highlight get no span at all, since the
 /// renderer paints uncovered text in the default color.
 pub fn highlight(lang: &str, text: &str) -> Vec<Span> {
+    if lang == "org" {
+        return org::highlight(text); // hand-rolled, already in char offsets
+    }
     let Some(config) = config(lang) else {
         return Vec::new();
     };
@@ -315,6 +325,15 @@ mod tests {
         text_of(src, span)
     }
 
+    /// Every span of `kind`, in order, as text.
+    fn all(src: &str, spans: &[Span], kind: HlKind) -> Vec<String> {
+        spans
+            .iter()
+            .filter(|s| s.kind == kind)
+            .map(|s| text_of(src, s))
+            .collect()
+    }
+
     /// Every id we advertise must have a working config — a grammar whose query
     /// stops compiling should be caught here, not by silently losing color.
     #[test]
@@ -322,7 +341,8 @@ mod tests {
         assert!(languages().contains(&"rust") && languages().contains(&"lisp"));
         assert_eq!(languages().len(), LANGS.len());
         for lang in languages() {
-            assert!(config(lang).is_some(), "{lang} failed to build");
+            // org is the hand-rolled scanner, not a grammar; it has no config.
+            assert!(config(lang).is_some() || *lang == "org", "{lang} failed to build");
         }
     }
 
@@ -369,7 +389,7 @@ mod tests {
     #[test]
     fn spans_are_sorted_and_disjoint() {
         let src = include_str!("lib.rs");
-        for lang in ["rust", "lisp", "python", "json", "toml", "c", "javascript"] {
+        for lang in ["rust", "lisp", "python", "json", "toml", "c", "javascript", "org"] {
             let spans = highlight(lang, src);
             for pair in spans.windows(2) {
                 assert!(pair[0].start < pair[0].end, "{lang}: empty span");
@@ -400,9 +420,157 @@ mod tests {
         assert_eq!(lang("zemacs.asd").as_deref(), Some("lisp"));
         assert_eq!(lang("init.el").as_deref(), Some("lisp"));
         assert_eq!(lang("Cargo.toml").as_deref(), Some("toml"));
+        assert_eq!(lang("TODO.org").as_deref(), Some("org"));
         assert_eq!(lang("SHOUT.RS").as_deref(), Some("rust"));
         assert_eq!(lang("notes.txt"), None);
         assert_eq!(lang("Makefile"), None);
         assert_eq!(lang(""), None);
+    }
+
+    // --- org ---------------------------------------------------------------
+
+    #[test]
+    fn org_headings_are_leveled_and_whole_line() {
+        let src = "* One\n** Two\n*** Three\n**** Four\nbody text\n";
+        let spans = highlight("org", src);
+        assert_eq!(all(src, &spans, HlKind::Heading1), ["* One"]);
+        assert_eq!(all(src, &spans, HlKind::Heading2), ["** Two"]);
+        // level 3 is the floor: deeper headings share it rather than fading out
+        assert_eq!(all(src, &spans, HlKind::Heading3), ["*** Three", "**** Four"]);
+        assert_eq!(spans.len(), 4, "body text should get no span: {spans:?}");
+    }
+
+    #[test]
+    fn org_emphasis_paints_body_and_delimiters_separately() {
+        let src = "*bold* /italic/ =verbatim= ~code~ _under_ +strike+\n";
+        let spans = highlight("org", src);
+        assert_eq!(all(src, &spans, HlKind::Bold), ["bold"]);
+        // `_underline_` has no face of its own and borrows Italic
+        assert_eq!(all(src, &spans, HlKind::Italic), ["italic", "under"]);
+        assert_eq!(all(src, &spans, HlKind::Code), ["verbatim", "code"]);
+        // ...and `+strike+` borrows Comment, the dimmest face there is
+        assert_eq!(all(src, &spans, HlKind::Comment), ["strike"]);
+        // the markers themselves, and nothing but the markers
+        assert_eq!(all(src, &spans, HlKind::Markup).concat(), "**//==~~__++");
+    }
+
+    /// The trap that makes `*` hard: it is a heading at column 0, emphasis
+    /// mid-line, and multiplication the rest of the time.
+    #[test]
+    fn org_arithmetic_is_not_bold() {
+        let src = "2 * 3 * 4 = 24, and a *b* is not\n";
+        let spans = highlight("org", src);
+        assert_eq!(all(src, &spans, HlKind::Bold), ["b"]);
+    }
+
+    /// The matching trap for `/`: the slashes in a URL are preceded by `:` and
+    /// by other slashes, neither of which may open emphasis.
+    #[test]
+    fn org_urls_are_not_italic() {
+        let src = "see http://example.com/a/b/ then /really/ italic\n";
+        let spans = highlight("org", src);
+        assert_eq!(all(src, &spans, HlKind::Italic), ["really"]);
+    }
+
+    /// `#+` is a directive, `# ` is a comment. Confusing the two paints every
+    /// keyword line grey.
+    #[test]
+    fn org_directives_and_comments_are_not_confused() {
+        let src = "#+TITLE: x\n# a comment\n\
+                   #+BEGIN_SRC rust\nlet y = *not markup*;\n#+end_src\n";
+        let spans = highlight("org", src);
+        assert_eq!(
+            all(src, &spans, HlKind::Keyword),
+            ["#+TITLE: x", "#+BEGIN_SRC rust", "#+end_src"]
+        );
+        assert_eq!(all(src, &spans, HlKind::Comment), ["# a comment"]);
+        // block contents are left plain rather than read as prose
+        assert!(!spans.iter().any(|s| s.kind == HlKind::Bold), "{spans:?}");
+    }
+
+    #[test]
+    fn org_links_with_and_without_a_description() {
+        let src = "[[https://x][label]] and [[bare]]\n";
+        let spans = highlight("org", src);
+        assert_eq!(all(src, &spans, HlKind::Link), ["https://x", "label", "bare"]);
+        assert_eq!(
+            all(src, &spans, HlKind::Markup),
+            ["[[", "][", "]]", "[[", "]]"]
+        );
+    }
+
+    #[test]
+    fn org_todo_keywords_split_the_heading() {
+        let src = "* TODO write tests\n** DONE ship it\n*** TODOS are just a word\n";
+        let spans = highlight("org", src);
+        assert_eq!(all(src, &spans, HlKind::Constant), ["TODO"]);
+        assert_eq!(all(src, &spans, HlKind::Comment), ["DONE"]);
+        assert_eq!(all(src, &spans, HlKind::Heading1), ["* ", " write tests"]);
+        assert_eq!(all(src, &spans, HlKind::Heading3), ["*** TODOS are just a word"]);
+    }
+
+    /// A table rule is full of `+` and `-`; read as prose it becomes a
+    /// strike-through run. Whole-line, like Emacs' own `org-table` face.
+    #[test]
+    fn org_table_rows_are_not_prose() {
+        let src = "| a | b |\n|---+---|\n| c | d |\n";
+        let spans = highlight("org", src);
+        assert_eq!(
+            all(src, &spans, HlKind::Punctuation),
+            ["| a | b |", "|---+---|", "| c | d |"]
+        );
+        assert_eq!(spans.len(), 3, "{spans:?}");
+    }
+
+    #[test]
+    fn org_list_bullets() {
+        let src = "- one\n+ two\n1. three\n2) four\n  - nested *b*\nnot- a bullet\n";
+        let spans = highlight("org", src);
+        assert_eq!(
+            all(src, &spans, HlKind::Punctuation),
+            ["-", "+", "1.", "2)", "-"]
+        );
+        assert_eq!(all(src, &spans, HlKind::Bold), ["b"]);
+    }
+
+    /// A byte-indexed scanner slices these one or two characters short.
+    #[test]
+    fn org_non_ascii_offsets_are_chars_not_bytes() {
+        let src = "* Überschrift\nein *café* wert\n";
+        let spans = highlight("org", src);
+        assert_eq!(first(src, &spans, HlKind::Heading1), "* Überschrift");
+        assert_eq!(first(src, &spans, HlKind::Bold), "café");
+        assert!(src.len() > src.chars().count());
+    }
+
+    /// Everything at once: the contract is sorted, disjoint, in-bounds spans,
+    /// and a heading that keeps its own line even when it contains markup.
+    #[test]
+    fn org_kitchen_sink_is_sorted_and_disjoint() {
+        let src = "#+TITLE: Everything\n\
+                   # a comment\n\
+                   * TODO Head *with* markup\n\
+                   ** Sub /italic/ and =verb=\n\
+                   *** Deep\n\
+                   - a list with ~code~ and [[https://x][a link]]\n\
+                   1. numbered 2 * 3 * 4\n\
+                   \n\
+                   #+begin_src rust\n\
+                   fn f() { /* *nope* */ }\n\
+                   #+end_src\n\
+                   \n\
+                   plain http://example.com/a/b/ tail *bold* café Überschrift\n";
+        let spans = highlight("org", src);
+        for pair in spans.windows(2) {
+            assert!(pair[0].start < pair[0].end, "empty span {pair:?}");
+            assert!(pair[0].end <= pair[1].start, "overlap {pair:?}");
+        }
+        let n = src.chars().count();
+        assert!(spans.iter().all(|s| s.end <= n), "span past end: {spans:?}");
+        // the heading wins over the `*with*`, `/italic/` and `=verb=` inside it
+        assert_eq!(all(src, &spans, HlKind::Bold), ["bold"]);
+        assert_eq!(all(src, &spans, HlKind::Italic), Vec::<String>::new());
+        assert_eq!(all(src, &spans, HlKind::Code), ["code"]);
+        assert_eq!(all(src, &spans, HlKind::Link), ["https://x", "a link"]);
     }
 }

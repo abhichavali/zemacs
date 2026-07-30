@@ -36,6 +36,10 @@ extern void rs_insert(const char *text);
 extern void rs_set_completion_style(const char *style);
 extern void rs_clear_commands(void);
 extern void rs_register_command(const char *name);
+extern void rs_set_line_overflow(const char *mode);
+extern void rs_set_relative_line_numbers(int on);
+extern void rs_set_major_mode(const char *name);
+extern void rs_set_minor_mode(const char *name, int on);
 
 /* --- Lisp -> C conversions ---------------------------------------------- */
 
@@ -208,6 +212,34 @@ static cl_object f_save_file(cl_object path) {
   return ECL_NIL;
 }
 
+static cl_object f_set_line_overflow(cl_object mode) {
+  char *m = dup_utf8_or_empty(mode);
+  rs_set_line_overflow(m);
+  free(m);
+  return ECL_NIL;
+}
+
+static cl_object f_set_relative_line_numbers(cl_object on) {
+  rs_set_relative_line_numbers(on != ECL_NIL);
+  return ECL_NIL;
+}
+
+static cl_object f_set_major_mode(cl_object name) {
+  char *n = dup_utf8_or_empty(name);
+  rs_set_major_mode(n);
+  free(n);
+  return ECL_NIL;
+}
+
+/* NIL turns the mode off; anything else turns it on. */
+static cl_object f_set_minor_mode(cl_object name, cl_object on) {
+  int enable = (on != ECL_NIL);
+  char *n = dup_utf8_or_empty(name);
+  rs_set_minor_mode(n, enable);
+  free(n);
+  return ECL_NIL;
+}
+
 static cl_object f_show_dashboard(void) {
   rs_show_dashboard();
   return ECL_NIL;
@@ -254,7 +286,9 @@ static const char *PACKAGE_FORM =
     "          \"CLEAR-DASHBOARD-ITEMS\" \"DASHBOARD-ITEM\" \"DEFINE-KEY\""
     "          \"FIND-FILE\" \"SAVE-FILE\" \"SHOW-DASHBOARD\" \"INSERT\""
     "          \"SET-COMPLETION-STYLE\" \"CLEAR-COMMANDS\""
-    "          \"REGISTER-COMMAND\"))";
+    "          \"REGISTER-COMMAND\" \"SET-LINE-OVERFLOW\""
+    "          \"SET-RELATIVE-LINE-NUMBERS\" \"SET-MAJOR-MODE\""
+    "          \"SET-MINOR-MODE\"))";
 
 /* Written with explicit `zemacs::` prefixes because a single EVAL reads the
  * whole PROGN before IN-PACKAGE could take effect. */
@@ -336,6 +370,11 @@ void zemacs_boot(void) {
   defprim("SET-TAB-WIDTH", (cl_objectfn_fixed)f_set_tab_width, 1);
   defprim("SET-MODELINE-RELIEF", (cl_objectfn_fixed)f_set_modeline_relief, 1);
   defprim("SET-MODELINE-PAD", (cl_objectfn_fixed)f_set_modeline_pad, 1);
+  defprim("SET-LINE-OVERFLOW", (cl_objectfn_fixed)f_set_line_overflow, 1);
+  defprim("SET-RELATIVE-LINE-NUMBERS",
+          (cl_objectfn_fixed)f_set_relative_line_numbers, 1);
+  defprim("SET-MAJOR-MODE", (cl_objectfn_fixed)f_set_major_mode, 1);
+  defprim("SET-MINOR-MODE", (cl_objectfn_fixed)f_set_minor_mode, 2);
   defprim("MESSAGE", (cl_objectfn_fixed)f_message, 1);
   defprim("QUIT", (cl_objectfn_fixed)f_quit, 0);
   defprim("DASHBOARD-BANNER", (cl_objectfn_fixed)f_dashboard_banner, 1);

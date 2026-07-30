@@ -45,7 +45,13 @@ same way Emacs tracks `text-scale-mode-amount' in a variable.")
 
 (set-font-size *font-size*)
 (set-line-numbers t)
+(set-relative-line-numbers nil)   ; t counts from the cursor, vim-style
 (set-tab-width 4)
+
+;;; What a window does with a line wider than it is.
+;;; "truncate" — cut it at the pane edge and mark the tail with a `→'
+;;; "wrap"     — continue it on the next row
+(set-line-overflow "truncate")
 
 ;;; A calm dark theme: a near-black blue-grey ground, cool off-white text.
 (set-background 0.07 0.08 0.12)
@@ -58,6 +64,18 @@ same way Emacs tracks `text-scale-mode-amount' in a variable.")
 (set-syntax-color "string"   0.62 0.85 0.55)
 (set-syntax-color "number"   0.98 0.72 0.47)
 (set-syntax-color "comment"  0.42 0.46 0.58)
+
+;;; Markup faces, used by org-mode. Emphasis is carried by colour rather than
+;;; by weight or slant — the renderer opens one font face, so real bold and
+;;; italic would mean loading two more.
+(set-syntax-color "heading-1" 0.60 0.80 1.00)
+(set-syntax-color "heading-2" 0.55 0.88 0.80)
+(set-syntax-color "heading-3" 0.80 0.75 0.98)
+(set-syntax-color "bold"      1.00 0.92 0.72)
+(set-syntax-color "italic"    0.78 0.88 0.72)
+(set-syntax-color "code"      0.72 0.82 0.95)
+(set-syntax-color "link"      0.52 0.76 0.98)
+(set-syntax-color "markup"    0.36 0.40 0.52) ; the delimiters themselves
 
 ;;; The modeline. Relief is Emacs' `:box :line-width': the magnitude is the
 ;;; bevel in pixels and the *sign* picks which way it goes — 2 raises the bar
@@ -308,6 +326,30 @@ the bindings.")
 (define-leader "SPC b s" "lisp-scratch")
 (define-leader "SPC q q" "quit")
 (define-key-everywhere "C-M-j" "switch-buffer")
+
+;;; ---------------------------------------------------------------------------
+;;; Major and minor modes
+;;;
+;;; A buffer has exactly one major mode, taken from its file (`notes.org' opens
+;;; in `org-mode'), and any number of minor modes on top. `M-x org-mode' sets it
+;;; by hand. Bindings made for a mode name that is not an editing mode belong to
+;;; that major/minor mode and apply only in its buffers — minor modes are
+;;; consulted first, most recently enabled first.
+;;;
+;;; A function named `<mode>-hook' runs whenever the mode is entered. Defining
+;;; one is the whole extension point; there is nothing to register.
+
+(defun org-mode-hook ()
+  "Prose wants wrapped lines and absolute numbering."
+  (set-line-overflow "wrap")
+  (message "org-mode"))
+
+(defun fundamental-mode-hook ()
+  "Back to the defaults for anything without a mode of its own."
+  (set-line-overflow "truncate"))
+
+(defun rust-mode-hook ()
+  (set-line-overflow "truncate"))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Magit

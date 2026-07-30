@@ -435,6 +435,16 @@ fn main() -> anyhow::Result<()> {
                 None => editor.highlights.clear(),
             }
         }
+        // Mode hooks: core records that one is due, the image runs it. Guarded
+        // with `fboundp` so a mode with no hook defined is silence rather than
+        // an "undefined function" every time you open a file.
+        for hook in std::mem::take(&mut editor.pending_hooks) {
+            lisp.eval(format!(
+                "(let ((h (find-symbol {:?} :zemacs))) (when (and h (fboundp h)) (funcall h)))",
+                hook.to_uppercase()
+            ));
+        }
+
         refresh_file_completions(&mut editor, &mut last_file_query);
 
         // Adopt a result only if the buffer hasn't moved on; if it has, a newer

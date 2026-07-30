@@ -21,6 +21,13 @@
 //! for rectangles inside [`Renderer::content_area`] and draws a document, a
 //! cursor and a modeline into each, so the renderer and the app's mouse
 //! hit-testing are reading the same arithmetic rather than two copies of it.
+//!
+//! A line wider than its pane is never allowed to bleed into the next one.
+//! [`zemacs_core::LineOverflow`] picks which way it is contained: `Truncate`
+//! cuts it and puts a marker glyph in the last column, `Wrap` continues it on
+//! the rows below. Scrolling stays by *buffer line* either way — core owns
+//! `Window::scroll` — so a wrapped line taller than the room left in the pane
+//! is simply cut at the bottom edge, which is what Emacs does too.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,7 +38,7 @@ use sdl2::render::{BlendMode, Texture, TextureCreator, WindowCanvas};
 use sdl2::ttf::{Font, Sdl2TtfContext};
 use sdl2::video::WindowContext;
 use zemacs_core::{
-    Buffer, BufferKind, CompletionStyle, Editor, HlKind, Mode, Settings, Span, Window,
+    Buffer, BufferKind, CompletionStyle, Editor, HlKind, LineOverflow, Mode, Settings, Span, Window,
 };
 
 /// Outer margin, in pixels, around the text area and inside the modeline.
@@ -219,7 +226,22 @@ impl Renderer {
         let dividers = frame.dividers(area_rect(area));
 
         for p in &panes {
-            let lines = doc_lines(area_of(p.rect), status_h, self.line_h);
+            let pane = area_of(p.rect);
+            let rows = doc_lines(pane, status_h, self.line_h);
+            // Wrapping breaks the one-row-per-line assumption this used to be a
+            // division by, so the lines have to be laid out to be counted.
+            let lines = editor.frames[frame_index]
+                .window(p.window)
+                .map(|w| (w.buffer, w.scroll))
+                .and_then(|(id, scroll)| {
+                    let buf = editor.buffer_by_id(id)?;
+                    let set = &editor.settings;
+                    let doc = doc_rect(pane, status_h);
+                    let cols =
+                        visible_cols(doc.w - gutter_w(buf, set, self.cell_w), self.cell_w);
+                    Some(visible_lines(buf, scroll, rows, cols, set))
+                })
+                .unwrap_or(rows);
             if let Some(w) = editor.frames[frame_index].window_mut(p.window) {
                 w.viewport_lines = lines;
             }
@@ -278,6 +300,11 @@ impl Renderer {
     /// One pane's buffer. `win` carries the cursor and scroll — the focused
     /// window's are copied onto it before the frame, so this never reads
     /// `editor.buffer.cursor`.
+    ///
+    /// Two nested loops: buffer lines down the pane, and the display rows each
+    /// of them occupies. Truncation is the degenerate case of wrapping — the
+    /// first row only, plus a marker — so both modes walk the same code and
+    /// there is one place where a cell can be placed outside the pane.
     fn draw_document(
         &mut self,
         editor: &Editor,
@@ -309,32 +336,31 @@ impl Renderer {
         };
         let block_cursor = editor.mode != Mode::Insert;
 
-        let digits = buf.len_lines().to_string().len().max(3);
-        let gutter = if set.line_numbers {
-            (digits as i32 + 1) * self.cell_w
-        } else {
-            0
-        };
+        let digits = gutter_digits(buf);
+        let gutter = gutter_w(buf, set, self.cell_w);
         let x0 = doc.x + gutter;
         let cols = visible_cols(doc.w - gutter, self.cell_w);
+        let wrap = set.line_overflow == LineOverflow::Wrap;
 
         let sel_bg = rgb(mix(bg, fg, 0.28));
         let cur_bg = rgb(mix(bg, fg, 0.05));
         let cursor_c = rgb(mix(bg, fg, 0.85));
         let num_c = rgb(mix(bg, fg, 0.35));
         let num_cur_c = rgb(mix(bg, fg, 0.7));
+        // The truncation marker is chrome, not a character in the file, so it
+        // gets the accent hue rather than a shade of the text colour — dimmed,
+        // so it does not out-shout the line it is annotating.
+        let marker_c = rgb(mix(bg, editor.theme.color(HlKind::Function, fg), 0.75));
 
         // Highlight spans are whole-buffer char offsets and sorted, so one
         // monotonic cursor walks them alongside the lines — no rescan per line.
         let mut si = 0usize;
         let rows = doc_lines(pane, status_h, self.line_h);
 
-        for row in 0..rows {
-            let line = win.scroll + row;
-            if line >= buf.len_lines() {
-                break;
-            }
-            let y = doc.y + row as i32 * self.line_h;
+        // `row` is a display row in the pane, `line` a buffer line: with
+        // wrapping the two advance at different rates.
+        let (mut row, mut line) = (0usize, win.scroll);
+        while row < rows && line < buf.len_lines() {
             let start = buf.line_start(line);
             let len = buf.line_len(line);
             let end = start + len;
@@ -344,69 +370,108 @@ impl Renderer {
 
             let cells = expand_line(&buf.slice_string(start, end), set.tab_width);
 
-            if line == cur_line && selection.is_empty() {
-                self.fill(pane.x, y, pane.w, self.line_h, cur_bg);
-            }
-
-            // Selection: `end + 1` is the newline, drawn as one trailing cell so
-            // a linewise selection visibly swallows the line break.
-            for &(s, e) in &selection {
-                if e > start && s <= end {
-                    let a = s.max(start) - start;
+            // Selection as display-cell ranges, resolved once per line so the
+            // row loop only has to clip. `end + 1` is the newline, kept as one
+            // trailing cell so a linewise selection visibly swallows the break.
+            let sel_cells: Vec<(usize, usize)> = selection
+                .iter()
+                .filter(|&&(s, e)| e > start && s <= end)
+                .map(|&(s, e)| {
                     let b = e.min(end + 1) - start;
-                    let c0 = visual_col(&cells, a) as i32;
-                    let c1 = if b > len {
-                        cells.len() as i32 + 1
-                    } else {
-                        visual_col(&cells, b) as i32
-                    };
-                    if c1 > c0 {
-                        self.fill(x0 + c0 * self.cell_w, y, (c1 - c0) * self.cell_w, self.line_h, sel_bg);
-                    }
-                }
-            }
+                    (
+                        visual_col(&cells, s.max(start) - start),
+                        if b > len { cells.len() + 1 } else { visual_col(&cells, b) },
+                    )
+                })
+                .collect();
+
+            // Rows this line wants, and how many of them are left in the pane.
+            // ponytail: a wrapped line taller than the remaining rows is cut at
+            // the bottom edge, because `scroll` counts buffer lines and there is
+            // no row to scroll to. Ceiling: a paragraph-length line at the foot
+            // of a short pane. Upgrade path: a scroll position of (line, row).
+            let need = if wrap { wrap_row_count(cells.len(), cols) } else { 1 };
+            let fits = need.min(rows - row);
 
             // Only the focused window of the focused frame gets a cursor: two
             // blocks on screen at once is two claims about where typing goes.
-            let cursor_vc =
-                (active && line == cur_line).then(|| visual_col(&cells, cur_col) as i32);
-            if block_cursor {
-                if let Some(vc) = cursor_vc {
-                    self.fill(x0 + vc * self.cell_w, y, self.cell_w, self.line_h, cursor_c);
-                }
-            }
+            let cursor_at = (active && line == cur_line)
+                .then(|| cursor_pos(visual_col(&cells, cur_col), cols, need));
 
-            if set.line_numbers {
-                let c = if line == cur_line { num_cur_c } else { num_c };
-                self.draw_str(&format!("{:>digits$}", line + 1), doc.x, y, c);
-            }
+            // ponytail: no horizontal scrolling. A truncated line gives up its
+            // last column to the marker; the tail is simply not reachable.
+            // Upgrade path: an `hscroll` alongside `scroll`.
+            let marker = (!wrap).then(|| truncation_marker(cells.len(), cols)).flatten();
 
-            // ponytail: no horizontal scrolling — long lines are cut at the
-            // pane's last whole column (the clip rect catches the partial glyph
-            // that lands on it). Upgrade path: an `hscroll` alongside `scroll`.
             let mut ri = 0usize;
-            for (vc, &(ch, src)) in cells.iter().take(cols).enumerate() {
-                let x = x0 + vc as i32 * self.cell_w;
-                while ri < runs.len() && runs[ri].1 <= src {
-                    ri += 1;
-                }
-                let kind = match runs.get(ri) {
-                    Some(&(s, _, k)) if s <= src => k,
-                    _ => HlKind::Default,
-                };
-                let color = if block_cursor && cursor_vc == Some(vc as i32) {
-                    rgb(bg) // knock the glyph out of the cursor block
-                } else {
-                    rgb(editor.theme.color(kind, fg))
-                };
-                self.draw_char(ch, x, y, color);
-            }
+            for (r, (rs, re)) in wrap_rows(cells.len(), cols).take(fits).enumerate() {
+                let y = doc.y + (row + r) as i32 * self.line_h;
+                let cursor_col = cursor_at.and_then(|(cr, cc)| (cr == r).then_some(cc));
 
-            if !block_cursor {
-                if let Some(vc) = cursor_vc {
-                    self.fill(x0 + vc * self.cell_w, y, 2, self.line_h, cursor_c);
+                if line == cur_line && selection.is_empty() {
+                    self.fill(pane.x, y, pane.w, self.line_h, cur_bg);
+                }
+                for &s in &sel_cells {
+                    if let Some((a, b)) = row_span(s, rs, cols) {
+                        let x = x0 + a as i32 * self.cell_w;
+                        self.fill(x, y, (b - a) as i32 * self.cell_w, self.line_h, sel_bg);
+                    }
+                }
+
+                // The number belongs to the buffer line, not to each of the
+                // rows it occupies: repeating it down a wrapped line would read
+                // as several lines, so continuation rows get a blank gutter.
+                // After the stripe, which is painted across the gutter too.
+                if set.line_numbers && r == 0 {
+                    let c = if line == cur_line { num_cur_c } else { num_c };
+                    self.draw_str(&format!("{:>digits$}", line + 1), doc.x, y, c);
+                }
+
+                if block_cursor {
+                    if let Some(cc) = cursor_col {
+                        let x = x0 + cc as i32 * self.cell_w;
+                        self.draw_cursor(x, y, self.cell_w, pane, cursor_c);
+                    }
+                }
+
+                // The marker replaces the last cell rather than following it:
+                // drawn one column further right it would be the overflow it
+                // exists to warn about.
+                let shown = marker.unwrap_or(re - rs);
+                for (col, &(ch, src)) in cells[rs..rs + shown].iter().enumerate() {
+                    let x = x0 + col as i32 * self.cell_w;
+                    while ri < runs.len() && runs[ri].1 <= src {
+                        ri += 1;
+                    }
+                    let kind = match runs.get(ri) {
+                        Some(&(s, _, k)) if s <= src => k,
+                        _ => HlKind::Default,
+                    };
+                    let color = if block_cursor && cursor_col == Some(col) {
+                        rgb(bg) // knock the glyph out of the cursor block
+                    } else {
+                        rgb(editor.theme.color(kind, fg))
+                    };
+                    self.draw_char(ch, x, y, color);
+                }
+                if let Some(mc) = marker {
+                    let c = if block_cursor && cursor_col == Some(mc) {
+                        rgb(bg)
+                    } else {
+                        marker_c
+                    };
+                    self.draw_char(LineOverflow::MARKER, x0 + mc as i32 * self.cell_w, y, c);
+                }
+
+                if !block_cursor {
+                    if let Some(cc) = cursor_col {
+                        let x = x0 + cc as i32 * self.cell_w;
+                        self.draw_cursor(x, y, 2, pane, cursor_c);
+                    }
                 }
             }
+            row += fits;
+            line += 1;
         }
     }
 
@@ -634,6 +699,14 @@ impl Renderer {
 
     fn clear_clip(&mut self) {
         self.canvas.set_clip_rect(None);
+    }
+
+    /// A cursor rect, trimmed to `pane`. The cursor legitimately sits one cell
+    /// *past* the last column — end of line in insert mode, see [`cursor_pos`] —
+    /// and a whole cell there overhangs the neighbouring pane. The clip rect
+    /// would hide it; trimming means we never ask SDL to draw it at all.
+    fn draw_cursor(&mut self, x: i32, y: i32, w: i32, pane: Area, color: Color) {
+        self.fill(x, y, w.min(pane.x + pane.w - x), self.line_h, color);
     }
 
     fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color) {
@@ -1118,6 +1191,129 @@ fn expand_line(line: &str, tab_width: usize) -> Vec<(char, usize)> {
     out
 }
 
+// --- line overflow ---------------------------------------------------------
+//
+// Everything below counts *display cells*, never source chars and never bytes:
+// a tab is several cells and a `→` is one, so wrapping on anything else puts
+// the break in the wrong place (or, for bytes, mid-codepoint).
+
+/// Display rows one line of `len` cells occupies in a pane `cols` wide.
+///
+/// Always at least one, so an empty line still has a row for its gutter number
+/// and its cursor. `cols == 0` — a pane narrower than its own line numbers —
+/// is the infinite-loop case: it yields one row rather than dividing by zero,
+/// and the caller advances past the line either way.
+fn wrap_row_count(len: usize, cols: usize) -> usize {
+    match cols {
+        0 => 1,
+        c => len.div_ceil(c).max(1),
+    }
+}
+
+/// The cell range `[start, end)` shown on each display row of a line of `len`
+/// cells, in order. Truncation takes the first of these and nothing else.
+fn wrap_rows(len: usize, cols: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..wrap_row_count(len, cols)).map(move |r| {
+        let s = (r * cols).min(len);
+        (s, (s + cols).min(len))
+    })
+}
+
+/// Column of the truncation marker for a line of `len` cells in `cols`
+/// columns, or `None` when the whole line is visible.
+///
+/// A line that exactly fills the pane is *not* marked: the marker claims there
+/// is more text, and it costs a column to say so, so saying it falsely is worse
+/// than staying quiet.
+fn truncation_marker(len: usize, cols: usize) -> Option<usize> {
+    (cols > 0 && len > cols).then(|| cols - 1)
+}
+
+/// The part of display-cell range `sel` that lands on the row starting at cell
+/// `rs`, as columns within that row — `None` when it misses the row entirely.
+///
+/// Clipped to `cols`, which is what stops a selection running off the pane: the
+/// range may extend one cell past the line's last character (the newline a
+/// linewise selection swallows) and a wrapped row's range is unbounded to the
+/// right until it is cut here.
+fn row_span(sel: (usize, usize), rs: usize, cols: usize) -> Option<(usize, usize)> {
+    let (a, b) = (sel.0.max(rs), sel.1.min(rs + cols));
+    (b > a).then(|| (a - rs, b - rs))
+}
+
+/// (row, column) of a cursor on display cell `vc` of a line occupying `rows`
+/// rows of `cols` columns.
+///
+/// The cursor may sit one cell *past* the last character — insert mode at end
+/// of line — and on a line ending exactly at the pane's edge that cell is the
+/// first column of a row this line does not own. Emacs opens a continuation row
+/// for it; we park it on the trailing margin of the last row the line does own,
+/// one cell left of where Emacs draws it and, more importantly, inside the
+/// pane. Truncated lines (`rows == 1`) land there too: with no horizontal
+/// scrolling there is nowhere else to say "the cursor is off to the right".
+fn cursor_pos(vc: usize, cols: usize, rows: usize) -> (usize, usize) {
+    if cols == 0 {
+        return (0, 0);
+    }
+    match vc / cols {
+        r if r < rows => (r, vc % cols),
+        _ => (rows.saturating_sub(1), cols),
+    }
+}
+
+/// Buffer lines that fit in `rows` display rows, given each line's row count in
+/// `heights` counting down from the first visible line — the window's
+/// `viewport_lines`.
+///
+/// Rows left over once the buffer ends count as one line each. Core clamps
+/// `scroll` against this number, so a count that shrank at the end of the file
+/// would let the view scroll past it; topping up also makes truncation (every
+/// height 1) report the pane's full row capacity, exactly as before wrapping
+/// existed. A single line taller than the whole pane still reports 1, which is
+/// what keeps scrolling able to step over it.
+fn lines_in_rows(heights: impl IntoIterator<Item = usize>, rows: usize) -> usize {
+    let (mut used, mut lines) = (0usize, 0usize);
+    for h in heights {
+        if used >= rows {
+            break;
+        }
+        used += h.max(1);
+        lines += 1;
+    }
+    lines + rows.saturating_sub(used)
+}
+
+/// [`lines_in_rows`] for a real buffer. Only the visible lines are expanded —
+/// the iterator is lazy and the count stops as soon as the pane is full — so a
+/// 10k-line file costs one screenful, same as drawing it.
+fn visible_lines(buf: &Buffer, scroll: usize, rows: usize, cols: usize, set: &Settings) -> usize {
+    if set.line_overflow == LineOverflow::Truncate {
+        return rows; // one row per line; the general path would agree, slower
+    }
+    let heights = (scroll..buf.len_lines()).map(|l| {
+        let start = buf.line_start(l);
+        let text = buf.slice_string(start, start + buf.line_len(l));
+        wrap_row_count(expand_line(&text, set.tab_width).len(), cols)
+    });
+    lines_in_rows(heights, rows)
+}
+
+/// Digits reserved for the line-number gutter. Sized from the whole file so the
+/// text column does not shift as you scroll into four-digit territory.
+fn gutter_digits(buf: &Buffer) -> usize {
+    buf.len_lines().to_string().len().max(3)
+}
+
+/// Width of the line-number gutter in pixels — zero when they are off. Both the
+/// row count and the drawing loop need it, and they must not disagree about how
+/// many columns the text has left.
+fn gutter_w(buf: &Buffer, set: &Settings, cell_w: i32) -> i32 {
+    match set.line_numbers {
+        true => (gutter_digits(buf) as i32 + 1) * cell_w,
+        false => 0,
+    }
+}
+
 /// Visual column of source char `src`; the end of the line if it is past it
 /// (which is where the cursor sits on an empty line, or at EOL in insert mode).
 fn visual_col(cells: &[(char, usize)], src: usize) -> usize {
@@ -1251,6 +1447,293 @@ mod tests {
         assert_eq!(visual_col(&cells, 1), 4); // 'f' after the tab stop
         assert_eq!(visual_col(&cells, 3), 6); // past EOL -> end of the line
         assert_eq!(visual_col(&expand_line("", 4), 0), 0);
+    }
+
+    // --- line overflow ----------------------------------------------------
+
+    /// The glyphs a row shows, so a wrap can be asserted on what you'd read.
+    fn row_text(cells: &[(char, usize)], (s, e): (usize, usize)) -> String {
+        cells[s..e].iter().map(|&(c, _)| c).collect()
+    }
+
+    /// `visible_lines` for `text` wrapped in a `cols`-wide, `rows`-tall pane —
+    /// the path the renderer actually takes, so a wrap measured in the wrong
+    /// unit shows up here rather than only in the helper it was measured with.
+    fn wrapped_lines(text: &str, rows: usize, cols: usize) -> usize {
+        let set = Settings {
+            line_overflow: LineOverflow::Wrap,
+            ..Settings::default()
+        };
+        visible_lines(&Buffer::from_str(text), 0, rows, cols, &set)
+    }
+
+    #[test]
+    fn a_line_wraps_into_whole_rows_of_the_panes_width() {
+        let rows = |n: usize, w: usize| wrap_rows(n, w).collect::<Vec<_>>();
+        // Narrower than the pane: one row, and it is the whole line.
+        assert_eq!(rows(3, 4), vec![(0, 3)]);
+        // Exactly the pane: still one row. A second, empty one would look like
+        // a blank line in the file.
+        assert_eq!(rows(4, 4), vec![(0, 4)]);
+        // One over: the overflow gets a row of its own.
+        assert_eq!(rows(5, 4), vec![(0, 4), (4, 5)]);
+        // Three panefuls: three full rows, no fourth.
+        assert_eq!(rows(12, 4), vec![(0, 4), (4, 8), (8, 12)]);
+        assert_eq!(rows(13, 4), vec![(0, 4), (4, 8), (8, 12), (12, 13)]);
+        // Empty line: one row to hold the cursor and the gutter number.
+        assert_eq!(rows(0, 4), vec![(0, 0)]);
+        for (n, w) in [(3, 4), (4, 4), (5, 4), (12, 4), (0, 4), (7, 3)] {
+            assert_eq!(rows(n, w).len(), wrap_row_count(n, w), "{n}/{w}");
+            // Every row is inside the line and they tile it end to end.
+            assert_eq!(rows(n, w).last().unwrap().1, n, "{n}/{w}");
+            assert!(rows(n, w).windows(2).all(|p| p[0].1 == p[1].0), "{n}/{w}");
+            assert!(rows(n, w).iter().all(|&(s, e)| e - s <= w), "{n}/{w}");
+        }
+    }
+
+    #[test]
+    fn a_degenerate_pane_width_terminates() {
+        // Zero columns: a pane narrower than its own gutter. Dividing by it is
+        // the infinite loop; one empty row is the answer that lets the caller
+        // move on to the next line.
+        assert_eq!(wrap_row_count(500, 0), 1);
+        assert_eq!(wrap_rows(500, 0).collect::<Vec<_>>(), vec![(0, 0)]);
+        assert_eq!(wrap_rows(0, 0).collect::<Vec<_>>(), vec![(0, 0)]);
+        assert_eq!(truncation_marker(500, 0), None); // nowhere to put it
+        assert_eq!(cursor_pos(7, 0, 1), (0, 0));
+        // One column: one row per character, and it does terminate.
+        assert_eq!(wrap_row_count(5, 1), 5);
+        assert_eq!(
+            wrap_rows(5, 1).collect::<Vec<_>>(),
+            vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
+        );
+        assert_eq!(truncation_marker(5, 1), Some(0));
+    }
+
+    #[test]
+    fn wrapping_measures_display_cells_not_source_chars() {
+        // "a\tb" is 3 source chars but 5 cells: 'a', three spaces to the tab
+        // stop, 'b'. Wrapping the chars would fit it on one 4-column row.
+        let cells = expand_line("a\tb", 4);
+        assert_eq!(cells.len(), 5);
+        let rows = wrap_rows(cells.len(), 4).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_text(&cells, rows[0]), "a   ");
+        assert_eq!(row_text(&cells, rows[1]), "b");
+        // ...and the cell that starts row 1 still points at its source char.
+        assert_eq!(cells[rows[1].0].1, 2);
+        // Same at the call site, which is what a source-char implementation
+        // would actually get wrong: "a\tb" costs two of the pane's twenty rows
+        // where the three-character "abc" costs one. (Both files also have the
+        // empty line their trailing newline leaves behind.)
+        assert_eq!(wrapped_lines("a\tb\n", 20, 4), 2 + 17);
+        assert_eq!(wrapped_lines("abc\n", 20, 4), 2 + 18);
+    }
+
+    #[test]
+    fn wrapping_measures_characters_not_bytes() {
+        // 5 chars, 10 bytes. A byte count wraps this into 4 rows and slices a
+        // codepoint in half doing it.
+        let cells = expand_line("ααααα", 4);
+        assert_eq!(cells.len(), 5);
+        assert_eq!(wrap_row_count(cells.len(), 3), 2);
+        let rows = wrap_rows(cells.len(), 3).collect::<Vec<_>>();
+        assert_eq!(row_text(&cells, rows[0]), "ααα");
+        assert_eq!(row_text(&cells, rows[1]), "αα");
+        // Box-drawing art from the dashboard banner, same story.
+        let cells = expand_line("███████╗", 4);
+        assert_eq!(cells.len(), 8);
+        assert_eq!(wrap_row_count(cells.len(), 8), 1);
+        assert_eq!(wrap_row_count(cells.len(), 4), 2);
+        // At the call site: ten Greek letters are ten cells and twenty bytes,
+        // so a byte-measured pane wraps them into five rows instead of three
+        // and reports 16 lines where the answer is 18.
+        assert_eq!(wrapped_lines("αααααααααα\n", 20, 4), 2 + 16);
+        assert_eq!(wrapped_lines("aaaaaaaaaa\n", 20, 4), 2 + 16);
+        // Three cells is one row; three bytes would be two.
+        assert_eq!(wrapped_lines("ααα\n", 20, 4), 2 + 18);
+    }
+
+    #[test]
+    fn the_marker_replaces_the_last_column_only_when_text_is_hidden() {
+        assert_eq!(truncation_marker(9, 10), None); // fits with room to spare
+        assert_eq!(truncation_marker(10, 10), None); // fits exactly: no lie
+        assert_eq!(truncation_marker(11, 10), Some(9)); // last column, not the 11th
+        assert_eq!(truncation_marker(500, 10), Some(9));
+        assert_eq!(truncation_marker(0, 10), None);
+        // It lands *inside* the pane: the whole point is that it is not itself
+        // the overflow it warns about.
+        let cols = 30;
+        let mc = truncation_marker(500, cols).unwrap();
+        assert!(mc < cols);
+        let pane = Area { x: 0, y: 0, w: 2 * PAD + cols as i32 * CW, h: 600 };
+        let doc = doc_rect(pane, mh());
+        assert!(doc.x + (mc as i32 + 1) * CW <= pane.x + pane.w);
+        // And it takes the place of a character rather than following one: the
+        // glyphs drawn plus the marker are exactly one paneful.
+        assert_eq!(mc + 1, cols);
+    }
+
+    #[test]
+    fn a_wrapped_offset_round_trips_to_its_row_and_column() {
+        let cells = expand_line("abcdefghij", 4);
+        let rows = wrap_rows(cells.len(), 4).collect::<Vec<_>>();
+        for vc in 0..cells.len() {
+            let (r, c) = cursor_pos(vc, 4, rows.len());
+            assert!(c < 4, "{vc} -> {r},{c}");
+            assert_eq!(rows[r].0 + c, vc, "{vc} -> {r},{c}");
+            assert!(vc >= rows[r].0 && vc < rows[r].1, "{vc} -> {r},{c}");
+        }
+        // Same for a tab-expanded line, where cells and chars disagree.
+        let cells = expand_line("\tfn main() {", 4);
+        let rows = wrap_rows(cells.len(), 5).collect::<Vec<_>>();
+        for src in [0usize, 1, 5] {
+            let vc = visual_col(&cells, src);
+            let (r, c) = cursor_pos(vc, 5, rows.len());
+            assert_eq!(rows[r].0 + c, vc);
+        }
+    }
+
+    #[test]
+    fn the_cursor_past_the_last_column_is_parked_in_the_margin() {
+        // End of a line that exactly fills its last row: cell 8 belongs to a
+        // row this line does not own, so it comes back to the trailing margin
+        // of row 1 rather than landing on the next buffer line.
+        assert_eq!(cursor_pos(8, 4, 2), (1, 4));
+        assert_eq!(cursor_pos(7, 4, 2), (1, 3)); // the last character itself
+        // Truncated: the cursor is somewhere off to the right, and the margin
+        // is the only place left to say so. Never past it.
+        for vc in [30, 31, 500] {
+            assert_eq!(cursor_pos(vc, 30, 1), (0, 30));
+        }
+        assert_eq!(cursor_pos(0, 30, 1), (0, 0));
+        // A margin cursor is still inside its pane once trimmed — this is the
+        // arithmetic `draw_cursor` protects.
+        let cols = 30i32;
+        let pane = Area { x: 0, y: 0, w: 2 * PAD + cols * CW, h: 600 };
+        let doc = doc_rect(pane, mh());
+        let x = doc.x + cols * CW;
+        assert!(x < pane.x + pane.w, "the margin is inside the pane");
+        assert!(CW.min(pane.x + pane.w - x) > 0, "and wide enough to see");
+    }
+
+    #[test]
+    fn a_selection_is_clipped_to_each_row_it_crosses() {
+        // Cells 2..9 of a line wrapped at 4: part of row 0, all of row 1, part
+        // of row 2.
+        assert_eq!(row_span((2, 9), 0, 4), Some((2, 4)));
+        assert_eq!(row_span((2, 9), 4, 4), Some((0, 4)));
+        assert_eq!(row_span((2, 9), 8, 4), Some((0, 1)));
+        assert_eq!(row_span((2, 9), 12, 4), None); // past the selection
+        assert_eq!(row_span((2, 9), 0, 0), None); // zero-column pane
+        // The trailing newline cell of a linewise selection: shown when the row
+        // has a column spare, dropped when it would land past the pane edge.
+        assert_eq!(row_span((0, 5), 0, 8), Some((0, 5)));
+        assert_eq!(row_span((0, 5), 0, 4), Some((0, 4)));
+        // Never wider than the pane, whatever it is handed.
+        for &(s, e) in &[(0usize, 500usize), (0, 5), (7, 9), (100, 200)] {
+            if let Some((a, b)) = row_span((s, e), 0, 30) {
+                assert!(b <= 30 && a < b, "{s}..{e} -> {a}..{b}");
+            }
+        }
+    }
+
+    #[test]
+    fn viewport_lines_counts_buffer_lines_not_rows() {
+        const ROWS: usize = 40;
+        // Truncation: one row each, so the pane's full capacity, file length
+        // notwithstanding — unchanged from before wrapping existed.
+        assert_eq!(lines_in_rows(std::iter::repeat_n(1, 100), ROWS), ROWS);
+        // A short file leaves rows empty; they count one line each, or `scroll`
+        // would be clamped further down every frame near the end of the file.
+        assert_eq!(lines_in_rows([1, 1, 1], ROWS), ROWS);
+        // Wrapped: a line worth several rows crowds the others out.
+        assert_eq!(lines_in_rows([10, 10, 10, 10, 1, 1], ROWS), 4);
+        assert_eq!(lines_in_rows([2, 2, 2, 2], ROWS), 4 + 32);
+        // One line taller than the whole pane still counts as one, so scrolling
+        // can step over it instead of getting stuck on it.
+        assert_eq!(lines_in_rows([100, 1, 1], ROWS), 1);
+        assert_eq!(lines_in_rows([100], ROWS), 1);
+        // A pane with no room for text advertises no lines: core reads that as
+        // zero and clamps, where a lie about one row would scroll by it.
+        assert_eq!(lines_in_rows([1, 1], 0), 0);
+        assert_eq!(lines_in_rows(std::iter::empty(), 0), 0);
+        // Past the end of the buffer: still the pane's capacity, never zero.
+        assert_eq!(lines_in_rows(std::iter::empty(), ROWS), ROWS);
+    }
+
+    #[test]
+    fn a_wrapped_buffer_reports_fewer_lines_than_a_truncated_one() {
+        // Four lines: 100 characters, "short", "short", and the empty line the
+        // trailing newline leaves behind.
+        let buf = Buffer::from_str(&format!("{}\nshort\nshort\n", "x".repeat(100)));
+        let mut set = Settings { line_numbers: false, ..Settings::default() };
+        // Truncated, every line is one row, so the answer is the pane's height
+        // whatever the buffer looks like.
+        assert_eq!(visible_lines(&buf, 0, 20, 10, &set), 20);
+        set.line_overflow = LineOverflow::Wrap;
+        // 100 cells in a 10-column pane is 10 rows for the first line alone,
+        // then three one-row lines, then seven rows of nothing.
+        assert_eq!(visible_lines(&buf, 0, 20, 10, &set), 4 + 7);
+        // Scrolled past the long line, the wrapped and truncated counts agree
+        // again — nothing on screen is wider than the pane.
+        assert_eq!(visible_lines(&buf, 1, 20, 10, &set), 20);
+        // Tall enough to matter: the long line alone fills a 5-row pane, and
+        // the count must not drop to zero or scrolling stops dead.
+        assert_eq!(visible_lines(&buf, 0, 5, 10, &set), 1);
+        assert_eq!(visible_lines(&buf, 0, 0, 10, &set), 0);
+        // A pane with no columns must not hang: every line is one row.
+        assert_eq!(visible_lines(&buf, 0, 5, 0, &set), 4 + 1);
+    }
+
+    #[test]
+    fn the_gutter_is_sized_from_the_whole_file() {
+        let set = Settings::default();
+        let short = Buffer::from_str("a\nb\n");
+        let long = Buffer::from_str(&"x\n".repeat(1500));
+        // Three digits minimum, so a short file's text does not sit flush left.
+        assert_eq!(gutter_digits(&short), 3);
+        assert_eq!(gutter_digits(&long), 4);
+        assert_eq!(gutter_w(&short, &set, CW), 4 * CW);
+        assert_eq!(gutter_w(&long, &set, CW), 5 * CW);
+        // Off: the text starts at the document edge and gets those columns back.
+        let off = Settings { line_numbers: false, ..set };
+        assert_eq!(gutter_w(&long, &off, CW), 0);
+    }
+
+    #[test]
+    fn neither_mode_puts_a_cell_outside_its_pane() {
+        // A 30-column left pane and a 500-character line, in both modes: every
+        // column that gets drawn ends inside the pane, cursor and marker
+        // included. This is the bug the whole feature exists for.
+        let pane = Area { x: 0, y: 0, w: 2 * PAD + 30 * CW, h: 600 };
+        let doc = doc_rect(pane, mh());
+        let right = pane.x + pane.w;
+        let cells = expand_line(&"x".repeat(500), 4);
+
+        for &(wrap, cols) in &[(false, 30usize), (true, 30)] {
+            let need = if wrap { wrap_row_count(cells.len(), cols) } else { 1 };
+            let marker = (!wrap).then(|| truncation_marker(cells.len(), cols)).flatten();
+            for (rs, re) in wrap_rows(cells.len(), cols).take(need) {
+                let shown = marker.unwrap_or(re - rs);
+                assert!(shown <= cols, "wrap={wrap}");
+                assert!(doc.x + shown as i32 * CW <= right, "wrap={wrap}");
+                if let Some(mc) = marker {
+                    assert!(doc.x + (mc as i32 + 1) * CW <= right, "marker spills");
+                }
+                // The selection of the entire line, clipped to this row.
+                let (a, b) = row_span((0, cells.len() + 1), rs, cols).unwrap();
+                assert!(doc.x + b as i32 * CW <= right, "selection spills");
+                assert!(b > a);
+            }
+            // The cursor at end of line — the position that used to be drawn at
+            // column 500 and left to the clip rect to hide.
+            let (_, cc) = cursor_pos(cells.len(), cols, need);
+            let x = doc.x + cc as i32 * CW;
+            assert!(x <= right, "cursor at {x} outside {pane:?}");
+            // `draw_cursor` trims it; a whole cell here would overhang.
+            assert!(x + CW.min(right - x) <= right, "trimmed cursor spills");
+        }
     }
 
     #[test]

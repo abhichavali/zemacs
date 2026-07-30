@@ -3,6 +3,7 @@
 
 * What it is
 
+
 zemacs is an Emacs-like editor built around a live *Common Lisp* image. Rust
 owns the substrate — the rope, the window, the parser — and Common Lisp owns
 the policy: your keybindings, your theme, your dashboard, your commands.
@@ -169,6 +170,36 @@ message the command just printed.
 
 Note =C-c= no longer leaves Insert mode — =Esc= and =C-g= still do.
 
+* Major and minor modes
+
+A buffer has exactly one *major mode*, taken from its file — =notes.org= opens
+in =org-mode= — plus any number of *minor modes* on top. =M-x org-mode= sets it
+by hand. This is a different axis from the modal editing state: a buffer is in
+org-mode whether you are in Normal or Insert.
+
+A binding whose mode name is not an editing mode belongs to that major or minor
+mode and applies only in its buffers:
+
+#+begin_src lisp
+(define-key "org-mode" "<tab>" "org-cycle")     ; only in org buffers
+#+end_src
+
+Minor modes are consulted first, most recently enabled first — a minor mode is
+something you switched on *for* this buffer, so it outranks the major mode.
+
+A function named =<mode>-hook= runs when the mode is entered. Defining one is
+the whole extension mechanism; there is nothing to register.
+
+#+begin_src lisp
+(defun org-mode-hook ()
+  (set-line-overflow "wrap"))
+#+end_src
+
+Org rendering covers headings (coloured by level), =*bold*=, =/italic/=,
+=~code~=, =[[links][with descriptions]]=, =#+DIRECTIVES=, tables and lists.
+Emphasis is carried by *colour rather than weight*: the renderer opens exactly
+one font face, so real bold and italic would mean loading two more.
+
 * Configuration
 
 =runtime/init.lisp= (or =~/.config/zemacs/init.lisp= if present) is loaded at
@@ -180,6 +211,11 @@ startup, into a live ECL image.
 (set-font-size 18)
 (set-background 0.11 0.12 0.18)          ; r g b in 0.0 .. 1.0
 (set-syntax-color "keyword" 0.78 0.57 0.94)
+
+(set-line-numbers t)
+(set-relative-line-numbers t)            ; count from the cursor, vim-style
+(set-line-overflow "truncate")           ; or "wrap"
+(set-modeline-relief 2)                  ; negative sinks the bar instead
 
 ;; "center" = telescope-style box, "bottom" = consult-style panel,
 ;; "minibuffer" = a plain one-line vim prompt.

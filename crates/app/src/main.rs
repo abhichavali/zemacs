@@ -28,7 +28,9 @@ use zemacs_core::{Editor, EditorCommand, Frame, Key, PromptKind, Rect, WindowId}
 use zemacs_lisp::Lisp;
 use zemacs_render::Renderer;
 
+mod dired;
 mod magit;
+use dired::Dired;
 use magit::Magit;
 
 const RECENT_LIMIT: usize = 10;
@@ -222,6 +224,7 @@ fn main() -> anyhow::Result<()> {
     let mut mouse = Mouse::default();
     let mut cursors = Cursors::new();
     let mut magit = Magit::default();
+    let mut dired = Dired::default();
 
     'main: loop {
         keys.clear();
@@ -259,7 +262,7 @@ fn main() -> anyhow::Result<()> {
                             // live buffer belongs to the focused window, so
                             // core has to park it and adopt the new frame's.
                             let cmd = EditorCommand::FocusFrame(i);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit);
+                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired);
                         }
                     }
                     WindowEvent::Close => {
@@ -304,10 +307,11 @@ fn main() -> anyhow::Result<()> {
                             &init_path,
                             &mut renderers,
                             &mut magit,
+                            &mut dired,
                         );
                         if let Some(window) = mouse.press(&editor.frames[i], i, area, x, y) {
                             let cmd = EditorCommand::FocusWindow(window);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit);
+                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired);
                         }
                     }
                 }
@@ -369,10 +373,10 @@ fn main() -> anyhow::Result<()> {
                         editor.focus_frame = i;
                         if let Some(window) = editor.frames[i].window_at(area, px, py) {
                             let cmd = EditorCommand::FocusWindow(window);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit);
+                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired);
                         }
                         let cmd = EditorCommand::ScrollLines(-y * SCROLL_LINES);
-                        dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit);
+                        dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired);
                     }
                 }
                 Event::TextInput { text, .. } => {
@@ -393,11 +397,11 @@ fn main() -> anyhow::Result<()> {
 
         for key in keys.drain(..) {
             for cmd in editor.handle_key(key) {
-                dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit);
+                dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired);
             }
         }
         while let Ok(cmd) = rx.try_recv() {
-            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit);
+            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired);
         }
 
         // Toggle SDL text input to match the mode. This is what stops macOS
@@ -492,12 +496,31 @@ fn dispatch(
     init_path: &Path,
     renderers: &mut Vec<Renderer>,
     magit: &mut Magit,
+    dired: &mut Dired,
 ) {
     match cmd {
         EditorCommand::CallLisp(form) => lisp.eval(form),
+        // dired borrows the file prompt for rename/copy/mkdir, so an answer to
+        // one of those is a filename for *it* rather than a file to open.
+        EditorCommand::OpenFile(path) if dired.awaiting_input() => {
+            dired.supply(editor, &path.to_string_lossy())
+        }
+        // Opening a directory lists it, as `find-file` does in Emacs.
+        EditorCommand::OpenFile(path) if path.is_dir() => {
+            editor.buffer.path = Some(path);
+            dired.run(editor, "open");
+        }
         EditorCommand::OpenFile(path) => open_file(editor, &path, init_path),
         EditorCommand::SaveFile(path) => save_file(editor, path),
         EditorCommand::Git(verb) => magit.run(editor, &verb),
+        EditorCommand::Dired(verb) => {
+            dired.run(editor, &verb);
+            // `RET` on a file leaves dired; opening a buffer is this layer's
+            // job, so dired asks rather than doing it.
+            if let Some(path) = dired.open_file.take() {
+                open_file(editor, &path, init_path);
+            }
+        }
         EditorCommand::CloseFrame => {
             let focused = editor.focus_frame;
             close_frame(editor, renderers, focused);

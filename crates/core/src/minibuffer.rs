@@ -22,6 +22,8 @@ pub enum PromptKind {
     File,
     /// An open buffer to switch to.
     Buffer,
+    /// A line of the current buffer to jump to — `consult-line`.
+    Line,
 }
 
 impl PromptKind {
@@ -67,6 +69,18 @@ pub struct Prompt {
     pub matches: Vec<usize>,
     /// Index into `matches`.
     pub selected: usize,
+    /// Where the cursor was when the prompt opened, so cancelling can put it
+    /// back. Only meaningful for prompts that move the cursor while you type.
+    pub origin: Option<usize>,
+}
+
+impl PromptKind {
+    /// True when moving the selection should move the *cursor* too, so the
+    /// buffer follows the highlighted candidate as you narrow — consult's
+    /// preview. Cancelling then has to restore the original position.
+    pub fn previews(self) -> bool {
+        matches!(self, PromptKind::Line)
+    }
 }
 
 impl Prompt {
@@ -78,6 +92,7 @@ impl Prompt {
             items,
             matches: Vec::new(),
             selected: 0,
+            origin: None,
         };
         p.refilter();
         p

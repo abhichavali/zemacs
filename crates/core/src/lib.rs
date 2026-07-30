@@ -39,6 +39,8 @@ pub enum Mode {
     /// staging rather than to substitute, undo and change — a user binding is
     /// consulted before the built-in grammar, so the motions still work.
     Magit,
+    /// The directory editor.
+    Dired,
 }
 
 impl Mode {
@@ -51,6 +53,7 @@ impl Mode {
             Mode::VisualBlock => "V-BLOCK",
             Mode::Dashboard => "DASHBOARD",
             Mode::Magit => "MAGIT",
+            Mode::Dired => "DIRED",
         }
     }
 
@@ -64,6 +67,7 @@ impl Mode {
             "visual-block" | "vblock" => Some(Mode::VisualBlock),
             "dashboard" => Some(Mode::Dashboard),
             "magit" | "git" => Some(Mode::Magit),
+            "dired" => Some(Mode::Dired),
             _ => None,
         }
     }
@@ -391,6 +395,11 @@ pub enum EditorCommand {
     /// result back as buffer text, the same shape as `OpenFile`.
     Git(String),
 
+    /// A dired verb — `"open"`, `"up"`, `"enter"`, `"mark"`, `"unmark"`,
+    /// `"toggle-marks"`, `"flag-delete"`, `"execute"`, `"rename"`, `"copy"`,
+    /// `"mkdir"`, `"toggle-hidden"`, `"refresh"`. Core has no filesystem in it.
+    Dired(String),
+
     // --- dashboard, configured from Lisp ---
     SetDashboardBanner(String),
     ClearDashboardItems,
@@ -504,6 +513,8 @@ pub enum BufferKind {
     Magit,
     /// A commit message being written. `C-c C-c` finishes it.
     CommitMessage,
+    /// A directory listing.
+    Dired,
 }
 
 impl BufferKind {
@@ -512,13 +523,17 @@ impl BufferKind {
         match self {
             BufferKind::Dashboard => Mode::Dashboard,
             BufferKind::Magit => Mode::Magit,
+            BufferKind::Dired => Mode::Dired,
             _ => Mode::Normal,
         }
     }
 
     /// Generated buffers have no file behind them and must never be written.
     pub fn is_generated(self) -> bool {
-        matches!(self, BufferKind::Dashboard | BufferKind::Magit)
+        matches!(
+            self,
+            BufferKind::Dashboard | BufferKind::Magit | BufferKind::Dired
+        )
     }
 }
 
@@ -576,6 +591,7 @@ impl Buffer {
             (None, BufferKind::Dashboard) => "*dashboard*".into(),
             (None, BufferKind::Scratch) => "*scratch*".into(),
             (None, BufferKind::Magit) => "*magit*".into(),
+            (None, BufferKind::Dired) => "*dired*".into(),
             (None, BufferKind::CommitMessage) => "COMMIT_EDITMSG".into(),
             (None, BufferKind::Text) => "*untitled*".into(),
         }
@@ -843,6 +859,9 @@ pub struct Editor {
     pub(crate) pending: evil::Pending,
     /// Anchor of the visual selection.
     pub(crate) visual_anchor: Option<usize>,
+    /// Window labels waiting to be picked — `ace-window` is up. The renderer
+    /// draws these over each pane; the next key chooses one.
+    pub ace: Option<Vec<(char, WindowId)>>,
     /// Column a run of `j`/`k` is trying to hold.
     ///
     /// Without it, passing through a short line permanently forgets how far
@@ -897,6 +916,7 @@ impl Editor {
             viewport_lines: 24,
             pending: evil::Pending::default(),
             visual_anchor: None,
+            ace: None,
             desired_col: None,
             register: String::new(),
             register_linewise: false,
@@ -1261,6 +1281,9 @@ impl Editor {
                 self.status = format!("no Lisp runtime to call {name}")
             }
             EditorCommand::Git(verb) => self.status = format!("no git backend for {verb}"),
+            EditorCommand::Dired(verb) => {
+                self.status = format!("no filesystem backend for {verb}")
+            }
             EditorCommand::OpenFile(p) => self.status = format!("cannot open {}", p.display()),
             EditorCommand::SaveFile(_) => self.status = "cannot save: no file backend".into(),
         }

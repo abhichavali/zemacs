@@ -532,6 +532,14 @@ fn open_file(editor: &mut Editor, path: &Path, init_path: &Path) {
 }
 
 fn save_file(editor: &mut Editor, path: Option<PathBuf>) {
+    // A dired buffer's `path` is the *directory* it lists, and a magit buffer's
+    // text is a rendered status. Writing either would overwrite something real
+    // with a screenshot of a view.
+    if editor.buffer.kind.is_generated() {
+        let name = editor.buffer.name();
+        editor.apply(EditorCommand::Message(format!("{name} is not a file")));
+        return;
+    }
     let Some(target) = path.or_else(|| editor.buffer.path.clone()) else {
         editor.apply(EditorCommand::Message("no file name — use :w <path>".into()));
         return;

@@ -205,6 +205,19 @@ impl Frame {
         }
     }
 
+    /// A label per window, in tree order, for ace-window style jumping.
+    ///
+    /// Home-row keys rather than digits: they are where your fingers already
+    /// are, and digits are counts everywhere else in this editor.
+    pub fn ace_labels(&self) -> Vec<(char, WindowId)> {
+        const KEYS: &[char] = &['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l'];
+        leaves(&self.layout)
+            .into_iter()
+            .zip(KEYS.iter().copied())
+            .map(|(id, key)| (key, id))
+            .collect()
+    }
+
     /// Every window's rectangle within `area`.
     pub fn panes(&self, area: Rect) -> Vec<Pane> {
         let mut out = Vec::new();

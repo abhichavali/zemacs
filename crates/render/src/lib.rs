@@ -284,6 +284,31 @@ impl Renderer {
             self.fill(r.x, r.y, r.w, r.h, div_c);
         }
 
+        // Ace labels: one big letter per pane, drawn over everything so it is
+        // readable whatever is underneath. Only on the focused frame, since
+        // that is the one whose next keystroke will pick.
+        if focused {
+            if let Some(labels) = &editor.ace {
+                let bg = rgb(editor.theme.color(HlKind::Keyword, editor.settings.foreground));
+                let fg = rgb(editor.settings.background);
+                for pane in &panes {
+                    let Some((label, _)) = labels.iter().find(|(_, id)| *id == pane.window) else {
+                        continue;
+                    };
+                    let r = area_of(pane.rect);
+                    let (w, h) = (self.cell_w * 3, self.line_h + PADV * 2);
+                    let (x, y) = (r.x + r.w / 2 - w / 2, r.y + r.h / 2 - h / 2);
+                    self.fill(x, y, w, h, bg);
+                    self.draw_str(
+                        &label.to_string(),
+                        x + self.cell_w,
+                        y + PADV,
+                        fg,
+                    );
+                }
+            }
+        }
+
         // The prompt and its popup belong to the editor, not to a pane, so they
         // are drawn once over everything — and only on the frame that owns the
         // keyboard, or every open frame would show the same M-x box.

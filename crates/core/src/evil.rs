@@ -121,12 +121,40 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "magit-push",
     "magit-pull",
     "magit-refresh",
+    "dired",
+    "dired-up",
+    "dired-enter",
+    "dired-mark",
+    "dired-unmark",
+    "dired-toggle-marks",
+    "dired-flag-delete",
+    "dired-execute",
+    "dired-rename",
+    "dired-copy",
+    "dired-mkdir",
+    "dired-toggle-hidden",
+    "dired-refresh",
+    "ace-window",
+    "search-line",
     "quit",
 ];
 
 impl Editor {
     /// Translate one key into zero or more commands.
     pub fn handle_key(&mut self, key: Key) -> Vec<EditorCommand> {
+        // Ace labels are up: this keystroke picks a window and nothing else.
+        if let Some(labels) = self.ace.take() {
+            let picked = match key {
+                Key::Char(c) => labels.iter().find(|(l, _)| *l == c).map(|(_, id)| *id),
+                _ => None,
+            };
+            return match picked {
+                Some(id) => vec![EditorCommand::FocusWindow(id)],
+                // Anything else cancels, rather than falling through and doing
+                // something surprising with a key you aimed at a label.
+                None => vec![EditorCommand::Message(String::new())],
+            };
+        }
         if self.prompt.is_some() {
             return self.prompt_key(key);
         }
@@ -818,14 +846,20 @@ impl Editor {
         };
         match key {
             Key::Esc | Key::Ctrl('g') => {
+                // A previewing prompt has been dragging the cursor around; put
+                // it back where it started rather than leaving you wherever the
+                // last candidate happened to be.
+                let origin = p.origin;
                 self.prompt = None;
+                return origin.into_iter().map(EditorCommand::MoveTo).collect();
             }
             Key::Backspace => {
                 if p.text.pop().is_none() {
+                    let origin = p.origin;
                     self.prompt = None;
-                } else {
-                    p.refilter();
+                    return origin.into_iter().map(EditorCommand::MoveTo).collect();
                 }
+                p.refilter();
             }
             Key::Char(c) => {
                 p.text.push(c);
@@ -837,9 +871,9 @@ impl Editor {
             Key::Ctrl('p') | Key::Ctrl('k') | Key::Up => p.prev(),
             Key::Tab => p.complete(),
             Key::Enter => return self.accept_prompt(),
-            _ => {}
+            _ => return vec![],
         }
-        vec![]
+        self.preview()
     }
 
     /// Enter: what the prompt was asking for decides what happens.
@@ -877,6 +911,27 @@ impl Editor {
                 Some(&i) => vec![EditorCommand::SwitchBuffer(i)],
                 None => vec![],
             },
+            // Items are one per line, in order, so the item index *is* the
+            // line number — no parsing back out of the rendered text.
+            PromptKind::Line => match p.matches.get(p.selected) {
+                Some(&line) => vec![EditorCommand::MoveTo(self.buffer.first_non_blank(line))],
+                None => vec![],
+            },
+        }
+    }
+
+    /// Move the cursor to the highlighted line while the prompt is still open —
+    /// consult's preview, so narrowing shows you where you would land.
+    fn preview(&mut self) -> Vec<EditorCommand> {
+        let Some(p) = self.prompt.as_ref() else {
+            return vec![];
+        };
+        if !p.kind.previews() {
+            return vec![];
+        }
+        match p.matches.get(p.selected) {
+            Some(&line) => vec![EditorCommand::MoveTo(self.buffer.first_non_blank(line))],
+            None => vec![],
         }
     }
 
@@ -912,8 +967,25 @@ impl Editor {
             PromptKind::File => ("Find file: ", Vec::new()),
             PromptKind::Ex => (":", Vec::new()),
             PromptKind::Search => ("/", Vec::new()),
+            // One item per line, in order, so `matches[selected]` is the line
+            // number itself. The number is in the text purely to read.
+            PromptKind::Line => {
+                let n = self.buffer.len_lines();
+                let width = n.to_string().len();
+                let items = (0..n)
+                    .map(|l| {
+                        let text = self
+                            .buffer
+                            .slice_string(self.buffer.line_start(l), self.buffer.line_end(l));
+                        format!("{:>width$}  {}", l + 1, text.trim_end())
+                    })
+                    .collect();
+                ("Line: ", items)
+            }
         };
-        self.prompt = Some(Prompt::new(kind, label, items));
+        let mut prompt = Prompt::new(kind, label, items);
+        prompt.origin = kind.previews().then_some(self.buffer.cursor);
+        self.prompt = Some(prompt);
     }
 
     fn ex_command(&mut self, line: &str) -> Vec<EditorCommand> {
@@ -1055,9 +1127,29 @@ impl Editor {
                     self.run_action("eval-buffer")
                 }
             }
-            // Magit. Core knows the verbs and nothing else; the app runs git.
+            // Magit and dired. Core knows the verbs and nothing else; the app
+            // runs git and touches the filesystem.
             other if other.starts_with("magit-") => {
                 vec![EditorCommand::Git(other["magit-".len()..].to_string())]
+            }
+            other if other.starts_with("dired-") => {
+                vec![EditorCommand::Dired(other["dired-".len()..].to_string())]
+            }
+            "dired" => vec![EditorCommand::Dired("open".into())],
+            // `consult-line`: pick a line by fuzzy match, with live preview.
+            "search-line" | "consult-line" | "goto-line" => {
+                self.open_prompt(PromptKind::Line);
+                vec![]
+            }
+            // `ace-window`: with two windows there is nothing to choose, so it
+            // just switches — which is what ace-window itself does.
+            "ace-window" => {
+                if self.frame().windows.len() <= 2 {
+                    vec![EditorCommand::FocusNextWindow]
+                } else {
+                    self.ace = Some(self.frame().ace_labels());
+                    vec![EditorCommand::Message("window: press a label".into())]
+                }
             }
             // `M-x org-mode` sets the major mode, the way Emacs does. Anything
             // ending in `-mode` that is not a Lisp command means this.
@@ -1769,6 +1861,73 @@ mod tests {
         // out of range is ignored rather than panicking
         ed.apply(EditorCommand::FocusFrame(99));
         assert_eq!(ed.focus_frame, 1);
+    }
+
+    #[test]
+    fn consult_line_previews_and_jumps() {
+        let mut ed = fresh("alpha\nbeta\ngamma\ndelta");
+        let start = ed.buffer.cursor;
+        ed.run_action("search-line");
+        assert_eq!(ed.prompt.as_ref().map(|p| p.kind), Some(PromptKind::Line));
+
+        // narrowing moves the cursor to the candidate — consult's preview
+        feed(&mut ed, &keys("gam"));
+        assert_eq!(ed.buffer.cursor_line_col().0, 2);
+
+        // Enter lands there for good
+        for cmd in ed.handle_key(Key::Enter) {
+            ed.apply(cmd);
+        }
+        assert!(ed.prompt.is_none());
+        assert_eq!(ed.buffer.cursor_line_col().0, 2);
+
+        // and cancelling puts the cursor back where it started
+        ed.run_action("search-line");
+        feed(&mut ed, &keys("delt"));
+        assert_eq!(ed.buffer.cursor_line_col().0, 3);
+        let origin = ed.prompt.as_ref().unwrap().origin.unwrap();
+        for cmd in ed.handle_key(Key::Esc) {
+            ed.apply(cmd);
+        }
+        assert_eq!(ed.buffer.cursor, origin);
+        assert_ne!(ed.buffer.cursor, start.max(1).min(0)); // sanity: it moved and came back
+    }
+
+    #[test]
+    fn ace_window_switches_with_two_and_labels_with_more() {
+        let mut ed = fresh("x");
+        // one window: nothing to choose
+        assert_eq!(
+            ed.run_action("ace-window"),
+            vec![EditorCommand::FocusNextWindow]
+        );
+        assert!(ed.ace.is_none());
+
+        ed.apply(EditorCommand::SplitWindow(crate::frame::Split::Columns));
+        assert_eq!(
+            ed.run_action("ace-window"),
+            vec![EditorCommand::FocusNextWindow],
+            "two windows still just toggles"
+        );
+
+        // three: labels come up and the next key picks one
+        ed.apply(EditorCommand::SplitWindow(crate::frame::Split::Rows));
+        ed.run_action("ace-window");
+        let labels = ed.ace.clone().expect("labels are up");
+        assert_eq!(labels.len(), 3);
+        let (key, want) = labels[2];
+        assert_eq!(
+            ed.handle_key(Key::Char(key)),
+            vec![EditorCommand::FocusWindow(want)]
+        );
+        assert!(ed.ace.is_none(), "labels are consumed");
+
+        // a key that is not a label cancels rather than doing something else
+        ed.run_action("ace-window");
+        let out = ed.handle_key(Key::Char('Z'));
+        assert!(!out.iter().any(|c| matches!(c, EditorCommand::FocusWindow(_))));
+        assert!(ed.ace.is_none());
+        assert_eq!(ed.buffer.text.to_string(), "x", "and edits nothing");
     }
 
     #[test]

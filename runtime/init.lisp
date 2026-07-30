@@ -327,6 +327,33 @@ the bindings.")
 (define-leader "SPC q q" "quit")
 (define-key-everywhere "C-M-j" "switch-buffer")
 
+;;; `M-o' jumps between windows, ace-window style: with two it just switches,
+;;; with more it labels each pane and waits for you to press a label.
+;;; `C-s' is consult-line — pick a line by fuzzy match, with the buffer
+;;; previewing as you narrow, and Esc putting the cursor back.
+(define-key-everywhere "M-o" "ace-window")
+(define-key-everywhere "C-s" "search-line")
+(define-leader "SPC s l" "search-line")
+(define-leader "SPC w w" "ace-window")
+
+;;; Dired. `SPC f d' opens the directory of the current file; in a listing,
+;;; the keys are Emacs' own.
+(define-leader "SPC f d" "dired")
+(define-key "dired" "<ret>" "dired-enter")
+(define-key "dired" "-" "dired-up")
+(define-key "dired" "^" "dired-up")
+(define-key "dired" "m" "dired-mark")
+(define-key "dired" "u" "dired-unmark")
+(define-key "dired" "t" "dired-toggle-marks")
+(define-key "dired" "d" "dired-flag-delete")
+(define-key "dired" "x" "dired-execute")
+(define-key "dired" "R" "dired-rename")
+(define-key "dired" "C" "dired-copy")
+(define-key "dired" "+" "dired-mkdir")
+(define-key "dired" "H" "dired-toggle-hidden")
+(define-key "dired" "g" "dired-refresh")
+(define-key "dired" "q" "show-dashboard")
+
 ;;; ---------------------------------------------------------------------------
 ;;; Major and minor modes
 ;;;

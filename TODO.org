@@ -1,4 +1,7 @@
 * Done
+- [X] Buffers / windows / frames, splits, *dashboard* as a buffer
+- [X] Lisp evaluation from the live buffer, C-c everywhere
+- [X] Emacs-style beveled modeline, faces settable from init.lisp
 - [X] M-x running arbitrary Lisp, with fuzzy completion
 - [X] Completion popups: consult-style from the bottom, telescope-style centered
 - [X] Multiple buffers + `SPC j j` switcher
@@ -21,7 +24,7 @@
 - Latexify/MathSync integration
 
 * Known gaps in what's built
-- No splits or windows (multiple buffers exist, one is visible at a time)
+- One highlight set per editor, so only the active buffer's pane is coloured
 - Full tree-sitter reparse per edit, on a worker thread (no incremental parse)
 - No text objects (`ciw`, `di(`) and only the unnamed register
 - Lisp can push commands and be called from keys, but cannot yet *read* buffer state

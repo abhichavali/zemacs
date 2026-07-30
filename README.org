@@ -102,9 +102,13 @@ all work as you'd expect.
 | Normal | =:lisp FORM=       | evaluate Common Lisp                    |
 | Insert | =Esc= / =C-c=      | back to Normal                          |
 | any    | =M-x=              | run any Lisp command, with completion   |
-| Normal | =SPC j j=          | switch buffer                           |
+| any    | =C-c=              | evaluate Lisp (selection / form / buffer) |
+| Normal | =SPC j j= / =C-⌘-j= | switch buffer                          |
 | Normal | =SPC f f=          | find file                               |
 | any    | =M-+= / =M--=      | magnify / shrink (=M-0= resets)         |
+| any    | =C-<ret>=          | split side by side                      |
+| any    | =C-M-<ret>=        | split stacked                           |
+| Normal | =C-w=              | other window                            |
 
 The cursor is a *block* in Normal and a *bar* in Insert.
 
@@ -132,6 +136,38 @@ Matching is a fuzzy subsequence ranked so word starts win: =sb= finds
 directory rewrites the input to it, so the next listing is that directory —
 repeated =Tab= walks down a tree. When completing leaves several candidates,
 =Tab= cycles instead.
+
+* Buffers, windows, frames
+
+The Emacs vocabulary, because it is the one that distinguishes the three things
+that actually differ:
+
+- a *buffer* is text — it belongs to the editor, not to any window;
+- a *window* is a viewport onto a buffer, with its own cursor and scroll, so the
+  same buffer shown twice scrolls independently;
+- a *frame* is an OS window, holding a tree of windows.
+
+=*dashboard*= and =*scratch*= are ordinary buffers, so they appear in the buffer
+switcher and can be put in any window. =M-x new-frame= opens another OS window
+on the dashboard.
+
+Layout is a binary tree, and the arithmetic that turns it into rectangles is a
+pure function in =zemacs-core=. That is deliberate: the renderer and the mouse
+hit-testing have to agree on where a divider is to the pixel, and the only way
+to guarantee that is for both to call the same code.
+
+* Evaluating Lisp
+
+=C-c= evaluates the selection if there is one, else the top-level form under
+point, else the whole buffer — read from the *live buffer*, so there is nothing
+to save first. =M-x eval-buffer=, =eval-region= and =eval-last-sexp= name the
+pieces individually, and =:lisp FORM= evaluates a form you type.
+
+A form's value is echoed (=(+ 1 2)= shows =3=). =NIL= is not, because every
+command that calls =message= returns =NIL= and echoing it would overwrite the
+message the command just printed.
+
+Note =C-c= no longer leaves Insert mode — =Esc= and =C-g= still do.
 
 * Configuration
 

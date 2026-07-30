@@ -93,6 +93,27 @@ struct Motion {
     span: Span,
 }
 
+/// Verbs the editor resolves itself, offered by `M-x` alongside whatever the
+/// Lisp image publishes. Keep in step with the match in [`Editor::run_action`].
+pub const BUILTIN_COMMANDS: &[&str] = &[
+    "find-file",
+    "switch-buffer",
+    "execute-command",
+    "scratch",
+    "config",
+    "eval-dwim",
+    "eval-buffer",
+    "eval-region",
+    "eval-last-sexp",
+    "split-window-right",
+    "split-window-below",
+    "other-window",
+    "delete-window",
+    "new-frame",
+    "delete-frame",
+    "quit",
+];
+
 impl Editor {
     /// Translate one key into zero or more commands.
     pub fn handle_key(&mut self, key: Key) -> Vec<EditorCommand> {
@@ -718,9 +739,11 @@ impl Editor {
                 if name.is_empty() {
                     vec![]
                 } else {
-                    // Bare `(name)` — same shape a keybinding sends, so a
-                    // command works identically however it was invoked.
-                    vec![EditorCommand::CallLisp(format!("({name})"))]
+                    // Through `run_action`, the same path a keybinding takes:
+                    // a built-in verb if it names one, otherwise a Lisp call.
+                    // Sending `(name)` straight to the image would mean `M-x
+                    // new-frame` looked up a Lisp function that does not exist.
+                    self.run_action(&name)
                 }
             }
             PromptKind::File => {
@@ -738,10 +761,33 @@ impl Editor {
         }
     }
 
+    /// Send source to the Lisp image, refusing to send nothing.
+    fn eval_text(&self, src: String) -> Vec<EditorCommand> {
+        if src.trim().is_empty() {
+            vec![EditorCommand::Message("nothing to evaluate".into())]
+        } else {
+            vec![EditorCommand::CallLisp(src)]
+        }
+    }
+
     /// Open one of the completing prompts.
     pub fn open_prompt(&mut self, kind: PromptKind) {
         let (label, items) = match kind {
-            PromptKind::Command => ("M-x ", self.commands.clone()),
+            PromptKind::Command => {
+                // Built-in verbs are commands too — `M-x new-frame` should work
+                // without anyone having defined it in Lisp. They come first
+                // because core resolves them first.
+                let mut items: Vec<String> =
+                    BUILTIN_COMMANDS.iter().map(|s| s.to_string()).collect();
+                let extra: Vec<String> = self
+                    .commands
+                    .iter()
+                    .filter(|c| !items.contains(c))
+                    .cloned()
+                    .collect();
+                items.extend(extra);
+                ("M-x ", items)
+            }
             PromptKind::Buffer => ("Buffer: ", self.buffer_names()),
             // The app fills these in as the path is typed; core does no IO.
             PromptKind::File => ("Find file: ", Vec::new()),
@@ -857,6 +903,34 @@ impl Editor {
             "split-window-below" => vec![EditorCommand::SplitWindow(frame::Split::Rows)],
             "delete-window" => vec![EditorCommand::CloseWindow],
             "other-window" => vec![EditorCommand::FocusNextWindow],
+            // Lisp evaluation. `CallLisp` carries *source*, not a function
+            // name, so core can hand the image any slice of the live buffer —
+            // no round trip through disk, and nothing to save first.
+            "eval-buffer" => self.eval_text(self.buffer.text.to_string()),
+            "eval-region" => match self.selection() {
+                Some((a, b)) => {
+                    let src = self.buffer.slice_string(a, b);
+                    let mut cmds = vec![EditorCommand::SetMode(Mode::Normal)];
+                    cmds.extend(self.eval_text(src));
+                    cmds
+                }
+                None => vec![EditorCommand::Message("no selection".into())],
+            },
+            "eval-last-sexp" => match self.buffer.last_top_level_form(self.buffer.cursor + 1) {
+                Some((a, b)) => self.eval_text(self.buffer.slice_string(a, b)),
+                None => vec![EditorCommand::Message("no complete form before point".into())],
+            },
+            // What `C-c` is bound to: the selection if there is one, else the
+            // form under point, else the whole buffer.
+            "eval-dwim" => {
+                if self.mode.is_visual() {
+                    self.run_action("eval-region")
+                } else if self.buffer.last_top_level_form(self.buffer.cursor + 1).is_some() {
+                    self.run_action("eval-last-sexp")
+                } else {
+                    self.run_action("eval-buffer")
+                }
+            }
             "new-frame" => vec![EditorCommand::NewFrame],
             "delete-frame" => vec![EditorCommand::CloseFrame],
             "config" => vec![EditorCommand::OpenFile(PathBuf::from("@init"))],
@@ -1244,6 +1318,26 @@ mod tests {
     }
 
     #[test]
+    fn m_x_offers_builtin_verbs_as_well_as_lisp_commands() {
+        let mut ed = fresh("");
+        ed.commands = vec!["reload-config".into()];
+        ed.open_prompt(PromptKind::Command);
+        let items = &ed.prompt.as_ref().unwrap().items;
+        // built-in verbs are runnable by name without any Lisp defining them
+        for verb in ["new-frame", "split-window-right", "eval-buffer", "quit"] {
+            assert!(items.iter().any(|i| i == verb), "{verb} missing from M-x");
+        }
+        assert!(items.iter().any(|i| i == "reload-config"));
+
+        feed(&mut ed, &keys("nfr"));
+        assert_eq!(ed.prompt.as_ref().unwrap().current(), Some("new-frame"));
+        for cmd in ed.handle_key(Key::Enter) {
+            ed.apply(cmd);
+        }
+        assert_eq!(ed.frames.len(), 2);
+    }
+
+    #[test]
     fn m_x_can_run_a_command_that_was_never_registered() {
         let mut ed = fresh("");
         ed.open_prompt(PromptKind::Command);
@@ -1257,17 +1351,20 @@ mod tests {
     #[test]
     fn prompt_navigation_accepts_both_spellings() {
         let mut ed = fresh("");
-        ed.commands = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        // A prefix no built-in verb matches, so the list is just these three.
+        ed.commands = vec!["qzz-aaa".into(), "qzz-bbb".into(), "qzz-ccc".into()];
         ed.open_prompt(PromptKind::Command);
-        assert_eq!(ed.prompt.as_ref().unwrap().current(), Some("alpha"));
+        feed(&mut ed, &keys("qzz-"));
+        assert_eq!(ed.prompt.as_ref().unwrap().matches.len(), 3);
+        assert_eq!(ed.prompt.as_ref().unwrap().current(), Some("qzz-aaa"));
 
         for (key, want) in [
-            (Key::Ctrl('j'), "beta"),
-            (Key::Ctrl('n'), "gamma"),
-            (Key::Down, "alpha"),
-            (Key::Ctrl('k'), "gamma"),
-            (Key::Ctrl('p'), "beta"),
-            (Key::Up, "alpha"),
+            (Key::Ctrl('j'), "qzz-bbb"),
+            (Key::Ctrl('n'), "qzz-ccc"),
+            (Key::Down, "qzz-aaa"),
+            (Key::Ctrl('k'), "qzz-ccc"),
+            (Key::Ctrl('p'), "qzz-bbb"),
+            (Key::Up, "qzz-aaa"),
         ] {
             ed.handle_key(key);
             assert_eq!(
@@ -1465,6 +1562,75 @@ mod tests {
 
         // and the first frame still has the file
         assert!(ed.buffer_names().contains(&"a.rs".to_string()));
+    }
+
+    fn lisp_of(cmds: &[EditorCommand]) -> Option<String> {
+        cmds.iter().find_map(|c| match c {
+            EditorCommand::CallLisp(s) => Some(s.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn eval_last_sexp_sends_the_form_under_point() {
+        let mut ed = fresh("(message \"a\")\n(+ 1 2)\n");
+        feed(&mut ed, &keys("G$"));
+        let out = ed.run_action("eval-last-sexp");
+        assert_eq!(lisp_of(&out).as_deref(), Some("(+ 1 2)"));
+
+        // from the first line it picks the first form, not the last
+        feed(&mut ed, &keys("gg$"));
+        let out = ed.run_action("eval-last-sexp");
+        assert_eq!(lisp_of(&out).as_deref(), Some("(message \"a\")"));
+    }
+
+    #[test]
+    fn the_sexp_scan_ignores_parens_in_strings_and_comments() {
+        let b = Buffer::from_str("(a \")\") ; )))\n");
+        assert_eq!(b.last_top_level_form(b.len_chars()), Some((0, 7)));
+        assert_eq!(b.slice_string(0, 7), "(a \")\")");
+
+        // an unclosed form is not offered
+        let open = Buffer::from_str("(a (b ");
+        assert_eq!(open.last_top_level_form(open.len_chars()), None);
+
+        // escaped quote inside a string does not end it
+        let esc = Buffer::from_str("(f \"x\\\"(\") ");
+        assert!(esc.last_top_level_form(esc.len_chars()).is_some());
+    }
+
+    #[test]
+    fn eval_buffer_and_region_send_the_right_text() {
+        let mut ed = fresh("(one)\n(two)\n");
+        let out = ed.run_action("eval-buffer");
+        assert_eq!(lisp_of(&out).as_deref(), Some("(one)\n(two)\n"));
+
+        // visual selection wins
+        feed(&mut ed, &keys("ggv$"));
+        let out = ed.run_action("eval-region");
+        assert_eq!(lisp_of(&out).as_deref(), Some("(one)"));
+
+        let mut empty = fresh("   \n");
+        assert!(lisp_of(&empty.run_action("eval-buffer")).is_none());
+    }
+
+    #[test]
+    fn eval_dwim_picks_selection_then_form_then_buffer() {
+        // no parens anywhere: falls back to the whole buffer
+        let mut plain = fresh("just text\n");
+        assert_eq!(
+            lisp_of(&plain.run_action("eval-dwim")).as_deref(),
+            Some("just text\n")
+        );
+
+        // a complete form under point wins over the buffer
+        let mut forms = fresh("(a)\n(b)\n");
+        feed(&mut forms, &keys("G$"));
+        assert_eq!(lisp_of(&forms.run_action("eval-dwim")).as_deref(), Some("(b)"));
+
+        // and a selection wins over everything
+        feed(&mut forms, &keys("ggv$"));
+        assert_eq!(lisp_of(&forms.run_action("eval-dwim")).as_deref(), Some("(a)"));
     }
 
     #[test]

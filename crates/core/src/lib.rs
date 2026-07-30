@@ -535,6 +535,47 @@ impl Buffer {
         self.modified = true;
     }
 
+    /// The last complete top-level `(...)` form ending at or before `pos`.
+    ///
+    /// Scanned *forward* from the start of the buffer rather than backward from
+    /// the cursor, because `;` comments can only be recognised by reading a
+    /// line from its beginning — scanning backward, a `)` inside a comment is
+    /// indistinguishable from a real one.
+    pub fn last_top_level_form(&self, pos: usize) -> Option<(usize, usize)> {
+        let pos = pos.min(self.len_chars());
+        let (mut depth, mut start) = (0usize, 0usize);
+        let (mut in_string, mut in_comment, mut escaped) = (false, false, false);
+        let mut found = None;
+
+        for (i, c) in self.text.chars().take(pos).enumerate() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' if in_string => escaped = true,
+                '"' if !in_comment => in_string = !in_string,
+                '\n' if in_comment => in_comment = false,
+                ';' if !in_string => in_comment = true,
+                _ if in_string || in_comment => {}
+                '(' => {
+                    if depth == 0 {
+                        start = i;
+                    }
+                    depth += 1;
+                }
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        found = Some((start, i + 1));
+                    }
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
     pub fn slice_string(&self, start: usize, end: usize) -> String {
         let n = self.len_chars();
         let (start, end) = (start.min(n), end.min(n));

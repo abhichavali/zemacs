@@ -93,6 +93,19 @@ pub extern "C" fn rs_set_tab_width(n: c_long) {
     emit(EditorCommand::SetTabWidth(n.max(0) as usize));
 }
 
+/// Signed on purpose: the sign *is* the feature, exactly as in Emacs' `:box
+/// :line-width` — positive raises the modeline, negative sinks it. Core clamps
+/// the magnitude, so nothing is rejected here.
+#[no_mangle]
+pub extern "C" fn rs_set_modeline_relief(n: c_long) {
+    emit(EditorCommand::SetModelineRelief(n as i32));
+}
+
+#[no_mangle]
+pub extern "C" fn rs_set_modeline_pad(n: c_long) {
+    emit(EditorCommand::SetModelinePad(n as i32));
+}
+
 #[no_mangle]
 pub extern "C" fn rs_message(text: *const c_char) {
     emit(EditorCommand::Message(unsafe { str_or_empty(text) }));

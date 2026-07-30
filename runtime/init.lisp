@@ -17,8 +17,12 @@
 ;;;;   (set-syntax-color "keyword" r g b)      keyword function type string
 ;;;;                                           number comment constant variable
 ;;;;                                           operator punctuation default
+;;;;                                           modeline modeline-inactive
+;;;;                                           modeline-text
 ;;;;   (set-line-numbers t)                    or NIL
 ;;;;   (set-tab-width n)
+;;;;   (set-modeline-relief n)                 bevel px; negative sinks it
+;;;;   (set-modeline-pad n)                    padding px inside the modeline
 ;;;;   (set-completion-style "center")         "minibuffer" "bottom" "center"
 ;;;;   (clear-commands) (register-command "name")   what M-x offers
 ;;;;   (message text)                          status line
@@ -55,6 +59,18 @@ same way Emacs tracks `text-scale-mode-amount' in a variable.")
 (set-syntax-color "number"   0.98 0.72 0.47)
 (set-syntax-color "comment"  0.42 0.46 0.58)
 
+;;; The modeline. Relief is Emacs' `:box :line-width': the magnitude is the
+;;; bevel in pixels and the *sign* picks which way it goes — 2 raises the bar
+;;; off the buffer, -2 sinks it into the window. 0 is flat.
+(set-modeline-relief 2)
+(set-modeline-pad 8)
+
+;;; Its faces go through `set-syntax-color' like any other: the modeline lives
+;;; in the same colour table, so there is nothing new to learn.
+(set-syntax-color "modeline"          0.16 0.18 0.26) ; bar, current window
+(set-syntax-color "modeline-inactive" 0.10 0.11 0.17) ; bar, other windows
+(set-syntax-color "modeline-text"     0.80 0.85 0.97) ; what is written on it
+
 ;;; Where completing prompts (M-x, find-file, buffer switch) are drawn.
 ;;; "center"     — a floating box in the middle of the window, telescope-style
 ;;; "bottom"     — a list growing up from the bottom edge, consult-style
@@ -76,14 +92,22 @@ same way Emacs tracks `text-scale-mode-amount' in a variable.")
 (defvar *config-file* *load-truename*
   "Truename of the init file that was loaded at startup.")
 
+(defun %eval-file (path)
+  "LOAD PATH, republish the M-x list, and report the outcome in the status line.
+*PACKAGE* is bound to ZEMACS around the LOAD so a file that never says
+`(in-package :zemacs)' — the scratch buffer — can still call `message' and the
+rest of the primitives unqualified."
+  (handler-case
+      (let ((*package* (find-package :zemacs)))
+        (load path :verbose nil :print nil)
+        (refresh-commands)
+        (message (format nil "evaluated ~a" (file-namestring path))))
+    (error (e) (message (format nil "~a: ~a" (file-namestring path) e)))))
+
 (defun reload-config ()
   "Re-LOAD the init file, picking up edits without restarting the editor."
   (if *config-file*
-      (handler-case
-          (progn (load *config-file*)
-                 (refresh-commands)
-                 (message "config reloaded"))
-        (error (e) (message (format nil "reload failed: ~a" e))))
+      (%eval-file *config-file*)
       (message "no config file to reload")))
 
 (defun edit-config ()
@@ -113,11 +137,65 @@ same way Emacs tracks `text-scale-mode-amount' in a variable.")
 (defun text-scale-decrease () (set-scale (- *font-size* 2)))
 (defun text-scale-reset    () (set-scale 22))
 
-(defun scratch-header ()
-  "Insert a scratch-buffer header, built with FORMAT rather than pasted."
-  (insert (format nil ";;; scratch — ~a~%;;; ~a~2%"
-                  (lisp-implementation-type)
-                  "everything here is evaluated Common Lisp")))
+;;; ---------------------------------------------------------------------------
+;;; The scratch buffer
+;;;
+;;; Emacs's *scratch* has no file behind it. Ours does, because `find-file' is
+;;; the only primitive that can put the editor in a *different* buffer —
+;;; `insert' would drop a Lisp header into whatever you happened to be editing.
+;;; A real .lisp file also gets syntax highlighting and survives a restart.
+
+(defparameter *scratch-file*
+  (merge-pathnames ".config/zemacs/scratch.lisp" (user-homedir-pathname))
+  "Where the scratch buffer lives on disk.")
+
+(defun %scratch-text ()
+  "What a fresh scratch file is seeded with."
+  (format nil ";;; *scratch* — ~a ~a
+;;;
+;;; A real Common Lisp buffer. Save it with `SPC f s', then press C-c to
+;;; evaluate the file: errors, and anything you `message', land in the status
+;;; line. Every symbol in the ZEMACS package is in scope unqualified.
+
+(message (format nil \"hello from ~~a\" (lisp-implementation-type)))
+"
+          (lisp-implementation-type)
+          (lisp-implementation-version)))
+
+(defun lisp-scratch ()
+  "Open the scratch buffer, creating it with a header the first time.
+Deliberately not called `scratch': core resolves its own built-in verbs before
+asking the image, so a Lisp function of that name could never be reached from a
+key binding or a dashboard item."
+  (handler-case
+      (progn
+        (ensure-directories-exist *scratch-file*)
+        (unless (probe-file *scratch-file*)
+          (with-open-file (out *scratch-file* :direction :output
+                                              :if-does-not-exist :create
+                                              :external-format :utf-8)
+            (write-string (%scratch-text) out)))
+        (find-file (namestring *scratch-file*)))
+    (error (e) (message (format nil "scratch: ~a" e)))))
+
+(defun %newest-file (&rest paths)
+  "The most recently written of PATHS that exists, or NIL."
+  (let ((live (remove-if-not #'probe-file (remove nil paths))))
+    (first (sort live #'> :key #'file-write-date))))
+
+(defun eval-file-dwim ()
+  "Evaluate the Lisp *file* you saved most recently — the scratch buffer or the
+init file — and report what happened.
+
+Note this reads from disk, so it needs a save first. `C-c' does not use it:
+that is the built-in `eval-dwim' verb, which evaluates the *live* buffer text
+(the selection if there is one, else the form under point, else the whole
+buffer) without touching the filesystem. This one is still handy for picking up
+a config edit made in another editor."
+  (let ((path (%newest-file *scratch-file* *config-file*)))
+    (if path
+        (%eval-file path)
+        (message "nothing to evaluate: no scratch file and no config file"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; M-x
@@ -183,8 +261,11 @@ Clears first, so reloading the config does not duplicate the list."
 (clear-dashboard-items)
 ;; Built-in verbs...
 (dashboard-item #\f "Find file"      "find-file")
-(dashboard-item #\s "Scratch buffer" "scratch")
-;; ...and functions defined above, on equal footing.
+;; ...and functions defined above, on equal footing. `lisp-scratch' rather than
+;; the built-in `scratch' verb, which only drops you in an empty, language-less
+;; buffer nothing can evaluate.
+(dashboard-item #\s "Scratch buffer" "lisp-scratch")
+(dashboard-item #\e "Evaluate Lisp"  "eval-dwim")
 (dashboard-item #\c "Edit configuration" "edit-config")
 (dashboard-item #\r "Reload configuration" "reload-config")
 (dashboard-item #\v "Lisp version" "lisp-version")
@@ -207,8 +288,20 @@ Clears first, so reloading the config does not duplicate the list."
   (define-key mode "C-M-j" "switch-buffer"))
 (define-key "normal" "SPC h r" "reload-config")
 (define-key "normal" "SPC h v" "lisp-version")
-(define-key "normal" "SPC h s" "scratch-header")
+(define-key "normal" "SPC b s" "lisp-scratch")
 (define-key "normal" "SPC q q" "quit")
+
+;;; C-c evaluates Lisp, from anywhere. `eval-dwim' is a built-in verb resolved
+;;; by the editor, not a function in this file: it evaluates the live buffer —
+;;; the selection if there is one, else the top-level form under point, else the
+;;; whole buffer — so nothing needs saving first.
+;;;
+;;; In Insert mode this *replaces* the built-in "C-c is a synonym for Esc":
+;;; `insert_key' looks the key up in the user keymap before it reaches that
+;;; rule, so this binding wins and C-c no
+;;; longer leaves Insert mode. <esc> and C-g still do.
+(dolist (mode '("normal" "insert" "visual" "dashboard"))
+  (define-key mode "C-c" "eval-dwim"))
 
 ;;; `execute-command' and `switch-buffer' are built-in verbs — core opens the
 ;;; prompt itself, so these names are not Lisp functions and are not in the M-x

@@ -21,6 +21,8 @@ extern void rs_set_foreground(double r, double g, double b);
 extern void rs_set_syntax_color(const char *face, double r, double g, double b);
 extern void rs_set_line_numbers(int on);
 extern void rs_set_tab_width(long n);
+extern void rs_set_modeline_relief(long n);
+extern void rs_set_modeline_pad(long n);
 extern void rs_message(const char *text);
 extern void rs_quit(void);
 extern void rs_dashboard_banner(const char *text);
@@ -132,6 +134,17 @@ static cl_object f_set_tab_width(cl_object n) {
   return ECL_NIL;
 }
 
+/* No abs/max here: a negative relief is a *sunken* modeline, not an error. */
+static cl_object f_set_modeline_relief(cl_object n) {
+  rs_set_modeline_relief((long)ecl_to_fixnum(n));
+  return ECL_NIL;
+}
+
+static cl_object f_set_modeline_pad(cl_object n) {
+  rs_set_modeline_pad((long)ecl_to_fixnum(n));
+  return ECL_NIL;
+}
+
 static cl_object f_message(cl_object text) {
   char *s = dup_utf8_or_empty(text);
   rs_message(s);
@@ -236,6 +249,7 @@ static const char *PACKAGE_FORM =
     "(defpackage \"ZEMACS\" (:use \"CL\")"
     " (:export \"SET-FONT-SIZE\" \"SET-BACKGROUND\" \"SET-FOREGROUND\""
     "          \"SET-SYNTAX-COLOR\" \"SET-LINE-NUMBERS\" \"SET-TAB-WIDTH\""
+    "          \"SET-MODELINE-RELIEF\" \"SET-MODELINE-PAD\""
     "          \"MESSAGE\" \"QUIT\" \"DASHBOARD-BANNER\""
     "          \"CLEAR-DASHBOARD-ITEMS\" \"DASHBOARD-ITEM\" \"DEFINE-KEY\""
     "          \"FIND-FILE\" \"SAVE-FILE\" \"SHOW-DASHBOARD\" \"INSERT\""
@@ -252,13 +266,25 @@ static const char *HELPERS_FORM =
      * we are back in CL-USER and `(find-file)` would read as an undefined
      * CL-USER::FIND-FILE. Binding it to ZEMACS is what makes both the host
      * primitives and the user's own DEFUNs in init.lisp resolve. */
+    /* Reports the value of the *last* form, the way `eval-last-sexp' echoes
+     * into the echo area — but stays silent when that value is NIL. Every
+     * command that already called `message' returns NIL, and echoing it would
+     * wipe out the message the command just produced. */
     " (defun zemacs::eval-string (s)"
     "   (handler-case"
     "       (let ((*package* (find-package \"ZEMACS\")))"
     "         (with-input-from-string (in s)"
-    "           (loop for form = (read in nil 'zemacs::%eof)"
-    "                 until (eq form 'zemacs::%eof)"
-    "                 do (eval form))))"
+    "           (let ((value nil))"
+    "             (loop for form = (read in nil 'zemacs::%eof)"
+    "                   until (eq form 'zemacs::%eof)"
+    "                   do (setf value (eval form)))"
+    "             (when value"
+    "               (zemacs::message"
+    /* ~S so \"3\" and 3 are distinguishable; the print limits keep a huge or
+     * circular structure from becoming a status line nobody can read. */
+    "                (let ((*print-length* 32) (*print-level* 4)"
+    "                      (*print-circle* t))"
+    "                  (format nil \"~s\" value)))))))"
     "     (error (e) (zemacs::message (format nil \"lisp error: ~a\" e)))))"
     " (defun zemacs::load-init (path)"
     "   (handler-case (load path :verbose nil :print nil)"
@@ -308,6 +334,8 @@ void zemacs_boot(void) {
   defprim("SET-SYNTAX-COLOR", (cl_objectfn_fixed)f_set_syntax_color, 4);
   defprim("SET-LINE-NUMBERS", (cl_objectfn_fixed)f_set_line_numbers, 1);
   defprim("SET-TAB-WIDTH", (cl_objectfn_fixed)f_set_tab_width, 1);
+  defprim("SET-MODELINE-RELIEF", (cl_objectfn_fixed)f_set_modeline_relief, 1);
+  defprim("SET-MODELINE-PAD", (cl_objectfn_fixed)f_set_modeline_pad, 1);
   defprim("MESSAGE", (cl_objectfn_fixed)f_message, 1);
   defprim("QUIT", (cl_objectfn_fixed)f_quit, 0);
   defprim("DASHBOARD-BANNER", (cl_objectfn_fixed)f_dashboard_banner, 1);

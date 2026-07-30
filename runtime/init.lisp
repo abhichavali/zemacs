@@ -274,22 +274,40 @@ Clears first, so reloading the config does not duplicate the list."
 ;;; ---------------------------------------------------------------------------
 ;;; Keys
 ;;;
-;;; Modes: "normal" "insert" "visual" "visual-line" "dashboard". Sequences are
-;;; space-separated tokens: SPC, C-x, <esc>, <ret>, <tab>, or a literal key.
-;;; These are consulted before the built-in vim grammar, so config wins.
+;;; Modes: "normal" "insert" "visual" "visual-line" "visual-block" "magit"
+;;; "dashboard". Sequences are space-separated tokens: SPC, C-x, <esc>, <ret>,
+;;; <tab>, or a literal key. These are consulted before the built-in vim
+;;; grammar, so config wins.
 
-(define-key "normal" "SPC f f" "find-file")
-(define-key "normal" "SPC f s" "save-file")
-(define-key "normal" "SPC b d" "show-dashboard")
-(define-key "normal" "SPC b b" "switch-buffer")
-(define-key "normal" "SPC j j" "switch-buffer")
-;;; C-⌘-j from anywhere, including while typing.
-(dolist (mode '("normal" "insert" "visual" "dashboard"))
-  (define-key mode "C-M-j" "switch-buffer"))
-(define-key "normal" "SPC h r" "reload-config")
-(define-key "normal" "SPC h v" "lisp-version")
-(define-key "normal" "SPC b s" "lisp-scratch")
-(define-key "normal" "SPC q q" "quit")
+(defparameter *leader-modes* '("normal" "visual" "visual-line" "visual-block")
+  "Modes with a SPC leader. Insert is excluded — SPC there types a space — and
+so is dashboard, where single letters pick items.")
+
+(defparameter *all-modes*
+  '("normal" "insert" "visual" "visual-line" "visual-block" "dashboard" "magit")
+  "Everywhere a modifier chord should work, including while typing and while a
+selection is up. Listed once so a new mode cannot be quietly left out of half
+the bindings.")
+
+(defun define-key-everywhere (keys command)
+  "Bind KEYS in every mode."
+  (dolist (mode *all-modes*) (define-key mode keys command)))
+
+(defun define-leader (keys command)
+  "Bind a SPC-prefixed sequence in the modes that have a leader."
+  (dolist (mode *leader-modes*) (define-key mode keys command)))
+
+;;; Leader bindings work with a selection up, not just from normal mode.
+(define-leader "SPC f f" "find-file")
+(define-leader "SPC f s" "save-file")
+(define-leader "SPC b d" "show-dashboard")
+(define-leader "SPC b b" "switch-buffer")
+(define-leader "SPC j j" "switch-buffer")
+(define-leader "SPC h r" "reload-config")
+(define-leader "SPC h v" "lisp-version")
+(define-leader "SPC b s" "lisp-scratch")
+(define-leader "SPC q q" "quit")
+(define-key-everywhere "C-M-j" "switch-buffer")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Magit
@@ -300,8 +318,8 @@ Clears first, so reloading the config does not duplicate the list."
 ;;; change everywhere else — a binding is consulted before the built-in grammar,
 ;;; so the motions (j k gg G /) keep working in the status buffer too.
 
-(define-key "normal" "SPC g g" "magit-status")
-(define-key "normal" "SPC g s" "magit-status")
+(define-leader "SPC g g" "magit-status")
+(define-leader "SPC g s" "magit-status")
 
 (define-key "magit" "s" "magit-stage")
 (define-key "magit" "u" "magit-unstage")
@@ -327,8 +345,7 @@ Clears first, so reloading the config does not duplicate the list."
 ;;; `insert_key' looks the key up in the user keymap before it reaches that
 ;;; rule, so this binding wins and C-c no
 ;;; longer leaves Insert mode. <esc> and C-g still do.
-(dolist (mode '("normal" "insert" "visual" "dashboard"))
-  (define-key mode "C-c" "eval-dwim"))
+(define-key-everywhere "C-c" "eval-dwim")
 
 ;;; `execute-command' and `switch-buffer' are built-in verbs — core opens the
 ;;; prompt itself, so these names are not Lisp functions and are not in the M-x
@@ -336,9 +353,8 @@ Clears first, so reloading the config does not duplicate the list."
 ;;; "dashboard" is in this list on purpose: it is the mode the editor *opens*
 ;;; in, so leaving it out means M-x does nothing until you have already entered
 ;;; a buffer — which reads as M-x being broken.
-(dolist (mode '("normal" "insert" "visual" "dashboard"))
-  (define-key mode "M-x" "execute-command"))
-(define-key "normal" "SPC ;" "execute-command")
+(define-key-everywhere "M-x" "execute-command")
+(define-leader "SPC ;" "execute-command")
 (define-key "dashboard" "f" "find-file")
 (define-key "dashboard" "b" "switch-buffer")
 
@@ -346,11 +362,10 @@ Clears first, so reloading the config does not duplicate the list."
 ;;; `M-+' is ⌘-Shift-= ; `M-=' is the same key without the Shift, and works on
 ;;; any keyboard layout. Bound in Insert mode too, so zooming does not require
 ;;; leaving what you were typing.
-(dolist (mode '("normal" "insert" "visual" "dashboard"))
-  (define-key mode "M-+" "text-scale-increase")
-  (define-key mode "M-=" "text-scale-increase")
-  (define-key mode "M--" "text-scale-decrease")
-  (define-key mode "M-0" "text-scale-reset"))
+(define-key-everywhere "M-+" "text-scale-increase")
+(define-key-everywhere "M-=" "text-scale-increase")
+(define-key-everywhere "M--" "text-scale-decrease")
+(define-key-everywhere "M-0" "text-scale-reset")
 
 ;;; ---------------------------------------------------------------------------
 

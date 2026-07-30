@@ -31,6 +31,8 @@ pub enum Mode {
     Insert,
     Visual,
     VisualLine,
+    /// Rectangular selection — `C-v`.
+    VisualBlock,
     /// The startup screen. Its own mode because its keymap is entirely its own.
     Dashboard,
     /// The git status buffer. Its own mode so `s`, `u` and `c` can be bound to
@@ -46,6 +48,7 @@ impl Mode {
             Mode::Insert => "INSERT",
             Mode::Visual => "VISUAL",
             Mode::VisualLine => "V-LINE",
+            Mode::VisualBlock => "V-BLOCK",
             Mode::Dashboard => "DASHBOARD",
             Mode::Magit => "MAGIT",
         }
@@ -58,14 +61,15 @@ impl Mode {
             "insert" => Some(Mode::Insert),
             "visual" => Some(Mode::Visual),
             "visual-line" | "vline" => Some(Mode::VisualLine),
+            "visual-block" | "vblock" => Some(Mode::VisualBlock),
             "dashboard" => Some(Mode::Dashboard),
             "magit" | "git" => Some(Mode::Magit),
             _ => None,
         }
     }
 
-    fn is_visual(self) -> bool {
-        matches!(self, Mode::Visual | Mode::VisualLine)
+    pub fn is_visual(self) -> bool {
+        matches!(self, Mode::Visual | Mode::VisualLine | Mode::VisualBlock)
     }
 }
 
@@ -257,6 +261,12 @@ pub enum EditorCommand {
         end: usize,
         linewise: bool,
     },
+    /// Put literal text in the register — a block yank is several disjoint
+    /// runs, so there is no single range to copy.
+    SetRegister {
+        text: String,
+        linewise: bool,
+    },
     Paste {
         after: bool,
     },
@@ -336,6 +346,31 @@ pub enum EditorCommand {
     // --- files ---
     OpenFile(PathBuf),
     SaveFile(Option<PathBuf>),
+}
+
+impl EditorCommand {
+    /// True for anything that changes the text, or that is only a prelude to
+    /// changing it. Used to keep generated buffers read-only.
+    ///
+    /// `SetMode(Insert)` counts: letting you into Insert on a buffer that
+    /// refuses every keystroke afterwards is a worse experience than refusing
+    /// the mode change itself.
+    pub fn mutates_document(&self) -> bool {
+        matches!(
+            self,
+            EditorCommand::InsertChar(_)
+                | EditorCommand::InsertText(_)
+                | EditorCommand::InsertNewline
+                | EditorCommand::DeleteBackward
+                | EditorCommand::DeleteForward
+                | EditorCommand::DeleteRange(..)
+                | EditorCommand::Paste { .. }
+                | EditorCommand::Undo
+                | EditorCommand::Redo
+                | EditorCommand::Checkpoint
+                | EditorCommand::SetMode(Mode::Insert)
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -705,6 +740,12 @@ pub struct Editor {
     pub(crate) pending: evil::Pending,
     /// Anchor of the visual selection.
     pub(crate) visual_anchor: Option<usize>,
+    /// Column a run of `j`/`k` is trying to hold.
+    ///
+    /// Without it, passing through a short line permanently forgets how far
+    /// right you were — and a block selection spanning a ragged region is
+    /// impossible, because getting to the far side clamps the column on the way.
+    pub(crate) desired_col: Option<usize>,
 
     register: String,
     register_linewise: bool,
@@ -751,6 +792,7 @@ impl Editor {
             viewport_lines: 24,
             pending: evil::Pending::default(),
             visual_anchor: None,
+            desired_col: None,
             register: String::new(),
             register_linewise: false,
             last_search: String::new(),
@@ -911,6 +953,14 @@ impl Editor {
 
     /// The one and only document mutator.
     pub fn apply(&mut self, cmd: EditorCommand) {
+        // Generated buffers are views, not documents: *dashboard* and *magit*
+        // are re-rendered from state, so an edit would be silently discarded on
+        // the next refresh and `:w` would write a screenshot of a status list.
+        // Refuse the edit and say so, rather than letting it look like it took.
+        if self.buffer.kind.is_generated() && cmd.mutates_document() {
+            self.status = format!("{} is read-only", self.buffer.name());
+            return;
+        }
         let before = self.revision;
         // Undo/redo move the revision too, but must not wipe the stack they feed.
         let history = matches!(cmd, EditorCommand::Undo | EditorCommand::Redo);
@@ -948,6 +998,12 @@ impl Editor {
                 self.register = self.buffer.slice_string(start, end);
                 self.register_linewise = linewise;
                 let n = self.register.chars().count();
+                self.status = format!("yanked {n} chars");
+            }
+            EditorCommand::SetRegister { text, linewise } => {
+                let n = text.chars().count();
+                self.register = text;
+                self.register_linewise = linewise;
                 self.status = format!("yanked {n} chars");
             }
             EditorCommand::Paste { after } => self.paste(after),
@@ -1132,7 +1188,9 @@ impl Editor {
 
     fn set_mode(&mut self, m: Mode) {
         match m {
-            Mode::Visual | Mode::VisualLine if !self.mode.is_visual() => {
+            // Switching *between* visual modes keeps the anchor, so `v` then
+            // `C-v` reshapes the same selection rather than restarting it.
+            m if m.is_visual() && !self.mode.is_visual() => {
                 self.visual_anchor = Some(self.buffer.cursor);
             }
             Mode::Normal | Mode::Insert | Mode::Dashboard => self.visual_anchor = None,
@@ -1147,9 +1205,51 @@ impl Editor {
         }
         self.mode = m;
         self.pending.clear();
+        self.desired_col = None;
+    }
+
+    /// Every char range the selection covers — one per line in block mode, and
+    /// a single range otherwise.
+    ///
+    /// This, not [`Editor::selection`], is what the renderer draws and what a
+    /// block operator works on: a rectangle is genuinely several disjoint runs
+    /// of text, and flattening it to its bounding span would select the middle
+    /// of every line it spans.
+    pub fn selection_ranges(&self) -> Vec<(usize, usize)> {
+        let Some((start, end)) = self.selection() else {
+            return Vec::new();
+        };
+        if self.mode != Mode::VisualBlock {
+            return vec![(start, end)];
+        }
+        let anchor = match self.visual_anchor {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+        let buf = &self.buffer;
+        let n = buf.len_chars();
+        let (al, ac) = line_col_of(buf, anchor.min(n));
+        let (cl, cc) = line_col_of(buf, buf.cursor.min(n));
+        let (first, last) = (al.min(cl), al.max(cl));
+        let (left, right) = (ac.min(cc), ac.max(cc));
+
+        (first..=last)
+            .filter_map(|line| {
+                let len = buf.line_len(line);
+                // A line shorter than the block's left edge contributes
+                // nothing — vim skips it rather than selecting its newline.
+                if left >= len {
+                    return None;
+                }
+                let s = buf.line_start(line) + left;
+                let e = buf.line_start(line) + (right + 1).min(len);
+                (s < e).then_some((s, e))
+            })
+            .collect()
     }
 
     /// The inclusive char range covered by the visual selection, if any.
+    /// In block mode this is the *bounding* span; see [`Editor::selection_ranges`].
     pub fn selection(&self) -> Option<(usize, usize)> {
         let anchor = self.visual_anchor?;
         if !self.mode.is_visual() {
@@ -1320,6 +1420,11 @@ pub fn normalize_keys(s: &str) -> String {
     } else {
         s.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")
     }
+}
+
+fn line_col_of(buf: &Buffer, at: usize) -> (usize, usize) {
+    let line = buf.text.char_to_line(at);
+    (line, at - buf.line_start(line))
 }
 
 fn clamp3(c: [f32; 3]) -> [f32; 3] {

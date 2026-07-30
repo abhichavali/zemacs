@@ -262,7 +262,18 @@ impl Editor {
     fn builtin(&mut self, seq: &str, key: Key) -> Option<Vec<EditorCommand>> {
         let n = self.pending.count();
         let op = self.pending.op;
-        let visual = matches!(self.mode, Mode::Visual | Mode::VisualLine);
+        // Every visual mode, block included — an explicit list here silently
+        // turned `d` in block mode into a pending operator instead.
+        let visual = self.mode.is_visual();
+
+        // A run of `j`/`k` remembers the column it started from; anything else
+        // is a new horizontal position and forgets it.
+        let (_, col_now) = self.buffer.cursor_line_col();
+        if matches!(seq, "j" | "k" | "<down>" | "<up>") {
+            self.desired_col.get_or_insert(col_now);
+        } else {
+            self.desired_col = None;
+        }
 
         // Motions first: they compose with a pending operator.
         if let Some(m) = self.motion(seq, n) {
@@ -396,6 +407,11 @@ impl Editor {
             } else {
                 Mode::VisualLine
             })],
+            "C-v" => vec![EditorCommand::SetMode(if self.mode == Mode::VisualBlock {
+                Mode::Normal
+            } else {
+                Mode::VisualBlock
+            })],
 
             // --- scrolling ---
             "C-d" => return Some(self.scroll_half(true)),
@@ -430,6 +446,12 @@ impl Editor {
 
     // --- motions ---------------------------------------------------------
 
+    /// The column a vertical run is aiming for: the one it started from, not
+    /// wherever a short line clamped it to along the way.
+    fn held_col(&self, col: usize) -> usize {
+        self.desired_col.unwrap_or(col)
+    }
+
     fn motion(&self, seq: &str, n: usize) -> Option<Motion> {
         let buf = &self.buffer;
         let (line, col) = buf.cursor_line_col();
@@ -443,14 +465,31 @@ impl Editor {
                 target: (cur + n).min(buf.line_end(line)),
                 span: Span::Exclusive,
             },
-            "j" | "<down>" => Motion {
-                target: buf.line_start((line + n).min(buf.len_lines().saturating_sub(1))),
-                span: Span::Linewise,
-            },
-            "k" | "<up>" => Motion {
-                target: buf.line_start(line.saturating_sub(n)),
-                span: Span::Linewise,
-            },
+            // Vertical motions keep the column. Targeting the line start would
+            // send `j` to column 0, which is wrong for the cursor and invisible
+            // to an operator (a linewise span only reads the *line*).
+            //
+            // ponytail: the column is taken from where the cursor is now, not
+            // a sticky "desired column", so passing through a short line
+            // forgets how far right you were. Vim remembers; add a
+            // `desired_col` on the editor when that starts to grate.
+            // Vertical motions hold the column. Targeting the line start would
+            // send `j` to column 0, which is wrong for the cursor and invisible
+            // to an operator (a linewise span only reads the *line*).
+            "j" | "<down>" => {
+                let target = (line + n).min(buf.len_lines().saturating_sub(1));
+                Motion {
+                    target: buf.line_start(target) + self.held_col(col).min(buf.line_len(target)),
+                    span: Span::Linewise,
+                }
+            }
+            "k" | "<up>" => {
+                let target = line.saturating_sub(n);
+                Motion {
+                    target: buf.line_start(target) + self.held_col(col).min(buf.line_len(target)),
+                    span: Span::Linewise,
+                }
+            }
             "0" => Motion {
                 target: buf.line_start(line),
                 span: Span::Exclusive,
@@ -568,12 +607,50 @@ impl Editor {
     }
 
     fn op_selection(&mut self, op: Op) -> Vec<EditorCommand> {
+        if self.mode == Mode::VisualBlock {
+            return self.op_block(op);
+        }
         let Some((start, end)) = self.selection() else {
             return vec![];
         };
         let linewise = self.mode == Mode::VisualLine;
         let mut cmds = vec![EditorCommand::SetMode(Mode::Normal)];
         cmds.extend(self.operate(op, start, end, linewise));
+        cmds
+    }
+
+    /// A block operator is several disjoint edits, so the ranges are deleted
+    /// **bottom-up**: every command is computed against the pre-edit buffer,
+    /// and removing a later range cannot move an earlier one.
+    fn op_block(&mut self, op: Op) -> Vec<EditorCommand> {
+        let ranges = self.selection_ranges();
+        if ranges.is_empty() {
+            return vec![EditorCommand::SetMode(Mode::Normal)];
+        }
+        let text = ranges
+            .iter()
+            .map(|&(s, e)| self.buffer.slice_string(s, e))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let top = ranges[0].0;
+
+        let mut cmds = vec![EditorCommand::SetMode(Mode::Normal)];
+        // The register holds the block's text; `linewise` is false because
+        // pasting a block back as whole lines is not what was copied.
+        cmds.push(EditorCommand::SetRegister {
+            text,
+            linewise: false,
+        });
+        if op != Op::Yank {
+            cmds.push(EditorCommand::Checkpoint);
+            for &(s, e) in ranges.iter().rev() {
+                cmds.push(EditorCommand::DeleteRange(s, e));
+            }
+        }
+        cmds.push(EditorCommand::MoveTo(top));
+        if op == Op::Change {
+            cmds.push(EditorCommand::SetMode(Mode::Insert));
+        }
         cmds
     }
 
@@ -1484,6 +1561,133 @@ mod tests {
     }
 
     #[test]
+    fn vertical_motions_keep_the_column() {
+        // Regression: `j` and `k` targeted the line *start*, so every vertical
+        // motion silently snapped the cursor to column 0.
+        let mut ed = fresh("abcdef\nghijkl\nmnopqr");
+        feed(&mut ed, &keys("lll"));
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 3));
+        feed(&mut ed, &keys("j"));
+        assert_eq!(ed.buffer.cursor_line_col(), (1, 3));
+        feed(&mut ed, &keys("j"));
+        assert_eq!(ed.buffer.cursor_line_col(), (2, 3));
+        feed(&mut ed, &keys("kk"));
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 3));
+
+        // a short line clamps to its end rather than overshooting...
+        let mut short = fresh("abcdef\nxy\nabcdef");
+        feed(&mut short, &keys("llllj"));
+        assert_eq!(short.buffer.cursor_line_col(), (1, 1));
+        // ...and passing through it does not forget how far right we were
+        feed(&mut short, &keys("j"));
+        assert_eq!(short.buffer.cursor_line_col(), (2, 4));
+        // any horizontal move sets a new column to hold
+        feed(&mut short, &keys("hkk"));
+        assert_eq!(short.buffer.cursor_line_col(), (0, 3));
+
+        // and `dj` is still linewise — the column must not leak into the span
+        let mut del = fresh("aaa\nbbb\nccc");
+        feed(&mut del, &keys("ldj"));
+        assert_eq!(del.buffer.text.to_string(), "ccc");
+    }
+
+    #[test]
+    fn visual_block_selects_a_rectangle_not_a_span() {
+        let mut ed = fresh("abcdef\nghijkl\nmnopqr");
+        feed(&mut ed, &keys("l")); // column 1
+        feed(&mut ed, &[Key::Ctrl('v')]);
+        assert_eq!(ed.mode, Mode::VisualBlock);
+        feed(&mut ed, &keys("ljj")); // columns 1..=2, lines 0..=2
+
+        let ranges = ed.selection_ranges();
+        assert_eq!(ranges.len(), 3, "one range per line");
+        let text: Vec<String> = ranges
+            .iter()
+            .map(|&(s, e)| ed.buffer.slice_string(s, e))
+            .collect();
+        assert_eq!(text, ["bc", "hi", "no"]);
+    }
+
+    #[test]
+    fn visual_block_delete_removes_the_column() {
+        let mut ed = fresh("abcdef\nghijkl\nmnopqr");
+        feed(&mut ed, &keys("l"));
+        feed(&mut ed, &[Key::Ctrl('v')]);
+        feed(&mut ed, &keys("ljjd"));
+        assert_eq!(ed.buffer.text.to_string(), "adef\ngjkl\nmpqr");
+        assert_eq!(ed.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn visual_block_yank_keeps_the_lines_separate() {
+        let mut ed = fresh("abcdef\nghijkl");
+        feed(&mut ed, &[Key::Ctrl('v')]);
+        feed(&mut ed, &keys("ljy"));
+        assert_eq!(ed.buffer.text.to_string(), "abcdef\nghijkl", "yank edits nothing");
+        // paste it back at the end to prove what was captured
+        feed(&mut ed, &keys("G$p"));
+        assert!(ed.buffer.text.to_string().contains("ab\ngh"));
+    }
+
+    #[test]
+    fn a_block_skips_lines_too_short_to_reach_it() {
+        // vim does not select a line that ends before the block's left edge.
+        let mut ed = fresh("aaaaa\nbb\nccccc");
+        feed(&mut ed, &keys("lll")); // column 3
+        feed(&mut ed, &[Key::Ctrl('v')]);
+        feed(&mut ed, &keys("jj"));
+        let text: Vec<String> = ed
+            .selection_ranges()
+            .iter()
+            .map(|&(s, e)| ed.buffer.slice_string(s, e))
+            .collect();
+        assert_eq!(text, ["a", "c"], "the short line contributes nothing");
+    }
+
+    #[test]
+    fn switching_visual_modes_keeps_the_anchor() {
+        let mut ed = fresh("abcdef\nghijkl");
+        feed(&mut ed, &keys("v"));
+        feed(&mut ed, &keys("ll"));
+        feed(&mut ed, &[Key::Ctrl('v')]); // reshape, do not restart
+        assert_eq!(ed.mode, Mode::VisualBlock);
+        let text: Vec<String> = ed
+            .selection_ranges()
+            .iter()
+            .map(|&(s, e)| ed.buffer.slice_string(s, e))
+            .collect();
+        assert_eq!(text, ["abc"]);
+    }
+
+    #[test]
+    fn generated_buffers_refuse_edits() {
+        for kind in [crate::BufferKind::Dashboard, crate::BufferKind::Magit] {
+            let mut ed = fresh("");
+            ed.show_special(kind, "Head:     main\nM src/lib.rs\n");
+            let before = ed.buffer.text.to_string();
+
+            // every route into the text is refused, including entering Insert
+            feed(&mut ed, &[Key::Char('i'), Key::Char('X')]);
+            feed(&mut ed, &keys("xdd"));
+            feed(&mut ed, &keys("p"));
+            ed.apply(EditorCommand::InsertText("nope".into()));
+            ed.apply(EditorCommand::Undo);
+
+            assert_eq!(ed.buffer.text.to_string(), before, "{kind:?} was edited");
+            assert_ne!(ed.mode, Mode::Insert, "{kind:?} let us into Insert");
+            assert!(ed.status.contains("read-only"), "{kind:?}: {}", ed.status);
+            assert!(!ed.buffer.modified);
+        }
+    }
+
+    #[test]
+    fn ordinary_buffers_are_still_editable() {
+        let mut ed = fresh("hello");
+        feed(&mut ed, &[Key::Char('i'), Key::Char('X')]);
+        assert_eq!(ed.buffer.text.to_string(), "Xhello");
+    }
+
+    #[test]
     fn c_c_finishes_a_commit_message_but_still_evaluates_elsewhere() {
         let mut ed = fresh("(+ 1 2)");
         // ordinary buffer: C-c evaluates
@@ -1831,3 +2035,4 @@ mod tests {
         assert!(out.contains(&EditorCommand::CallLisp("(zemacs-projects)".into())));
     }
 }
+

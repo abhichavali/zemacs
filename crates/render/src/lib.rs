@@ -294,7 +294,14 @@ impl Renderer {
         // The selection and the highlight spans both describe `editor.buffer`
         // as the focused window sees it, and there is exactly one of each in
         // the editor — so no other pane may borrow them.
-        let selection = active.then(|| editor.selection()).flatten();
+        // `selection_ranges`, not `selection`: a block selection is genuinely
+        // several disjoint runs, and its bounding span would paint the middle
+        // of every line it covers.
+        let selection: Vec<(usize, usize)> = if active {
+            editor.selection_ranges()
+        } else {
+            Vec::new()
+        };
         let spans: &[Span] = if win.buffer == editor.buffer.id {
             &editor.highlights
         } else {
@@ -337,13 +344,13 @@ impl Renderer {
 
             let cells = expand_line(&buf.slice_string(start, end), set.tab_width);
 
-            if line == cur_line && selection.is_none() {
+            if line == cur_line && selection.is_empty() {
                 self.fill(pane.x, y, pane.w, self.line_h, cur_bg);
             }
 
             // Selection: `end + 1` is the newline, drawn as one trailing cell so
             // a linewise selection visibly swallows the line break.
-            if let Some((s, e)) = selection {
+            for &(s, e) in &selection {
                 if e > start && s <= end {
                     let a = s.max(start) - start;
                     let b = e.min(end + 1) - start;

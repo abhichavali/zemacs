@@ -7,7 +7,7 @@
 //! Lookup order for every key, which is what makes the Lisp config authoritative:
 //! prompt line → pending literal (`r`, `f`) → **user keymap** → built-in grammar.
 
-use crate::{Direction, Editor, EditorCommand, Key, Mode, Prompt, PromptKind};
+use crate::{frame, Direction, Editor, EditorCommand, Key, Mode, Prompt, PromptKind};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +132,8 @@ impl Editor {
             Key::Up => vec![EditorCommand::MoveCursor(Direction::Up)],
             Key::Down => vec![EditorCommand::MoveCursor(Direction::Down)],
             Key::Ctrl(_) | Key::Meta(_) | Key::CtrlMeta(_) => vec![],
+            Key::CtrlEnter => vec![EditorCommand::SplitWindow(frame::Split::Columns)],
+            Key::CtrlMetaEnter => vec![EditorCommand::SplitWindow(frame::Split::Rows)],
         }
     }
 
@@ -379,6 +381,10 @@ impl Editor {
             }
             "n" => self.search_from(self.buffer.cursor + 1, true),
             "N" => self.search_from(self.buffer.cursor, false),
+            // Window splits, reachable in Normal and Visual as well as Insert.
+            "C-<ret>" => vec![EditorCommand::SplitWindow(frame::Split::Columns)],
+            "C-M-<ret>" => vec![EditorCommand::SplitWindow(frame::Split::Rows)],
+            "C-w" => vec![EditorCommand::FocusNextWindow],
             "Z Z" => vec![EditorCommand::Quit],
             "Z Q" => vec![EditorCommand::Quit],
             "g h" => vec![EditorCommand::ShowDashboard],
@@ -845,6 +851,14 @@ impl Editor {
                 self.open_prompt(PromptKind::Buffer);
                 vec![]
             }
+            // Named after the result, not the divider: "horizontal split" means
+            // opposite things in vim and Emacs, "right"/"below" means one thing.
+            "split-window-right" => vec![EditorCommand::SplitWindow(frame::Split::Columns)],
+            "split-window-below" => vec![EditorCommand::SplitWindow(frame::Split::Rows)],
+            "delete-window" => vec![EditorCommand::CloseWindow],
+            "other-window" => vec![EditorCommand::FocusNextWindow],
+            "new-frame" => vec![EditorCommand::NewFrame],
+            "delete-frame" => vec![EditorCommand::CloseFrame],
             "config" => vec![EditorCommand::OpenFile(PathBuf::from("@init"))],
             other if other.starts_with("open:") => vec![EditorCommand::OpenFile(PathBuf::from(
                 expand_tilde(&other[5..]),
@@ -1354,11 +1368,113 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_is_a_buffer_you_can_switch_to() {
+        let mut ed = Editor::new();
+        assert!(ed.buffer_names().contains(&"*dashboard*".to_string()));
+        assert!(ed.buffer_names().contains(&"*scratch*".to_string()));
+
+        // leaving it and coming back via the switcher restores dashboard mode
+        ed.load("code\n", Some("/tmp/a.rs".into()), None);
+        assert_eq!(ed.mode, Mode::Normal);
+        let at = ed
+            .buffer_names()
+            .iter()
+            .position(|n| n == "*dashboard*")
+            .expect("dashboard in the buffer list");
+        ed.apply(EditorCommand::SwitchBuffer(at));
+        assert_eq!(ed.mode, Mode::Dashboard);
+        assert_eq!(ed.buffer.name(), "*dashboard*");
+    }
+
+    #[test]
+    fn opening_a_file_from_the_dashboard_keeps_the_dashboard() {
+        // The dashboard buffer is empty and pathless, so a naive "is this a
+        // throwaway scratch?" check would recycle it and lose it.
+        let mut ed = Editor::new();
+        ed.load("code\n", Some("/tmp/a.rs".into()), None);
+        assert!(ed.buffer_names().contains(&"*dashboard*".to_string()));
+    }
+
+    #[test]
+    fn ctrl_enter_splits_side_by_side_and_ctrl_meta_enter_stacks() {
+        let mut ed = fresh("hello");
+        for cmd in ed.handle_key(Key::CtrlEnter) {
+            ed.apply(cmd);
+        }
+        let area = crate::Rect::new(0, 0, 800, 600);
+        let panes = ed.frame().panes(area);
+        assert_eq!(panes.len(), 2);
+        assert!(panes[0].rect.x < panes[1].rect.x, "side by side");
+        assert_eq!(panes[0].rect.y, panes[1].rect.y);
+
+        for cmd in ed.handle_key(Key::CtrlMetaEnter) {
+            ed.apply(cmd);
+        }
+        let panes = ed.frame().panes(area);
+        assert_eq!(panes.len(), 3);
+    }
+
+    #[test]
+    fn a_split_shows_the_same_buffer_and_windows_scroll_independently() {
+        let mut ed = fresh("a\nb\nc\nd\ne\nf\ng\nh");
+        ed.viewport_lines = 3;
+        let first = ed.frame().current;
+        ed.apply(EditorCommand::SplitWindow(crate::frame::Split::Columns));
+        let second = ed.frame().current;
+        assert_ne!(first, second);
+        assert_eq!(
+            ed.frame().window(first).unwrap().buffer,
+            ed.frame().window(second).unwrap().buffer,
+        );
+
+        // scroll in the focused window, then look at the other one
+        ed.apply(EditorCommand::ScrollLines(4));
+        let moved = ed.scroll;
+        assert!(moved > 0);
+        ed.apply(EditorCommand::FocusNextWindow);
+        assert_eq!(ed.frame().current, first);
+        assert_eq!(ed.scroll, 0, "the other window kept its own scroll");
+    }
+
+    #[test]
+    fn closing_the_last_window_is_refused() {
+        let mut ed = fresh("x");
+        ed.apply(EditorCommand::CloseWindow);
+        assert_eq!(ed.frame().windows.len(), 1);
+        assert!(ed.status.contains("cannot close"));
+
+        ed.apply(EditorCommand::SplitWindow(crate::frame::Split::Rows));
+        ed.apply(EditorCommand::CloseWindow);
+        assert_eq!(ed.frame().windows.len(), 1);
+    }
+
+    #[test]
+    fn new_frame_opens_on_the_dashboard() {
+        let mut ed = Editor::new();
+        ed.load("code\n", Some("/tmp/a.rs".into()), None);
+        assert_eq!(ed.frames.len(), 1);
+
+        let out = bind_and_press(&mut ed, "SPC n f", "new-frame");
+        for cmd in out {
+            ed.apply(cmd);
+        }
+        assert_eq!(ed.frames.len(), 2);
+        assert_eq!(ed.focus_frame, 1);
+        assert_eq!(ed.mode, Mode::Dashboard);
+        assert_eq!(ed.buffer.name(), "*dashboard*");
+
+        // and the first frame still has the file
+        assert!(ed.buffer_names().contains(&"a.rs".to_string()));
+    }
+
+    #[test]
     fn switch_buffer_lists_and_switches() {
         let mut ed = fresh("");
         ed.load("FIRST\n", Some("/tmp/a.rs".into()), None);
         ed.load("SECOND\n", Some("/tmp/b.rs".into()), None);
-        assert_eq!(ed.buffer_names(), vec!["b.rs", "a.rs"]);
+        // `*scratch*` is a real buffer and stays in the list.
+        assert_eq!(ed.buffer_names()[..2], ["b.rs", "a.rs"]);
+        assert!(ed.buffer_names().contains(&"*scratch*".to_string()));
 
         let out = bind_and_press(&mut ed, "SPC j j", "switch-buffer");
         assert!(out.is_empty());
@@ -1369,7 +1485,7 @@ mod tests {
             ed.apply(cmd);
         }
         assert_eq!(ed.buffer.text.to_string(), "FIRST\n");
-        assert_eq!(ed.buffer_names(), vec!["a.rs", "b.rs"]);
+        assert_eq!(ed.buffer_names()[..2], ["a.rs", "b.rs"]);
     }
 
     #[test]
@@ -1378,7 +1494,7 @@ mod tests {
         ed.load("FIRST\n", Some("/tmp/a.rs".into()), None);
         ed.load("SECOND\n", Some("/tmp/b.rs".into()), None);
         ed.load("FIRST\n", Some("/tmp/a.rs".into()), None);
-        assert_eq!(ed.buffer_names(), vec!["a.rs", "b.rs"]);
+        assert_eq!(ed.buffer_names()[..2], ["a.rs", "b.rs"]);
         assert_eq!(ed.buffer.text.to_string(), "FIRST\n");
     }
 

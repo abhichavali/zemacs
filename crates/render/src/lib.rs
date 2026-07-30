@@ -3,8 +3,9 @@
 //! The whole frame is drawn with two primitives: filled rectangles
 //! (`Canvas::fill_rect`) and single-glyph textures blitted at monospace cell
 //! positions. That is *why* SDL2 instead of a GPU text stack: the cursor, the
-//! visual selection, the current-line highlight and the status strip are all
-//! just rects, and the text is a grid — no shaping, no atlas, no pipeline.
+//! visual selection, the current-line highlight and the modeline — bevel and
+//! all — are just rects, and the text is a grid — no shaping, no atlas, no
+//! pipeline.
 //!
 //! Glyphs are cached one texture per `char`, rasterised white/blended once and
 //! recoloured per draw with `set_color_mod`. So a frame costs one `copy` per
@@ -23,9 +24,9 @@ use sdl2::rect::Rect;
 use sdl2::render::{BlendMode, Texture, TextureCreator, WindowCanvas};
 use sdl2::ttf::{Font, Sdl2TtfContext};
 use sdl2::video::WindowContext;
-use zemacs_core::{CompletionStyle, Editor, HlKind, Mode, Span};
+use zemacs_core::{CompletionStyle, Editor, HlKind, Mode, Settings, Span};
 
-/// Outer margin, in pixels, around the text area and inside the status strip.
+/// Outer margin, in pixels, around the text area and inside the modeline.
 const PAD: i32 = 8;
 
 /// Vertical breathing room inside a completion popup. Half of [`PAD`], because
@@ -166,7 +167,7 @@ impl Renderer {
             .map_err(|e| anyhow::anyhow!("output size: {e}"))?;
         let (w, h) = (w as i32, h as i32);
 
-        let status_h = self.line_h + PAD;
+        let status_h = modeline_h(self.line_h, &editor.settings);
         let text_h = (h - status_h - PAD).max(self.line_h);
         editor.viewport_lines = (text_h / self.line_h).max(1) as usize;
 
@@ -179,8 +180,12 @@ impl Renderer {
         } else {
             self.draw_document(editor, w, text_h);
         }
-        self.draw_status(editor, w, h, status_h);
-        // Last, and over the status strip's scrim too: the popup is the only
+        // One window, so its modeline is always the active one. When the frame
+        // splits, this becomes one call per window with `is_active` set from
+        // whichever window has the cursor.
+        let frame = Area { x: 0, y: 0, w, h };
+        self.draw_modeline(editor, modeline_rect(frame, status_h), true);
+        // Last, and over the modeline's scrim too: the popup is the only
         // live thing on screen while it is up.
         self.draw_completion(editor, w, h, status_h);
 
@@ -338,20 +343,50 @@ impl Renderer {
         }
     }
 
-    // --- status line ------------------------------------------------------
+    // --- modeline ---------------------------------------------------------
 
-    fn draw_status(&mut self, editor: &Editor, w: i32, h: i32, status_h: i32) {
-        let (bg, fg) = (editor.settings.background, editor.settings.foreground);
-        let y = h - status_h;
-        self.fill(0, y, w, status_h, rgb(mix(bg, fg, 0.09)));
-        self.fill(0, y, w, 1, rgb(mix(bg, fg, 0.20)));
+    /// One window's modeline, drawn into `rect`.
+    ///
+    /// Takes its rectangle rather than deriving one from the window because
+    /// Emacs draws a modeline per *window*, not per frame; when the frame
+    /// splits, this is called once per window with the rect the layout hands
+    /// it. `is_active` is the mode-line / mode-line-inactive distinction: only
+    /// the window holding the cursor gets the bright face.
+    ///
+    /// The 3D look is Emacs's `:box` attribute, nothing cleverer: a lit edge
+    /// along the top and left, a shadowed one along the bottom and right, over
+    /// a background lighter than the buffer's. Two tones on opposite edges read
+    /// as a light source above-left, which is the whole trick — see [`bevel`]
+    /// for the sunken case.
+    fn draw_modeline(&mut self, editor: &Editor, rect: Area, is_active: bool) {
+        let set = &editor.settings;
+        let bg = modeline_bg(set, is_active);
+        let relief = relief(set);
 
-        let text = editor.status_line();
-        let ty = y + PAD / 2;
-        let color = rgb(mix(bg, fg, if editor.prompt.is_some() { 1.0 } else { 0.85 }));
-        let end = self.draw_str(&text, PAD, ty, color);
-        if editor.prompt.is_some() {
-            self.fill(end, ty, 2, self.line_h, rgb(fg));
+        self.fill(rect.x, rect.y, rect.w, rect.h, rgb(bg));
+        let (lit, dark) = (rgb(highlight_shade(bg)), rgb(shadow_shade(bg)));
+        for (e, is_lit) in bevel(rect, relief) {
+            self.fill(e.x, e.y, e.w, e.h, if is_lit { lit } else { dark });
+        }
+
+        // Text sits inside the box and centred in whatever height is left, so
+        // changing the relief or the padding moves the whole label with it.
+        let inset = bevel_width(rect, relief) + PAD;
+        let x = rect.x + inset;
+        let y = rect.y + ((rect.h - self.line_h) / 2).max(0);
+        let cols = ((rect.w - 2 * inset).max(0) / self.cell_w) as usize;
+
+        // A prompt takes over the strip, so it gets full contrast and a caret
+        // regardless of how dim an inactive modeline would otherwise be.
+        let prompting = editor.prompt.is_some();
+        let color = rgb(if prompting {
+            set.foreground
+        } else {
+            modeline_fg(set, is_active)
+        });
+        let end = self.draw_str(&truncate(&editor.status_line(), cols), x, y, color);
+        if prompting {
+            self.fill(end, y, 2, self.line_h, rgb(set.foreground));
         }
     }
 
@@ -603,6 +638,128 @@ fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
         a[0] + (b[0] - a[0]) * t,
         a[1] + (b[1] - a[1]) * t,
         a[2] + (b[2] - a[2]) * t,
+    ]
+}
+
+/// A pixel rectangle. Not `sdl2::rect::Rect`: that one stores its size
+/// unsigned, and every bit of layout below wants to subtract freely and clamp
+/// once at the end. [`Renderer::fill`] drops non-positive rects anyway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Area {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+// --- modeline appearance ---------------------------------------------------
+//
+// Every knob Emacs exposes on `mode-line` lives behind one of the functions
+// below, so wiring a real setting to it later is a one-line change to the
+// body. None of them are customisable *today*: the only paths from Lisp into
+// the renderer are `Settings` (font size, fg/bg, line numbers, tab width,
+// completion style) and `EditorCommand::SetSyntaxColor`, whose face names come
+// from `HlKind::from_name` — and there is no modeline face in `HlKind`. So
+// these read what exists and derive the rest.
+
+/// Width of the modeline's 3D border in pixels — Emacs's `:box :line-width`.
+/// Positive raises the strip, negative sinks it (see [`bevel`]), 0 is flat.
+///
+/// ponytail: hardcoded. Becomes `settings.modeline_relief` the day core grows
+/// the field and a `SetModelineRelief` command to set it.
+fn relief(_settings: &Settings) -> i32 {
+    2
+}
+
+/// Vertical breathing room around the modeline's text, on top of the glyph
+/// height and the box. ponytail: hardcoded; wants `settings.modeline_pad`.
+fn modeline_pad(_settings: &Settings) -> i32 {
+    PAD
+}
+
+/// The strip's own background. Derived from the theme rather than fixed, so it
+/// stays a *lighter shade of the buffer* on a light theme instead of turning
+/// into a grey bar — and so the bevel shades below have something to push off.
+///
+/// ponytail: the two mix factors are hardcoded; they want a `"modeline"` /
+/// `"modeline-inactive"` face pair settable from Lisp.
+fn modeline_bg(settings: &Settings, is_active: bool) -> [f32; 3] {
+    let t = if is_active { 0.14 } else { 0.06 };
+    mix(settings.background, settings.foreground, t)
+}
+
+/// Text colour on the strip. Inactive windows get a dimmer label, which is most
+/// of what separates them at a glance. ponytail: hardcoded, same face story.
+fn modeline_fg(settings: &Settings, is_active: bool) -> [f32; 3] {
+    mix(settings.background, settings.foreground, if is_active { 0.92 } else { 0.55 })
+}
+
+/// The lit edge: the strip's background pushed toward white.
+///
+/// Toward *white* rather than by a fixed amount, because a light theme's
+/// modeline is already near the top of the range and adding a constant would
+/// clip both edges to the same colour, flattening the bevel.
+/// ponytail: hardcoded; wants a settable highlight shade.
+fn highlight_shade(base: [f32; 3]) -> [f32; 3] {
+    mix(base, [1.0; 3], 0.40)
+}
+
+/// The shadowed edge — [`highlight_shade`] toward black, and deliberately the
+/// stronger of the two: a shadow that is weaker than its highlight reads as
+/// glow rather than depth. ponytail: hardcoded; wants a settable shadow shade.
+fn shadow_shade(base: [f32; 3]) -> [f32; 3] {
+    mix(base, [0.0; 3], 0.50)
+}
+
+/// Total height of a modeline: one text line, its padding, and the box on both
+/// edges. The relief is *added* rather than eaten out of the text row, matching
+/// Emacs, where a wider `:box` makes the mode line taller.
+fn modeline_h(line_h: i32, settings: &Settings) -> i32 {
+    line_h + modeline_pad(settings) + 2 * relief(settings).abs()
+}
+
+/// The modeline strip inside `area`: full width, hugging the bottom edge.
+///
+/// Clamped to `area`, so a window too short for a modeline gets a shorter one
+/// (possibly empty) rather than a rectangle with a negative height or a `y`
+/// hanging off the top of its own window.
+fn modeline_rect(area: Area, h: i32) -> Area {
+    let avail = area.h.max(0);
+    let h = h.clamp(0, avail);
+    Area {
+        x: area.x,
+        y: area.y + avail - h,
+        w: area.w.max(0),
+        h,
+    }
+}
+
+/// Bevel width actually used for `rect` — the requested relief, clamped so the
+/// facing edges of a very short or narrow strip cannot overlap and paint the
+/// whole thing shadow-coloured.
+fn bevel_width(rect: Area, relief: i32) -> i32 {
+    relief.abs().min(rect.w.max(0) / 2).min(rect.h.max(0) / 2)
+}
+
+/// The four edges of `rect`'s 3D border as `(edge, is_highlight)`, for a relief
+/// of `relief` pixels. Empty when the relief is 0 or the rect is too small to
+/// hold one.
+///
+/// Positive relief lights the top and left and shadows the bottom and right —
+/// a surface tilted toward a light source above and to the left, i.e. raised.
+/// Negative swaps them, which is the same surface tilted away: pressed in.
+/// Emacs's `:box` `:line-width` has exactly this sign convention.
+fn bevel(rect: Area, relief: i32) -> Vec<(Area, bool)> {
+    let n = bevel_width(rect, relief);
+    if n == 0 {
+        return Vec::new();
+    }
+    let lit = relief > 0;
+    vec![
+        (Area { h: n, ..rect }, lit),                                  // top
+        (Area { y: rect.y + rect.h - n, h: n, ..rect }, !lit),         // bottom
+        (Area { w: n, ..rect }, lit),                                  // left
+        (Area { x: rect.x + rect.w - n, w: n, ..rect }, !lit),         // right
     ]
 }
 
@@ -973,6 +1130,133 @@ mod tests {
             let b = center_popup(1100, h, STATUS, LH, CW, 10);
             assert_eq!(b.rows, 0, "h={h}");
             assert!(b.y >= 0 && b.h > 0, "h={h} -> {b:?}");
+        }
+    }
+
+    // --- modeline ---------------------------------------------------------
+
+    /// Enough to compare two shades of the same hue; the bevel only ever pushes
+    /// a colour toward white or black, so a channel sum orders them correctly.
+    fn luma(c: [f32; 3]) -> f32 {
+        c[0] + c[1] + c[2]
+    }
+
+    /// A modeline-shaped strip at the bottom of a 1100x760 window.
+    const STRIP: Area = Area {
+        x: 0,
+        y: 726,
+        w: 1100,
+        h: 34,
+    };
+
+    #[test]
+    fn positive_relief_lights_the_top_and_left() {
+        let edges = bevel(STRIP, 2);
+        assert_eq!(
+            edges,
+            vec![
+                (Area { x: 0, y: 726, w: 1100, h: 2 }, true),   // top: lit
+                (Area { x: 0, y: 758, w: 1100, h: 2 }, false),  // bottom: shadow
+                (Area { x: 0, y: 726, w: 2, h: 34 }, true),     // left: lit
+                (Area { x: 1098, y: 726, w: 2, h: 34 }, false), // right: shadow
+            ]
+        );
+        // Every edge is inside the strip it decorates.
+        for (e, _) in bevel(STRIP, 2) {
+            assert!(e.x >= STRIP.x && e.x + e.w <= STRIP.x + STRIP.w, "{e:?}");
+            assert!(e.y >= STRIP.y && e.y + e.h <= STRIP.y + STRIP.h, "{e:?}");
+        }
+    }
+
+    #[test]
+    fn negative_relief_swaps_highlight_and_shadow() {
+        let raised = bevel(STRIP, 2);
+        let sunken = bevel(STRIP, -2);
+        // Same four rectangles...
+        let rects = |v: &[(Area, bool)]| v.iter().map(|&(a, _)| a).collect::<Vec<_>>();
+        assert_eq!(rects(&raised), rects(&sunken));
+        // ...with the light source flipped, which is the entire difference
+        // between a raised modeline and a pressed one.
+        for (&(_, a), &(_, b)) in raised.iter().zip(&sunken) {
+            assert_ne!(a, b);
+        }
+        assert!(!sunken[0].1 && sunken[1].1); // top shadowed, bottom lit
+    }
+
+    #[test]
+    fn relief_zero_or_no_room_draws_no_bevel() {
+        assert!(bevel(STRIP, 0).is_empty());
+        // Degenerate strips: no bevel rather than facing edges overlapping into
+        // one solid shadow-coloured bar, and never a negative rectangle.
+        for h in [0, 1, 2, 3, 4] {
+            for w in [0, 1, 2, 1100] {
+                let r = Area { x: 0, y: 0, w, h };
+                for relief in [-2, 0, 2] {
+                    for (e, _) in bevel(r, relief) {
+                        assert!(e.w > 0 && e.h > 0, "w={w} h={h} relief={relief} -> {e:?}");
+                        assert!(e.w <= r.w && e.h <= r.h, "w={w} h={h} -> {e:?}");
+                    }
+                }
+            }
+        }
+        // A 4px strip can hold a 2px box exactly, a 3px one only half of it.
+        assert_eq!(bevel_width(Area { x: 0, y: 0, w: 100, h: 4 }, 2), 2);
+        assert_eq!(bevel_width(Area { x: 0, y: 0, w: 100, h: 3 }, 2), 1);
+    }
+
+    #[test]
+    fn bevel_shades_straddle_the_strip_background() {
+        // Both directions matter: on a light theme a "lighten" that clipped to
+        // white would make the two edges identical and kill the 3D read.
+        for background in [[0.06, 0.06, 0.09], [0.98, 0.97, 0.94]] {
+            let set = Settings {
+                background,
+                foreground: [1.0 - background[0]; 3],
+                ..Settings::default()
+            };
+            let base = modeline_bg(&set, true);
+            assert!(luma(highlight_shade(base)) > luma(base), "{background:?}");
+            assert!(luma(shadow_shade(base)) < luma(base), "{background:?}");
+            // Distinct from the buffer behind it, or the strip has no edge at all.
+            assert_ne!(luma(base), luma(background), "{background:?}");
+            // The active strip is the brighter and higher-contrast of the two.
+            let idle = modeline_bg(&set, false);
+            assert!((luma(base) - luma(background)).abs() > (luma(idle) - luma(background)).abs());
+            assert_ne!(luma(modeline_fg(&set, true)), luma(modeline_fg(&set, false)));
+        }
+    }
+
+    #[test]
+    fn modeline_hugs_the_bottom_of_its_window() {
+        let set = Settings::default();
+        let mh = modeline_h(LH, &set);
+        assert!(mh > LH, "the box and padding must add height, not eat the text row");
+
+        let frame = Area { x: 0, y: 0, w: 1100, h: 760 };
+        let r = modeline_rect(frame, mh);
+        assert_eq!(r, Area { x: 0, y: 760 - mh, w: 1100, h: mh });
+        assert_eq!(r.y + r.h, frame.h); // flush with the bottom edge
+        // Tall enough for the full relief, by construction.
+        assert_eq!(bevel_width(r, relief(&set)), relief(&set).abs());
+
+        // A window that is not the frame — the multi-window case.
+        let pane = Area { x: 550, y: 100, w: 550, h: 300 };
+        let r = modeline_rect(pane, mh);
+        assert_eq!(r, Area { x: 550, y: 400 - mh, w: 550, h: mh });
+    }
+
+    #[test]
+    fn a_degenerate_window_yields_no_negative_modeline() {
+        let mh = modeline_h(LH, &Settings::default());
+        for h in [-10, 0, 1, 5, mh - 1, mh, mh + 1] {
+            for w in [-4, 0, 1, 1100] {
+                let area = Area { x: 3, y: 7, w, h };
+                let r = modeline_rect(area, mh);
+                assert!(r.w >= 0 && r.h >= 0, "w={w} h={h} -> {r:?}");
+                assert!(r.h <= h.max(0), "w={w} h={h} -> {r:?}");
+                assert!(r.y >= area.y, "w={w} h={h} -> {r:?}"); // never above its window
+                assert_eq!(r.y + r.h, area.y + h.max(0), "w={w} h={h} -> {r:?}");
+            }
         }
     }
 

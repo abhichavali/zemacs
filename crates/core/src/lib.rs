@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use ropey::Rope;
 
 pub use dashboard::Dashboard;
+pub use frame::{BufferId, Frame, Rect, Window, WindowId};
 pub use minibuffer::{CompletionStyle, Prompt, PromptKind};
 
 /// Editing mode — the heart of the modal ("Evil") feel.
@@ -80,6 +81,11 @@ pub enum Key {
     Meta(char),
     /// Both together, `C-M-` in a binding.
     CtrlMeta(char),
+    // ponytail: Enter is the only *named* key that needs modifiers today (the
+    // window splits). Generalize to a modifier bitset over a `Named` enum when
+    // a second one does.
+    CtrlEnter,
+    CtrlMetaEnter,
     Enter,
     Tab,
     Backspace,
@@ -99,6 +105,8 @@ impl Key {
             Key::Ctrl(c) => format!("C-{}", c.to_ascii_lowercase()),
             Key::Meta(c) => format!("M-{c}"),
             Key::CtrlMeta(c) => format!("C-M-{}", c.to_ascii_lowercase()),
+            Key::CtrlEnter => "C-<ret>".into(),
+            Key::CtrlMetaEnter => "C-M-<ret>".into(),
             Key::Enter => "<ret>".into(),
             Key::Tab => "<tab>".into(),
             Key::Backspace => "<bs>".into(),
@@ -265,6 +273,16 @@ pub enum EditorCommand {
     /// Index into [`Editor::buffer_names`]; 0 is the current buffer.
     SwitchBuffer(usize),
 
+    // --- windows and frames ---
+    /// Split the focused window; the new one shows the same buffer.
+    SplitWindow(frame::Split),
+    CloseWindow,
+    FocusNextWindow,
+    FocusWindow(frame::WindowId),
+    /// A new OS window, opening on the dashboard.
+    NewFrame,
+    CloseFrame,
+
     // --- dashboard, configured from Lisp ---
     SetDashboardBanner(String),
     ClearDashboardItems,
@@ -313,8 +331,21 @@ impl Default for Settings {
     }
 }
 
+/// What a buffer is for. The dashboard is a buffer rather than a mode so it
+/// shows up in the buffer switcher and can be put in any window, exactly like
+/// Emacs' `*scratch*`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BufferKind {
+    Text,
+    Scratch,
+    Dashboard,
+}
+
 /// A text document plus a cursor expressed as a character index into the rope.
 pub struct Buffer {
+    /// Stable handle. Windows refer to buffers by this, never by index.
+    pub id: BufferId,
+    pub kind: BufferKind,
     pub text: Rope,
     pub cursor: usize,
     pub path: Option<PathBuf>,
@@ -332,6 +363,8 @@ pub struct Buffer {
 impl Buffer {
     pub fn from_str(s: &str) -> Self {
         Self {
+            id: 0,
+            kind: BufferKind::Text,
             text: Rope::from_str(s),
             cursor: 0,
             path: None,
@@ -345,19 +378,25 @@ impl Buffer {
 
     /// Display name for the status line and the buffer switcher.
     pub fn name(&self) -> String {
-        match &self.path {
-            Some(p) => p
+        match (&self.path, self.kind) {
+            (Some(p), _) => p
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| p.display().to_string()),
-            None => "*scratch*".into(),
+            (None, BufferKind::Dashboard) => "*dashboard*".into(),
+            (None, BufferKind::Scratch) => "*scratch*".into(),
+            (None, BufferKind::Text) => "*untitled*".into(),
         }
     }
 
-    /// True for a buffer that was never touched — the startup scratch, which
-    /// opening a file should replace rather than stack behind.
+    /// True for a throwaway buffer that opening a file should replace rather
+    /// than stack behind. `*dashboard*` and `*scratch*` are never throwaway,
+    /// however empty they look — they are named buffers you can come back to.
     fn is_pristine(&self) -> bool {
-        self.path.is_none() && !self.modified && self.len_chars() == 0
+        self.kind == BufferKind::Text
+            && self.path.is_none()
+            && !self.modified
+            && self.len_chars() == 0
     }
 
     /// Move one step through history, pushing the current state onto the other
@@ -529,6 +568,10 @@ pub struct Editor {
     pub buffer: Buffer,
     /// The other open buffers, most recently visited first.
     pub others: Vec<Buffer>,
+    /// One per OS window. Always at least one.
+    pub frames: Vec<frame::Frame>,
+    pub focus_frame: usize,
+    next_buffer_id: BufferId,
     /// Command names published by the Lisp image, for `M-x` completion.
     pub commands: Vec<String>,
     pub mode: Mode,
@@ -575,9 +618,21 @@ const UNDO_LIMIT: usize = 500;
 
 impl Editor {
     pub fn new() -> Self {
+        // Buffer 0 is *dashboard*, buffer 1 is *scratch*. Both are real
+        // buffers, so both appear in the switcher.
+        let mut dash = Buffer::from_str("");
+        dash.kind = BufferKind::Dashboard;
+        let mut scratch = Buffer::from_str("");
+        scratch.id = 1;
+        scratch.kind = BufferKind::Scratch;
+        scratch.language = Some("lisp".into());
+
         Self {
-            buffer: Buffer::from_str(""),
-            others: Vec::new(),
+            buffer: dash,
+            others: vec![scratch],
+            frames: vec![frame::Frame::new(0)],
+            focus_frame: 0,
+            next_buffer_id: 2,
             commands: Vec::new(),
             mode: Mode::Dashboard,
             settings: Settings::default(),
@@ -599,6 +654,70 @@ impl Editor {
         }
     }
 
+    /// The focused frame.
+    pub fn frame(&self) -> &frame::Frame {
+        &self.frames[self.focus_frame.min(self.frames.len() - 1)]
+    }
+
+    pub fn frame_mut(&mut self) -> &mut frame::Frame {
+        let i = self.focus_frame.min(self.frames.len() - 1);
+        &mut self.frames[i]
+    }
+
+    fn dashboard_buffer_id(&self) -> BufferId {
+        std::iter::once(&self.buffer)
+            .chain(self.others.iter())
+            .find(|b| b.kind == BufferKind::Dashboard)
+            .map(|b| b.id)
+            .unwrap_or(0)
+    }
+
+    /// Any buffer by handle — the renderer needs this to draw the *inactive*
+    /// windows, whose buffers are not `self.buffer`.
+    pub fn buffer_by_id(&self, id: BufferId) -> Option<&Buffer> {
+        std::iter::once(&self.buffer)
+            .chain(self.others.iter())
+            .find(|b| b.id == id)
+    }
+
+    /// Park the live cursor and scroll on the focused window. Must run before
+    /// anything changes which window is focused.
+    fn sync_window(&mut self) {
+        let (cursor, scroll, lines, id) = (
+            self.buffer.cursor,
+            self.scroll,
+            self.viewport_lines,
+            self.buffer.id,
+        );
+        let w = self.frame_mut().current_window_mut();
+        w.cursor = cursor;
+        w.scroll = scroll;
+        w.viewport_lines = lines;
+        w.buffer = id;
+    }
+
+    /// Make the focused window's buffer and position the live ones. The
+    /// inverse of [`Editor::sync_window`].
+    fn adopt_window(&mut self) {
+        let w = self.frame().current_window().clone();
+        if w.buffer != self.buffer.id {
+            if let Some(i) = self.others.iter().position(|b| b.id == w.buffer) {
+                let incoming = self.others.remove(i);
+                let outgoing = std::mem::replace(&mut self.buffer, incoming);
+                self.others.insert(0, outgoing);
+            }
+        }
+        self.buffer.cursor = w.cursor.min(self.buffer.len_chars());
+        self.scroll = w.scroll;
+        self.viewport_lines = w.viewport_lines;
+        self.highlights.clear();
+        self.revision += 1;
+        self.mode = match self.buffer.kind {
+            BufferKind::Dashboard => Mode::Dashboard,
+            _ => Mode::Normal,
+        };
+    }
+
     /// Open buffer names, active first — the candidate list for the switcher.
     pub fn buffer_names(&self) -> Vec<String> {
         std::iter::once(&self.buffer)
@@ -616,6 +735,7 @@ impl Editor {
         if index == 0 || index > self.others.len() {
             return;
         }
+        self.sync_window();
         self.buffer.saved_scroll = self.scroll;
         let mut incoming = self.others.remove(index - 1);
         std::mem::swap(&mut self.buffer, &mut incoming);
@@ -624,7 +744,17 @@ impl Editor {
         self.highlights.clear();
         self.revision += 1;
         self.status = format!("switched to {}", self.buffer.name());
-        self.mode = Mode::Normal;
+        self.mode = match self.buffer.kind {
+            BufferKind::Dashboard => Mode::Dashboard,
+            _ => Mode::Normal,
+        };
+        // The window now shows this buffer — otherwise the next focus change
+        // would swap the old one straight back in.
+        let (id, cursor, scroll) = (self.buffer.id, self.buffer.cursor, self.scroll);
+        let w = self.frame_mut().current_window_mut();
+        w.buffer = id;
+        w.cursor = cursor;
+        w.scroll = scroll;
     }
 
     /// The one and only document mutator.
@@ -706,6 +836,49 @@ impl Editor {
                 }
             }
             EditorCommand::SwitchBuffer(i) => self.switch_buffer(i),
+            EditorCommand::SplitWindow(dir) => {
+                self.sync_window();
+                let id = self.frames[self.focus_frame].split(dir);
+                self.status = format!("split window {id}");
+            }
+            EditorCommand::CloseWindow => {
+                self.sync_window();
+                if self.frames[self.focus_frame].close_current() {
+                    self.adopt_window();
+                } else {
+                    self.status = "cannot close the last window".into();
+                }
+            }
+            EditorCommand::FocusNextWindow => {
+                self.sync_window();
+                self.frames[self.focus_frame].focus_next();
+                self.adopt_window();
+            }
+            EditorCommand::FocusWindow(id) => {
+                if self.frames[self.focus_frame].window(id).is_some()
+                    && self.frames[self.focus_frame].current != id
+                {
+                    self.sync_window();
+                    self.frames[self.focus_frame].focus(id);
+                    self.adopt_window();
+                }
+            }
+            EditorCommand::NewFrame => {
+                self.sync_window();
+                let dashboard = self.dashboard_buffer_id();
+                self.frames.push(frame::Frame::new(dashboard));
+                self.focus_frame = self.frames.len() - 1;
+                self.adopt_window();
+            }
+            EditorCommand::CloseFrame => {
+                if self.frames.len() > 1 {
+                    self.frames.remove(self.focus_frame);
+                    self.focus_frame = self.focus_frame.min(self.frames.len() - 1);
+                    self.adopt_window();
+                } else {
+                    self.should_quit = true;
+                }
+            }
 
             EditorCommand::SetDashboardBanner(b) => self.dashboard.banner = b,
             // Both of these can strand `selected` past the end of the list —
@@ -760,10 +933,13 @@ impl Editor {
                 return;
             }
         }
-        // Stack the outgoing buffer, unless it is the untouched startup scratch.
+        // Stack the outgoing buffer, unless it is a throwaway.
         if !self.buffer.is_pristine() {
             self.buffer.saved_scroll = self.scroll;
-            let previous = std::mem::replace(&mut self.buffer, Buffer::from_str(""));
+            let mut fresh = Buffer::from_str("");
+            fresh.id = self.next_buffer_id;
+            self.next_buffer_id += 1;
+            let previous = std::mem::replace(&mut self.buffer, fresh);
             self.others.insert(0, previous);
         }
         // A new document gets a new history — and note the outgoing buffer took
@@ -776,10 +952,16 @@ impl Editor {
         self.buffer.modified = false;
         self.buffer.undo.clear();
         self.buffer.redo.clear();
+        self.buffer.kind = BufferKind::Text;
         self.highlights.clear();
         self.revision += 1;
         self.scroll = 0;
         self.mode = Mode::Normal;
+        let id = self.buffer.id;
+        let w = self.frame_mut().current_window_mut();
+        w.buffer = id;
+        w.cursor = 0;
+        w.scroll = 0;
     }
 
     fn set_mode(&mut self, m: Mode) {

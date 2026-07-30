@@ -397,6 +397,15 @@ fn key_from_keydown(kc: Keycode, keymod: Mod, raw: bool) -> Option<Key> {
     // not compose text, so `⌘-` needs no special handling. Option stays a Meta
     // fallback for anyone used to it (and for other OSes).
     let meta = keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD | Mod::LALTMOD | Mod::RALTMOD);
+    // Enter has a multi-character key name, so `combo_char` cannot spell it —
+    // but `C-<ret>` and `C-M-<ret>` are the window splits.
+    if matches!(kc, Keycode::Return | Keycode::KpEnter) {
+        match (ctrl, meta) {
+            (true, true) => return Some(Key::CtrlMetaEnter),
+            (true, false) => return Some(Key::CtrlEnter),
+            _ => {}
+        }
+    }
     match (ctrl, meta) {
         // Shift is not consulted for Ctrl combos: `C-a` and `C-A` are one key,
         // as in Emacs. Meta keeps it so `M-+` can be spelled the way it's typed.
@@ -591,6 +600,20 @@ mod tests {
             Some(Key::CtrlMeta('j'))
         );
         assert_eq!(Key::CtrlMeta('j').token(), "C-M-j");
+        // the window splits
+        assert_eq!(
+            key_from_keydown(Keycode::Return, Mod::LCTRLMOD, false),
+            Some(Key::CtrlEnter)
+        );
+        assert_eq!(
+            key_from_keydown(Keycode::Return, Mod::LCTRLMOD | Mod::LGUIMOD, false),
+            Some(Key::CtrlMetaEnter)
+        );
+        // plain Enter is unaffected
+        assert_eq!(
+            key_from_keydown(Keycode::Return, Mod::NOMOD, false),
+            Some(Key::Enter)
+        );
         // Ctrl+Option spells the same key, so either Meta source works.
         assert_eq!(
             key_from_keydown(Keycode::J, Mod::LALTMOD | Mod::RCTRLMOD, false),

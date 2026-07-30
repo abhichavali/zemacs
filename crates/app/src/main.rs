@@ -28,6 +28,9 @@ use zemacs_core::{Editor, EditorCommand, Frame, Key, PromptKind, Rect, WindowId}
 use zemacs_lisp::Lisp;
 use zemacs_render::Renderer;
 
+mod magit;
+use magit::Magit;
+
 const RECENT_LIMIT: usize = 10;
 const RECENT_ON_DASHBOARD: usize = 5;
 /// Lines per wheel notch.
@@ -218,6 +221,7 @@ fn main() -> anyhow::Result<()> {
     let mut swallow_text = false;
     let mut mouse = Mouse::default();
     let mut cursors = Cursors::new();
+    let mut magit = Magit::default();
 
     'main: loop {
         keys.clear();
@@ -255,7 +259,7 @@ fn main() -> anyhow::Result<()> {
                             // live buffer belongs to the focused window, so
                             // core has to park it and adopt the new frame's.
                             let cmd = EditorCommand::FocusFrame(i);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers);
+                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit);
                         }
                     }
                     WindowEvent::Close => {
@@ -299,10 +303,11 @@ fn main() -> anyhow::Result<()> {
                             EditorCommand::FocusFrame(i),
                             &init_path,
                             &mut renderers,
+                            &mut magit,
                         );
                         if let Some(window) = mouse.press(&editor.frames[i], i, area, x, y) {
                             let cmd = EditorCommand::FocusWindow(window);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers);
+                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit);
                         }
                     }
                 }
@@ -364,10 +369,10 @@ fn main() -> anyhow::Result<()> {
                         editor.focus_frame = i;
                         if let Some(window) = editor.frames[i].window_at(area, px, py) {
                             let cmd = EditorCommand::FocusWindow(window);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers);
+                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit);
                         }
                         let cmd = EditorCommand::ScrollLines(-y * SCROLL_LINES);
-                        dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers);
+                        dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit);
                     }
                 }
                 Event::TextInput { text, .. } => {
@@ -388,11 +393,11 @@ fn main() -> anyhow::Result<()> {
 
         for key in keys.drain(..) {
             for cmd in editor.handle_key(key) {
-                dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers);
+                dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit);
             }
         }
         while let Ok(cmd) = rx.try_recv() {
-            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers);
+            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit);
         }
 
         // Toggle SDL text input to match the mode. This is what stops macOS
@@ -476,11 +481,13 @@ fn dispatch(
     cmd: EditorCommand,
     init_path: &Path,
     renderers: &mut Vec<Renderer>,
+    magit: &mut Magit,
 ) {
     match cmd {
         EditorCommand::CallLisp(form) => lisp.eval(form),
         EditorCommand::OpenFile(path) => open_file(editor, &path, init_path),
         EditorCommand::SaveFile(path) => save_file(editor, path),
+        EditorCommand::Git(verb) => magit.run(editor, &verb),
         EditorCommand::CloseFrame => {
             let focused = editor.focus_frame;
             close_frame(editor, renderers, focused);

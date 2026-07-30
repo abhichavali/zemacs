@@ -933,7 +933,12 @@ impl Editor {
             // What `C-c` is bound to: the selection if there is one, else the
             // form under point, else the whole buffer.
             "eval-dwim" => {
-                if self.mode.is_visual() {
+                // In a commit message, `C-c` means "finish the commit" — the
+                // buffer decides, so one binding covers both without taking
+                // C-c away from everywhere else.
+                if self.buffer.kind == crate::BufferKind::CommitMessage {
+                    self.run_action("magit-commit-finish")
+                } else if self.mode.is_visual() {
                     self.run_action("eval-region")
                 } else if self.buffer.last_top_level_form(self.buffer.cursor + 1).is_some() {
                     self.run_action("eval-last-sexp")
@@ -1476,6 +1481,28 @@ mod tests {
         });
         ed.handle_key(Key::Meta('x'));
         assert_eq!(ed.prompt.as_ref().map(|p| p.kind), Some(PromptKind::Command));
+    }
+
+    #[test]
+    fn c_c_finishes_a_commit_message_but_still_evaluates_elsewhere() {
+        let mut ed = fresh("(+ 1 2)");
+        // ordinary buffer: C-c evaluates
+        assert!(matches!(
+            ed.run_action("eval-dwim").as_slice(),
+            [EditorCommand::CallLisp(_)]
+        ));
+
+        // commit message: the same key finishes the commit instead
+        ed.show_special(crate::BufferKind::CommitMessage, "\n# comment\n");
+        assert_eq!(
+            ed.run_action("eval-dwim"),
+            vec![EditorCommand::Git("commit-finish".into())]
+        );
+        assert_eq!(ed.buffer.name(), "COMMIT_EDITMSG");
+        // and it is an ordinary editable buffer, not a mode of its own
+        assert_eq!(ed.mode, Mode::Normal);
+        feed(&mut ed, &[Key::Char('i'), Key::Char('h'), Key::Char('i')]);
+        assert!(ed.buffer.text.to_string().starts_with("hi"));
     }
 
     #[test]

@@ -291,6 +291,33 @@ Clears first, so reloading the config does not duplicate the list."
 (define-key "normal" "SPC b s" "lisp-scratch")
 (define-key "normal" "SPC q q" "quit")
 
+;;; ---------------------------------------------------------------------------
+;;; Magit
+;;;
+;;; `magit-*' are built-in verbs, run by the editor rather than by this image.
+;;; The status buffer has its own mode, which is what lets `s', `u' and `c' mean
+;;; stage, unstage and commit there while still meaning substitute, undo and
+;;; change everywhere else — a binding is consulted before the built-in grammar,
+;;; so the motions (j k gg G /) keep working in the status buffer too.
+
+(define-key "normal" "SPC g g" "magit-status")
+(define-key "normal" "SPC g s" "magit-status")
+
+(define-key "magit" "s" "magit-stage")
+(define-key "magit" "u" "magit-unstage")
+(define-key "magit" "S" "magit-stage-all")
+(define-key "magit" "U" "magit-unstage-all")
+(define-key "magit" "c" "magit-commit")
+(define-key "magit" "P" "magit-push")
+(define-key "magit" "F" "magit-pull")
+(define-key "magit" "g" "magit-refresh")
+(define-key "magit" "q" "show-dashboard")
+
+;;; C-c stays one binding — `eval-dwim' — and finishes the commit when the
+;;; buffer is a commit message. Binding C-c to `magit-commit-finish' outright
+;;; would take it away from every other buffer, and giving the message buffer
+;;; its own mode would lose the binding the moment you pressed `i' to type.
+
 ;;; C-c evaluates Lisp, from anywhere. `eval-dwim' is a built-in verb resolved
 ;;; by the editor, not a function in this file: it evaluates the live buffer —
 ;;; the selection if there is one, else the top-level form under point, else the

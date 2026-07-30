@@ -15,6 +15,12 @@
 //! Everything is measured in *cells*: `cell_w` is the font's advance for `'M'`
 //! and `line_h` is `recommended_line_spacing()`. Layout therefore assumes a
 //! monospace font; the font search below only offers monospace faces.
+//!
+//! One `Renderer` is one OS window, drawing one [`zemacs_core::Frame`]. Where
+//! the panes go is not decided here: [`Renderer::render`] asks `Frame::panes`
+//! for rectangles inside [`Renderer::content_area`] and draws a document, a
+//! cursor and a modeline into each, so the renderer and the app's mouse
+//! hit-testing are reading the same arithmetic rather than two copies of it.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,7 +30,9 @@ use sdl2::rect::Rect;
 use sdl2::render::{BlendMode, Texture, TextureCreator, WindowCanvas};
 use sdl2::ttf::{Font, Sdl2TtfContext};
 use sdl2::video::WindowContext;
-use zemacs_core::{CompletionStyle, Editor, HlKind, Mode, Settings, Span};
+use zemacs_core::{
+    Buffer, BufferKind, CompletionStyle, Editor, HlKind, Mode, Settings, Span, Window,
+};
 
 /// Outer margin, in pixels, around the text area and inside the modeline.
 const PAD: i32 = 8;
@@ -155,39 +163,111 @@ impl Renderer {
         Ok(())
     }
 
-    /// Draw one frame. Writes `editor.viewport_lines` back because only the
-    /// renderer knows how many lines actually fit, and the core scroll logic
+    /// This window's SDL id, so the app can route events to the right frame.
+    pub fn window_id(&self) -> u32 {
+        self.canvas.window().id()
+    }
+
+    /// The rectangle the window tree is laid out in — exactly what gets handed
+    /// to [`zemacs_core::Frame::panes`], and what the app hit-tests dividers
+    /// against. The whole drawable: every pane carries its own modeline, so
+    /// nothing is reserved at frame level.
+    pub fn content_area(&self) -> zemacs_core::Rect {
+        // `output_size` only fails on a dead renderer, which is not something a
+        // hit test can do anything about — an empty area yields no panes.
+        let (w, h) = self.canvas.output_size().unwrap_or((0, 0));
+        zemacs_core::Rect::new(0, 0, w as i32, h as i32)
+    }
+
+    /// An SDL mouse position (logical window coordinates) in the pixel space
+    /// [`Renderer::content_area`] and the panes use.
+    ///
+    /// The canvas is `allow_highdpi`, so on a Retina display the drawable is
+    /// twice the window and the two spaces are a factor of two apart. Skipping
+    /// this puts every divider grab and pane click in the wrong half of the
+    /// window.
+    pub fn to_pixels(&self, x: i32, y: i32) -> (i32, i32) {
+        scale_point(dpi_scale(&self.canvas), x, y)
+    }
+
+    /// Draw frame `frame_index` of the editor. Writes `viewport_lines` back —
+    /// per window, and on the editor from the focused pane — because only the
+    /// renderer knows how many lines actually fit and the core scroll logic
     /// needs it.
-    pub fn render(&mut self, editor: &mut Editor) -> anyhow::Result<()> {
+    ///
+    /// The app calls `Editor::sync_focused_window` first, so every window's
+    /// `cursor`/`scroll` is live and no pane needs a special case.
+    pub fn render(&mut self, editor: &mut Editor, frame_index: usize) -> anyhow::Result<()> {
         self.sync(editor)?; // cheap no-op; makes an app-side `sync` call optional
 
-        let (w, h) = self
-            .canvas
-            .output_size()
-            .map_err(|e| anyhow::anyhow!("output size: {e}"))?;
-        let (w, h) = (w as i32, h as i32);
-
+        let area = area_of(self.content_area());
         let status_h = modeline_h(self.line_h, &editor.settings);
-        let text_h = (h - status_h - PAD).max(self.line_h);
-        editor.viewport_lines = (text_h / self.line_h).max(1) as usize;
+        let focused = frame_index == editor.focus_frame;
 
         let bg = editor.settings.background;
         self.canvas.set_draw_color(rgb(bg));
         self.canvas.clear();
 
-        if editor.mode == Mode::Dashboard {
-            self.draw_dashboard(editor, w, h - status_h);
-        } else {
-            self.draw_document(editor, w, text_h);
+        // Layout once, then two passes: the first needs `&mut editor` to park
+        // the row counts, the second only `&`.
+        let Some(frame) = editor.frames.get(frame_index) else {
+            self.canvas.present();
+            return Ok(());
+        };
+        let current = frame.current;
+        let panes = frame.panes(area_rect(area));
+        let dividers = frame.dividers(area_rect(area));
+
+        for p in &panes {
+            let lines = doc_lines(area_of(p.rect), status_h, self.line_h);
+            if let Some(w) = editor.frames[frame_index].window_mut(p.window) {
+                w.viewport_lines = lines;
+            }
+            // Core clamps scrolling against this one, and it belongs to
+            // whichever window is being typed into.
+            if focused && p.window == current {
+                editor.viewport_lines = lines;
+            }
         }
-        // One window, so its modeline is always the active one. When the frame
-        // splits, this becomes one call per window with `is_active` set from
-        // whichever window has the cursor.
-        let frame = Area { x: 0, y: 0, w, h };
-        self.draw_modeline(editor, modeline_rect(frame, status_h), true);
-        // Last, and over the modeline's scrim too: the popup is the only
-        // live thing on screen while it is up.
-        self.draw_completion(editor, w, h, status_h);
+
+        let editor = &*editor;
+        for p in &panes {
+            let pane = area_of(p.rect);
+            if pane.w <= 0 || pane.h <= 0 {
+                continue; // a frame dragged to nothing; SDL dislikes empty clips
+            }
+            let Some(win) = editor.frames[frame_index].window(p.window) else {
+                continue;
+            };
+            let Some(buf) = editor.buffer_by_id(win.buffer) else {
+                continue;
+            };
+            let active = focused && p.window == current;
+            // Everything inside a pane is clipped to it, so a long line, a
+            // selection or an overhanging glyph cannot paint into its
+            // neighbour. Cheaper than teaching every primitive about the pane.
+            self.set_clip(pane);
+            if buf.kind == BufferKind::Dashboard {
+                self.draw_dashboard(editor, doc_rect(pane, status_h));
+            } else {
+                self.draw_document(editor, buf, win, pane, status_h, active);
+            }
+            self.draw_modeline(editor, buf, modeline_rect(pane, status_h), active);
+            self.clear_clip();
+        }
+
+        let div_c = rgb(divider_shade(&editor.settings));
+        for d in &dividers {
+            let r = area_of(d.rect);
+            self.fill(r.x, r.y, r.w, r.h, div_c);
+        }
+
+        // The prompt and its popup belong to the editor, not to a pane, so they
+        // are drawn once over everything — and only on the frame that owns the
+        // keyboard, or every open frame would show the same M-x box.
+        if focused {
+            self.draw_completion(editor, area.w, area.h, status_h);
+        }
 
         self.canvas.present();
         Ok(())
@@ -195,12 +275,31 @@ impl Renderer {
 
     // --- document ---------------------------------------------------------
 
-    fn draw_document(&mut self, editor: &Editor, w: i32, text_h: i32) {
-        let buf = &editor.buffer;
+    /// One pane's buffer. `win` carries the cursor and scroll — the focused
+    /// window's are copied onto it before the frame, so this never reads
+    /// `editor.buffer.cursor`.
+    fn draw_document(
+        &mut self,
+        editor: &Editor,
+        buf: &Buffer,
+        win: &Window,
+        pane: Area,
+        status_h: i32,
+        active: bool,
+    ) {
         let set = &editor.settings;
         let (bg, fg) = (set.background, set.foreground);
-        let (cur_line, cur_col) = buf.cursor_line_col();
-        let selection = editor.selection();
+        let doc = doc_rect(pane, status_h);
+        let (cur_line, cur_col) = line_col(buf, win.cursor);
+        // The selection and the highlight spans both describe `editor.buffer`
+        // as the focused window sees it, and there is exactly one of each in
+        // the editor — so no other pane may borrow them.
+        let selection = active.then(|| editor.selection()).flatten();
+        let spans: &[Span] = if win.buffer == editor.buffer.id {
+            &editor.highlights
+        } else {
+            &[]
+        };
         let block_cursor = editor.mode != Mode::Insert;
 
         let digits = buf.len_lines().to_string().len().max(3);
@@ -209,7 +308,8 @@ impl Renderer {
         } else {
             0
         };
-        let x0 = PAD + gutter;
+        let x0 = doc.x + gutter;
+        let cols = visible_cols(doc.w - gutter, self.cell_w);
 
         let sel_bg = rgb(mix(bg, fg, 0.28));
         let cur_bg = rgb(mix(bg, fg, 0.05));
@@ -220,25 +320,25 @@ impl Renderer {
         // Highlight spans are whole-buffer char offsets and sorted, so one
         // monotonic cursor walks them alongside the lines — no rescan per line.
         let mut si = 0usize;
-        let rows = (text_h / self.line_h) as usize;
+        let rows = doc_lines(pane, status_h, self.line_h);
 
         for row in 0..rows {
-            let line = editor.scroll + row;
+            let line = win.scroll + row;
             if line >= buf.len_lines() {
                 break;
             }
-            let y = PAD + row as i32 * self.line_h;
+            let y = doc.y + row as i32 * self.line_h;
             let start = buf.line_start(line);
             let len = buf.line_len(line);
             let end = start + len;
 
-            let (next, runs) = spans_for_line(&editor.highlights, si, start, end);
+            let (next, runs) = spans_for_line(spans, si, start, end);
             si = next;
 
             let cells = expand_line(&buf.slice_string(start, end), set.tab_width);
 
             if line == cur_line && selection.is_none() {
-                self.fill(0, y, w, self.line_h, cur_bg);
+                self.fill(pane.x, y, pane.w, self.line_h, cur_bg);
             }
 
             // Selection: `end + 1` is the newline, drawn as one trailing cell so
@@ -259,7 +359,10 @@ impl Renderer {
                 }
             }
 
-            let cursor_vc = (line == cur_line).then(|| visual_col(&cells, cur_col) as i32);
+            // Only the focused window of the focused frame gets a cursor: two
+            // blocks on screen at once is two claims about where typing goes.
+            let cursor_vc =
+                (active && line == cur_line).then(|| visual_col(&cells, cur_col) as i32);
             if block_cursor {
                 if let Some(vc) = cursor_vc {
                     self.fill(x0 + vc * self.cell_w, y, self.cell_w, self.line_h, cursor_c);
@@ -268,17 +371,15 @@ impl Renderer {
 
             if set.line_numbers {
                 let c = if line == cur_line { num_cur_c } else { num_c };
-                self.draw_str(&format!("{:>digits$}", line + 1), PAD, y, c);
+                self.draw_str(&format!("{:>digits$}", line + 1), doc.x, y, c);
             }
 
-            // ponytail: no horizontal scrolling — long lines are clipped at the
-            // window edge. Upgrade path: an `hscroll` offset alongside `scroll`.
+            // ponytail: no horizontal scrolling — long lines are cut at the
+            // pane's last whole column (the clip rect catches the partial glyph
+            // that lands on it). Upgrade path: an `hscroll` alongside `scroll`.
             let mut ri = 0usize;
-            for (vc, &(ch, src)) in cells.iter().enumerate() {
+            for (vc, &(ch, src)) in cells.iter().take(cols).enumerate() {
                 let x = x0 + vc as i32 * self.cell_w;
-                if x >= w {
-                    break;
-                }
                 while ri < runs.len() && runs[ri].1 <= src {
                     ri += 1;
                 }
@@ -304,7 +405,9 @@ impl Renderer {
 
     // --- dashboard --------------------------------------------------------
 
-    fn draw_dashboard(&mut self, editor: &Editor, w: i32, avail_h: i32) {
+    /// The startup screen, centred in whichever pane holds the dashboard
+    /// buffer — `doc` is that pane's text rectangle, not the window's.
+    fn draw_dashboard(&mut self, editor: &Editor, doc: Area) {
         let (bg, fg) = (editor.settings.background, editor.settings.foreground);
         let accent = editor.theme.color(HlKind::Function, fg);
         let banner_c = rgb(editor.theme.color(HlKind::Keyword, fg));
@@ -312,17 +415,17 @@ impl Renderer {
         let sel_bg = rgb(mix(bg, accent, 0.18));
 
         let lines = editor.dashboard.lines();
-        let cols = ((w - 2 * PAD).max(0) / self.cell_w) as usize;
+        let cols = visible_cols(doc.w, self.cell_w);
         let total = lines.len() as i32 * self.line_h;
-        let y0 = (PAD + (avail_h - total) / 2).max(PAD);
+        let y0 = doc.y + ((doc.h - total) / 2).max(0);
 
         for (i, (text, selected)) in lines.iter().enumerate() {
             let y = y0 + i as i32 * self.line_h;
-            if y + self.line_h > avail_h {
+            if y + self.line_h > doc.y + doc.h {
                 break;
             }
             let n = text.chars().count() as i32;
-            let x = PAD + center_col(text, cols) as i32 * self.cell_w;
+            let x = doc.x + center_col(text, cols) as i32 * self.cell_w;
             if *selected {
                 self.fill(
                     x - self.cell_w,
@@ -348,17 +451,17 @@ impl Renderer {
     /// One window's modeline, drawn into `rect`.
     ///
     /// Takes its rectangle rather than deriving one from the window because
-    /// Emacs draws a modeline per *window*, not per frame; when the frame
-    /// splits, this is called once per window with the rect the layout hands
-    /// it. `is_active` is the mode-line / mode-line-inactive distinction: only
-    /// the window holding the cursor gets the bright face.
+    /// Emacs draws a modeline per *window*, not per frame: this is called once
+    /// per pane with the rect the layout hands it. `is_active` is the
+    /// mode-line / mode-line-inactive distinction: only the window holding the
+    /// cursor gets the bright face.
     ///
     /// The 3D look is Emacs's `:box` attribute, nothing cleverer: a lit edge
     /// along the top and left, a shadowed one along the bottom and right, over
     /// a background lighter than the buffer's. Two tones on opposite edges read
     /// as a light source above-left, which is the whole trick — see [`bevel`]
     /// for the sunken case.
-    fn draw_modeline(&mut self, editor: &Editor, rect: Area, is_active: bool) {
+    fn draw_modeline(&mut self, editor: &Editor, buf: &Buffer, rect: Area, is_active: bool) {
         let set = &editor.settings;
         let bg = modeline_bg(editor, is_active);
         let relief = relief(set);
@@ -376,15 +479,19 @@ impl Renderer {
         let y = rect.y + ((rect.h - self.line_h) / 2).max(0);
         let cols = ((rect.w - 2 * inset).max(0) / self.cell_w) as usize;
 
-        // A prompt takes over the strip, so it gets full contrast and a caret
-        // regardless of how dim an inactive modeline would otherwise be.
-        let prompting = editor.prompt.is_some();
+        // A prompt takes over the active strip, so it gets full contrast and a
+        // caret regardless of how dim an inactive modeline would otherwise be.
+        // ponytail: it lands on the *focused* pane's modeline, which may be at
+        // the top of the window while the popup grows from the bottom. Ceiling:
+        // a split with the prompt open. Upgrade path: an echo area of its own,
+        // reserved out of `content_area`.
+        let prompting = is_active && editor.prompt.is_some();
         let color = rgb(if prompting {
             set.foreground
         } else {
             modeline_fg(editor, is_active)
         });
-        let end = self.draw_str(&truncate(&editor.status_line(), cols), x, y, color);
+        let end = self.draw_str(&truncate(&pane_status(editor, buf, is_active), cols), x, y, color);
         if prompting {
             self.fill(end, y, 2, self.line_h, rgb(set.foreground));
         }
@@ -509,6 +616,18 @@ impl Renderer {
     }
 
     // --- primitives -------------------------------------------------------
+
+    /// Confine every following draw to `a`. Nothing else in the renderer knows
+    /// about pane boundaries — this is what keeps a long line, a wide selection
+    /// or an overhanging glyph inside the window it belongs to.
+    fn set_clip(&mut self, a: Area) {
+        let r = Rect::new(a.x, a.y, a.w.max(0) as u32, a.h.max(0) as u32);
+        self.canvas.set_clip_rect(Some(r));
+    }
+
+    fn clear_clip(&mut self) {
+        self.canvas.set_clip_rect(None);
+    }
 
     fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color) {
         if w <= 0 || h <= 0 {
@@ -644,12 +763,88 @@ fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 /// A pixel rectangle. Not `sdl2::rect::Rect`: that one stores its size
 /// unsigned, and every bit of layout below wants to subtract freely and clamp
 /// once at the end. [`Renderer::fill`] drops non-positive rects anyway.
+///
+/// Structurally identical to [`zemacs_core::Rect`], which is the layout's
+/// currency; [`area_of`] and [`area_rect`] convert. Keeping the local type
+/// means the popup and bevel maths below stay untouched by the window tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Area {
     x: i32,
     y: i32,
     w: i32,
     h: i32,
+}
+
+fn area_of(r: zemacs_core::Rect) -> Area {
+    Area {
+        x: r.x,
+        y: r.y,
+        w: r.w,
+        h: r.h,
+    }
+}
+
+fn area_rect(a: Area) -> zemacs_core::Rect {
+    zemacs_core::Rect::new(a.x, a.y, a.w, a.h)
+}
+
+/// A logical (mouse) coordinate in drawable pixels. See
+/// [`Renderer::to_pixels`]; split out so it is testable without a window.
+fn scale_point(scale: f32, x: i32, y: i32) -> (i32, i32) {
+    let at = |v: i32| (v as f32 * scale).round() as i32;
+    (at(x), at(y))
+}
+
+/// The text rectangle inside a pane: everything above its modeline, inset by
+/// [`PAD`].
+///
+/// Returned as the *text* rectangle rather than the whole remainder so the row
+/// count and the drawing loop cannot disagree about the inset.
+fn doc_rect(pane: Area, status_h: i32) -> Area {
+    let modeline = modeline_rect(pane, status_h);
+    Area {
+        x: pane.x + PAD,
+        y: pane.y + PAD,
+        w: (pane.w - 2 * PAD).max(0),
+        h: (pane.h.max(0) - modeline.h - PAD).max(0),
+    }
+}
+
+/// Document lines that fit in a pane — the window's `viewport_lines`.
+///
+/// Zero for a pane too short to show one: the modeline is still drawn, the text
+/// just has nowhere to go. Core clamps this with `.max(1)` wherever it divides
+/// by it, so an honest zero is safe and a lie about one row is not.
+fn doc_lines(pane: Area, status_h: i32, line_h: i32) -> usize {
+    (doc_rect(pane, status_h).h / line_h.max(1)).max(0) as usize
+}
+
+/// Whole columns that fit in `w` pixels. Long lines are cut here rather than
+/// drawn and clipped, so a 10k-character line costs one pane's worth of blits.
+fn visible_cols(w: i32, cell_w: i32) -> usize {
+    (w.max(0) / cell_w.max(1)) as usize
+}
+
+/// (line, column) of an arbitrary char offset. `Buffer::cursor_line_col` reads
+/// the buffer's own cursor, which is only the *focused* window's.
+fn line_col(buf: &Buffer, cursor: usize) -> (usize, usize) {
+    let c = cursor.min(buf.len_chars());
+    let line = buf.text.char_to_line(c);
+    (line, c - buf.line_start(line))
+}
+
+/// What a pane's modeline says.
+///
+/// The active pane gets the editor's status line — mode, position, messages,
+/// and the prompt while one is open. The others get only their own buffer,
+/// because every other field in that line describes the focused window and
+/// would be the same lie repeated in every pane.
+fn pane_status(editor: &Editor, buf: &Buffer, is_active: bool) -> String {
+    if is_active {
+        return editor.status_line();
+    }
+    let dirty = if buf.modified { " [+]" } else { "" };
+    format!("   {}{dirty}", buf.name())
 }
 
 // --- modeline appearance ---------------------------------------------------
@@ -721,6 +916,18 @@ fn highlight_shade(base: [f32; 3]) -> [f32; 3] {
 /// glow rather than depth. ponytail: hardcoded; wants a settable shadow shade.
 fn shadow_shade(base: [f32; 3]) -> [f32; 3] {
     mix(base, [0.0; 3], 0.50)
+}
+
+/// The bar between two panes. Pushed further toward the foreground than either
+/// modeline shade (0.14 active, 0.06 idle) so it reads as a seam rather than as
+/// more chrome, and derived from the theme for the same reason [`modeline_bg`]
+/// is — on a light theme a fixed grey would be the darkest thing on screen.
+///
+/// ponytail: not settable. Ceiling: a theme that wants a coloured seam. Upgrade
+/// path: a `HlKind::Divider` face, which is a one-line change here plus an
+/// entry in `HlKind::ALL` — and that lives in core.
+fn divider_shade(settings: &Settings) -> [f32; 3] {
+    mix(settings.background, settings.foreground, 0.22)
 }
 
 /// Total height of a modeline: one text line, its padding, and the box on both
@@ -1307,6 +1514,140 @@ mod tests {
         assert_eq!(title_of("Find file: "), "Find file");
         assert_eq!(title_of("Buffer: "), "Buffer");
         assert_eq!(title_of(""), "");
+    }
+
+    // --- panes ------------------------------------------------------------
+
+    /// The strip a pane reserves with the stock settings: 34px.
+    fn mh() -> i32 {
+        modeline_h(LH, &Settings::default())
+    }
+
+    #[test]
+    fn mouse_coordinates_are_scaled_into_drawable_pixels() {
+        assert_eq!(scale_point(1.0, 0, 0), (0, 0));
+        assert_eq!(scale_point(1.0, 137, 42), (137, 42));
+        // Retina: SDL reports the click in window points while every pane
+        // rectangle is in drawable pixels. Identity here puts a divider grab in
+        // the wrong half of the window.
+        assert_eq!(scale_point(2.0, 137, 42), (274, 84));
+        assert_eq!(scale_point(2.0, 1, 1), (2, 2));
+        // Fractional scales round rather than truncate, so the pixel picked is
+        // the one under the pointer.
+        assert_eq!(scale_point(1.5, 3, 5), (5, 8));
+    }
+
+    #[test]
+    fn a_panes_document_stops_above_its_modeline() {
+        let pane = Area { x: 550, y: 100, w: 450, h: 300 };
+        let doc = doc_rect(pane, mh());
+        let strip = modeline_rect(pane, mh());
+        assert!(doc.x >= pane.x && doc.y >= pane.y, "{doc:?} outside {pane:?}");
+        assert!(doc.x + doc.w <= pane.x + pane.w, "{doc:?} outside {pane:?}");
+        assert!(doc.y + doc.h <= strip.y, "{doc:?} runs into {strip:?}");
+        // Every row it advertises fits in what is left.
+        let rows = doc_lines(pane, mh(), LH);
+        assert_eq!(rows, (doc.h / LH) as usize);
+        assert!(doc.y + rows as i32 * LH <= strip.y);
+    }
+
+    #[test]
+    fn a_pane_too_short_for_a_line_gets_no_lines() {
+        for h in [-5, 0, 1, mh(), mh() + PAD, mh() + PAD + LH - 1] {
+            let pane = Area { x: 0, y: 0, w: 400, h };
+            assert_eq!(doc_lines(pane, mh(), LH), 0, "h={h}");
+            let doc = doc_rect(pane, mh());
+            assert!(doc.w >= 0 && doc.h >= 0, "h={h} -> {doc:?}");
+        }
+        // One pixel more than the chrome plus a line, and one row appears.
+        let pane = Area { x: 0, y: 0, w: 400, h: mh() + PAD + LH };
+        assert_eq!(doc_lines(pane, mh(), LH), 1);
+        assert_eq!(doc_lines(pane, mh(), 0), doc_rect(pane, mh()).h as usize); // no /0
+    }
+
+    #[test]
+    fn every_pane_pays_for_its_own_modeline() {
+        let area = zemacs_core::Rect::new(0, 0, 1000, 600);
+        let lines = |p: &zemacs_core::frame::Pane| doc_lines(area_of(p.rect), mh(), LH);
+
+        let f = zemacs_core::Frame::new(0);
+        let whole = lines(&f.panes(area)[0]);
+        assert!(whole > 0);
+
+        let mut f = zemacs_core::Frame::new(0);
+        f.split(zemacs_core::frame::Split::Rows);
+        let panes = f.panes(area);
+        let (top, bottom) = (lines(&panes[0]), lines(&panes[1]));
+        assert!(top > 0 && bottom > 0);
+        // Strictly fewer than one window over the same height: two modelines
+        // and two divider halves came out of the middle.
+        assert!(top + bottom < whole, "{top}+{bottom} vs {whole}");
+
+        // Side by side changes nothing vertically.
+        let mut f = zemacs_core::Frame::new(0);
+        f.split(zemacs_core::frame::Split::Columns);
+        for p in &f.panes(area) {
+            assert_eq!(lines(p), whole);
+        }
+    }
+
+    #[test]
+    fn a_long_line_is_cut_at_the_panes_last_whole_column() {
+        assert_eq!(visible_cols(30 * CW, CW), 30);
+        assert_eq!(visible_cols(30 * CW + CW - 1, CW), 30); // no partial column
+        assert_eq!(visible_cols(0, CW), 0);
+        assert_eq!(visible_cols(-40, CW), 0); // pane narrower than its gutter
+        assert_eq!(visible_cols(100, 0), 100); // never divides by zero
+
+        // The real case: 500 characters in a 30-column left pane. The last cell
+        // drawn ends inside the pane, so the right pane keeps its pixels.
+        let pane = Area { x: 0, y: 0, w: 2 * PAD + 30 * CW, h: 600 };
+        let doc = doc_rect(pane, mh());
+        let cols = visible_cols(doc.w, CW);
+        assert_eq!(cols, 30);
+        let cells = expand_line(&"x".repeat(500), 4);
+        assert!(cells.len() > cols);
+        let last = doc.x + (cols as i32 - 1) * CW;
+        assert!(last + CW <= pane.x + pane.w, "{last} spills out of {pane:?}");
+    }
+
+    #[test]
+    fn an_inactive_pane_names_its_own_buffer() {
+        let ed = Editor::new();
+        let mut other = Buffer::from_str("");
+        other.id = 9;
+        other.modified = true;
+        other.path = Some(PathBuf::from("/tmp/notes.org"));
+
+        assert_eq!(pane_status(&ed, &ed.buffer, true), ed.status_line());
+
+        let idle = pane_status(&ed, &other, false);
+        assert!(idle.contains("notes.org") && idle.contains("[+]"), "{idle}");
+        // Nothing about the focused window: mode, position and messages all
+        // describe a window this pane is not.
+        assert!(!idle.contains(&ed.buffer.name()), "{idle}");
+        assert!(!idle.contains("DASHBOARD"), "{idle}");
+    }
+
+    #[test]
+    fn the_divider_is_its_own_shade() {
+        for background in [[0.06, 0.06, 0.09], [0.98, 0.97, 0.94]] {
+            let mut ed = Editor::new();
+            ed.settings = Settings {
+                background,
+                foreground: [1.0 - background[0]; 3],
+                ..Settings::default()
+            };
+            let d = divider_shade(&ed.settings);
+            // Distinct from the buffer it sits between and from both modeline
+            // faces, or a split has no visible seam at all.
+            assert_ne!(luma(d), luma(background), "{background:?}");
+            assert_ne!(luma(d), luma(modeline_bg(&ed, true)), "{background:?}");
+            assert_ne!(luma(d), luma(modeline_bg(&ed, false)), "{background:?}");
+            // Further from the buffer than either strip, on a light theme too.
+            let from_bg = |c: [f32; 3]| (luma(c) - luma(background)).abs();
+            assert!(from_bg(d) > from_bg(modeline_bg(&ed, true)), "{background:?}");
+        }
     }
 
     #[test]

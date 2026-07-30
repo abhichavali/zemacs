@@ -744,6 +744,17 @@ impl Editor {
             .find(|b| b.id == id)
     }
 
+    /// Park the live cursor and scroll onto the focused window so every window
+    /// can be read the same way.
+    ///
+    /// The focused window's position lives in `buffer.cursor`/`self.scroll`
+    /// while it is being edited; the others keep theirs in their own `Window`.
+    /// The renderer would otherwise need to special-case the focused pane, so
+    /// the app calls this once per frame before drawing.
+    pub fn sync_focused_window(&mut self) {
+        self.sync_window();
+    }
+
     /// Park the live cursor and scroll on the focused window. Must run before
     /// anything changes which window is focused.
     fn sync_window(&mut self) {

@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/render", "crates/syntax", "crates/lisp", "crates/app"]
+members = [
+    "crates/core",
+    "crates/render",
+    "crates/syntax",
+    "crates/lisp",
+    "crates/git",
+    "crates/app",
+]
 
 [workspace.package]
 version = "0.0.0"
@@ -12,6 +19,7 @@ zemacs-core = { path = "crates/core" }
 zemacs-render = { path = "crates/render" }
 zemacs-syntax = { path = "crates/syntax" }
 zemacs-lisp = { path = "crates/lisp" }
+zemacs-git = { path = "crates/git" }
 
 ropey = "1.6"
 crossbeam-channel = "0.5"

@@ -111,6 +111,16 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "delete-window",
     "new-frame",
     "delete-frame",
+    "magit-status",
+    "magit-stage",
+    "magit-unstage",
+    "magit-stage-all",
+    "magit-unstage-all",
+    "magit-commit",
+    "magit-commit-finish",
+    "magit-push",
+    "magit-pull",
+    "magit-refresh",
     "quit",
 ];
 
@@ -931,6 +941,10 @@ impl Editor {
                     self.run_action("eval-buffer")
                 }
             }
+            // Magit. Core knows the verbs and nothing else; the app runs git.
+            other if other.starts_with("magit-") => {
+                vec![EditorCommand::Git(other["magit-".len()..].to_string())]
+            }
             "new-frame" => vec![EditorCommand::NewFrame],
             "delete-frame" => vec![EditorCommand::CloseFrame],
             "config" => vec![EditorCommand::OpenFile(PathBuf::from("@init"))],
@@ -1462,6 +1476,59 @@ mod tests {
         });
         ed.handle_key(Key::Meta('x'));
         assert_eq!(ed.prompt.as_ref().map(|p| p.kind), Some(PromptKind::Command));
+    }
+
+    #[test]
+    fn magit_verbs_become_git_commands_and_keep_motions() {
+        let mut ed = fresh("");
+        assert_eq!(
+            ed.run_action("magit-status"),
+            vec![EditorCommand::Git("status".into())]
+        );
+        assert_eq!(
+            ed.run_action("magit-commit-finish"),
+            vec![EditorCommand::Git("commit-finish".into())]
+        );
+
+        // The status buffer gets its own mode, so `s`/`u`/`c` can be staging
+        // rather than substitute/undo/change...
+        ed.show_special(crate::BufferKind::Magit, "line one\nline two\nline three");
+        assert_eq!(ed.mode, Mode::Magit);
+        assert_eq!(ed.buffer.name(), "*magit*");
+        ed.apply(EditorCommand::BindKey {
+            mode: "magit".into(),
+            keys: "s".into(),
+            command: "magit-stage".into(),
+        });
+        assert_eq!(
+            ed.handle_key(Key::Char('s')),
+            vec![EditorCommand::Git("stage".into())]
+        );
+
+        // ...while the vim motions still work, because the keymap is consulted
+        // before the built-in grammar rather than replacing it.
+        feed(&mut ed, &keys("j"));
+        assert_eq!(ed.buffer.cursor_line_col().0, 1);
+        feed(&mut ed, &keys("G"));
+        assert_eq!(ed.buffer.cursor_line_col().0, 2);
+    }
+
+    #[test]
+    fn refreshing_the_status_buffer_reuses_it_and_holds_the_line() {
+        let mut ed = fresh("");
+        ed.show_special(crate::BufferKind::Magit, "a\nb\nc\n");
+        feed(&mut ed, &keys("jj"));
+        assert_eq!(ed.buffer.cursor_line_col().0, 2);
+        let id = ed.buffer.id;
+
+        // staging something re-renders; the cursor must not jump to the top
+        ed.show_special(crate::BufferKind::Magit, "a\nb\nc\nd\n");
+        assert_eq!(ed.buffer.id, id, "one *magit*, not one per refresh");
+        assert_eq!(ed.buffer.cursor_line_col().0, 2);
+        assert_eq!(
+            ed.buffer_names().iter().filter(|n| *n == "*magit*").count(),
+            1
+        );
     }
 
     #[test]

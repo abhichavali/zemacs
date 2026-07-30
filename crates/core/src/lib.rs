@@ -33,6 +33,10 @@ pub enum Mode {
     VisualLine,
     /// The startup screen. Its own mode because its keymap is entirely its own.
     Dashboard,
+    /// The git status buffer. Its own mode so `s`, `u` and `c` can be bound to
+    /// staging rather than to substitute, undo and change — a user binding is
+    /// consulted before the built-in grammar, so the motions still work.
+    Magit,
 }
 
 impl Mode {
@@ -43,6 +47,7 @@ impl Mode {
             Mode::Visual => "VISUAL",
             Mode::VisualLine => "V-LINE",
             Mode::Dashboard => "DASHBOARD",
+            Mode::Magit => "MAGIT",
         }
     }
 
@@ -54,6 +59,7 @@ impl Mode {
             "visual" => Some(Mode::Visual),
             "visual-line" | "vline" => Some(Mode::VisualLine),
             "dashboard" => Some(Mode::Dashboard),
+            "magit" | "git" => Some(Mode::Magit),
             _ => None,
         }
     }
@@ -297,6 +303,12 @@ pub enum EditorCommand {
     NewFrame,
     CloseFrame,
 
+    /// A git verb — `"status"`, `"stage"`, `"unstage"`, `"stage-all"`,
+    /// `"unstage-all"`, `"commit"`, `"commit-finish"`, `"push"`, `"pull"`,
+    /// `"refresh"`. Core has no git in it; the app runs these and feeds the
+    /// result back as buffer text, the same shape as `OpenFile`.
+    Git(String),
+
     // --- dashboard, configured from Lisp ---
     SetDashboardBanner(String),
     ClearDashboardItems,
@@ -362,6 +374,26 @@ pub enum BufferKind {
     Text,
     Scratch,
     Dashboard,
+    /// The git status buffer. Its text is generated, so it is never saved.
+    Magit,
+    /// A commit message being written. `C-c C-c` finishes it.
+    CommitMessage,
+}
+
+impl BufferKind {
+    /// The editing mode a buffer of this kind is entered in.
+    pub fn mode(self) -> Mode {
+        match self {
+            BufferKind::Dashboard => Mode::Dashboard,
+            BufferKind::Magit => Mode::Magit,
+            _ => Mode::Normal,
+        }
+    }
+
+    /// Generated buffers have no file behind them and must never be written.
+    pub fn is_generated(self) -> bool {
+        matches!(self, BufferKind::Dashboard | BufferKind::Magit)
+    }
 }
 
 /// A text document plus a cursor expressed as a character index into the rope.
@@ -408,6 +440,8 @@ impl Buffer {
                 .unwrap_or_else(|| p.display().to_string()),
             (None, BufferKind::Dashboard) => "*dashboard*".into(),
             (None, BufferKind::Scratch) => "*scratch*".into(),
+            (None, BufferKind::Magit) => "*magit*".into(),
+            (None, BufferKind::CommitMessage) => "COMMIT_EDITMSG".into(),
             (None, BufferKind::Text) => "*untitled*".into(),
         }
     }
@@ -718,6 +752,50 @@ impl Editor {
         }
     }
 
+    /// Put a generated buffer on screen with `text`, creating it if this is the
+    /// first time and reusing it afterwards — one `*magit*`, not one per
+    /// refresh. The mode follows the kind, so the magit keymap comes with it.
+    ///
+    /// The cursor line is preserved across a refresh where it still exists,
+    /// which is what stops the cursor jumping to the top every time you stage
+    /// something.
+    pub fn show_special(&mut self, kind: BufferKind, text: &str) {
+        let line = if self.buffer.kind == kind {
+            self.buffer.cursor_line_col().0
+        } else {
+            0
+        };
+        if self.buffer.kind != kind {
+            match self.others.iter().position(|b| b.kind == kind) {
+                Some(i) => self.switch_buffer(i + 1),
+                None => {
+                    self.sync_window();
+                    self.buffer.saved_scroll = self.scroll;
+                    let mut fresh = Buffer::from_str("");
+                    fresh.id = self.next_buffer_id;
+                    fresh.kind = kind;
+                    self.next_buffer_id += 1;
+                    let previous = std::mem::replace(&mut self.buffer, fresh);
+                    self.others.insert(0, previous);
+                }
+            }
+        }
+        self.buffer.kind = kind;
+        self.buffer.text = Rope::from_str(text);
+        self.buffer.modified = false;
+        self.buffer.undo.clear();
+        self.buffer.redo.clear();
+        self.buffer.move_to_line_col(line, 0);
+        self.mode = kind.mode();
+        self.highlights.clear();
+        self.revision += 1;
+
+        let (id, cursor) = (self.buffer.id, self.buffer.cursor);
+        let w = self.frame_mut().current_window_mut();
+        w.buffer = id;
+        w.cursor = cursor;
+    }
+
     /// The focused frame.
     pub fn frame(&self) -> &frame::Frame {
         &self.frames[self.focus_frame.min(self.frames.len() - 1)]
@@ -787,10 +865,7 @@ impl Editor {
         self.viewport_lines = w.viewport_lines;
         self.highlights.clear();
         self.revision += 1;
-        self.mode = match self.buffer.kind {
-            BufferKind::Dashboard => Mode::Dashboard,
-            _ => Mode::Normal,
-        };
+        self.mode = self.buffer.kind.mode();
     }
 
     /// Open buffer names, active first — the candidate list for the switcher.
@@ -819,10 +894,7 @@ impl Editor {
         self.highlights.clear();
         self.revision += 1;
         self.status = format!("switched to {}", self.buffer.name());
-        self.mode = match self.buffer.kind {
-            BufferKind::Dashboard => Mode::Dashboard,
-            _ => Mode::Normal,
-        };
+        self.mode = self.buffer.kind.mode();
         // The window now shows this buffer — otherwise the next focus change
         // would swap the old one straight back in.
         let (id, cursor, scroll) = (self.buffer.id, self.buffer.cursor, self.scroll);
@@ -991,6 +1063,7 @@ impl Editor {
             EditorCommand::CallLisp(name) => {
                 self.status = format!("no Lisp runtime to call {name}")
             }
+            EditorCommand::Git(verb) => self.status = format!("no git backend for {verb}"),
             EditorCommand::OpenFile(p) => self.status = format!("cannot open {}", p.display()),
             EditorCommand::SaveFile(_) => self.status = "cannot save: no file backend".into(),
         }

@@ -302,6 +302,11 @@ pub enum EditorCommand {
     /// A new OS window, opening on the dashboard.
     NewFrame,
     CloseFrame,
+    /// Move focus to another frame. Not a bare assignment to `focus_frame`:
+    /// the live buffer belongs to the *focused* window, so switching frames
+    /// has to park it and adopt the new frame's window, or clicking between
+    /// two frames swaps the buffers they were showing.
+    FocusFrame(usize),
 
     /// A git verb — `"status"`, `"stage"`, `"unstage"`, `"stage-all"`,
     /// `"unstage-all"`, `"commit"`, `"commit-finish"`, `"push"`, `"pull"`,
@@ -1022,6 +1027,13 @@ impl Editor {
                 self.frames.push(frame::Frame::new(dashboard));
                 self.focus_frame = self.frames.len() - 1;
                 self.adopt_window();
+            }
+            EditorCommand::FocusFrame(i) => {
+                if i < self.frames.len() && i != self.focus_frame {
+                    self.sync_window();
+                    self.focus_frame = i;
+                    self.adopt_window();
+                }
             }
             EditorCommand::CloseFrame => {
                 if self.frames.len() > 1 {

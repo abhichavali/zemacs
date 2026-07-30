@@ -1479,6 +1479,31 @@ mod tests {
     }
 
     #[test]
+    fn focusing_another_frame_does_not_swap_their_buffers() {
+        // The live buffer belongs to the focused window, so moving focus
+        // between frames has to park it and adopt the new frame's window. A
+        // bare `focus_frame = i` drags the buffer along, and clicking between
+        // two frames swaps what they were showing.
+        let mut ed = Editor::new();
+        ed.load("FIRST\n", Some("/tmp/a.rs".into()), None);
+        assert_eq!(ed.buffer.name(), "a.rs");
+
+        ed.apply(EditorCommand::NewFrame); // frame 1, on the dashboard
+        assert_eq!(ed.buffer.name(), "*dashboard*");
+
+        ed.apply(EditorCommand::FocusFrame(0));
+        assert_eq!(ed.buffer.name(), "a.rs", "frame 0 kept its file");
+        assert_eq!(ed.buffer.text.to_string(), "FIRST\n");
+
+        ed.apply(EditorCommand::FocusFrame(1));
+        assert_eq!(ed.buffer.name(), "*dashboard*", "frame 1 kept its dashboard");
+
+        // out of range is ignored rather than panicking
+        ed.apply(EditorCommand::FocusFrame(99));
+        assert_eq!(ed.focus_frame, 1);
+    }
+
+    #[test]
     fn magit_verbs_become_git_commands_and_keep_motions() {
         let mut ed = fresh("");
         assert_eq!(

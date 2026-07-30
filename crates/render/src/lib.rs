@@ -360,7 +360,7 @@ impl Renderer {
     /// for the sunken case.
     fn draw_modeline(&mut self, editor: &Editor, rect: Area, is_active: bool) {
         let set = &editor.settings;
-        let bg = modeline_bg(set, is_active);
+        let bg = modeline_bg(editor, is_active);
         let relief = relief(set);
 
         self.fill(rect.x, rect.y, rect.w, rect.h, rgb(bg));
@@ -382,7 +382,7 @@ impl Renderer {
         let color = rgb(if prompting {
             set.foreground
         } else {
-            modeline_fg(set, is_active)
+            modeline_fg(editor, is_active)
         });
         let end = self.draw_str(&truncate(&editor.status_line(), cols), x, y, color);
         if prompting {
@@ -665,33 +665,45 @@ struct Area {
 /// Width of the modeline's 3D border in pixels — Emacs's `:box :line-width`.
 /// Positive raises the strip, negative sinks it (see [`bevel`]), 0 is flat.
 ///
-/// ponytail: hardcoded. Becomes `settings.modeline_relief` the day core grows
-/// the field and a `SetModelineRelief` command to set it.
-fn relief(_settings: &Settings) -> i32 {
-    2
+/// Set from Lisp with `(set-modeline-relief n)`.
+fn relief(settings: &Settings) -> i32 {
+    settings.modeline_relief
 }
 
 /// Vertical breathing room around the modeline's text, on top of the glyph
-/// height and the box. ponytail: hardcoded; wants `settings.modeline_pad`.
-fn modeline_pad(_settings: &Settings) -> i32 {
-    PAD
+/// height and the box. `(set-modeline-pad n)`.
+fn modeline_pad(settings: &Settings) -> i32 {
+    settings.modeline_pad
 }
 
 /// The strip's own background. Derived from the theme rather than fixed, so it
 /// stays a *lighter shade of the buffer* on a light theme instead of turning
 /// into a grey bar — and so the bevel shades below have something to push off.
 ///
-/// ponytail: the two mix factors are hardcoded; they want a `"modeline"` /
-/// `"modeline-inactive"` face pair settable from Lisp.
-fn modeline_bg(settings: &Settings, is_active: bool) -> [f32; 3] {
-    let t = if is_active { 0.14 } else { 0.06 };
-    mix(settings.background, settings.foreground, t)
+/// The derived shade is the *fallback*: `(set-syntax-color "modeline" r g b)`
+/// overrides it, and leaving it unset keeps the strip tracking the theme.
+fn modeline_bg(editor: &Editor, is_active: bool) -> [f32; 3] {
+    let (kind, t) = if is_active {
+        (HlKind::Modeline, 0.14)
+    } else {
+        (HlKind::ModelineInactive, 0.06)
+    };
+    let derived = mix(editor.settings.background, editor.settings.foreground, t);
+    editor.theme.color(kind, derived)
 }
 
 /// Text colour on the strip. Inactive windows get a dimmer label, which is most
-/// of what separates them at a glance. ponytail: hardcoded, same face story.
-fn modeline_fg(settings: &Settings, is_active: bool) -> [f32; 3] {
-    mix(settings.background, settings.foreground, if is_active { 0.92 } else { 0.55 })
+/// of what separates them at a glance. `"modeline-text"` overrides it.
+fn modeline_fg(editor: &Editor, is_active: bool) -> [f32; 3] {
+    let derived = mix(
+        editor.settings.background,
+        editor.settings.foreground,
+        if is_active { 0.92 } else { 0.55 },
+    );
+    match is_active {
+        true => editor.theme.color(HlKind::ModelineText, derived),
+        false => derived,
+    }
 }
 
 /// The lit edge: the strip's background pushed toward white.
@@ -1214,15 +1226,28 @@ mod tests {
                 foreground: [1.0 - background[0]; 3],
                 ..Settings::default()
             };
-            let base = modeline_bg(&set, true);
+            // The colours are theme-aware now, so they need a whole Editor.
+            let mut ed = Editor::new();
+            ed.settings = set;
+
+            let base = modeline_bg(&ed, true);
             assert!(luma(highlight_shade(base)) > luma(base), "{background:?}");
             assert!(luma(shadow_shade(base)) < luma(base), "{background:?}");
             // Distinct from the buffer behind it, or the strip has no edge at all.
             assert_ne!(luma(base), luma(background), "{background:?}");
             // The active strip is the brighter and higher-contrast of the two.
-            let idle = modeline_bg(&set, false);
+            let idle = modeline_bg(&ed, false);
             assert!((luma(base) - luma(background)).abs() > (luma(idle) - luma(background)).abs());
-            assert_ne!(luma(modeline_fg(&set, true)), luma(modeline_fg(&set, false)));
+            assert_ne!(luma(modeline_fg(&ed, true)), luma(modeline_fg(&ed, false)));
+
+            // A Lisp `(set-syntax-color "modeline" ...)` overrides the derived
+            // shade; leaving it unset is what keeps the strip tracking the theme.
+            ed.apply(zemacs_core::EditorCommand::SetSyntaxColor(
+                "modeline".into(),
+                [0.5, 0.0, 0.0],
+            ));
+            assert_eq!(modeline_bg(&ed, true), [0.5, 0.0, 0.0]);
+            assert_eq!(modeline_bg(&ed, false), idle, "inactive is its own face");
         }
     }
 

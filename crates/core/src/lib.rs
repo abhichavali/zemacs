@@ -138,10 +138,15 @@ pub enum HlKind {
     Operator,
     Punctuation,
     Default,
+    /// Modeline faces. In the same table as the syntax faces so `init.lisp`
+    /// styles them with the `set-syntax-color` it already has.
+    Modeline,
+    ModelineInactive,
+    ModelineText,
 }
 
 impl HlKind {
-    pub const ALL: [HlKind; 11] = [
+    pub const ALL: [HlKind; 14] = [
         HlKind::Keyword,
         HlKind::Function,
         HlKind::Type,
@@ -153,6 +158,9 @@ impl HlKind {
         HlKind::Operator,
         HlKind::Punctuation,
         HlKind::Default,
+        HlKind::Modeline,
+        HlKind::ModelineInactive,
+        HlKind::ModelineText,
     ];
 
     pub fn name(self) -> &'static str {
@@ -168,6 +176,9 @@ impl HlKind {
             HlKind::Operator => "operator",
             HlKind::Punctuation => "punctuation",
             HlKind::Default => "default",
+            HlKind::Modeline => "modeline",
+            HlKind::ModelineInactive => "modeline-inactive",
+            HlKind::ModelineText => "modeline-text",
         }
     }
 
@@ -265,6 +276,9 @@ pub enum EditorCommand {
     SetTabWidth(usize),
     /// `"minibuffer"`, `"bottom"` (consult-like) or `"center"` (telescope-like).
     SetCompletionStyle(String),
+    /// Negative sinks the modeline instead of raising it.
+    SetModelineRelief(i32),
+    SetModelinePad(i32),
 
     /// Names offered by `M-x`. The Lisp image publishes these at startup and
     /// after a config reload.
@@ -316,6 +330,13 @@ pub struct Settings {
     pub tab_width: usize,
     /// Where completing prompts (`M-x`, find-file, buffer switch) are drawn.
     pub completion_style: CompletionStyle,
+    /// Modeline bevel, in pixels, following Emacs' `:box :line-width`:
+    /// positive raises, **negative sinks** (highlight and shadow swap), zero is
+    /// flat. The sign is the whole feature, so this is deliberately signed and
+    /// deliberately not clamped at zero.
+    pub modeline_relief: i32,
+    /// Padding inside the modeline, in pixels.
+    pub modeline_pad: i32,
 }
 
 impl Default for Settings {
@@ -327,6 +348,8 @@ impl Default for Settings {
             line_numbers: true,
             tab_width: 4,
             completion_style: CompletionStyle::default(),
+            modeline_relief: 2,
+            modeline_pad: 8,
         }
     }
 }
@@ -829,6 +852,12 @@ impl Editor {
                 Some(s) => self.settings.completion_style = s,
                 None => self.status = format!("unknown completion style: {name}"),
             },
+            // Clamped only for sanity, and symmetrically: the sign carries
+            // meaning, so squashing negatives would silently drop "sunken".
+            EditorCommand::SetModelineRelief(n) => {
+                self.settings.modeline_relief = n.clamp(-16, 16)
+            }
+            EditorCommand::SetModelinePad(n) => self.settings.modeline_pad = n.clamp(0, 64),
             EditorCommand::ClearCommands => self.commands.clear(),
             EditorCommand::RegisterCommand(name) => {
                 if !self.commands.contains(&name) {

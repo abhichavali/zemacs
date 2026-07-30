@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/render", "crates/syntax", "crates/lisp", "crates/app"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+zemacs-core = { path = "crates/core" }
+zemacs-render = { path = "crates/render" }
+zemacs-syntax = { path = "crates/syntax" }
+zemacs-lisp = { path = "crates/lisp" }
+
+ropey = "1.6"
+crossbeam-channel = "0.5"
+anyhow = "1"
+
+[profile.dev]
+opt-level = 1          # tree-sitter and font rasterization are painful at opt-level 0
+
+[profile.dev.package."*"]
+opt-level = 3          # always optimize dependencies

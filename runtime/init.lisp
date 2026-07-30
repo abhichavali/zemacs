@@ -1,0 +1,242 @@
+;;;; zemacs default configuration — Common Lisp.
+;;;;
+;;;; This file is LOADed on startup by the embedded ECL image, which runs on its
+;;;; own thread with its own GC. It is the config file the way ~/.emacs is for
+;;;; Emacs: everything below is ordinary Common Lisp, evaluated at startup, and
+;;;; anything you can express in CL you can express here.
+;;;;
+;;;; If a form in this file signals an error, the error is caught and shown in
+;;;; the status line — the editor still starts, it just stops loading here.
+;;;;
+;;;; Host primitives live in the ZEMACS package. Each one sends a command to the
+;;;; editor thread; none of them read editor state back.
+;;;;
+;;;;   (set-font-size n)                       point size
+;;;;   (set-background r g b)                  components 0.0 .. 1.0
+;;;;   (set-foreground r g b)
+;;;;   (set-syntax-color "keyword" r g b)      keyword function type string
+;;;;                                           number comment constant variable
+;;;;                                           operator punctuation default
+;;;;   (set-line-numbers t)                    or NIL
+;;;;   (set-tab-width n)
+;;;;   (set-completion-style "center")         "minibuffer" "bottom" "center"
+;;;;   (clear-commands) (register-command "name")   what M-x offers
+;;;;   (message text)                          status line
+;;;;   (insert text)                           into the current buffer
+;;;;   (find-file "path") (save-file) (save-file "path")
+;;;;   (show-dashboard) (quit)
+;;;;   (dashboard-banner text)
+;;;;   (clear-dashboard-items)
+;;;;   (dashboard-item #\f "Find file" "find-file")
+;;;;   (define-key "normal" "SPC f f" "find-file")
+
+(in-package :zemacs)
+
+;;; ---------------------------------------------------------------------------
+;;; Appearance
+
+(defparameter *font-size* 22
+  "Current point size. Kept here rather than read back from the editor, the
+same way Emacs tracks `text-scale-mode-amount' in a variable.")
+
+(set-font-size *font-size*)
+(set-line-numbers t)
+(set-tab-width 4)
+
+;;; A calm dark theme: a near-black blue-grey ground, cool off-white text.
+(set-background 0.07 0.08 0.12)
+(set-foreground 0.86 0.90 1.00)
+
+;;; Syntax faces. Any face you leave out keeps its built-in colour.
+(set-syntax-color "keyword"  0.78 0.57 0.94)
+(set-syntax-color "function" 0.51 0.75 1.00)
+(set-syntax-color "type"     0.45 0.86 0.83)
+(set-syntax-color "string"   0.62 0.85 0.55)
+(set-syntax-color "number"   0.98 0.72 0.47)
+(set-syntax-color "comment"  0.42 0.46 0.58)
+
+;;; Where completing prompts (M-x, find-file, buffer switch) are drawn.
+;;; "center"     — a floating box in the middle of the window, telescope-style
+;;; "bottom"     — a list growing up from the bottom edge, consult-style
+;;; "minibuffer" — one plain line at the bottom, the vim prompt
+(set-completion-style "center")
+
+;;; ---------------------------------------------------------------------------
+;;; Your own commands
+;;;
+;;; A "command" is just a zero-argument function in this package. Dashboard
+;;; items and key bindings name commands as strings; anything that is not a
+;;; built-in verb is called here, in the image. That is the whole extension
+;;; mechanism — key bindings and dashboard items need no registration step.
+;;; `M-x' is the exception: it has to know the names *before* you type them, so
+;;; `refresh-commands' below publishes them.
+
+;;; LOAD binds *LOAD-TRUENAME* while this file is being read, so the config can
+;;; remember where it came from and re-read itself later.
+(defvar *config-file* *load-truename*
+  "Truename of the init file that was loaded at startup.")
+
+(defun reload-config ()
+  "Re-LOAD the init file, picking up edits without restarting the editor."
+  (if *config-file*
+      (handler-case
+          (progn (load *config-file*)
+                 (refresh-commands)
+                 (message "config reloaded"))
+        (error (e) (message (format nil "reload failed: ~a" e))))
+      (message "no config file to reload")))
+
+(defun edit-config ()
+  "Open the init file for editing."
+  (if *config-file*
+      (find-file (namestring *config-file*))
+      (message "no config file to edit")))
+
+(defun lisp-version ()
+  "Prove there is a real Common Lisp in here."
+  (message (format nil "~a ~a — ~d symbol~:p in ZEMACS"
+                   (lisp-implementation-type)
+                   (lisp-implementation-version)
+                   (let ((n 0))
+                     (do-symbols (s (find-package :zemacs)) (declare (ignore s))
+                       (incf n))
+                     n))))
+
+;;; Magnification, the way `text-scale-adjust' works in Emacs.
+
+(defun set-scale (n)
+  (setf *font-size* (max 6 (min 96 n)))
+  (set-font-size *font-size*)
+  (message (format nil "font size ~d" *font-size*)))
+
+(defun text-scale-increase () (set-scale (+ *font-size* 2)))
+(defun text-scale-decrease () (set-scale (- *font-size* 2)))
+(defun text-scale-reset    () (set-scale 22))
+
+(defun scratch-header ()
+  "Insert a scratch-buffer header, built with FORMAT rather than pasted."
+  (insert (format nil ";;; scratch — ~a~%;;; ~a~2%"
+                  (lisp-implementation-type)
+                  "everything here is evaluated Common Lisp")))
+
+;;; ---------------------------------------------------------------------------
+;;; M-x
+;;;
+;;; M-x calls the name you pick as `(name)', with no arguments, so only
+;;; zero-argument functions belong in the list — offering `set-scale' would just
+;;; produce a wrong-number-of-arguments error.
+
+(defparameter *lambda-list-fn* (find-symbol "FUNCTION-LAMBDA-LIST" "EXT")
+  "ECL's introspection entry point, looked up rather than named literally so a
+build without it still reads this file.")
+
+;;; The host primitives are C functions: ECL has no lambda list for them and
+;;; reports "unknown", so the filter below excludes all of them — including the
+;;; zero-argument ones. These few are worth offering anyway.
+(defparameter *extra-commands* '("quit" "show-dashboard")
+  "Names published to M-x on top of what introspection finds.")
+
+(defun %zero-arg-p (sym)
+  "True when (SYM) is a legal call: no lambda list at all, or nothing but
+&OPTIONAL/&REST/&KEY/&AUX parameters. Unknown arity counts as false — guessing
+here would put a command in the list that errors the moment you run it."
+  (let ((info (and *lambda-list-fn*
+                   (ignore-errors
+                    (multiple-value-list (funcall *lambda-list-fn* sym))))))
+    (and (second info)                  ; second value: was it known?
+         (let ((args (first info)))
+           (or (null args) (member (first args) lambda-list-keywords))))))
+
+(defun refresh-commands ()
+  "Publish the zero-argument functions of this package as M-x candidates.
+Clears first, so reloading the config does not duplicate the list."
+  (clear-commands)
+  (dolist (name *extra-commands*) (register-command name))
+  (do-symbols (s (find-package :zemacs))
+    (let ((name (symbol-name s)))
+      (when (and (eq (symbol-package s) (find-package :zemacs)) ; not CL's
+                 (fboundp s)
+                 (plusp (length name))
+                 (char/= (char name 0) #\%) ; internal helper
+                 (%zero-arg-p s))
+        ;; Lowercase is what the user types and what the list displays; ECL
+        ;; stores the name upcased.
+        (register-command (string-downcase name))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Dashboard
+;;;
+;;; The banner is plain text; the renderer centres it. Items are (key label
+;;; action) and are matched by pressing the key.
+
+(dashboard-banner "
+ ███████╗███████╗███╗   ███╗ █████╗  ██████╗███████╗
+ ╚══███╔╝██╔════╝████╗ ████║██╔══██╗██╔════╝██╔════╝
+   ███╔╝ █████╗  ██╔████╔██║███████║██║     ███████╗
+  ███╔╝  ██╔══╝  ██║╚██╔╝██║██╔══██║██║     ╚════██║
+ ███████╗███████╗██║ ╚═╝ ██║██║  ██║╚██████╗███████║
+ ╚══════╝╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝
+
+        a Common Lisp machine that edits text
+")
+
+(clear-dashboard-items)
+;; Built-in verbs...
+(dashboard-item #\f "Find file"      "find-file")
+(dashboard-item #\s "Scratch buffer" "scratch")
+;; ...and functions defined above, on equal footing.
+(dashboard-item #\c "Edit configuration" "edit-config")
+(dashboard-item #\r "Reload configuration" "reload-config")
+(dashboard-item #\v "Lisp version" "lisp-version")
+(dashboard-item #\q "Quit" "quit")
+
+;;; ---------------------------------------------------------------------------
+;;; Keys
+;;;
+;;; Modes: "normal" "insert" "visual" "visual-line" "dashboard". Sequences are
+;;; space-separated tokens: SPC, C-x, <esc>, <ret>, <tab>, or a literal key.
+;;; These are consulted before the built-in vim grammar, so config wins.
+
+(define-key "normal" "SPC f f" "find-file")
+(define-key "normal" "SPC f s" "save-file")
+(define-key "normal" "SPC b d" "show-dashboard")
+(define-key "normal" "SPC b b" "switch-buffer")
+(define-key "normal" "SPC j j" "switch-buffer")
+;;; C-⌘-j from anywhere, including while typing.
+(dolist (mode '("normal" "insert" "visual" "dashboard"))
+  (define-key mode "C-M-j" "switch-buffer"))
+(define-key "normal" "SPC h r" "reload-config")
+(define-key "normal" "SPC h v" "lisp-version")
+(define-key "normal" "SPC h s" "scratch-header")
+(define-key "normal" "SPC q q" "quit")
+
+;;; `execute-command' and `switch-buffer' are built-in verbs — core opens the
+;;; prompt itself, so these names are not Lisp functions and are not in the M-x
+;;; list. `SPC ;' is the usual leader spelling for M-x.
+;;; "dashboard" is in this list on purpose: it is the mode the editor *opens*
+;;; in, so leaving it out means M-x does nothing until you have already entered
+;;; a buffer — which reads as M-x being broken.
+(dolist (mode '("normal" "insert" "visual" "dashboard"))
+  (define-key mode "M-x" "execute-command"))
+(define-key "normal" "SPC ;" "execute-command")
+(define-key "dashboard" "f" "find-file")
+(define-key "dashboard" "b" "switch-buffer")
+
+;;; Magnify the buffer. Meta is Command (⌘) first, with Option as a fallback, so
+;;; `M-+' is ⌘-Shift-= ; `M-=' is the same key without the Shift, and works on
+;;; any keyboard layout. Bound in Insert mode too, so zooming does not require
+;;; leaving what you were typing.
+(dolist (mode '("normal" "insert" "visual" "dashboard"))
+  (define-key mode "M-+" "text-scale-increase")
+  (define-key mode "M-=" "text-scale-increase")
+  (define-key mode "M--" "text-scale-decrease")
+  (define-key mode "M-0" "text-scale-reset"))
+
+;;; ---------------------------------------------------------------------------
+
+;;; Last, so that every function defined above is in the list.
+(refresh-commands)
+
+(message (format nil "zemacs: init.lisp loaded — ~a ~a is driving the editor."
+                 (lisp-implementation-type)
+                 (lisp-implementation-version)))

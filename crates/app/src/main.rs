@@ -103,13 +103,14 @@ struct Cursors {
 }
 
 impl Cursors {
-    fn new() -> anyhow::Result<Self> {
-        let load =
-            |c| Cursor::from_system(c).map_err(|e| anyhow::anyhow!("SDL system cursor: {e}"));
-        Ok(Self {
-            arrow: load(SystemCursor::Arrow)?,
-            we: load(SystemCursor::SizeWE)?,
-            ns: load(SystemCursor::SizeNS)?,
+    /// `None` when the platform has no system cursors — the dummy video driver
+    /// used for headless runs is one. Pointer feedback is a nicety, and losing
+    /// it must not be able to stop the editor from starting.
+    fn new() -> Option<Self> {
+        Some(Self {
+            arrow: Cursor::from_system(SystemCursor::Arrow).ok()?,
+            we: Cursor::from_system(SystemCursor::SizeWE).ok()?,
+            ns: Cursor::from_system(SystemCursor::SizeNS).ok()?,
             shown: None,
         })
     }
@@ -216,7 +217,7 @@ fn main() -> anyhow::Result<()> {
     // character the user actually typed.
     let mut swallow_text = false;
     let mut mouse = Mouse::default();
-    let mut cursors = Cursors::new()?;
+    let mut cursors = Cursors::new();
 
     'main: loop {
         keys.clear();
@@ -327,7 +328,10 @@ fn main() -> anyhow::Result<()> {
                         {
                             let (x, y) = renderers[i].to_pixels(x, y);
                             let area = renderers[i].content_area();
-                            cursors.hover(editor.frames[i].divider_at(area, x, y).map(|d| d.dir));
+                            if let Some(cursors) = &mut cursors {
+                                cursors
+                                    .hover(editor.frames[i].divider_at(area, x, y).map(|d| d.dir));
+                            }
                         }
                     }
                 },

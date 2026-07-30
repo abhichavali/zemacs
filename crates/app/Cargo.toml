@@ -1,0 +1,20 @@
+[package]
+name = "zemacs-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "zemacs"
+path = "src/main.rs"
+
+[dependencies]
+zemacs-core.workspace = true
+zemacs-render.workspace = true
+zemacs-syntax.workspace = true
+zemacs-lisp.workspace = true
+crossbeam-channel.workspace = true
+anyhow.workspace = true
+# `use-pkgconfig` is required on Apple Silicon: Homebrew's /opt/homebrew/lib is
+# not on the default linker search path, so SDL2 is otherwise not found.
+sdl2 = { version = "0.38", features = ["use-pkgconfig"] }

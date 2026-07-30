@@ -1,0 +1,182 @@
+#+TITLE: zemacs
+#+SUBTITLE: a Common Lisp machine that edits text
+
+* What it is
+
+zemacs is an Emacs-like editor built around a live *Common Lisp* image. Rust
+owns the substrate — the rope, the window, the parser — and Common Lisp owns
+the policy: your keybindings, your theme, your dashboard, your commands.
+
+- *Common Lisp inside* — an embedded ECL image runs on its own thread. Your
+  =init.lisp= drives the editor the way elisp drives Emacs.
+- *GPU-accelerated* — SDL2 on an =accelerated= canvas (Metal on macOS, Vulkan
+  or GL elsewhere). Glyphs are rasterized once into a per-character texture
+  cache and thereafter blitted and recolored by the GPU. The dashboard footer
+  and the startup line both print the backend actually in use, so "accelerated"
+  is a fact you can check rather than a claim.
+- *Multithreaded* — three threads that never block each other: input+draw,
+  the Lisp image, and syntax highlighting.
+- *Modal ("Evil") editing* — Normal / Insert / Visual / Visual-Line are
+  first-class, with counts, operators and motions, not an add-on.
+- *tree-sitter* highlighting, themed from Lisp.
+- *A dashboard* on open, with your recent files, also configured from Lisp.
+- *A completing minibuffer* — =M-x=, find-file and the buffer switcher, with
+  fuzzy matching, drawn either as a =consult=-style panel from the bottom or a
+  =telescope=-style box in the middle. One setting, one word.
+
+* Architecture
+
+Three threads, message-passing only (=crossbeam-channel=) — no shared mutable
+state, so nothing in the editor takes a lock:
+
+- *Main thread* — SDL2 event loop, renderer, and the single mutable =Editor=.
+  Single-writer, so the text rope needs no lock.
+- *Lisp thread* — owns the ECL image and its GC. Loads =init.lisp= and pushes
+  =EditorCommand=s; it never touches the editor directly. The main thread hands
+  it forms to evaluate when a keybinding fires.
+- *Syntax thread* — reparses the buffer and returns highlight spans. Its queue
+  *coalesces*: a burst of keystrokes causes one parse of the newest text, not
+  one parse per key, so a fast typist can't outrun it. Results carry the
+  revision they were computed from and are dropped if the buffer has moved on.
+
+Every mutation — from the keyboard or from Lisp — is an =EditorCommand=, and
+every command goes through =Editor::apply=. The only exceptions are the three
+effects the pure core cannot perform (evaluate Lisp, read a file, write a
+file); the app layer handles those in one =dispatch= function.
+
+#+begin_example
+crates/
+  core/    pure model: ropey buffer, modes, EditorCommand, the Evil grammar
+  render/  SDL2 + SDL2_ttf: glyph cache, cursor/selection rects, dashboard
+  syntax/  tree-sitter highlighting -> char-offset spans
+  lisp/    ECL embedded via a small C shim, on its own thread
+  app/     SDL2 loop; owns Editor, spawns Lisp, wires it together
+runtime/
+  init.lisp default configuration (Common Lisp)
+#+end_example
+
+* Prerequisites
+
+- Rust (stable, 1.89+)
+- =brew install ecl sdl2 sdl2_ttf pkg-config=
+
+* Run
+
+#+begin_src sh
+cargo run -p zemacs-app          # or: cargo run --bin zemacs
+cargo run -p zemacs-app -- FILE  # open a file instead of the dashboard
+cargo test                       # model, grammar, highlighting, Lisp bridge
+#+end_src
+
+Environment overrides, both useful for trying things without touching your
+config:
+
+| =ZEMACS_INIT= | path to an init file, instead of the usual lookup |
+| =ZEMACS_FONT= | path to a monospace =.ttf= / =.ttc=               |
+
+Highlighting covers rust, lisp (=.lisp .cl .asd .el .scm=), python, json, toml,
+c and javascript.
+
+* Keys
+
+Motions take counts and compose with operators, so =d2w=, =3j=, =c$= and =dfx=
+all work as you'd expect.
+
+| Mode   | Key                | Action                                  |
+|--------+--------------------+-----------------------------------------|
+| Normal | =h j k l=          | move                                    |
+| Normal | =w b e=            | word motions (=-= counts as a word char) |
+| Normal | =0 ^ $=            | line start / first non-blank / line end |
+| Normal | =gg G {count}G=    | buffer start / end / line               |
+| Normal | ={ }=              | previous / next blank line              |
+| Normal | =f F t T=          | find character on the line              |
+| Normal | =i a I A o O=      | enter Insert                            |
+| Normal | =d c y= + motion   | delete / change / yank (=dd=, =cc=, =yy=) |
+| Normal | =x D C r J p P=    | the usual single-key edits              |
+| Normal | =u= / =C-r=        | undo / redo                             |
+| Normal | =v= / =V=          | Visual / Visual-Line                    |
+| Normal | =/= then =n N=     | search                                  |
+| Normal | =C-d= / =C-u=      | half-page scroll                        |
+| Normal | =gh=               | back to the dashboard                   |
+| Normal | =:q :w :wq :e=     | quit, write, write-quit, edit           |
+| Normal | =:lisp FORM=       | evaluate Common Lisp                    |
+| Insert | =Esc= / =C-c=      | back to Normal                          |
+| any    | =M-x=              | run any Lisp command, with completion   |
+| Normal | =SPC j j=          | switch buffer                           |
+| Normal | =SPC f f=          | find file                               |
+| any    | =M-+= / =M--=      | magnify / shrink (=M-0= resets)         |
+
+The cursor is a *block* in Normal and a *bar* in Insert.
+
+Holding a key repeats it. SDL text input is enabled only in Insert mode and in
+prompts, which is where the keyboard layout, dead keys and IME matter; in the
+modal modes it is off and characters come straight from the keycode. That is
+deliberate: macOS press-and-hold (the accent panel) is a text-input feature, so
+leaving it on would mean holding =j= offers you =ĵ= instead of moving down.
+
+*Meta is Command (⌘)*, the macOS Emacs convention — Option works too.
+
+The mouse wheel scrolls the view; the cursor is dragged along only as far as
+keeping it on screen requires, so scrolling is not a motion.
+
+In a completing prompt:
+
+| =C-j= / =C-n= / =↓=  | next candidate                                   |
+| =C-k= / =C-p= / =↑=  | previous candidate                               |
+| =Tab=                | adopt the highlighted candidate                  |
+| =RET=                | accept                                           |
+| =Esc= / =C-g=        | cancel                                           |
+
+Matching is a fuzzy subsequence ranked so word starts win: =sb= finds
+=switch-buffer=, =tsi= finds =text-scale-increase=. In find-file, =Tab= on a
+directory rewrites the input to it, so the next listing is that directory —
+repeated =Tab= walks down a tree. When completing leaves several candidates,
+=Tab= cycles instead.
+
+* Configuration
+
+=runtime/init.lisp= (or =~/.config/zemacs/init.lisp= if present) is loaded at
+startup, into a live ECL image.
+
+#+begin_src lisp
+(in-package :zemacs)
+
+(set-font-size 18)
+(set-background 0.11 0.12 0.18)          ; r g b in 0.0 .. 1.0
+(set-syntax-color "keyword" 0.78 0.57 0.94)
+
+;; "center" = telescope-style box, "bottom" = consult-style panel,
+;; "minibuffer" = a plain one-line vim prompt.
+(set-completion-style "center")
+
+(defun scratch-notes ()
+  (find-file "~/notes.lisp"))
+
+(dashboard-item #\n "Notes" "scratch-notes")
+(define-key "normal" "SPC f f" "find-file")
+(define-key "normal" "SPC j j" "switch-buffer")
+(define-key "normal" "M-x" "execute-command")
+
+(message (format nil "~a ~a is live"
+                 (lisp-implementation-type)
+                 (lisp-implementation-version)))
+#+end_src
+
+Keybindings are looked up *before* the built-in Evil grammar, so Lisp always
+wins. A binding and a dashboard item name the same things: either a built-in
+verb (=find-file=, =execute-command=, =switch-buffer=, =scratch=, =config=,
+=quit=, =open:PATH=) or the name of a Lisp function, called as =(name)=.
+
+=M-x= offers every zero-argument function in the =ZEMACS= package, so a
+=defun= in your config is a command the moment you write it — there is no
+registration step.
+
+An error in =init.lisp= is caught and reported in the status line — a broken
+config never stops the editor from starting.
+
+* Roadmap
+
+Multiple buffers + splits · a minibuffer with completion (vertico/consult-like)
+· incremental reparse on a worker thread · text objects (=ciw=, =di(=) and
+registers · Magit / Dired / Org · a Lisp-side buffer and window API · project
+and session management.

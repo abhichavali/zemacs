@@ -1,0 +1,28 @@
+* Done
+- [X] M-x running arbitrary Lisp, with fuzzy completion
+- [X] Completion popups: consult-style from the bottom, telescope-style centered
+- [X] Multiple buffers + `SPC j j` switcher
+- [X] Meta bindings (Command first, Option fallback) + buffer magnification
+- [X] Bootstrap zemacs editor, evil mode, GUI (SDL2)
+- [X] Common Lisp machine at the core (embedded ECL on its own thread)
+- [X] Dashboard (recent files + Lisp-defined items)
+- [X] Configuration system (init.lisp: theme, keymap, commands, dashboard)
+- [X] Tree sitter highlighting
+- [X] Key binding system (Lisp `define-key`, looked up before the Evil grammar)
+
+* Next
+- Add Magit, Dired, Terminal
+- Add Project.el, Which Key, M-x should spawn central popup (like telescope.nvim)
+- Add Org mode with latex rendering support, Add AI Mode with multi agent support
+- Add org roam, Git based package manager, native ssh support like TRAMP, a server-daemon architecture, custom mode hooks
+- Vertico/consult/marginalia like system, but more customizable and beautiful
+- Avy and ace window replacement, code folding
+- parinfer rust mode like lisp editing
+- Latexify/MathSync integration
+
+* Known gaps in what's built
+- No splits or windows (multiple buffers exist, one is visible at a time)
+- Full tree-sitter reparse per edit, on a worker thread (no incremental parse)
+- No text objects (`ciw`, `di(`) and only the unnamed register
+- Lisp can push commands and be called from keys, but cannot yet *read* buffer state
+- `M-x` offers zero-argument commands only, since it calls `(name)` with no args

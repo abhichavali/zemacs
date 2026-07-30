@@ -1,0 +1,8 @@
+[package]
+name = "zemacs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ropey.workspace = true

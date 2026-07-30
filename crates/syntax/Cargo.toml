@@ -1,0 +1,18 @@
+[package]
+name = "zemacs-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+tree-sitter = "0.26"
+tree-sitter-c = "0.24"
+tree-sitter-commonlisp = "0.4"
+tree-sitter-highlight = "0.26"
+tree-sitter-javascript = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-toml-ng = "0.7"
+zemacs-core.workspace = true

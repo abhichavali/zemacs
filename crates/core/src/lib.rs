@@ -96,6 +96,19 @@ impl Mode {
     pub fn is_visual(self) -> bool {
         matches!(self, Mode::Visual | Mode::VisualLine | Mode::VisualBlock)
     }
+
+    /// A keymap for a generated buffer rather than an editing mode: dired,
+    /// magit, the dashboard.
+    ///
+    /// These *layer over* Normal rather than replacing it. `s` in magit stages
+    /// and `d` in dired flags, but `M-x`, `M-o`, the window splits and every
+    /// motion have to keep working — a buffer you cannot run a command from is
+    /// a dead end, and nothing about listing a directory means the leader key
+    /// should stop existing. Terminal is deliberately not here: a shell owns
+    /// the keyboard and has its own, narrower fallthrough ([`Key::is_editor_key`]).
+    pub fn layers_over_normal(self) -> bool {
+        matches!(self, Mode::Dashboard | Mode::Magit | Mode::Dired)
+    }
 }
 
 impl Key {

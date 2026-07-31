@@ -380,10 +380,40 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 Event::MouseButtonUp {
+                    window_id,
                     mouse_btn: MouseButton::Left,
+                    x,
+                    y,
                     ..
-                } => mouse.release(),
-                Event::MouseMotion { window_id, x, y, .. } => match mouse.dragging() {
+                } => {
+                    mouse.release();
+                    // A press with no release is half a gesture. SGR reporting
+                    // makes the two separate events, so a program that only
+                    // ever hears the press has a button held down forever —
+                    // which is why clicking in `vim` or `htop` in here did
+                    // nothing until the *next* click.
+                    if editor.mode == zemacs_core::Mode::Terminal {
+                        if let Some(i) =
+                            frame_for_window(renderers.iter().map(Renderer::window_id), window_id)
+                        {
+                            let (x, y) = renderers[i].to_pixels(x, y);
+                            let (col, row) = cell_at(&editor, &renderers, x, y);
+                            term.mouse(zemacs_term::Mouse {
+                                button: zemacs_term::Button::Left,
+                                kind: zemacs_term::MouseKind::Release,
+                                col,
+                                row,
+                            });
+                        }
+                    }
+                }
+                Event::MouseMotion {
+                    window_id,
+                    x,
+                    y,
+                    mousestate,
+                    ..
+                } => match mouse.dragging() {
                     // A held divider keeps its own frame rather than the event's:
                     // SDL captures the mouse for the press, so the coordinates
                     // stay in that window's space even once the pointer has left
@@ -404,6 +434,20 @@ fn main() -> anyhow::Result<()> {
                             if let Some(cursors) = &mut cursors {
                                 cursors
                                     .hover(editor.frames[i].divider_at(area, x, y).map(|d| d.dir));
+                            }
+                            // Held-button motion is a drag, which is how a
+                            // selection is made in `vim` or a pane resized in
+                            // `tmux`. The terminal drops it unless the child
+                            // asked for drag reporting, so this costs nothing
+                            // for a program that did not.
+                            if mousestate.left() && editor.mode == zemacs_core::Mode::Terminal {
+                                let (col, row) = cell_at(&editor, &renderers, x, y);
+                                term.mouse(zemacs_term::Mouse {
+                                    button: zemacs_term::Button::Left,
+                                    kind: zemacs_term::MouseKind::Drag,
+                                    col,
+                                    row,
+                                });
                             }
                         }
                     }

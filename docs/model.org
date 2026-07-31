@@ -151,10 +151,25 @@ The modal state is *editor-global*, not per buffer. Switching to a buffer sets
 the state from its kind — entering =*dired*= puts you in ="dired"=, leaving it puts
 you back in ="normal"=.
 
-Three of the states are not really modes at all but keymaps for generated
-buffers. ="terminal"= is the odd one: it is the only state whose keymap is
-consulted *instead of* the vim grammar rather than before it, because =d=, =j= and
-above all =C-c= have to reach the shell.
+Four of the states are not really modes at all but keymaps for generated
+buffers, and they *layer over* Normal rather than replacing it: ="dired"=,
+="magit"= and ="dashboard"= get their own binding first and fall through to the
+Normal keymap and the vim grammar for everything they do not claim. So =s= stages
+in magit and =d= flags in dired, while =M-x=, =M-o=, the leader sequences, the
+window splits, the motions and the visual modes all keep working — a listing is
+a buffer you browse, not a room with the door shut.
+
+The one thing that does *not* fall through is Insert. The text of a generated
+buffer is re-rendered from state, so an edit could never survive; =i= there
+reports that the buffer is not a file and stays put rather than parking you in a
+mode where every keystroke is refused.
+
+="terminal"= is the odd one out and is genuinely consulted *instead of* the
+grammar, because =d=, =j= and above all =C-c= have to reach the shell. Its
+fallthrough is narrower and spelled out in =Key::is_editor_key=: the keys a
+terminal has no use for — Command chords and the two modified Enters — still
+reach the Normal keymap, which is what keeps =M-x= and the window splits alive
+inside a shell.
 
 * Selections
 

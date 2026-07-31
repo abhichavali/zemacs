@@ -452,7 +452,7 @@ impl Editor {
         // never be typed at all.
         let mode_prefix = self.mode_prefix(&seq);
         if !mode_prefix {
-            if let Some(cmd) = self.keymap.get(&(self.mode, seq.clone())) {
+            if let Some(cmd) = self.keymap_lookup(&seq) {
                 // Same namespace as a dashboard action: a built-in verb if it names
                 // one, otherwise a Lisp call. Without this, binding a key to
                 // `find-file` would reach the Lisp primitive of that name, which
@@ -462,12 +462,7 @@ impl Editor {
                 return self.run_action(&action);
             }
         }
-        if mode_prefix
-            || self
-                .keymap
-                .keys()
-                .any(|(m, k)| *m == self.mode && k.starts_with(&format!("{seq} ")))
-        {
+        if mode_prefix || self.keymap_prefix(&seq) {
             // A longer binding may still match — and this is the one moment
             // Lisp cannot see for itself, so which-key is told about it. The
             // `fboundp` guard means a config that never loaded which-key gets
@@ -482,10 +477,29 @@ impl Editor {
         match cmds {
             Some(cmds) => {
                 self.pending.clear();
-                cmds
+                self.without_insert(cmds)
             }
             None => vec![],
         }
+    }
+
+    /// Drop a request to enter Insert in a generated buffer.
+    ///
+    /// The grammar now runs in dired, magit and the dashboard, which is what
+    /// makes their motions and operators work — but `i` there would park you in
+    /// a mode where every keystroke is refused by `apply`, with the modeline
+    /// claiming INSERT. The text is re-rendered from state and an edit could
+    /// never survive anyway, so the honest answer is to say so and stay put.
+    fn without_insert(&mut self, cmds: Vec<EditorCommand>) -> Vec<EditorCommand> {
+        if !self.buffer.kind.is_generated()
+            || !cmds
+                .iter()
+                .any(|c| matches!(c, EditorCommand::SetMode(Mode::Insert)))
+        {
+            return cmds;
+        }
+        let name = self.buffer.name();
+        vec![EditorCommand::Message(format!("{name} is not a file"))]
     }
 
     /// The built-in grammar. `None` means "incomplete, wait for more keys".
@@ -713,6 +727,33 @@ impl Editor {
             .rev()
             .chain(std::iter::once(&self.buffer.major_mode))
             .find_map(|m| self.mode_keymap.get(&(m.clone(), seq.to_string())).cloned())
+    }
+
+    /// The keymaps a lookup tries, nearest first.
+    ///
+    /// One entry for an editing mode. Two for dired, magit and the dashboard,
+    /// which *layer over* Normal: their own binding wins, and anything they do
+    /// not claim falls through, so `M-x` and the leader key work in a listing
+    /// exactly as they do in a file.
+    fn keymaps(&self) -> impl Iterator<Item = Mode> {
+        std::iter::once(self.mode).chain(self.mode.layers_over_normal().then_some(Mode::Normal))
+    }
+
+    fn keymap_lookup(&self, seq: &str) -> Option<String> {
+        self.keymaps()
+            .find_map(|m| self.keymap.get(&(m, seq.to_string())).cloned())
+    }
+
+    /// True when some binding in reach is still waiting on more keys — so a
+    /// leader sequence typed in dired waits for the rest of itself rather than
+    /// giving up after `SPC`.
+    fn keymap_prefix(&self, seq: &str) -> bool {
+        let with_space = format!("{seq} ");
+        self.keymaps().any(|mode| {
+            self.keymap
+                .keys()
+                .any(|(m, k)| *m == mode && k.starts_with(&with_space))
+        })
     }
 
     /// True when some mode binding is still waiting on more keys.
@@ -1659,7 +1700,13 @@ impl Editor {
                     .map(|i| i.action.clone());
                 action.map(|a| self.run_action(&a)).unwrap_or_default()
             }
-            Key::Char(c) => {
+            // An item hotkey, but only when nothing is already part-typed:
+            // mid-sequence, `f` belongs to `SPC f f` and not to the dashboard's
+            // "Find file" item.
+            Key::Char(c)
+                if self.pending.keys.is_empty()
+                    && self.dashboard.entries().iter().any(|i| i.key == c) =>
+            {
                 let action = self
                     .dashboard
                     .entries()
@@ -1669,7 +1716,11 @@ impl Editor {
                 action.map(|a| self.run_action(&a)).unwrap_or_default()
             }
             Key::Esc => vec![EditorCommand::SetMode(Mode::Normal)],
-            _ => vec![],
+            // Everything the dashboard does not claim is an ordinary Normal
+            // key. Without this the startup screen was a dead end: no `M-x`, no
+            // `M-o`, no `M-RET` to split it, because a `Char` arm swallowed
+            // every letter and every other key answered with nothing.
+            key => self.normal_key(key),
         }
     }
 
@@ -2273,6 +2324,69 @@ mod tests {
             cmds.iter()
                 .any(|c| matches!(c, EditorCommand::CallLisp(s) if s.contains("org-latex-preview"))),
             "C-c r in org-mode must preview, got {cmds:#?}"
+        );
+    }
+
+    /// A listing is a buffer you browse, not a room with the door shut: the
+    /// leader key, `M-x` and the window verbs all have to survive it.
+    #[test]
+    fn normal_bindings_reach_dired_magit_and_the_dashboard() {
+        for mode in [Mode::Dired, Mode::Magit, Mode::Dashboard] {
+            let mut ed = fresh("a\nb\nc\n");
+            ed.apply(EditorCommand::BindKey {
+                mode: "normal".into(),
+                keys: "M-x".into(),
+                command: "execute-command".into(),
+            });
+            ed.apply(EditorCommand::BindKey {
+                mode: "normal".into(),
+                keys: "SPC f f".into(),
+                command: "find-file".into(),
+            });
+            ed.apply(EditorCommand::SetMode(mode));
+
+            // `execute-command` puts the picker up rather than answering with
+            // a command, so the prompt is what "it fired" looks like.
+            ed.handle_key(Key::Meta('x'));
+            assert!(
+                matches!(&ed.prompt, Some(p) if p.kind == PromptKind::Command),
+                "M-x must open the command picker in {mode:?}"
+            );
+            ed.handle_key(Key::Esc);
+
+            // And a *sequence*, which needs the prefix scan to look in the
+            // Normal keymap too rather than giving up after `SPC`.
+            for key in [Key::Char(' '), Key::Char('f')] {
+                assert!(
+                    ed.handle_key(key).iter().all(|c| matches!(
+                        c,
+                        EditorCommand::CallLisp(s) if s.contains("which-key")
+                    )),
+                    "{mode:?} must still be waiting mid-sequence"
+                );
+            }
+            ed.handle_key(Key::Char('f'));
+            assert!(
+                matches!(&ed.prompt, Some(p) if p.kind == PromptKind::File),
+                "SPC f f must complete in {mode:?}"
+            );
+        }
+    }
+
+    /// The other half: the grammar reaching a listing must not let you into a
+    /// mode where every keystroke is refused.
+    #[test]
+    fn insert_is_refused_in_a_generated_buffer() {
+        let mut ed = fresh("a\nb\n");
+        ed.show_special(crate::BufferKind::Dired, "a\nb\n");
+        let before = ed.mode;
+        let cmds = ed.handle_key(Key::Char('i'));
+        assert_eq!(ed.mode, before, "`i` must not enter Insert in dired");
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, EditorCommand::SetMode(Mode::Insert))),
+            "got {cmds:#?}"
         );
     }
 

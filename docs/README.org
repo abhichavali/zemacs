@@ -66,7 +66,11 @@ bound to =ZEMACS=, so you never have to qualify a name.
 | =runtime/init.lisp=            | The shipped config. Ordinary Lisp, all of it replaceable.            |
 | =runtime/modes/=               | Major and minor mode machinery, written in Lisp on top of one hook.  |
 
-The tests are executable documentation: =crates/lisp/tests/api.rs=,
-=eval.rs= and =modes.rs= each boot a real image against a real editor and assert
-on what comes out. When this reference and those tests disagree, the tests are
-right.
+The tests are executable documentation: =crates/lisp/tests/api.rs=, =eval.rs=,
+=modes.rs= and =prompt.rs= each boot a real image against a real editor and
+assert on what comes out. When this reference and those tests disagree, the tests
+are right.
+
+=prompt.rs= is also the only place the *whole* route a prompt's answer takes is
+written down as code: it plays the part of the main loop, and if the two ever
+disagree it is the test that notices.

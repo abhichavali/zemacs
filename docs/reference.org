@@ -35,7 +35,7 @@ exported and =refresh-commands= deliberately keeps them out of =M-x=.
 | =(point-max)=                   | R | Offset past the last character = character count.    |
 | =(buffer-size)=                 | R | Same as =point-max=.                                   |
 | =(line-number)=                 | R | 1-based line the cursor is on.                       |
-| =(column)=                      | R | 0-based column.                                      |
+| =(column)=                      | R | 0-based column, counted in *characters* — see below. |
 | =(line-count)=                  | R | Number of lines, counting the empty one after a trailing newline: 3 for ="a\nb\n"=. |
 | =(line-start &optional line)=   | R | Offset of the first character of =line= (1-based), or of the cursor's line. |
 | =(line-end &optional line)=     | R | Offset just past the last character, *newline excluded*. |
@@ -51,6 +51,15 @@ exported and =refresh-commands= deliberately keeps them out of =M-x=.
 (line-end 2)                           ; => 10
 (line-string 9999)                     ; => ""  — clamped to the last line
 #+end_src
+
+*A column is a character, not a cell.* =(column)= counts characters, exactly as
+=(point)= counts characters — every offset in this API does, because the document
+is a rope of characters and nothing else would round-trip. The *screen* column is
+a different quantity: =漢= is drawn two cells wide and a combining mark none, so on
+a line of CJK the cursor is at column 3 and in screen cell 6. That conversion is
+=crates/core/src/display.rs=, shared by the renderer and by =j= / =k= so the two
+cannot disagree, and it is deliberately *not* reachable from Lisp — there is no
+reader that answers in cells, because nothing in Lisp draws.
 
 *Watch the Normal-mode clamp.* In Normal mode the cursor sits *on* a character,
 never past the last one, so =goto-char= to =(line-end)= is pulled back by one. On
@@ -216,7 +225,7 @@ characters is what makes every offset here a character index, and threading a
 plist through it would give that up to buy an inheritance rule most configs turn
 off. One mechanism, and this is it.
 
-** The four properties the renderer draws
+** The five properties the renderer draws
 
 | Property     | Value                        | Effect                                    |
 |--------------+------------------------------+-------------------------------------------|
@@ -224,6 +233,7 @@ off. One mechanism, and this is it.
 | =background=   | a name from =(face-list)=      | Background of the covered cells.          |
 | =display=      | a string                     | Drawn *instead of* the covered text.      |
 | =image=        | a handle from =latex-preview=  | Drawn instead of the covered text, as a bitmap. |
+| =fold=         | =T= or =NIL=                     | The lines *after* the first stop occupying rows at all. |
 
 =NIL= clears any of them. A colour is a *face name*, not an =(R G B)= — the theme
 already owns that vocabulary, so an overlay recolours itself when a theme is
@@ -240,6 +250,57 @@ Priority, where two things claim the same cell:
 
 Overlapping =display= substitutions are not composed: the one that starts first
 wins and the rest are ignored.
+
+** Folding
+
+=fold= is the odd one out and worth its own paragraph: the other four swap cells
+for other cells, and this makes *rows stop existing*. Every line after the
+overlay's first, up to its end, is skipped by the renderer and stepped over by
+=j= and =k= — one predicate answers for both, because a line the frame does not
+draw and a line the cursor may land on have to be the same set or point
+disappears. The overlay's own first line stays drawn and gets a =…= after its
+text, which is what you unfold from.
+
+It is an overlay and gets everything an overlay gets: it slides when you type
+above it, it dies when its text is deleted, =delete-overlay= opens it, and undo
+clamps it back into the document.
+
+| Form                     |   | Effect                                                |
+|--------------------------+---+-------------------------------------------------------|
+| =(fold-region beg end)=    | H | Hide every line after =beg='s, through =end='s. Answers the overlay. |
+| =(folds-in beg end)=       | H | Handles of every fold overlapping the range, oldest first. |
+| =(folded-p &optional pos)= | H | The innermost fold covering =pos= (default point), or =NIL=. |
+| =(unfold-region beg end)=  | H | Delete every fold overlapping the range. Answers how many. |
+| =(unfold-all)=             | H | Open every fold in the buffer.                        |
+
+Those five are the whole mechanism, and *nothing in them knows what a subtree
+is*. That is the policy, and it lives in =runtime/modes/org-fold.lisp=:
+
+| Form                        |   | Effect                                              |
+|-----------------------------+---+-----------------------------------------------------|
+| =(fold-dwim)=                 | H | Toggle the selection, or the mode's subtree under point. =z a= |
+| =(fold-all)=                  | H | Fold every foldable range in the buffer. =z M=        |
+| =(fold-open-all)=             | H | Open them all. =z R=                                  |
+| =*fold-subtree-functions*=    |   | Major mode -> a function answering =(BEG . END)= under point. |
+| =*fold-all-functions*=        |   | Major mode -> a function answering every =(BEG . END)=. |
+
+Teaching another mode to fold is one entry in each alist and one function; there
+is nothing to add in Rust, because Rust has no opinion about what a subtree is.
+
+#+begin_src lisp
+;; Fold a `defun' in a Lisp buffer, over the sexp motion lisp-mode already has.
+(defun lisp-defun-at-point ()
+  (save-excursion
+    (let ((beg (progn (beginning-of-defun) (point))))
+      (cons beg (progn (forward-sexp) (point))))))
+
+(push (cons "lisp-mode" 'lisp-defun-at-point) *fold-subtree-functions*)
+#+end_src
+
+ponytail: folding is two-state, not org's three — a headline is closed or open,
+and opening one opens everything under it (org's =SUBTREE=, never =CHILDREN=).
+The upgrade is a third case in =fold-dwim= and a per-headline state table, all of
+it in Lisp.
 
 ** Every other property
 
@@ -299,8 +360,11 @@ is a dollar sign. =DISPLAY-P= is =T= for the ones that want a line of their own.
 
 The image is rasterised to match the text it sits in and placed against the
 *baseline*, so =$x_1$= hangs below the line the way a descender does. A fragment
-taller than one line is hung from the top of its row instead, because rows are a
-fixed height here and it would otherwise grow up over the lines above.
+taller than one line gets one: the line it starts on grows to as many display
+rows as the image needs, so a display equation claims space upward from its own
+baseline instead of painting over the text below. A fragment spanning several
+source lines already owns a blank row for each of them and is charged only the
+shortfall, so =\begin{equation}= looks exactly as it did.
 
 * The region
 
@@ -338,6 +402,9 @@ stay valid:
 | =(buffer-index name)=                   | H | Its position in that list, or =NIL=.                |
 | =(switch-to-buffer name)=               | H | Switch by name. =T=, or =NIL= and a message.          |
 | =(with-current-buffer name &body body)= | H | Switch, run =body=, switch back. Answers =body='s value, or =NIL= if there is no such buffer. |
+| =(create-buffer name &optional language)= | H | A buffer with no file behind it. Shows it if it is already open. Answers =name=. |
+| =(kill-buffer &optional name)=          | H | Kill it, or the live one. =T=, or =NIL= and a message.  |
+| =(set-language &optional language)=     | H | What tree-sitter colours the live buffer as. =NIL= is plain text. |
 
 =buffer-list= is the switcher's list and is right for a menu; =buffer-info= is the
 same buffers with their fields apart and is right for anything that has to
@@ -369,9 +436,40 @@ text. Keep the body short, and prefer it for reading:
 Two buffers with the same base name are indistinguishable to it, and the first
 one wins.
 
-*Not reachable from Lisp*: creating a buffer that has no file behind it, and
-killing one. See [[file:boundary.org][boundary.org]]. The shipped workaround for the first is
-=lisp-scratch=, which writes a real file and opens it.
+** Buffers with no file behind them
+
+=create-buffer= is what =*Messages*=, an =*xref*= listing and any other generated
+view are made of. Three things about it:
+
+- it is *idempotent by name* — a second call shows the buffer rather than
+  stacking a copy nobody can tell from the first, so a command that fills a
+  buffer is written as "make it, then write into it";
+- it is applied *on the spot*, unlike =find-file=, which lands a frame later. The
+  very next form is already in the new buffer. That is the whole reason the
+  =*Messages*= command below is five lines;
+- what it makes is an *ordinary* buffer — writable, no path, and never saved
+  unless you give =save-file= somewhere to put it. It is =*scratch*=, not
+  =*magit*=: the generated buffers (dashboard, magit, dired, terminal) are
+  read-only views the editor re-renders, and Lisp does not make those.
+
+#+begin_src lisp
+(defun messages-buffer ()
+  "Show the message log in a buffer, newest at the bottom."
+  (let ((log (messages)))
+    (create-buffer "*Messages*")
+    (replace-region 0 (point-max) (format nil "~{~a~%~}" log))
+    (goto-char (point-max))))
+#+end_src
+
+=language= is the tree-sitter language id (="rust"=, ="lisp"=, ="python"=), not a
+mode name — a mode is what Lisp dispatches on and a language is what gets
+coloured, and a buffer can want one without the other. =set-language= changes it
+afterwards.
+
+=kill-buffer= refuses the last remaining buffer and says so; every window showing
+the killed buffer, in any frame, moves to the live one. It never asks, whatever
+=(buffer-modified-p)= says — confirming is policy, policy is Lisp's, and the
+reader is right there.
 
 * Windows and frames
 
@@ -417,6 +515,7 @@ split" means opposite things in vim and Emacs.
 | =(set-major-mode name)=       | P | Set it. Fires =name-hook=.                       |
 | =(set-minor-mode name on)=    | P | Turn one on or off. Fires =name-on-hook= / =name-off-hook=. |
 | =(evil-state)=                | R | The modal state: ="normal"=, ="insert"=, ="visual"=, … |
+| =(evil-keymaps)=              | R | The state maps the *next key* will be looked up in, nearest first. Usually just =(evil-state)=; ="dashboard"=, ="dired"= and ="magit"= answer their own name **and** ="normal"=, because they layer over it rather than replacing it. |
 | =(set-evil-state name)=       | P | Move to a state. An unknown name reports.      |
 
 The mode *machinery* — =define-derived-mode=, =define-minor-mode=, =set-mode-local=,
@@ -435,6 +534,17 @@ top of the one hook above, and documented in that file's header and in
 | =(register-command name)=          | P | Offer =name= in =M-x=.                                    |
 | =(clear-commands)=                 | P | Empty the =M-x= list — call it before republishing.     |
 | =(command-list)=                   | R | What =M-x= currently offers.                             |
+| =(call-command name)=              | H | *Run* a command by name — the same resolution a key binding does. |
+| =(term-send-key key)=              | H | Send one keystroke to the shell. Dropped if none is running. |
+
+=call-command= is the other half of =define-key=: it resolves =name= exactly as
+pressing the key would, so a built-in verb runs as a verb and anything else is
+called as =(name)= in the image. =(call-command "magit-status")= and a key bound to
+="magit-status"= cannot drift apart, because they are the same line of code.
+
+=term-send-key= takes a key spelled the way =(key-bindings)= reports one — ="a"=,
+="SPC"=, ="C-c"=, ="<esc>"=, ="M-<bs>"= — so the string read out of a binding is the
+string that can be sent. One token, never a sequence; an unspellable one reports.
 
 ** =mode=
 
@@ -485,7 +595,8 @@ Built-in verbs, resolved by the editor before the image is asked:
 | =eval-dwim=                                   | Selection, else the form under point, else the buffer. |
 | =magit-*=                                     | A git verb.                          |
 | =dired= / =dired-*=                             | A dired verb.                        |
-| =terminal= / =term= / =shell= / =terminal-*=        | The shell.                           |
+| =terminal= / =term= / =shell= / =terminal-*=        | A terminal session — see below.      |
+| =ai=                                          | Pick a coding agent. =C-a=.            |
 | =config=                                      | Open the init file.                  |
 | =open:PATH=                                   | Open a specific path (=~/= expanded).  |
 | =scratch=                                     | Leave the dashboard.                 |
@@ -508,6 +619,19 @@ While a sequence is pending the editor calls =(which-key KEYS)= in the image, if
 something has defined it — that is the whole hook =runtime/modes/which-key.lisp=
 hangs from, and a config that does not define =which-key= never notices.
 
+What it answers with can go two places. =(message ...)= is the status line;
+=(which-key-row "KEY LABEL")= appends one row to the *panel* the renderer draws
+in a grid above the status line, and =(which-key-row)= with no argument empties
+it. Rows go one at a time for the same reason completion candidates do — the
+write envelope carries a single string — and the renderer splits each at its
+first space, which a normalised key token never contains.
+
+Nothing has to retire the panel: the editor empties it itself the moment no key
+sequence is pending, so a binding that fired, an =Esc=, and a key that turned out
+not to be a prefix all clear it without Lisp being called at all. And it is not a
+prompt, deliberately — a prompt would swallow the next keystroke, which is the
+one which-key exists to help you aim.
+
 #+begin_src lisp
 (where-is "find-file")
 ;; => (("normal" "SPC f f" "find-file") ...)  — one row per mode it is bound in
@@ -528,9 +652,13 @@ function takes an argument — which is the same split Emacs has.
 
 * Prompts
 
-| Form                  |   | Effect                            |
-|-----------------------+---+-----------------------------------|
-| =(open-prompt kind)=    | P | Put one of the editor's pickers up. |
+| Form                                       |   | Effect                            |
+|--------------------------------------------+---+-----------------------------------|
+| =(open-prompt kind)=                         | P | Put one of the *editor's* pickers up. |
+| =(read-string label callback)=               | H | Ask a question. =callback= gets the answer, later. |
+| =(completing-read label candidates callback)= | H | The same, with a candidate list.  |
+
+** The editor's own pickers
 
 =kind= is one of ="file"=, ="buffer"=, ="command"= (=M-x=), ="line"= (=consult-line=),
 ="grep"= (ripgrep), ="project-file"=, ="ex"= (=:=) or ="search"= (=/=). Unknown names
@@ -544,9 +672,63 @@ project-file.
 #+end_src
 
 *What the answer does is fixed by the kind* — a file is opened, a command is run,
-a line is jumped to. Lisp gets no continuation, so this is "put the picker up",
-not =read-string=. A command that needs an answer back cannot be written; see
-[[file:boundary.org][boundary.org]].
+a line is jumped to. So this is "put one of the editor's pickers up", and the
+next section is the other thing.
+
+** Asking your own question
+
+=read-string= and =completing-read= are what most interactive commands are built
+out of. Both answer the prompt id and *return before the user has typed
+anything*, so there is no value for them to return: the answer arrives at
+=callback=, on a later turn of the Lisp queue.
+
+#+begin_src lisp
+(defun rename-thing ()
+  (read-string "New name: "
+    (lambda (name)
+      (when name                       ; NIL means the user backed out
+        (replace-region (point) (+ (point) 4) name)))))
+
+(defun switch-project-buffer ()
+  (completing-read "Buffer: " (buffer-names)
+    (lambda (pick) (when pick (switch-to-buffer pick)))))
+#+end_src
+
+- =callback= is called with the string typed, or with =NIL= if the prompt was
+  cancelled — Escape, =C-g=, or backspacing past the start. It is *always*
+  called exactly once, so a command can clean up in it.
+- Nothing is required to match. With no candidate highlighted the answer is what
+  was typed, which is Emacs' =require-match= =NIL= and the useful default.
+- =candidates= is a list of strings, matched by the same fuzzy matcher every
+  other picker uses, and offered in the order you gave.
+- Errors signalled inside =callback= cost you that one answer and report
+  =prompt handler error: ...=. They never reach the editor.
+
+*** Why it is a continuation and not a return value
+
+Because the Lisp thread evaluates one queued form at a time. A primitive that
+*waited* for a keystroke would stop the image — every mode hook, every key bound
+to a Lisp command, every =M-x= — until the question was answered. That is exactly
+the elisp behaviour [[file:threading.org][threading.org]] exists to avoid, and it is the same trade
+=rpc-request= makes for the same reason.
+
+The route is the one a JSON-RPC reply already takes, deliberately rather than as
+a second mechanism:
+
+1. the closure is parked in =*prompt-continuations*= under a fresh id;
+2. that id goes into core, which opens a prompt whose destination is *Lisp*
+   rather than a file or a command;
+3. accepting or cancelling it makes the editor call =(%prompt-reply ID ANSWER)=
+   in the image — the same route a mode hook takes;
+4. =%prompt-reply= looks the id up and calls the closure.
+
+No foreign thread ever calls into ECL and nothing blocks the editor. The cost is
+that *your callback cannot return a value to whoever asked*: put the rest of the
+command inside it, or chain a second prompt from within the first.
+
+Opening one prompt from inside another's callback is fine. Opening a *second*
+prompt while the first is still up is not — the first continuation never gets a
+reply and stays in the table. =(clrhash *prompt-continuations*)= is the sweep.
 
 * The dashboard
 
@@ -579,7 +761,7 @@ Every setting now has both halves. Writers are primitives, readers are readers.
 | =(set-syntax-color face r g b)=         | =(syntax-color face)=         | =NIL= for an unknown face.          |
 | —                                     | =(face-list)=                 | The whole closed vocabulary.      |
 | =(set-line-numbers on)=                 | =(line-numbers-p)=            | Whether the gutter is drawn.      |
-| =(set-relative-line-numbers on)=        | =(relative-line-numbers-p)=   | Count from the cursor. Orthogonal. |
+| =(set-relative-line-numbers on)=        | =(relative-line-numbers-p)=   | Count from the cursor, in *visual* rows — Emacs' =display-line-numbers-type 'visual=. Orthogonal to whether the gutter is drawn at all. |
 | =(set-tab-width n)=                     | =(tab-width)=                 | Clamped 1–16.                     |
 | =(set-line-overflow mode)=              | =(line-overflow)=             | ="truncate"= or ="wrap"=.            |
 | =(set-completion-style style)=          | =(completion-style)=          | ="minibuffer"=, ="bottom"=, ="center"=. |
@@ -633,7 +815,8 @@ app layer, which does the work and feeds the result back as buffer text.
 |------------------------+----+--------------------------------------------------------------|
 | =(magit verb)=           | HA | ="status"= ="stage"= ="unstage"= ="stage-all"= ="unstage-all"= ="commit"= ="commit-finish"= ="push"= ="pull"= ="refresh"= |
 | =(dired verb)=           | HA | ="open"= ="up"= ="enter"= ="mark"= ="unmark"= ="toggle-marks"= ="flag-delete"= ="execute"= ="rename"= ="copy"= ="mkdir"= ="toggle-hidden"= ="refresh"= |
-| =(terminal verb)=        | HA | ="open"= ="close"=                                              |
+| =(terminal verb)=        | HA | ="open"= ="new"= ="close"= ="restart"= ="next"= ="prev"= ="normal"= ="insert"= ="run:NAME:COMMAND"= |
+| =(term-send-key key)=    | HA | One keystroke, spelled as =(key-bindings)= spells one.        |
 
 #+begin_src lisp
 (defun git-refresh-and-report ()
@@ -643,6 +826,106 @@ app layer, which does the work and feeds the result back as buffer text.
 
 The same verbs are reachable as command strings (=magit-status=, =dired-enter=,
 =terminal-close=), which is what the shipped bindings use.
+
+** Terminal sessions come in more than one
+
+There is a live child per terminal *buffer*, not one per editor, and the buffer
+is how everything addresses it — keystrokes reach the session whose buffer is
+live, and the rest keep running. See the buffer-kind table in [[file:model.org][model.org]].
+
+| Verb                    | What it does                                                  |
+|-------------------------+---------------------------------------------------------------|
+| ="open"=                  | Show the shell session, starting it if there is none.          |
+| ="new"=                   | A *second* shell, however many are already up.                 |
+| ="run:NAME:COMMAND"=      | Run =COMMAND= in a buffer called =*NAME*=. What AI mode is built on. |
+| ="close"=                 | Hang up on the live session and kill its buffer.               |
+| ="restart"=               | Run the same command again in the *same* buffer.               |
+| ="next"= / ="prev"=         | Walk the sessions, wrapping.                                   |
+| ="normal"= / ="insert"=     | Out to the scrollback and back in. =C-M-t= both ways.            |
+
+=run:NAME:COMMAND= is the one verb carrying an argument. =COMMAND= is split on
+whitespace, so an argument containing a space cannot be expressed — that is a
+named ceiling, not an oversight, and the upgrade is the verb carrying a list.
+The command must be on =$PATH=: an absent one is reported by name and no buffer
+is opened, rather than a PTY appearing and dying.
+
+#+begin_src lisp
+(terminal "run:notes:hx ~/notes.md")          ; anything, not only agents
+(call-command "terminal-run:notes:hx ~/notes.md")   ; the same, as a binding
+#+end_src
+
+* AI mode — coding agents as buffers
+
+Claude Code, Cursor and opencode are terminal programs, so they are terminal
+buffers: =runtime/modes/ai.lisp= is the whole feature, and there is no AI code in
+Rust at all. =C-a= puts up the menu — pick a harness, then =new= or =resume=.
+
+| Form                                            |   | Effect                                          |
+|-------------------------------------------------+---+-------------------------------------------------|
+| =(ai)=                                            | H | The menu. Bound to =C-a=, and to =C-M-a= inside a session. |
+| =(ai-add-harness name program &optional new resume)= | H | Offer =name= in the menu. Replaces an entry of the same name. |
+| =(ai-installed-p name)=                           | R | Whether that harness's binary is on =$PATH=.      |
+| =(executable-find program)=                       | R | Where a program is on =$PATH=, or =NIL=.           |
+| =(ai-find-file-at-point)=                         | H | Open the path under the cursor, at its line number if it has one. |
+| =*ai-harnesses*=                                  |   | The list itself: =(NAME PROGRAM NEW-ARGS RESUME-ARGS)=. |
+
+** Adding a fourth is one line
+
+That is the whole point of the list being data:
+
+#+begin_src lisp
+(ai-add-harness "aider" "aider" nil '("--restore-chat-history"))
+#+end_src
+
+=NEW-ARGS= starts a fresh conversation, =RESUME-ARGS= picks up an old one. Both are
+lists of strings and both may be =NIL=. The harness appears in the menu
+immediately, marked =(not installed)= if its binary is not on =$PATH= — offered
+anyway and refused with a reason, because a harness silently missing from the
+menu is indistinguishable from one you spelled wrong.
+
+The three shipped entries use each tool's own flags, read out of its =--help=:
+
+| Harness  | Binary         | Resume           | What that does                          |
+|----------+----------------+------------------+-----------------------------------------|
+| claude   | =claude=         | =-r=               | Claude Code's own session picker.        |
+| cursor   | =cursor-agent=   | =--resume=         | Cursor's own session picker.             |
+| opencode | =opencode=       | =--continue=       | The last session — opencode has no interactive resume flag. |
+
+=cursor-agent= is the CLI; =cursor= is the GUI. =claude -c= and =cursor-agent
+--continue= are the no-picker variants if you prefer them.
+
+** The mode
+
+A session running a harness reports =(major-mode)= = ="ai-mode"=; a plain shell
+reports ="terminal-mode"=. =ai-mode-hook= fires once, when the session starts.
+
+The keys are all Command chords, deliberately: ="terminal"= is consulted instead
+of the vim grammar so that =d=, =j= and =C-c= reach the child, and you are typing
+English at an agent. =C-a= itself is left to readline.
+
+| Key       | Leader      | Verb                    |
+|-----------+-------------+-------------------------|
+| =C-a=       | =SPC a a=     | The menu (=C-M-a= inside a session) |
+| =C-M-t=     |             | Out to the scrollback, and back |
+| =C-M-n=     | =SPC a n=     | Next session            |
+| =C-M-b=     | =SPC a p=     | Previous session        |
+| =C-M-r=     | =SPC a r=     | Restart, keeping the buffer |
+| =C-M-w=     | =SPC a k=     | Close                   |
+|           | =SPC a t=     | A second plain shell    |
+|           | =SPC a f=     | Open the file under the cursor |
+
+=SPC a f= is for reading what an agent just said: =C-M-t= out to the scrollback,
+put the cursor on =crates/app/src/term.rs:42=, and it opens that file on that
+line. It is =find-file-at= underneath — the same thing a ripgrep hit uses — with
+a parser that strips the punctuation prose wraps around a path.
+
+** Files it edits
+
+An agent writing files is the whole point, so auto-revert watches *every* open
+buffer four times a second rather than the live one every five seconds. A buffer
+with unsaved changes is never clobbered — it gets one message and keeps its
+text — and the comparison is on content, so saving a file does not revert the
+buffer that saved it.
 
 * Undo, the register and the clipboard
 
@@ -682,6 +965,7 @@ would be aliases for the one that already is the clipboard.
 | =(message text)=    | P | Status line, and appended to the log.                    |
 | =(messages &optional n)= | R | The last =n= messages, or all of them. Capped at 500.  |
 | =(status)=          | R | What the status line last said.                          |
+| =(which-key-row &optional row)= | H | Append one ="KEY LABEL"= row to the which-key panel; no argument empties it. |
 | =(quit)=            | P | Quit the editor.                                         |
 
 =message= takes a string, so =format= does the work:
@@ -690,9 +974,11 @@ would be aliases for the one that already is the clipboard.
 (message (format nil "~a lines, ~a chars" (line-count) (point-max)))
 #+end_src
 
-=(messages)= is =*Messages*=: the status line only ever shows the last one, so this
-is the only record that a message which was immediately replaced was ever
-produced at all.
+=(messages)= is the log behind =*Messages*=: the status line only ever shows the
+last one, so this is the only record that a message which was immediately
+replaced was ever produced at all. =runtime/init.lisp= puts it in a buffer with
+=messages-buffer=, bound to =SPC h m= and written in five lines over
+=create-buffer= — there is nothing in Rust behind it.
 
 * Evaluating
 
@@ -877,6 +1163,17 @@ integers. =NIL= for =arg= means absent. An unknown verb reports =no such command
 | ="paste"=                                    | —     | after?     | —   |
 | ="git"= ="dired"= ="term"=                      | verb  | —          | —   |
 | ="open-at"=                                  | =path:line:text= | —  | —   |
+| ="create-buffer"=                            | name  | —          | —   |
+| ="kill-buffer"=                              | —     | index      | —   |
+| ="set-language"=                             | language, =NIL= for none | — | — |
+| ="read-from-minibuffer"=                     | label | continuation id | completing? |
+| ="prompt-item"=                              | one candidate | —  | —   |
+| ="term-key"=                                 | key token | —      | —   |
+| ="call"=                                     | command name | —   | —   |
+
+="call"= is the one verb that is not a single command: it resolves a name the way
+a key binding does and issues whatever *batch* that produces, which is why it is
+handled beside =paste='s checkpoint rather than in =command_for=.
 
 Adding a verb is one arm of the =match= in =zemacs_lisp::command_for= plus a
 one-line =DEFUN= in =shim.c= — nothing in C. Adding a reader is one arm of the

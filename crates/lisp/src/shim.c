@@ -535,7 +535,8 @@ static const char *QUERIES_FORM =
     "              \"buffer-read-only-p\" \"buffer-list\" \"buffer-info\""
     "              \"register\"" /* clipboard */
     "              \"major-mode\""
-    "              \"minor-modes\" \"evil-state\" \"region\" \"region-ranges\""
+    "              \"minor-modes\" \"evil-state\" \"evil-keymaps\""
+    "              \"region\" \"region-ranges\""
     "              \"window-scroll\" \"window-height\" \"frame-count\""
     "              \"window-list\" \"window-id\" \"frame-index\""
     "              \"key-bindings\" \"command-list\" \"status\" \"face-list\""
@@ -668,6 +669,50 @@ static const char *LIBRARY_FORM =
     " (defun zemacs::terminal (verb) (zemacs::%do \"term\" verb 0 0))"
     " (defun zemacs::find-file-at (hit) (zemacs::%do \"open-at\" hit 0 0))"
 
+    /* --- lisp-api: buffers with no file, and calling a built-in verb ------ */
+    /* `create-buffer' is idempotent by name: called twice it shows the buffer
+     * and does not stack a second one, which is what lets a command that fills
+     * a buffer be written as "make it, then rewrite it". It is applied on the
+     * spot — unlike `find-file', which lands a frame later — so the very next
+     * form already sees the new buffer, and that is the whole reason a
+     * `*Messages*' command can be five lines of Lisp. */
+    /* NIL means plain text. Separate from `set-major-mode' on purpose: a mode is
+     * what Lisp dispatches on, a language is what tree-sitter colours, and a
+     * buffer can want one without the other. */
+    " (defun zemacs::set-language (&optional language)"
+    "   (zemacs::%do \"set-language\" (and language (string language)) 0 0))"
+    " (defun zemacs::create-buffer (name &optional language)"
+    "   (zemacs::%do \"create-buffer\" (string name) 0 0)"
+    "   (when language (zemacs::set-language language))"
+    "   name)"
+    /* NIL (or nothing) kills the live buffer. The last one cannot be killed and
+     * says so; nothing is confirmed, because asking is policy and
+     * `(buffer-modified-p)' is a reader. */
+    " (defun zemacs::kill-buffer (&optional name)"
+    "   (let ((i (if name (zemacs::buffer-index name) 0)))"
+    "     (cond (i (zemacs::%do \"kill-buffer\" nil i 0) t)"
+    "           (t (zemacs::message (format nil \"no such buffer: ~a\" name)) nil))))"
+    /* Run a built-in verb by name — the same resolution `M-x' and every key
+     * binding do, so `(call-command \"magit-status\")' is exactly what pressing
+     * the key bound to it does. A name that is not a built-in verb falls through
+     * to `(name)' in the image, which is also what `M-x' does. */
+    " (defun zemacs::call-command (name) (zemacs::%do \"call\" (string name) 0 0))"
+    /* One keystroke to the shell, spelled the way `key-bindings' reports one:
+     * \"a\" \"SPC\" \"C-c\" \"<esc>\" \"M-<bs>\". Dropped when no shell is
+     * running, which is what a key aimed at something that is not there is. */
+    " (defun zemacs::term-send-key (key) (zemacs::%do \"term-key\" (string key) 0 0))"
+    /* The which-key panel, one \"KEY LABEL\" row per call and NIL to clear it.
+     * The renderer draws the rows in a grid above the status line and splits
+     * each at its first space; a normalised key token never has one.
+     *
+     * Not a prompt, which is the whole point: a prompt owns the next keystroke
+     * and which-key exists to help you choose one. Retiring the panel is core's
+     * job — it empties it as soon as no key sequence is pending — so nothing
+     * here has to remember to. */
+    " (defun zemacs::which-key-row (&optional row)"
+    "   (zemacs::%do \"which-key\" (and row (string row)) 0 0))"
+    /* --- end of the lisp-api block --------------------------------------- */
+
     /* --- buffers -------------------------------------------------------- */
     " (defun zemacs::buffer-names () (mapcar #'first (zemacs::buffer-info)))"
     " (defun zemacs::buffer-index (name)"
@@ -788,7 +833,10 @@ static const char *LIBRARY_FORM =
     "              \"DELETE-LINE\" \"SEARCH-FORWARD\" \"SEARCH-BACKWARD\""
     "              \"REPLACE-ALL\" \"WHERE-IS\" \"BUFFER-LINES\""
     "              \"LINE-START\" \"LINE-END\""
-    "              \"LINE-STRING\" \"MESSAGES\" \"SYNTAX-COLOR\"))"
+    "              \"LINE-STRING\" \"MESSAGES\" \"SYNTAX-COLOR\""
+    /* lisp-api */
+    "              \"CREATE-BUFFER\" \"KILL-BUFFER\" \"SET-LANGUAGE\""
+    "              \"CALL-COMMAND\" \"TERM-SEND-KEY\"))"
     "   (export (intern n \"ZEMACS\") \"ZEMACS\")))";
 
 /* --- overlays ------------------------------------------------------------ */
@@ -839,7 +887,12 @@ static const char *OVERLAY_FORM =
     "        (zemacs::%do \"overlay-background\" (zemacs::%overlay-face value) ov 0))"
     "       (:display"
     "        (zemacs::%do \"overlay-display\" (and value (string value)) ov 0))"
-    "       (:image (zemacs::%do \"overlay-image\" nil ov (or value 0)))))"
+    "       (:image (zemacs::%do \"overlay-image\" nil ov (or value 0)))"
+    /* The one property that is about *lines* rather than about cells: the
+     * lines after the overlay's first one stop occupying rows at all. The
+     * renderer does not draw them and `j' steps over them, which is code
+     * folding — and everything about *what* to fold is up here, in Lisp. */
+    "       (:fold (zemacs::%do \"overlay-fold\" nil ov (if value 1 0)))))"
     "   value)"
     " (defun zemacs::overlay-get (ov prop)"
     "   (getf (gethash ov zemacs::*overlay-properties*)"
@@ -869,11 +922,125 @@ static const char *OVERLAY_FORM =
     /* A reader is a noun, not a command: keep it out of the M-x list the same
      * way every other reader is kept out. */
     " (pushnew \"latex-fragments\" zemacs::*readers* :test #'string=)"
+    /* --- folding ---------------------------------------------------------
+     *
+     * Five functions and no new mechanism: a fold *is* an overlay carrying
+     * `fold', so it moves with the text, dies with it, and is undone by the
+     * same `delete-overlay' as anything else. What is deliberately not here is
+     * any opinion about *what* is foldable — an org subtree, a `defun', a
+     * brace block — because that is the policy, and policy is Lisp's.
+     * `runtime/modes/org-fold.lisp' is the first such policy and lives
+     * entirely on top of these. */
+    " (defun zemacs::fold-region (beg end)"
+    "   \"Hide every line after BEG's, through END's. Answers the overlay.\""
+    "   (let ((ov (zemacs::make-overlay beg end)))"
+    "     (zemacs::overlay-put ov 'fold t)"
+    "     ov))"
+    /* Only *our* overlays, unlike `remove-overlays': an org buffer is full of
+     * `display' overlays for its bullets and folding must not eat them. */
+    " (defun zemacs::folds-in (beg end)"
+    "   \"Every fold overlapping BEG..END, as handles, oldest first.\""
+    "   (let ((out nil))"
+    "     (dolist (o (zemacs::overlays-in beg end) (nreverse out))"
+    "       (when (zemacs::overlay-get (first o) 'fold) (push (first o) out)))))"
+    " (defun zemacs::folded-p (&optional pos)"
+    "   \"The innermost fold covering POS (default point), or NIL.\""
+    "   (let ((pos (or pos (zemacs::point))))"
+    "     (first (last (zemacs::folds-in pos (1+ pos))))))"
+    " (defun zemacs::unfold-region (beg end)"
+    "   \"Take out every fold overlapping BEG..END. Answers how many.\""
+    "   (let ((folds (zemacs::folds-in beg end)))"
+    "     (dolist (ov folds (length folds)) (zemacs::delete-overlay ov))))"
+    " (defun zemacs::unfold-all ()"
+    "   \"Open every fold in the buffer.\""
+    "   (zemacs::unfold-region (zemacs::point-min) (zemacs::point-max)))"
     " (dolist (n '(\"MAKE-OVERLAY\" \"OVERLAY-PUT\" \"OVERLAY-GET\" \"DELETE-OVERLAY\""
     "              \"OVERLAYS-IN\" \"OVERLAYS-AT\" \"OVERLAY-POSITION\""
     "              \"OVERLAY-START\" \"OVERLAY-END\" \"REMOVE-OVERLAYS\""
+    "              \"FOLD-REGION\" \"FOLDS-IN\" \"FOLDED-P\" \"UNFOLD-REGION\""
+    "              \"UNFOLD-ALL\""
     "              \"LATEX-PREVIEW\" \"LATEX-FRAGMENTS\" \"*OVERLAY-PROPERTIES*\"))"
     "   (export (intern n \"ZEMACS\") \"ZEMACS\")))";
+
+/* --- lisp-api: prompts whose answer comes back here ----------------------- */
+/* `read-string' and `completing-read', which is what most interactive commands
+ * in a real config are built out of. Every other prompt has its destination
+ * fixed in core — a file is opened, a command is run — and this one hands the
+ * reply to a Lisp closure instead.
+ *
+ * **It is a continuation, not a blocking read**, and it has to be: the Lisp
+ * thread evaluates one queued form at a time, so a primitive that waited for a
+ * keystroke would stop the image — every mode hook, every key bound to a Lisp
+ * command, every `M-x' — until the user answered. That is precisely the elisp
+ * behaviour `docs/threading.org' exists to avoid.
+ *
+ * The route is the one `runtime/rpc.lisp' already uses for a JSON-RPC reply, and
+ * deliberately the same shape rather than a second mechanism:
+ *
+ *   1. the closure is parked in a table under a fresh id;
+ *   2. `%DO \"read-from-minibuffer\"' carries that id into core, which opens a
+ *      prompt of kind `Lisp';
+ *   3. accepting or cancelling it produces `CallLisp', the app hands the form to
+ *      this thread, and `%prompt-reply' calls the closure parked under the id.
+ *
+ * No foreign thread ever calls into ECL and nothing blocks the editor. The cost
+ * is the one every continuation has: your callback cannot return a value to
+ * whoever asked. Write the rest of the command inside it.
+ *
+ * A table rather than a single variable even though the editor has exactly one
+ * prompt slot: an id means a stale reply is *dropped* rather than delivered to
+ * whoever asked most recently, which is the failure a single variable would have
+ * if Lisp opened a second prompt over the first.
+ *
+ * ponytail: a Lisp prompt replaced by another prompt before it is answered never
+ * gets a reply, so its closure stays in the table — a few conses, and only
+ * reachable by opening a picker from inside a `read-string'. The sweep is
+ * `(clrhash *prompt-continuations*)'. */
+static const char *PROMPT_FORM =
+    "(progn"
+    " (defparameter zemacs::*prompt-continuations* (make-hash-table)"
+    "   \"Prompt id -> the closure waiting for that answer.\")"
+    " (defparameter zemacs::*prompt-next-id* 0)"
+    " (defun zemacs::%prompt-park (k)"
+    "   (setf (gethash (incf zemacs::*prompt-next-id*)"
+    "                  zemacs::*prompt-continuations*) k)"
+    "   zemacs::*prompt-next-id*)"
+    /* Called by the editor, on this thread, with the answer or NIL. Everything
+     * is inside a HANDLER-CASE for the same reason `%rpc-event' is: a callback
+     * that signals must cost you that one answer, not the editor. Answers NIL so
+     * `eval-string' has nothing to echo over the command's own message. */
+    " (defun zemacs::%prompt-reply (id answer)"
+    "   (let ((k (gethash id zemacs::*prompt-continuations*)))"
+    "     (remhash id zemacs::*prompt-continuations*)"
+    "     (when k"
+    "       (handler-case (funcall k answer)"
+    "         (error (e) (zemacs::message"
+    "                     (format nil \"prompt handler error: ~a\" e))))))"
+    "   nil)"
+    /* CALLBACK is called with the string typed, or NIL if the prompt was
+     * cancelled — so `(when answer ...)' is the idiom, as it is for every other
+     * optional in this API. Answers the id, as `rpc-request' does. */
+    " (defun zemacs::read-string (label callback)"
+    "   (let ((id (zemacs::%prompt-park callback)))"
+    "     (zemacs::%do \"read-from-minibuffer\" (string label) id 0)"
+    "     id))"
+    /* The same, with a candidate list and the fuzzy matcher every other picker
+     * uses. Nothing is required to match: with no hit the answer is what was
+     * typed, which is Emacs' `require-match' NIL and the useful default.
+     *
+     * The candidates go over one at a time because the write envelope carries a
+     * single string — N locks for N candidates, each of which appends without
+     * re-ranking. Fine for the few hundred a command offers; a list long enough
+     * for that to be felt wants a reader on the Rust side instead. */
+    " (defun zemacs::completing-read (label candidates callback)"
+    "   (let ((id (zemacs::%prompt-park callback)))"
+    "     (zemacs::%do \"read-from-minibuffer\" (string label) id 1)"
+    "     (dolist (c candidates) (zemacs::%do \"prompt-item\" (string c) 0 0))"
+    "     id))"
+    " (dolist (n '(\"READ-STRING\" \"COMPLETING-READ\" \"*PROMPT-CONTINUATIONS*\"))"
+    "   (export (intern n \"ZEMACS\") \"ZEMACS\")))";
+
+/* --- end of the lisp-api block -------------------------------------------- */
 
 static void defprim(const char *name, cl_objectfn_fixed fn, int narg) {
   ecl_def_c_function(ecl_make_symbol(name, "ZEMACS"), fn, narg);
@@ -968,6 +1135,8 @@ void zemacs_boot(void) {
   cl_safe_eval(ecl_read_from_cstring(LIBRARY_FORM), ECL_NIL, ECL_NIL);
   /* ...and this one in terms of all three: `*readers*' comes from QUERIES_FORM. */
   cl_safe_eval(ecl_read_from_cstring(OVERLAY_FORM), ECL_NIL, ECL_NIL);
+  /* lisp-api: needs only %DO, but goes last so a reload reads in file order. */
+  cl_safe_eval(ecl_read_from_cstring(PROMPT_FORM), ECL_NIL, ECL_NIL);
 }
 
 /* Strings are self-evaluating, so `(zemacs::f "...")` needs no QUOTE. Both

@@ -8,6 +8,7 @@ license.workspace = true
 zemacs-core.workspace = true
 zemacs-term.workspace = true
 anyhow.workspace = true
+unicode-width.workspace = true
 
 # `use-pkgconfig` is what finds Homebrew's SDL2 on Apple Silicon — /opt/homebrew/lib
 # is not on the default linker search path, so without it the test binary fails to link.

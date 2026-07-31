@@ -353,6 +353,62 @@ This genuinely switches the editor to that buffer and back — zemacs has one li
 buffer. Keep the body short, and prefer it for reading rather than editing: a
 keystroke landing while the body runs is typed into the wrong buffer.
 
+* Asking the user something
+
+=read-string= and =completing-read= are what most interactive commands are made
+of. Both hand the answer to a *callback*, later — see below for why — so the
+rest of the command goes inside it.
+
+#+begin_src lisp
+(defun retitle-line ()
+  "Replace the rest of the line with something typed."
+  ;; Markers, not integers: by the time the callback runs the buffer may have
+  ;; moved under them. The same reason `save-excursion' holds one.
+  (let ((beg (make-marker (point)))
+        (end (make-marker (line-end) t)))
+    (read-string "new text: "
+      (lambda (new)
+        (when (and new (marker-position beg))
+          (replace-region (marker-position beg) (marker-position end) new))
+        (delete-marker beg)
+        (delete-marker end)))))
+
+(defun goto-open-buffer ()
+  "The buffer switcher, written in Lisp."
+  (completing-read "Buffer: " (buffer-names)
+    (lambda (pick) (when pick (switch-to-buffer pick)))))
+#+end_src
+
+The callback is called *exactly once*: with the string typed, or with =NIL= if
+the prompt was cancelled. So =(when answer ...)= is the idiom and cleanup can go
+after it.
+
+It cannot return a value to the command that asked, because the Lisp thread
+evaluates one queued form at a time and a primitive that waited for a keystroke
+would stop the whole image until you answered. That is the same contract as
+=rpc-request= and everything else here; see [[file:threading.org][threading.org]].
+
+* Making a buffer to put something in
+
+#+begin_src lisp
+(defun long-lines ()
+  "List every line over 80 characters, in a buffer of its own."
+  (let ((hits (loop for line in (buffer-lines)
+                    for n from 1
+                    when (> (length line) 80)
+                      collect (format nil "~a: ~a" n line))))
+    (create-buffer "*long-lines*")
+    (replace-region 0 (point-max) (format nil "~{~a~%~}" hits))
+    (goto-char 0)))
+#+end_src
+
+=create-buffer= makes a buffer with no file behind it and is applied *on the
+spot*, so the very next form is already writing into it — unlike =find-file=,
+which lands a frame later. Calling it again shows the same buffer rather than
+stacking a second one, which is what makes "generate, then rewrite" the natural
+shape. Pass a language (=(create-buffer "*pad*" "lisp")=) to get it highlighted,
+and =(kill-buffer "*long-lines*")= to take it away.
+
 * Talking to git and dired
 
 #+begin_src lisp
@@ -440,8 +496,7 @@ Two things to notice, and they are the whole shape of writing one of these:
 |----------------------------------------+---------------------------------------------------------|
 | =(find-file "x") (buffer-name)=          | =find-file= lands a frame later. Use =find-file-at=, or a mode hook. |
 | =(delete-region a b) (insert s)=         | Not atomic. Use =replace-region=.                          |
-| =(read-string "name: ")=                 | =(open-prompt "file")= puts a picker up, but the answer never comes back to Lisp. See [[file:boundary.org][boundary.org]]. |
-| =(kill-buffer "x")=                      | No such command exists. See [[file:boundary.org][boundary.org]].              |
+| =(setf n (read-string "name: "))=        | =read-string= answers the prompt id, not the answer — the answer arrives at the callback, later. Write the rest of the command inside it. |
 | =(re-search-forward "fo+")=              | No regexp engine in ECL. =search-forward= is literal.      |
 | =(length (buffer-string))=               | Counts bytes on a non-ASCII buffer. Use =(point-max)=.      |
 | =(loop)=                                 | Wedges the image; the editor survives but no later Lisp runs. |

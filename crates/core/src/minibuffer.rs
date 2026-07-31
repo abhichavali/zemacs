@@ -34,13 +34,29 @@ pub enum PromptKind {
     /// editor, so they are refreshed by the app as the pattern is typed instead
     /// of filtered from a fixed list.
     Grep,
+    /// lisp-api: a question asked *by Lisp*, whose answer goes back to a
+    /// continuation parked in the image under `id`. This is the only prompt kind
+    /// whose destination is not fixed in core, and it is what `read-string` and
+    /// `completing-read` are.
+    ///
+    /// `completing` is carried rather than derived from the candidate list
+    /// because the candidates arrive *after* the prompt opens, one
+    /// `EditorCommand::PromptItem` each — and the renderer asks
+    /// [`PromptKind::completes`] on the frame in between. A `read-string` that
+    /// flashed an empty "no matches" box would be a bug nobody could reproduce.
+    Lisp { id: u64, completing: bool },
 }
 
 impl PromptKind {
     /// Prompts with no candidate list stay a single line whatever the style —
     /// there is nothing to draw in a popup.
     pub fn completes(self) -> bool {
-        !matches!(self, PromptKind::Ex | PromptKind::Search)
+        match self {
+            PromptKind::Ex | PromptKind::Search => false,
+            // Whichever of the two Lisp asked for.
+            PromptKind::Lisp { completing, .. } => completing,
+            _ => true,
+        }
     }
 }
 
@@ -172,6 +188,21 @@ impl Prompt {
     pub fn set_items(&mut self, items: Vec<String>) {
         self.items = items;
         self.refilter();
+    }
+
+    /// lisp-api: append one candidate to a live prompt, which is how a Lisp
+    /// `completing-read` delivers its list — one `%do` per candidate, because
+    /// the write envelope carries a single string.
+    ///
+    /// Appends to `matches` rather than re-ranking, so building a list of N is N
+    /// cheap calls instead of N sorts. The order is therefore the order Lisp
+    /// gave, which is what a hand-written list means; the first keystroke
+    /// re-ranks properly.
+    pub fn push_item(&mut self, item: String) {
+        if score(&self.text, &item).is_some() {
+            self.matches.push(self.items.len());
+        }
+        self.items.push(item);
     }
 
     /// Tab: adopt the highlighted candidate as the input.

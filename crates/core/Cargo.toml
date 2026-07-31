@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ropey.workspace = true
+unicode-width.workspace = true
 
 # Search and `:s` are regex, and a hand-rolled engine is a bug farm rather than
 # laziness. Already in the lock as a tree-sitter dependency, so this costs no

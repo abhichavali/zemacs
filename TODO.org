@@ -22,11 +22,11 @@ The Lisp API is =make-overlay=, =overlay-put=, =overlay-get=, =overlay-position=
 =overlays-in=, =overlays-at=, =delete-overlay=, =remove-overlays= — one C primitive
 (the handle has to come back), everything else =%do= and =%query=.
 
-Now unblocked and still to write, all of it in Lisp: org-modern bullets
-(=display=), org-appear (=display=, cleared on the fragment under point), avy hint
-labels, copilot ghost text, flymake in the gutter, LSP inlay hints. Code
-folding still needs a Rust hole of its own — an overlay hides *cells*, not
-*lines*.
+org-modern bullets and org-appear are *written*, both in Lisp and both on
+=display=, in =runtime/modes/org-modern.lisp=. Still to write on the same
+mechanism: avy hint labels, copilot ghost text, flymake in the gutter, LSP
+inlay hints. Code folding needed a Rust hole of its own — an overlay hid
+*cells*, not *lines* — and got one: a fifth property, =fold=, below.
 
 ** DONE Inline images in a buffer
 Overlay property =image=, whose value is a handle from =(latex-preview source)=.
@@ -43,12 +43,28 @@ change =lisp-mode= made for its own =C-c C-e= family: a mode-local *prefix* now
 outranks a global exact binding, so =C-c= waits for the next key in an org
 buffer and still evaluates on its own everywhere else. Nothing was given up.
 
-*** TODO Rows of variable height
-What inline images actually want, and what wide characters want too. Today an
-image reserves =ceil(width / cell_w)= blank cells and reflows nothing, and one
-taller than a line is hung from the top of its row rather than the baseline so
-a display equation grows downward over its own blank rows instead of upward
-over the lines above.
+*** DONE Rows of variable height
+One integer, in the end. A line's height is
+=max(rows its text wraps into, rows the image on it needs)= — the only thing in
+=crates/render= that has an opinion about how tall a row is — and =image_rows=
+places every bitmap by a single rule instead of the two the old code
+special-cased: *its baseline lands on the baseline of the last row it was
+given*. An inline =$x_1$= is shorter than the ascent, gets one row, and hangs its
+depth below the text baseline the way a descender does; a display equation claims
+whole rows *upward*, which is now safe because the line grew to hold them.
+
+A fragment spanning several source lines already owns a blank row per line — the
+substitution blanked them — so only the shortfall is charged, and
+=\begin{equation}= draws exactly as it did while a =$$…$$= written on one line
+stops painting over its neighbour.
+
+Wide characters were the other half of the old justification and turned out not
+to need this at all: several *cells* is what a tab already was.
+
+Left open, and written down in =docs/boundary.org=: core is not told. =j= over an
+equation is still one buffer line and =viewport_lines= counts text rows, so a
+pane holding one reports a line more than it draws. Same ceiling as "core lays a
+line out without overlays", same upgrade.
 
 ** DONE A JSON-RPC subprocess layer
 =crates/rpc=: spawn a long-lived child, =Content-Length=-framed JSON on its
@@ -66,7 +82,11 @@ here only because the two shipped are the two it was proved against.
 Sync is full-text; see the ceiling in =docs/boundary.org=.
 *** TODO xref — find references, and a *xref* results buffer
 Go-to-definition is done (=lsp-goto-definition=, bound to =g d=). References
-need somewhere to put a list, which is the same hole =project-find-dir= has.
+need somewhere to put a list. =project-find-dir= no longer shares that hole —
+it turned out to be a completion prompt like every other picker here — so this
+is on its own: a *xref* buffer wants a generated buffer kind, its own keymap
+and a line-to-location table, which is the magit/dired shape rather than the
+minibuffer one.
 *** TODO flymake — diagnostics in the gutter
 The *data* is done: =(lsp-diagnostics)= answers
 =((LINE COLUMN SEVERITY MESSAGE SOURCE) ...)= and
@@ -74,22 +94,99 @@ The *data* is done: =(lsp-diagnostics)= answers
 missing, and overlays now exist for it — a =background= overlay per diagnostic
 range, hung off =*lsp-diagnostics-functions*=, is Lisp. Today they are an
 echo-area summary, =lsp-diagnostics-at-point=, and =lsp-list-diagnostics=.
-*** TODO AI mode with multi-agent support
+*** DONE AI mode with multi-agent support
+Not the JSON-RPC route in the end, and that is the finding: Claude Code, Cursor
+and opencode are all *terminal* programs, and the editor already runs terminal
+programs. So the work turned out to be four things, none of them a protocol.
+
+*Sessions became plural.* =crates/term::Terminal= was always one PTY per struct;
+what was singular was =Term= in the app, which held one and drove one
+=BufferKind::Terminal= buffer through =show_special=. It now holds a =Session= per
+child — its own PTY, its own buffer, its own frozen flag — keyed by =BufferId=,
+which is what makes a session act like any other buffer: =(buffer-list)= sees it,
+=switch-to-buffer= reaches it, =kill-buffer= hangs up on it, and closing one leaves
+the rest running. Core grew =show_named= beside =show_special= for it: the match is
+on =(kind, given-name)= rather than on kind alone, so one =*magit*= is still one
+=*magit*= and =*claude*=, =*claude*<2>= and =*terminal*= are three.
+
+*Change detection got faster and wider.* Auto-revert was one =stat= on the live
+buffer every five seconds, which is the right size for "a formatter ran" and the
+wrong size for an agent rewriting six files you are not looking at. It is now
+every buffer with a file behind it, four times a second, through a new
+=Editor::revert_buffer(id, text)= — the =EditorCommand::Revert(BufferId)= the old
+ponytail note asked for, as a method, since it performs no effect the pure core
+cannot. Still polled rather than watched, and the argument is in the comment
+above it: on macOS =notify= is FSEvents, which reports *directories* and coalesces
+on its own latency, so it removes the loop and not the syscall — and the loop is
+tens of =stat=s against hot inodes. Both safety properties survive and are tested:
+a modified buffer is never clobbered, and the comparison is on content so the
+buffer that just saved does not revert itself.
+
+*The menu is data.* =runtime/modes/ai.lisp= holds =*ai-harnesses*= as
+=(NAME PROGRAM NEW-ARGS RESUME-ARGS)=; =C-a= is =completing-read= over it, then
+=new= / =resume=. A fourth tool is =(ai-add-harness "aider" "aider")= and nothing
+else — no Rust, no recompile. The resume flags were read out of each tool's own
+=--help= rather than remembered (=claude -r=, =cursor-agent --resume=,
+=opencode --continue=), and =crates/lisp/tests/ai.rs= re-reads them from the
+installed binaries so a rename cannot rot the config silently. =executable-find=
+is nine lines of Lisp over =$PATH=, so the menu can say "not installed" instead of
+forking a PTY that dies.
+
+*AI mode* is =(major-mode)= answering ="ai-mode"=, an =ai-mode-hook= fired once per
+session, and session verbs on Command chords — =C-M-n=/=C-M-b= to walk,
+=C-M-r= restart, =C-M-w= close, =C-M-t= out to the scrollback, =SPC a f= to open the
+file the agent just mentioned. Deliberately no bare keys: ="terminal"= is the one
+state consulted *instead of* the vim grammar precisely so =d=, =j= and =C-c= reach
+the child, and typing English at an agent needs that more than a shell does.
+
+Two ceilings, both named in the code. A split showing two terminal buffers at
+once draws the live session's grid in both panes, because the renderer takes one
+=Option<&Screen>=; the fix is a grid per buffer id and it is a signature change in
+=zemacs-render=. And the session verbs are bound in the ="terminal"= *state* rather
+than in =ai-mode=, because =terminal_key= consults only the state's keymap — every
+verb is meaningful in a shell too, so layering the major-mode map in there buys
+nothing yet.
 *** TODO Latexify / MathSync integration
 
 * CONTRADICTS THE EXISTING CONFIG
 Worse than missing: these are *wrong* rather than absent, so muscle memory
 fights them.
 
-** TODO =j= / =k= should move by visual line
-Config uses =evil-next-visual-line= with =display-line-numbers-type 'visual=.
-zemacs moves by buffer line. Felt immediately once wrapping is on. Line
-numbers must count visual lines too, so "relative" means relative *visual*.
+** DONE =j= / =k= move by visual line
+A visual line is a *renderer* fact and =j= is a *core* one, so the channel is the
+one =viewport_lines= already established: the renderer parks =wrap_cols= — cells of
+text a window has across, gutter taken out — on each =Window= and on the =Editor=
+every frame, and core does the row arithmetic itself. =0= means nothing has drawn
+yet, which is every headless test, so they all still move by buffer line.
 
-** TODO Free the Option key for unicode
+Both sides lay a line out with the *same* function: =crates/core/src/display.rs=
+(=expand_line=, =visual_col=, =char_cells=) moved out of the renderer so that a =j=
+that computed cells differently could not put the cursor where the block is not
+drawn. =desired_col= holds a *cell* column during a visual run — on CJK the two
+units differ by a factor of two — and a run down and back up through wrapped and
+unwrapped lines returns to the same character.
+
+Relative line numbers count visual rows (=display-line-numbers-type 'visual=): a
+number on every row rather than one per buffer line, the cursor's own row keeping
+its absolute number. They were declared in =Settings= and never drawn at all
+before this.
+
+Left open: with an *operator* pending, =dj= is still two whole buffer lines, which
+is what vim does and what the tests assert — Emacs' =evil-next-visual-line= is an
+exclusive motion and adopting that changes what =dj= means. And a =display= overlay
+is not applied when core lays a line out, so =j= down a line carrying one can land
+a character off.
+
+** DONE Free the Option key for unicode
 =mac-option-modifier 'none= is set: Option is deliberately kept for composing
-characters. zemacs still treats it as a Meta fallback and eats it. Drop Option
-from the Meta test in =key_from_keydown=.
+characters. Command is now the *only* Meta, and the whole mechanism that
+existed to fight Option went with it — an Alt keydown used to arm
+=swallow_text= so that the =TextInput= macOS composed from the combo was
+dropped, because =M--= had already been dispatched and – would otherwise have
+been inserted on top of it. With Option out of the Meta test that text is
+exactly what was being asked for, so it is inserted like any other. ⌥- is –,
+⌥= is ≠, ⌥u then u is ü, and in a modal mode — where there is no text input to
+compose into — Option is simply ignored and the key is the key.
 
 ** TODO =C-d= is unbound in the config, half-page scroll here
 
@@ -138,16 +235,47 @@ The cursor follows the match on every keystroke, a pattern that stops matching
 falls back to the origin, Escape restores it and RET commits where the preview
 was — not one match further on. =PromptKind::previews= is the flag; the prompt
 already reported its keystrokes, it just had nothing to say about a search.
-** TODO Wide characters
-Every character is assumed one cell (=cell_w= is the advance of =M=). CJK,
-emoji and combining marks misalign cursor and selection. A correctness bug,
-not a feature gap.
+** DONE Wide characters
+=char_cells= (=unicode-width=, already in the tree because =alacritty_terminal=
+measures its grid with it) is now the only thing with an opinion, and it turned
+out to be a *smaller* change than it looked: a character occupying several cells
+is exactly what a tab already was, so =expand_line= gives 漢 and 😀 a glyph cell
+plus a blank continuation cell attributed to the same source character, and a
+combining mark no cell at all. Everything downstream — =visual_col=, the
+selection runs, wrapping, the cursor — was already written against cells and
+needed nothing. The block cursor is as wide as the character under it.
+Chrome measures in cells too, so a CJK candidate no longer overruns its box.
+
+Offsets stay *characters* everywhere they cross into core: =(column)= counts
+characters and a display column is not reachable from Lisp, because nothing in
+Lisp draws. Left open: a wide character straddling the wrap point is cut rather
+than moved down (Emacs moves it), and a control character draws as nothing
+rather than as =^G=.
 ** TODO Backups — config keeps 20 versions, zemacs keeps none
 Auto-save itself is *done*: every modified buffer is copied to
 =~/.config/zemacs/auto-save/#!mangled!path#= every 30 s, the copy is deleted on
 a real save, and opening a file whose copy is newer says so. Numbered backups
 of the previous *saved* version are the separate half, and are still missing.
-** TODO Auto-revert on external change (=global-auto-revert-mode= is on)
+** DONE Auto-revert on external change (=global-auto-revert-mode= is on)
+Polled off =Instant= beside the auto-save timer, at Emacs' own
+=auto-revert-interval= of five seconds — a notification crate is a dependency,
+a thread and a per-platform backend for a question one =stat= answers, and
+Emacs polls for this too. One =stat=; a read only when the stamp moved.
+
+Three things it will not do. A *modified* buffer is never reverted — it says
+so once per external change and leaves your text alone. A =:w= does not revert
+the buffer that wrote the file, because the text is compared and not just the
+timestamp (which also makes a bare =touch= a no-op). And point is restored by
+*line and column* rather than by offset, so text inserted above the cursor does
+not drag it off the line you were reading.
+
+ponytail: the live buffer only — every mutator core exposes goes through
+=editor.buffer=, so a background buffer reverts within five seconds of you
+switching to it rather than before. The upgrade is an
+=EditorCommand::Revert(BufferId)=. Saving *over* a file that changed underneath
+is still allowed and still silent; that is Emacs' "has changed since visited;
+save anyway?" and it belongs with the confirmation flow the destructive git
+verbs are waiting on.
 ** TODO =M-x= with arguments — it calls =(name)= and so offers zero-arg only
 ** TODO Confirmation before destructive git verbs
 =rebase-abort=, =reset --hard=, =discard=, =stash drop=, =branch -D= are all
@@ -165,9 +293,37 @@ linearly scanned =Vec=, and one per hit is exactly what that was sized against.
 =runtime/modes/which-key.lisp=, off =(key-bindings)= — a reader, so there is no
 shadow keymap to go stale. The one thing Lisp could not see was *that a prefix
 is pending*, which is three lines in =normal_key= handing the sequence over as
-=(which-key "SPC f")=, guarded by =fboundp=. One status line rather than a panel:
-a real popup wants overlays, and this function is the only thing that changes
-when it gets one.
+=(which-key "SPC f")=, guarded by =fboundp=.
+
+*A real panel*, not a status line — a grid above the status strip, drawn by
+=draw_which_key= beside the completion popup it is a sibling of. The docstring
+here used to say a panel "wants overlays" and that was wrong twice over: an
+overlay anchors to a range of *buffer text* and moves when you type in front of
+it, and this describes the keyboard rather than the document. A prompt is the
+other tempting answer and is worse — it would swallow the next keystroke, which
+is the one which-key exists to help you aim.
+
+So it is =Editor::which_key=, a =Vec<String>= filed beside =ace= because it is the
+same kind of thing: a label drawn over the frame. Lisp fills it a row at a time
+(=(which-key-row "f +file")=, no argument to clear), core *empties* it — one
+question, =handle_key= asking "is anything still pending?", which is right for a
+binding that fired, an =Esc=, and a key that turned out not to be a prefix alike.
+=which-key= is the only Lisp function that changed, and it still writes the same
+status line so a window too short for a panel loses nothing.
+
+*It was silent in the buffer the editor starts in.* Core learned to layer dired,
+magit and the dashboard *over* Normal — so =SPC= in a listing reaches the leader
+map and the editor waits for the rest of the sequence — and asked which-key about
+the pending prefix there. which-key looked only in =(evil-state)='s own map, found
+no row whose keymap was ="dashboard"=, and =(when rows ...)= made that silence
+rather than an empty box. A one-integer fix in the wrong place would have been a
+shadow copy of core's precedence rule, so it is a *reader* instead:
+=(evil-keymaps)= answers the maps the next key will actually be looked up in, and
+=%which-key-maps= uses it. =crates/lisp/tests/which_key.rs= drives the whole chain
+against the *shipped* =init.lisp= — core's arm, the app's dispatch, the =fboundp=
+guard, the message reaching the modeline, the rows reaching the panel and core
+retiring it again — in Normal and in all three layered modes, because every link
+had a test and the feature was still dead.
 ** TODO corfu — in-buffer completion popup
 ** TODO orderless — space-separated matching
 The filter is subsequence-only, so =fn main= matches nothing useful.
@@ -178,52 +334,210 @@ unrecognised one as =(candidate)=), so the annotation rides inside a =#| |#=
 block comment, which reads as nothing. =register-command= is wrapped in
 =which-key.lisp= to add it, so every route into the list is covered at once.
 ** TODO embark — act on the thing under point, or under a candidate
-** TODO Code folding (treesit-fold)
+** DONE Code folding, org headline cycling included
+The hole this file has been describing for months, and it turned out to be a
+*fifth overlay property* rather than a mechanism of its own: =fold=. Every other
+property swaps cells for other cells; this one makes rows stop existing. The
+lines after the overlay's first, up to its end, are skipped by the renderer and
+stepped over by =j= and =k= — *one* predicate, =fold_hiding=, answers for both,
+because a line the frame does not draw and a line the cursor may land on have to
+be the same set or point vanishes. =clamp_cursor= is the backstop behind it, so a
+fold made *around* point puts point back on the head line.
+
+Being an overlay is most of what makes it cheap: a fold slides when you type
+above it, dies with the text it covered, comes off with =delete-overlay=, and
+undo clamps it back into the document — all of it machinery that already
+existed and is already tested.
+
+The head line stays drawn and gets a =…= after its own text. =visible_lines=
+counts a folded line as a *line* costing no *row*, which is what lets =scroll=
+step over a fold rather than stopping at it.
+
+*And Rust has no idea what a subtree is.* The mechanism is five Lisp functions
+(=fold-region=, =folds-in=, =folded-p=, =unfold-region=, =unfold-all=) beside the
+other overlay helpers; the policy is =runtime/modes/org-fold.lisp=, which knows
+that an org headline is stars at column 0 followed by a space and that a subtree
+runs to the next headline of the same or shallower level. =z a= toggles, =z M=
+folds all, =z R= opens all, and teaching another mode to fold is one entry in
+=*fold-subtree-functions*= and one function — the worked example for a =defun= is
+in =docs/reference.org=.
+
+=crates/lisp/tests/fold.rs= drives all five links against the shipped
+=init.lisp=: the Lisp range, the overlay, the =%do=, core hiding the lines, and
+=j= stepping over them.
+
+Left open: two-state rather than org's three (opening a headline opens
+everything under it), and =Window::scroll= is still a buffer line, so scrolling
+onto a folded line lands on the first drawn one after it.
+** TODO treesit-fold — fold by tree-sitter node rather than by indentation
+The Rust hole is done and so is the org policy; what is missing is a *reader*
+answering the syntax node at point, which is one arm of =query.rs= over the tree
+=crates/syntax= already has. Then =(push (cons "rust-mode" 'treesit-node-at-point)
+*fold-subtree-functions*)= and there is nothing else to write.
 ** TODO org-roam (+ org-roam-ui)
-** TODO org-modern bullets
-Parsing is *done* in =crates/syntax= (=bullets()=, level and marker range) and
-the substitution is *done* (=(overlay-put ov 'display "◉")=). What is left is a
-reader for =bullets()= beside =latex-fragments= — same argument, same file — and
-about ten lines of Lisp in an =org-mode-hook=.
-** TODO org-appear — reveal markup under the cursor
-Overlays do the hiding; what is missing is a hook on cursor movement, which
-the editor still reports nothing for.
-** TODO parinfer-style structural Lisp editing
-Not parinfer, but the ground under it is laid: =runtime/modes/lisp-mode.lisp=
-classifies every character once (code / string / comment / quoted), which is
-what =#\\(= and =";)"= need, and =forward-sexp=, =backward-sexp=, =match-paren=,
-=kill-sexp=, forward slurp and forward barf are built on it. Parinfer proper is
-the *inverse* — indentation driving the parens — and wants a hook on every
-edit, which the editor still reports nothing for.
+** DONE org-modern bullets
+=runtime/modes/org-modern.lisp=, a minor mode on =display= overlays. Heading
+stars become =◉ ○ ✸ ✿ ❀ ✜= padded to the width they replace, so the heading text
+does not move; =-= and =+= become =• ◦=; =[ ] [X] [-]= become =☐ ☑ ☒=;
+=[[a][b]]= becomes =b= in the link face; and an emphasis run is covered *whole*
+so =*bold*= draws as bold text with no asterisks. Every table is a
+=defparameter=. A source block is skipped, =2 * 3= is not emphasis and a URL's
+slashes are not italics — the same three exclusions =org.rs= makes.
+
+Turning it off removes exactly its own overlays: the mark is a Lisp-side
+=:org-modern= property holding the *kind*, which is both "this one is mine" and
+everything needed to draw it again. =org-latex-preview='s images survive it.
+=org-mode= is re-declared with a body, so opening a =.org= file is the whole
+installation.
+
+*What is not done: the reader.* =bullets()= is still not reachable from the
+image — no arm in =query.rs=, no name in =QUERIES_FORM= — so the classification
+is repeated in Lisp, line by line, and can drift from the highlighter's. It is
+~90 lines that an =org-bullets= reader beside =latex-fragments= would delete.
+The Lisp scan is once per *command*, not per keystroke, so it is affordable;
+the argument for the reader is agreement, not speed.
+** DONE org-appear — reveal markup under the cursor
+In the same file, and it turned out to be a dozen lines: at most one overlay is
+revealed at a time, so the whole job is =overlays-at (point)= and, when that is
+not the one already revealed, two =overlay-put=s. Re-hiding *re-reads the text
+underneath* and renders it again rather than restoring a string saved when the
+overlay was made — which is what lets you edit inside a revealed fragment and
+still get the right glyph back.
+
+*The ceiling is unchanged and is the one you feel.* There is still no
+cursor-movement hook, so this runs off =after-change-hook=: markup is revealed
+as you *type* and not as you *navigate*. In Normal mode =j= and =w= change
+nothing, so the asterisks around the word you just moved onto appear when you
+press =i= and type the first character. =SPC m a= asks for it by hand.
+
+The fix is one line in the application, beside the =pending_hooks.push= that
+=after-change-hook= already uses: a =point-moved-hook= queued when the cursor
+offset moves. Nothing in Lisp would change but the name in the =pushnew=.
+Rebinding the motion keys to Lisp wrappers is the other way and is the wrong
+one — it reimplements counts, operators and the desired column in the image to
+buy a hook.
+** DONE parinfer-style structural Lisp editing — indent mode
+=runtime/modes/parinfer.lisp=, and it adds no scanner: =%lisp-classes= already
+says which =)= is structure, and =%line-starts=, =%line-of=,
+=%lisp-verbatim-p= and =%toplevel-form= are all in =lisp-mode.lisp= already.
+
+*Indent mode*, which is the part people use: every closing parenthesis a line
+trails is thrown away and re-emitted where the next line's indentation puts it.
+A no-op on code that already agrees — it reports "already agrees" and does not
+write, so no undo step and no =after-change-hook=. =parinfer-indent-defun=
+(=SPC m p=), =parinfer-indent-buffer= (=SPC m P=), and the two that make it feel
+like parinfer rather than a formatter: =parinfer-shift-right= / =-left= (=M-]= /
+=M-[=) move the line by =tab-width= and let the parentheses follow, in *one*
+=replace-region= so there is no window in which the form is unbalanced.
+
+It refuses on a closing parenthesis with nothing open, because that means the
+scan and the reader disagree and moving parens on a disagreement is how a
+structural editor eats a file. A trailing surplus one is absorbed instead —
+that is parinfer's bargain, and it is written down.
+
+*What is not done: paren mode and smart mode.* Paren mode is
+=lisp-indent-defun= plus a paren-trail tracker that must preserve edits made
+inside the trail; smart mode needs to know *what changed*, which is exactly the
+delta =after-change-hook= does not carry. Half-building either gives a command
+that reformats correctly nine times and eats a form on the tenth.
+
+*And it is a command rather than a per-edit hook, deliberately.* Four reasons,
+the last decisive: the hook carries no delta, so every keystroke would mean a
+full rescan to find out whether an indentation moved; the rewrite is itself a
+change and re-fires the hook; the rewrite is one =replace-region= over a whole
+form, so undo would take back a paragraph per keystroke; and Lisp here is *not
+synchronous with the command loop*, so the rewrite lands a queue turn after the
+keystroke that provoked it and would silently discard whatever you typed in
+between. Emacs' parinfer is safe from the last one only because elisp freezes
+the editor while it runs, and that trade is the whole reason zemacs is not
+elisp.
 ** TODO jinx — spell checking
 ** TODO jupyter
 ** TODO A git-based package manager
 ** TODO A server/daemon architecture (=emacsclient=)
 Config runs Emacs as a daemon, including two macOS workarounds: SIGUSR1
 unwinding and a parked 1×1 frame for bug#18705.
-** TODO A =*Messages*= buffer — the log exists (capped at 500), nothing shows it
+** DONE A =*Messages*= buffer
+Five lines of Lisp in =runtime/init.lisp=, over =create-buffer= and the
+=(messages)= reader that already existed, with *nothing* in Rust behind it —
+which is the whole argument for having spent the effort on ~CreateBuffer~
+rather than on a =*Messages*= command. Bound to =SPC h m=, and in =M-x= for
+free because it is a zero-argument function in the package.
+Rewritten from the log each time you ask rather than appended to, which is the
+same thing to look at and one form to write. Not done: it is an ordinary
+buffer, so it can be typed into, and the typing goes when you ask again.
 
 * NEW ~EditorCommand~ VARIANTS THE LISP API NEEDS
 Found by auditing what is reachable from the image. Each is genuinely
 impossible today, not merely awkward — the API agent could not add them
 because the enum lives in ~crates/core/src/lib.rs~.
 
-** TODO ~CreateBuffer~ — a buffer with no file behind it
-Only ~OpenFile~ makes one; ~show_special~ is a method, not a command.
-** TODO ~KillBuffer~
-** TODO A prompt whose answer comes *back* to Lisp
-Every ~PromptKind~ has its destination fixed in core, so there is no
-~read-string~ / ~completing-read~ — which is what most interactive commands
-in a real config are built out of. Probably the most valuable of these.
+All of them are closed, and the shape of the answer is the point: *six =%do=
+verbs and two accessors*, no new C primitive and nothing in ~shim.c~ but Lisp.
+What looked like "the enum has to grow" was, every time, one arm of
+~command_for~ and one arm of ~Editor::apply~.
+
+** DONE ~CreateBuffer~ — a buffer with no file behind it
+~(create-buffer name &optional language)~. Idempotent by name — a second call
+shows the buffer rather than stacking a copy — and applied *on the spot*
+unlike ~find-file~, so the very next form writes into the buffer it just made.
+What it makes is an *ordinary* buffer: writable, no path, never saved. The
+generated kinds (dashboard, magit, dired, terminal) stay the editor's.
+~(set-language "lisp")~ is the missing writer beside ~set-major-mode~, so a
+created buffer can be coloured — without it every Lisp-made buffer would have
+been condemned to plain text, which is a new ceiling for the sake of one arm.
+Not done: no per-buffer read-only flag, so ~*Messages*~ can be typed into.
+** DONE ~KillBuffer~
+~(kill-buffer &optional name)~ — the live one with no argument. The last
+buffer is refused, as in Emacs; every window showing the killed buffer, in any
+frame, follows the live one. Never asks: confirming is policy, policy is
+Lisp's, and ~(buffer-modified-p)~ is right there.
+** DONE A prompt whose answer comes *back* to Lisp
+~(read-string label callback)~ and ~(completing-read label candidates
+callback)~. A *continuation*, not a blocking read, and it had to be: the Lisp
+thread evaluates one queued form at a time, so a primitive that waited on a
+keystroke would stop the whole image until the question was answered — the
+elisp behaviour ~docs/threading.org~ exists to avoid.
+
+The route is the one ~rpc-request~ already uses, deliberately rather than as a
+second mechanism: the closure is parked in ~*prompt-continuations*~ under an
+id, the id rides into core inside the command, and accepting *or cancelling*
+makes core emit ~CallLisp~ of ~(%prompt-reply ID ANSWER)~. Cancelling replies
+NIL rather than staying silent, so a callback is always called exactly once.
+
+The candidates arrive one ~%do~ at a time, because the write envelope carries
+a single string — which is also why the prompt kind carries a ~completing~
+flag rather than deriving it from a list that has not arrived yet.
 ** DONE Read the unnamed register (~Editor::register~ is private, no accessor)
 =(register)= answers =(TEXT . LINEWISE-P)=, or NIL when it is empty. One reader
 and one accessor — the accessor existed anyway once the clipboard needed to
 mirror the register, so this closed itself.
-** TODO ~TermKey~ from Lisp — ~Key~ has no string spelling to send
-** TODO Call a built-in verb by name — ~run_action~ is private, so Lisp can
-   *bind* ~"magit-status"~ but not *call* it
-** TODO Group N edits into one undo step — every mutator checkpoints, and
-   there is no "begin group"
+** DONE ~TermKey~ from Lisp — ~Key~ had no string spelling to send
+~(term-send-key "C-c")~, over ~Key::from_token~ — the exact inverse of the
+~Key::token~ that ~(key-bindings)~ already reports, so the string read out of
+a binding is the string that can be sent. One vocabulary, both directions, and
+one token rather than a sequence: ~"g d"~ is ~normalize_keys~' business.
+** DONE Call a built-in verb by name
+~(call-command "magit-status")~. ~run_action~ is ~pub~ and answers a *batch* —
+some of which may need the app layer — so the verb is resolved in ~rs_do~
+beside ~paste~'s checkpoint rather than in ~command_for~, which can only
+answer one command. The lock is released before anything is emitted, so a
+built-in verb that needs the app goes down the same channel ~(magit "status")~
+does. Same resolution as a key binding, so the two cannot drift.
+** DONE Group N edits into one undo step — *closed by argument, not by a
+   feature*
+Deliberately not built. The checkpoint is *inside* each mutator, so "begin a
+group" is either a flag the mutators consult — left set forever the first time
+a Lisp error escapes between begin and end, and an editor that has quietly
+stopped recording undo is a worse failure than N undo steps — or a nesting
+counter with the same hazard plus ~unwind-protect~ discipline everywhere.
+
+And it would not buy what it looks like it buys: grouping makes N edits *undo*
+together and does nothing about the gap between them, so a keystroke can still
+land in the middle of a half-finished edit. The thing that fixes both already
+exists — build the whole text in Lisp and apply it with one ~replace-region~,
+which is one lock, one undo step and no gap. ~replace-all~ is exactly that.
+The table in ~docs/threading.org~ is the documentation this row wanted.
 
 * WIRING — built but not connected
 ** TODO TRAMP into =find-file= / =save-file= / dired
@@ -234,7 +548,31 @@ Library has =plan_last=/=plan_onto= (rebase todo composition), branch
 create/checkout/delete, cherry-pick, revert, reset variants, hunk discard.
 Only a subset is bound: the rest wants a todo-editing buffer and confirmation
 flows first.
-** TODO Project: =project-find-dir=, project-wide replace
+** DONE Project: =project-find-dir=, and a picker that reaches the filesystem
+The complaint was "there is no select project where I can look at the entire
+filesystem", and it was right: =project-switch= could only offer roots you had
+*visited* and =project-find-file= is scoped to one of them, so a project you
+had never opened was unreachable from the one keymap anybody looks in.
+
+=project-open= (=SPC p o=) is the ordinary file prompt seeded at =~/=: the app
+already completes it a directory at a time, so typing or Tab descends and a
+leading =/= starts again from the root. Two smaller things make it a *project*
+picker rather than just find-file — opening any directory now records it as a
+project, so browsing to a repository puts it in the =SPC p p= list instead of
+requiring you to already be in it; and =switch= with no history hands over to
+it rather than dead-ending on "open a file in one first".
+
+Hidden entries are now offered exactly when you have typed a leading dot, which
+is what makes =~/.config= reachable at all. That turned up a bug the whole time
+it has existed: a directory entry carries a trailing =/=, so the dotfile filter
+was testing an empty last component and hidden *directories* were always shown.
+
+=project-find-dir= (=SPC p D=) is the cached file list folded up to its
+directories — one pass over something already walked.
+
+Still open: project-wide replace.
+
+** TODO Project: project-wide replace
 
 * PERFORMANCE
 ** TODO Incremental tree-sitter parsing

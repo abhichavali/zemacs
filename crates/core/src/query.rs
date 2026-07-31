@@ -91,6 +91,16 @@ pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
         "major-mode" => string(&buf.major_mode),
         "minor-modes" => list(buf.minor_modes.iter().map(|m| string(m))),
         "evil-state" => string(state_name(ed.mode)),
+        // The keymaps the *next* key will be looked up in, nearest first —
+        // `Editor::keymaps` spelled as a list, and usually just `(evil-state)`.
+        //
+        // It is more than that exactly where dired, magit and the dashboard
+        // *layer over* Normal: `SPC` in a listing reaches the leader map, so
+        // anything reasoning about what a key will do there has to know that
+        // Normal is still in reach. which-key is the reason this exists — it
+        // was asked about a pending prefix on the dashboard, looked only in the
+        // dashboard's own map, found nothing, and said nothing.
+        "evil-keymaps" => list(ed.keymaps().map(|m| string(state_name(m)))),
 
         // `(BEG . END)`, or NIL with no selection — so `(when (region) ...)`
         // reads the way `(when (use-region-p) ...)` does in Emacs.
@@ -251,6 +261,13 @@ fn string(s: &str) -> String {
     out
 }
 
+/// lisp-api: the same escaping, for a caller outside this module. `evil.rs` has
+/// to spell a prompt's answer as source before handing it to the image, and
+/// there is no second right way to write a Lisp string literal.
+pub(crate) fn lisp_string(s: &str) -> String {
+    string(s)
+}
+
 fn boolean(b: bool) -> String {
     if b { "t" } else { "nil" }.into()
 }
@@ -329,6 +346,22 @@ mod tests {
         // ...and a newline needs no escape in a Lisp string literal
         let ed = editor("a\nb");
         assert_eq!(q(&ed, "buffer-string"), "\"a\nb\"");
+    }
+
+    /// which-key's bug in one assertion: on the dashboard the leader map is
+    /// still in reach, so anything asking "what will the next key do here" has
+    /// to be told about Normal as well as about the mode's own map.
+    #[test]
+    fn a_layered_mode_reports_normal_as_a_keymap_too() {
+        let mut ed = editor("x");
+        ed.apply(EditorCommand::SetMode(Mode::Normal));
+        assert_eq!(q(&ed, "evil-keymaps"), r#"("normal")"#);
+        ed.apply(EditorCommand::SetMode(Mode::Dashboard));
+        assert_eq!(q(&ed, "evil-keymaps"), r#"("dashboard" "normal")"#);
+        // Insert and the visual modes replace Normal rather than layering over
+        // it, so they answer only for themselves.
+        ed.apply(EditorCommand::SetMode(Mode::Visual));
+        assert_eq!(q(&ed, "evil-keymaps"), r#"("visual")"#);
     }
 
     #[test]

@@ -222,6 +222,10 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "search-line",
     "search-project",
     "project-find-file",
+    // Added with the filesystem-wide picker: `open` types a path to any
+    // directory at all, `find-dir` picks one inside the current project.
+    "project-open",
+    "project-find-dir",
     "project-switch",
     "project-dired",
     "project-compile",
@@ -244,7 +248,27 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
 
 impl Editor {
     /// Translate one key into zero or more commands.
+    ///
+    /// A wrapper around [`Editor::dispatch_key`] for one reason: the which-key
+    /// panel is a picture of a *half-typed sequence*, so it has to be retired
+    /// when the sequence is, and the sequence can end at a dozen places inside
+    /// the dispatch. Asking afterwards — "is anything still pending?" — is one
+    /// site instead of a dozen, and it is the right question at every one of
+    /// them: a binding that fired, an `Esc`, a key that was not a prefix after
+    /// all, all leave `pending.keys` empty.
+    ///
+    /// Only ever *emptied* here. A key that lengthens a sequence leaves the old
+    /// rows up until the image sends the new ones, which is what stops the panel
+    /// blinking once per keystroke on the Lisp round trip.
     pub fn handle_key(&mut self, key: Key) -> Vec<EditorCommand> {
+        let cmds = self.dispatch_key(key);
+        if self.pending.keys.is_empty() {
+            self.which_key.clear();
+        }
+        cmds
+    }
+
+    fn dispatch_key(&mut self, key: Key) -> Vec<EditorCommand> {
         // `q` ends a recording, and is the one key a macro must never contain —
         // replaying it would start a recording over the top of itself. Checked
         // before anything else looks at the key, and only where `q` could have
@@ -512,7 +536,17 @@ impl Editor {
 
         // A run of `j`/`k` remembers the column it started from; anything else
         // is a new horizontal position and forgets it.
-        let (_, col_now) = self.buffer.cursor_line_col();
+        //
+        // The *unit* follows the motion: a visual run holds a cell column,
+        // because "the same place on the row below" is a grid position once one
+        // buffer line can be several rows. One field rather than two, since any
+        // key that is not `j`/`k` clears it — a run cannot straddle the two, and
+        // the only way to change which unit is in force is to resize the window
+        // mid-run, which costs one keystroke of drift.
+        let col_now = match self.visual_lines() {
+            true => self.cursor_vcol(),
+            false => self.buffer.cursor_line_col().1,
+        };
         if matches!(seq, "j" | "k" | "<down>" | "<up>") {
             self.desired_col.get_or_insert(col_now);
         } else {
@@ -735,7 +769,7 @@ impl Editor {
     /// which *layer over* Normal: their own binding wins, and anything they do
     /// not claim falls through, so `M-x` and the leader key work in a listing
     /// exactly as they do in a file.
-    fn keymaps(&self) -> impl Iterator<Item = Mode> {
+    pub(crate) fn keymaps(&self) -> impl Iterator<Item = Mode> {
         std::iter::once(self.mode).chain(self.mode.layers_over_normal().then_some(Mode::Normal))
     }
 
@@ -771,6 +805,68 @@ impl Editor {
         self.desired_col.unwrap_or(col)
     }
 
+    /// One buffer line down (`down`) or up from `line`, stepping *over* every
+    /// line a fold is hiding.
+    ///
+    /// This is the whole of folding as far as the command loop is concerned. The
+    /// renderer does not draw a hidden line, so `j` must not land on one either
+    /// — a cursor on a row that is not drawn is a cursor nobody can see, and the
+    /// next keystroke would edit text nobody can see. One predicate,
+    /// [`zemacs_core::fold_hiding`](crate::fold_hiding), answers for both sides.
+    ///
+    /// Answers `line` itself when there is no visible line that way: the end of
+    /// the document, and equally a fold that runs to it. `j` on the last line
+    /// already stays put, so a fold reaching the end behaves the same.
+    ///
+    /// Free on a buffer with no overlays, which is nearly all of them — the
+    /// predicate is a scan of an empty slice.
+    pub(crate) fn step_line(&self, line: usize, down: bool) -> usize {
+        let buf = &self.buffer;
+        let mut l = line;
+        loop {
+            l = match (down, l) {
+                (true, l) if l + 1 < buf.len_lines() => l + 1,
+                (false, l) if l > 0 => l - 1,
+                _ => return line,
+            };
+            if crate::fold_hiding(buf.overlays(), buf.line_start(l)).is_none() {
+                return l;
+            }
+        }
+    }
+
+    /// `j` and `k`, by **visual** line when the window wraps — the config's
+    /// `evil-next-visual-line` — and by buffer line otherwise.
+    ///
+    /// Which one is in force is decided by the window, not by the key: with
+    /// truncation on, or before anything has drawn, every buffer line is exactly
+    /// one row and the two answers are identical.
+    ///
+    /// ponytail: an operator still gets the buffer-line target, so `dj` deletes
+    /// two whole lines even on a wrapped one — which is what vim does and what
+    /// every test here asserts. Emacs' `evil-next-visual-line` is an *exclusive*
+    /// motion and would instead delete to the same column one row down; adopting
+    /// that means changing this `Span` as well as this target, and it changes
+    /// what `dj` means, which is a much louder change than the cursor moving.
+    fn vertical(&self, down: bool, n: usize) -> Motion {
+        let buf = &self.buffer;
+        let (line, col) = buf.cursor_line_col();
+        let target = match self.pending.op.is_none() && self.visual_lines() {
+            true => self.visual_target(down, n, self.held_col(self.cursor_vcol())),
+            false => {
+                let mut l = line;
+                for _ in 0..n {
+                    l = self.step_line(l, down);
+                }
+                buf.line_start(l) + self.held_col(col).min(buf.line_len(l))
+            }
+        };
+        Motion {
+            target,
+            span: Span::Linewise,
+        }
+    }
+
     fn motion(&self, seq: &str, n: usize) -> Option<Motion> {
         let buf = &self.buffer;
         let (line, col) = buf.cursor_line_col();
@@ -784,31 +880,11 @@ impl Editor {
                 target: (cur + n).min(buf.line_end(line)),
                 span: Span::Exclusive,
             },
-            // Vertical motions keep the column. Targeting the line start would
-            // send `j` to column 0, which is wrong for the cursor and invisible
-            // to an operator (a linewise span only reads the *line*).
-            //
-            // ponytail: the column is taken from where the cursor is now, not
-            // a sticky "desired column", so passing through a short line
-            // forgets how far right you were. Vim remembers; add a
-            // `desired_col` on the editor when that starts to grate.
             // Vertical motions hold the column. Targeting the line start would
             // send `j` to column 0, which is wrong for the cursor and invisible
             // to an operator (a linewise span only reads the *line*).
-            "j" | "<down>" => {
-                let target = (line + n).min(buf.len_lines().saturating_sub(1));
-                Motion {
-                    target: buf.line_start(target) + self.held_col(col).min(buf.line_len(target)),
-                    span: Span::Linewise,
-                }
-            }
-            "k" | "<up>" => {
-                let target = line.saturating_sub(n);
-                Motion {
-                    target: buf.line_start(target) + self.held_col(col).min(buf.line_len(target)),
-                    span: Span::Linewise,
-                }
-            }
+            "j" | "<down>" => self.vertical(true, n),
+            "k" | "<up>" => self.vertical(false, n),
             "0" => Motion {
                 target: buf.line_start(line),
                 span: Span::Exclusive,
@@ -1316,19 +1392,10 @@ impl Editor {
             return vec![];
         };
         match key {
-            Key::Esc | Key::Ctrl('g') => {
-                // A previewing prompt has been dragging the cursor around; put
-                // it back where it started rather than leaving you wherever the
-                // last candidate happened to be.
-                let origin = p.origin;
-                self.prompt = None;
-                return origin.into_iter().map(EditorCommand::MoveTo).collect();
-            }
+            Key::Esc | Key::Ctrl('g') => return self.cancel_prompt(),
             Key::Backspace => {
                 if p.text.pop().is_none() {
-                    let origin = p.origin;
-                    self.prompt = None;
-                    return origin.into_iter().map(EditorCommand::MoveTo).collect();
+                    return self.cancel_prompt();
                 }
                 p.refilter();
             }
@@ -1409,7 +1476,42 @@ impl Editor {
                 Some(hit) => vec![EditorCommand::OpenAt(hit.to_string())],
                 None => vec![],
             },
+            // lisp-api: the one kind whose destination is not fixed here. The
+            // answer goes back to the image as a call, which is the *only* way
+            // core can reach Lisp — and it is a continuation rather than a
+            // return value because the Lisp thread must never sit waiting on the
+            // user. See `docs/threading.org`.
+            //
+            // `value()`, so a highlighted candidate wins over the raw text and a
+            // `completing-read` with nothing matching still answers what was
+            // typed — Emacs' `require-match nil`, which is the useful default.
+            PromptKind::Lisp { id, .. } => vec![EditorCommand::CallLisp(format!(
+                "(%prompt-reply {id} {})",
+                crate::query::lisp_string(&p.value())
+            ))],
         }
+    }
+
+    /// lisp-api: drop the prompt without an answer — Escape, `C-g`, or
+    /// backspacing past the start of an empty one.
+    ///
+    /// A previewing prompt has been dragging the cursor around, so it goes back
+    /// where it started rather than being left wherever the last candidate was.
+    /// A *Lisp* prompt has to be told as well: its continuation is parked in a
+    /// table in the image, and a cancel that said nothing would leave the
+    /// closure there forever and the caller waiting for a call that never comes.
+    /// `NIL` is the answer, which is what `(when answer ...)` in a handler reads
+    /// as "the user backed out".
+    fn cancel_prompt(&mut self) -> Vec<EditorCommand> {
+        let Some(p) = self.prompt.take() else {
+            return vec![];
+        };
+        let mut out: Vec<EditorCommand> =
+            p.origin.into_iter().map(EditorCommand::MoveTo).collect();
+        if let PromptKind::Lisp { id, .. } = p.kind {
+            out.push(EditorCommand::CallLisp(format!("(%prompt-reply {id} nil)")));
+        }
+        out
     }
 
     /// Move the cursor to the highlighted line while the prompt is still open —
@@ -1491,6 +1593,12 @@ impl Editor {
                     .collect();
                 ("Line: ", items)
             }
+            // lisp-api: not opened here. Its label comes from Lisp and its
+            // candidates arrive afterwards, so it is a command
+            // (`ReadFromMinibuffer`) rather than a kind this function can build.
+            // Reaching this arm means `(open-prompt "...")` was handed a kind
+            // only `read-string` can make, which the shim refuses by name.
+            PromptKind::Lisp { .. } => ("", Vec::new()),
         };
         let mut prompt = Prompt::new(kind, label, items);
         prompt.origin = kind.previews().then_some(self.buffer.cursor);
@@ -1731,7 +1839,12 @@ impl Editor {
     /// Mode-neutral by design — a key bound in Visual mode must not silently
     /// drop you into Normal. The dashboard leaves itself via the commands that
     /// load a buffer (`config`, `open:`) or via `scratch`.
-    fn run_action(&mut self, action: &str) -> Vec<EditorCommand> {
+    ///
+    /// lisp-api: `pub`, so the image can *call* a name it can already *bind*.
+    /// It answers a batch rather than one command — and some of that batch may
+    /// need the app layer — which is why the Lisp side of it lives in `rs_do`
+    /// beside `paste` rather than being an arm of `command_for`.
+    pub fn run_action(&mut self, action: &str) -> Vec<EditorCommand> {
         match action {
             "quit" => vec![EditorCommand::Quit],
             "scratch" => vec![EditorCommand::SetMode(Mode::Normal)],
@@ -2730,6 +2843,168 @@ mod tests {
         let mut del = fresh("aaa\nbbb\nccc");
         feed(&mut del, &keys("ldj"));
         assert_eq!(del.buffer.text.to_string(), "ccc");
+    }
+
+    // --- folding ----------------------------------------------------------
+
+    /// `ed` with `[start, end)` folded, the way `(fold-region ...)` does it.
+    fn folded(ed: &mut Editor, start: usize, end: usize) {
+        let id = ed.make_overlay(start, end);
+        ed.apply(EditorCommand::Overlay(crate::OverlayEdit::Fold(id, true)));
+    }
+
+    /// A folded line does not occupy a row, and the *whole* consequence of that
+    /// for the command loop is that `j` must not land on one — a cursor on a row
+    /// the renderer skipped is a cursor nobody can see.
+    #[test]
+    fn j_and_k_step_over_a_folded_line() {
+        // "* one\nbody\nmore\n* two", line starts 0, 6, 11, 16.
+        let mut ed = fresh("* one\nbody\nmore\n* two");
+        folded(&mut ed, 0, 15); // the heading's line stays; its body goes
+        feed(&mut ed, &keys("j"));
+        assert_eq!(ed.buffer.cursor_line_col(), (3, 0), "over both hidden lines");
+        feed(&mut ed, &keys("k"));
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 0), "and back over them");
+        // A count steps in visible lines, since that is what is on screen.
+        let mut two = fresh("a\nb\nc\nd\ne");
+        folded(&mut two, 0, 3); // hides "b"
+        feed(&mut two, &keys("2j"));
+        assert_eq!(two.buffer.cursor_line_col(), (3, 0));
+
+        // A fold running to the end of the document leaves `j` where it is,
+        // exactly as `j` on the last line already does.
+        let mut tail = fresh("a\nb\nc");
+        folded(&mut tail, 0, 5);
+        feed(&mut tail, &keys("jjj"));
+        assert_eq!(tail.buffer.cursor_line_col(), (0, 0));
+
+        // `dj` over a closed fold takes the whole fold with it, which is vim's
+        // answer too: the motion is linewise and its target is past the fold.
+        let mut del = fresh("* one\nbody\nmore\n* two");
+        folded(&mut del, 0, 15);
+        feed(&mut del, &keys("dj"));
+        assert_eq!(del.buffer.text.to_string(), "");
+    }
+
+    /// The backstop behind the motion: whatever puts point inside a fold — a
+    /// fold made around it, an undo, a Lisp `goto-char` — it comes back out onto
+    /// the line that is still drawn.
+    #[test]
+    fn a_fold_made_around_point_puts_it_on_the_head_line() {
+        let mut ed = fresh("* one\nbody\nmore\n* two");
+        feed(&mut ed, &keys("jj"));
+        assert_eq!(ed.buffer.cursor_line_col(), (2, 0));
+        folded(&mut ed, 0, 15);
+        // `apply` ran `clamp_cursor`, which is where the escape lives.
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 0));
+    }
+
+    // --- visual lines -----------------------------------------------------
+
+    /// A window ten cells wide with wrapping on, which is all it takes for core
+    /// to start counting rows instead of lines: `wrap_cols` is what the renderer
+    /// parks there every frame.
+    fn wrapped(text: &str, cols: usize) -> Editor {
+        let mut ed = fresh(text);
+        ed.settings.line_overflow = LineOverflow::Wrap;
+        ed.wrap_cols = cols;
+        ed
+    }
+
+    /// The config's `evil-next-visual-line`: `j` in the middle of a long line
+    /// lands on the row below, not on the next paragraph.
+    #[test]
+    fn j_and_k_move_by_visual_line_when_the_window_wraps() {
+        // Line 0 is 25 cells, so in a 10-cell window it is three rows:
+        // "0123456789" | "abcdefghij" | "ABCDE". Line 1 is one row.
+        let mut ed = wrapped("0123456789abcdefghijABCDE\nzz", 10);
+        feed(&mut ed, &keys("lll"));
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 3));
+        // Same buffer line, one row down: character 13, not the line below.
+        feed(&mut ed, &keys("j"));
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 13));
+        feed(&mut ed, &keys("j"));
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 23));
+        // Off the end of the last row and onto the next buffer line, which is
+        // short — so the column clamps to it, and then the Normal-mode clamp
+        // pulls it onto the last character rather than past it.
+        feed(&mut ed, &keys("j"));
+        assert_eq!(ed.buffer.cursor_line_col(), (1, 1));
+        // Nothing below: `j` stops rather than wrapping or panicking.
+        feed(&mut ed, &keys("jjj"));
+        assert_eq!(ed.buffer.cursor_line_col(), (1, 1));
+    }
+
+    /// The whole point of a held column, in the unit visual motion works in: a
+    /// run down and back up through rows of different lengths must end on the
+    /// character it started on.
+    #[test]
+    fn a_run_down_and_back_up_through_a_wrapped_line_returns_to_the_same_character() {
+        // Row layout in a 10-cell window:
+        //   line 0: "0123456789" | "abcd"   (a short second row)
+        //   line 1: "xy"                    (a short line)
+        //   line 2: "0123456789" | "ABCDEFG"
+        let mut ed = wrapped("0123456789abcd\nxy\n0123456789ABCDEFG", 10);
+        feed(&mut ed, &keys("llllll")); // cell column 6 of row 0
+        let start = ed.buffer.cursor;
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 6));
+
+        // Down through a short row and a short line, both of which clamp...
+        feed(&mut ed, &keys("j"));
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 13)); // last cell of "abcd"
+        feed(&mut ed, &keys("j"));
+        assert_eq!(ed.buffer.cursor_line_col(), (1, 1)); // last cell of "xy"
+        feed(&mut ed, &keys("j"));
+        assert_eq!(ed.buffer.cursor_line_col(), (2, 6)); // column 6 again
+        feed(&mut ed, &keys("j"));
+        assert_eq!(ed.buffer.cursor_line_col(), (2, 16));
+
+        // ...and back up to exactly where it started.
+        feed(&mut ed, &keys("kkkk"));
+        assert_eq!(ed.buffer.cursor, start);
+
+        // A horizontal key ends the run, so the next `j` holds the new column.
+        feed(&mut ed, &keys("hj"));
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 13));
+    }
+
+    /// Wide characters and visual lines are the same arithmetic, so a run must
+    /// hold a *cell* column: two CJK characters are one row of four cells, and
+    /// holding the character column would drift left one column per row.
+    #[test]
+    fn a_visual_run_holds_cells_rather_than_characters() {
+        // Four cells wide: "日本" is one full row, "abcd" is another.
+        let mut ed = wrapped("日本語漢\nabcdefgh", 4);
+        feed(&mut ed, &keys("l")); // on 本, cell column 2
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 1));
+        feed(&mut ed, &keys("j"));
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 3), "row 2 of the same line");
+        feed(&mut ed, &keys("j"));
+        // Cell column 2 of "abcd" is 'c' — not character 2 of the CJK line.
+        assert_eq!(ed.buffer.cursor_line_col(), (1, 2));
+        feed(&mut ed, &keys("kk"));
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 1));
+    }
+
+    /// Truncation, and a window nothing has drawn yet, both mean one row per
+    /// line — so every existing motion is untouched, and so is every operator.
+    #[test]
+    fn buffer_lines_are_still_the_rule_without_wrapping() {
+        let mut off = fresh("0123456789abcdefghij\nzz");
+        off.wrap_cols = 10; // drawn, but truncating
+        feed(&mut off, &keys("lllj"));
+        assert_eq!(off.buffer.cursor_line_col(), (1, 1));
+
+        let mut undrawn = fresh("0123456789abcdefghij\nzz");
+        undrawn.settings.line_overflow = LineOverflow::Wrap; // never rendered
+        feed(&mut undrawn, &keys("lllj"));
+        assert_eq!(undrawn.buffer.cursor_line_col(), (1, 1));
+
+        // And an operator keeps buffer-line semantics even where `j` alone
+        // would move one row: `dj` is two whole lines, as in vim.
+        let mut del = wrapped("0123456789abcd\nxy\nzz", 10);
+        feed(&mut del, &keys("dj"));
+        assert_eq!(del.buffer.text.to_string(), "zz");
     }
 
     #[test]

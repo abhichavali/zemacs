@@ -11,6 +11,7 @@
 //! state (command line, pending operator, counts) but never the document.
 
 pub mod dashboard;
+pub mod display;
 pub mod evil;
 pub mod frame;
 pub mod marker;
@@ -28,7 +29,7 @@ pub use dashboard::Dashboard;
 pub use frame::{BufferId, Frame, Rect, Window, WindowId};
 pub use marker::{Insertion, MarkerId};
 pub use minibuffer::{CompletionStyle, Prompt, PromptKind};
-pub use overlay::{Image, ImageId, Overlay, OverlayEdit, OverlayId};
+pub use overlay::{fold_hiding, fold_starts_in, Image, ImageId, Overlay, OverlayEdit, OverlayId};
 
 /// The editor, as the app and the Lisp image both hold it.
 ///
@@ -184,6 +185,51 @@ impl Key {
             Key::Down => "<down>".into(),
         }
     }
+
+    // --- lisp-api: the inverse of `token` -----------------------------------
+
+    /// The key a keymap token names, or `None`. The exact inverse of
+    /// [`Key::token`] for everything `token` can produce.
+    ///
+    /// `token` could always *spell* a key and nothing could read one back, which
+    /// is precisely why [`EditorCommand::TermKey`] was unreachable from Lisp: a
+    /// primitive can carry a string and had no way to turn one into a `Key`.
+    ///
+    /// One token, never a sequence — `"g d"` is two keys and is
+    /// [`normalize_keys`]' business. Case is kept for a plain character (`"A"`
+    /// is shift-a) and folded for a control chord, exactly as `token` writes
+    /// them. The handful of aliases are the spellings a config already types in
+    /// `define-key`.
+    pub fn from_token(s: &str) -> Option<Key> {
+        // Exactly one character, so `"C-xy"` is rejected rather than silently
+        // meaning `C-x`.
+        fn one(s: &str) -> Option<char> {
+            let mut it = s.chars();
+            let c = it.next()?;
+            it.next().is_none().then_some(c)
+        }
+        Some(match s {
+            "SPC" | "<spc>" => Key::Char(' '),
+            "<ret>" | "RET" | "<cr>" => Key::Enter,
+            "<tab>" | "TAB" => Key::Tab,
+            "<bs>" | "<backspace>" => Key::Backspace,
+            "<esc>" | "ESC" => Key::Esc,
+            "<left>" => Key::Left,
+            "<right>" => Key::Right,
+            "<up>" => Key::Up,
+            "<down>" => Key::Down,
+            "C-<ret>" => Key::CtrlEnter,
+            "C-M-<ret>" => Key::CtrlMetaEnter,
+            "M-<bs>" => Key::MetaBackspace,
+            // Order matters: `C-M-` has to be tried before `C-`.
+            _ if s.starts_with("C-M-") => Key::CtrlMeta(one(&s[4..])?.to_ascii_lowercase()),
+            _ if s.starts_with("C-") => Key::Ctrl(one(&s[2..])?.to_ascii_lowercase()),
+            _ if s.starts_with("M-") => Key::Meta(one(&s[2..])?),
+            _ => Key::Char(one(s)?),
+        })
+    }
+
+    // --- end of the lisp-api block ------------------------------------------
 }
 
 // --- Syntax highlighting types -------------------------------------------
@@ -448,8 +494,9 @@ pub enum EditorCommand {
     /// result back as buffer text, the same shape as `OpenFile`.
     Git(String),
 
-    /// A project verb — `"find-file"`, `"switch"`, `"dired"`, `"compile"`,
-    /// `"test"`, `"root"`, `"forget"`. Core has no filesystem in it.
+    /// A project verb — `"find-file"`, `"find-dir"`, `"switch"`, `"open"`,
+    /// `"dired"`, `"compile"`, `"test"`, `"root"`, `"forget"`. Core has no
+    /// filesystem in it.
     Project(String),
     /// A terminal verb — `"open"` or `"close"`. Core has no processes in it.
     Term(String),
@@ -501,6 +548,70 @@ pub enum EditorCommand {
     /// cannot do, so [`Editor::make_overlay`] is a method the way
     /// [`Editor::make_marker`] is.
     Overlay(OverlayEdit),
+
+    // --- lisp-api: the variants the image could not work around --------------
+    //
+    // Each of these was a row of the "genuinely unreachable from Lisp" table in
+    // `docs/boundary.org`. They are here rather than scattered because the enum
+    // is the one file the Lisp side cannot route around, and because they share
+    // an argument: none of them needs the app layer, so all of them are applied
+    // on the spot and a read that follows one sees it.
+
+    /// A buffer with no file behind it, named by the string — `*Messages*`,
+    /// `*xref*`, a scratchpad. Switches to it if a buffer of that name is
+    /// already open, so calling it twice is a *show*, not a second copy.
+    ///
+    /// Deliberately not [`BufferKind`]-flavoured: a generated buffer is
+    /// read-only and re-rendered from state, and this one is an ordinary text
+    /// buffer that Lisp owns. It is `*scratch*`, not `*magit*`.
+    CreateBuffer(String),
+    /// Kill the buffer at that index in [`Editor::buffer_names`] — 0 is the live
+    /// one. The last remaining buffer is refused: Emacs always has one, and an
+    /// editor showing nothing has no state to draw.
+    ///
+    /// No confirmation, ever, whatever the buffer's `modified` flag says. Asking
+    /// is policy and policy is Lisp's — `(buffer-modified-p)` is a reader.
+    KillBuffer(usize),
+    /// The live buffer's tree-sitter language, or `None` for plain text. The
+    /// missing writer beside [`EditorCommand::SetMajorMode`]: a mode is what
+    /// Lisp dispatches on, a language is what gets highlighted, and a buffer
+    /// created from Lisp had no way to ask for colour.
+    SetLanguage(Option<String>),
+
+    /// Put a prompt up whose answer goes **back to Lisp**, as
+    /// `(%prompt-reply ID ANSWER)` through [`EditorCommand::CallLisp`]. `id`
+    /// names the continuation parked in the image's table; `completing` says
+    /// whether to draw a candidate box, which the renderer asks
+    /// [`PromptKind::completes`] and which cannot be inferred from the items
+    /// because they arrive afterwards, one [`EditorCommand::PromptItem`] each.
+    ///
+    /// This is `read-string` and `completing-read`. It is a *continuation* and
+    /// not a blocking read for the reason in `docs/threading.org`: the Lisp
+    /// thread must never wait on the user, or a prompt would freeze the image
+    /// the way a slow elisp function freezes Emacs.
+    ReadFromMinibuffer {
+        id: u64,
+        label: String,
+        completing: bool,
+    },
+    /// Append one candidate to the open Lisp prompt. Ignored for any other
+    /// prompt — the file and grep pickers get their candidates from the app,
+    /// and a stray item from a continuation that has already been cancelled
+    /// must not land in somebody else's list.
+    PromptItem(String),
+
+    /// Append one `"KEY LABEL"` row to the which-key panel, or — with `None` —
+    /// empty it. Rows arrive one at a time for the same reason
+    /// [`EditorCommand::PromptItem`]'s do: the write envelope carries a single
+    /// string, and a list is many.
+    ///
+    /// Deliberately *not* a prompt and deliberately not an overlay. A prompt
+    /// eats the next keystroke and which-key's whole job is to help you aim one;
+    /// an overlay anchors to a range of buffer text and moves with it, and a
+    /// panel describing the keyboard is not about the document at all.
+    WhichKey(Option<String>),
+
+    // --- end of the lisp-api block -------------------------------------------
 }
 
 impl EditorCommand {
@@ -654,6 +765,12 @@ pub struct Buffer {
     pub text: Rope,
     pub cursor: usize,
     pub path: Option<PathBuf>,
+    /// lisp-api: the name Lisp asked for, for a buffer with no file behind it.
+    /// Outranks everything in [`Buffer::name`] — a `*Messages*` made by
+    /// `create-buffer` would otherwise be called `*untitled*` like every other
+    /// pathless text buffer. `None` for every buffer the editor made itself, so
+    /// the existing naming rules are untouched.
+    pub given_name: Option<String>,
     pub modified: bool,
     /// Language id for tree-sitter, e.g. `"rust"`, `"lisp"`. `None` = plain text.
     pub language: Option<String>,
@@ -700,6 +817,7 @@ impl Buffer {
             text: Rope::from_str(s),
             cursor: 0,
             path: None,
+            given_name: None,
             modified: false,
             language: None,
             major_mode: FUNDAMENTAL.into(),
@@ -726,6 +844,11 @@ impl Buffer {
 
     /// Display name for the status line and the buffer switcher.
     pub fn name(&self) -> String {
+        // lisp-api: a name Lisp gave wins over both, because a buffer it made
+        // has neither a path nor a kind of its own to be named after.
+        if let Some(name) = &self.given_name {
+            return name.clone();
+        }
         match (&self.path, self.kind) {
             (Some(p), _) => p
                 .file_name()
@@ -747,6 +870,10 @@ impl Buffer {
     fn is_pristine(&self) -> bool {
         self.kind == BufferKind::Text
             && self.path.is_none()
+            // lisp-api: and neither is a buffer Lisp named. `(create-buffer
+            // "*xref*")` then `find-file` must not quietly reuse the buffer
+            // whose name something is about to look up.
+            && self.given_name.is_none()
             && !self.modified
             && self.len_chars() == 0
     }
@@ -1047,6 +1174,16 @@ pub struct Editor {
     /// First visible line, and how many lines fit (set by the renderer).
     pub scroll: usize,
     pub viewport_lines: usize,
+    /// Cells of text the focused window has across — the renderer parks it here
+    /// every frame beside `viewport_lines`, and for the same reason: a *visual*
+    /// line is a row of cells, and how many cells fit is a fact about a font and
+    /// a pane that core cannot possibly know.
+    ///
+    /// This is the entire channel by which layout reaches the command loop. `0`
+    /// means nothing has drawn yet, which every reader takes as "no wrapping" —
+    /// so a headless `Editor` (every test, every Lisp-only path) moves by buffer
+    /// line exactly as it always did.
+    pub wrap_cols: usize,
 
     /// Evil pending state: counts, operators, multi-key prefixes.
     pub(crate) pending: evil::Pending,
@@ -1055,6 +1192,20 @@ pub struct Editor {
     /// Window labels waiting to be picked — `ace-window` is up. The renderer
     /// draws these over each pane; the next key chooses one.
     pub ace: Option<Vec<(char, WindowId)>>,
+    /// which-key panel: one `"KEY LABEL"` row per continuation of the key
+    /// sequence currently half-typed, composed by the image. Empty means no
+    /// panel, which is every frame in which nothing is pending.
+    ///
+    /// Filed beside `ace` rather than beside `prompt`, and that placement is the
+    /// design: this is a *label drawn over the frame*, like the ace-window
+    /// letters, and not a thing that owns the keyboard. A prompt would swallow
+    /// the next keystroke, and the next keystroke is exactly what which-key
+    /// exists to help you choose.
+    ///
+    /// Core only ever *empties* it — [`Editor::handle_key`], the moment nothing
+    /// is pending any more. Filling it is the image's job, because what a prefix
+    /// means is Lisp's opinion and not core's.
+    pub which_key: Vec<String>,
     /// Column a run of `j`/`k` is trying to hold.
     ///
     /// Without it, passing through a short line permanently forgets how far
@@ -1123,9 +1274,11 @@ impl Editor {
             revision: 0,
             scroll: 0,
             viewport_lines: 24,
+            wrap_cols: 0,
             pending: evil::Pending::default(),
             visual_anchor: None,
             ace: None,
+            which_key: Vec::new(), // which-key panel
             desired_col: None,
             register: String::new(),
             register_linewise: false,
@@ -1143,13 +1296,35 @@ impl Editor {
     /// which is what stops the cursor jumping to the top every time you stage
     /// something.
     pub fn show_special(&mut self, kind: BufferKind, text: &str) {
-        let line = if self.buffer.kind == kind {
+        self.show_named(kind, None, text);
+    }
+
+    // --- term-agent: generated buffers that come in more than one -------------
+
+    /// [`Editor::show_special`], addressed by *name* as well as by kind.
+    ///
+    /// One `*magit*` is the right answer for a rendered view of one repository.
+    /// It is the wrong answer for a terminal: a shell, a `claude` session and an
+    /// `opencode` session are three live children, and folding them onto one
+    /// buffer is what made the second one replace the first. So the match is on
+    /// `(kind, given_name)` — `None` keeps the old behaviour exactly, which is
+    /// why every existing caller is untouched, and `Some(name)` gives one buffer
+    /// per session that `buffer-list` and the switcher find like any other.
+    ///
+    /// Answers the buffer's id, because the caller running a process needs a
+    /// handle to route keystrokes and screen refreshes by.
+    pub fn show_named(&mut self, kind: BufferKind, name: Option<&str>, text: &str) -> BufferId {
+        let wanted = |b: &Buffer| {
+            b.kind == kind && (name.is_none() || b.given_name.as_deref() == name)
+        };
+        let live = wanted(&self.buffer);
+        let line = if live {
             self.buffer.cursor_line_col().0
         } else {
             0
         };
-        if self.buffer.kind != kind {
-            match self.others.iter().position(|b| b.kind == kind) {
+        if !live {
+            match self.others.iter().position(wanted) {
                 Some(i) => self.switch_buffer(i + 1),
                 None => {
                     self.sync_window();
@@ -1162,6 +1337,12 @@ impl Editor {
                     self.others.insert(0, previous);
                 }
             }
+        }
+        // Set on every call, not only on creation: `name()` reads it, and a
+        // session buffer that lost its name would answer `*terminal*` like all
+        // the others and stop being tellable apart in the switcher.
+        if let Some(name) = name {
+            self.buffer.given_name = Some(name.to_string());
         }
         self.buffer.kind = kind;
         self.buffer.text = Rope::from_str(text);
@@ -1182,7 +1363,52 @@ impl Editor {
         let w = self.frame_mut().current_window_mut();
         w.buffer = id;
         w.cursor = cursor;
+        id
     }
+
+    /// Replace buffer `id`'s text with `text`, keeping point on the line it was
+    /// on. False when nothing has that id.
+    ///
+    /// This is the revert path for a buffer that is *not* live. `Editor::apply`
+    /// only ever touches `self.buffer`, which is exactly why auto-revert watched
+    /// one buffer and why that stopped being good enough: a coding agent
+    /// rewrites six files in a burst, and finding out about them one buffer
+    /// switch at a time is not "quickly".
+    ///
+    /// It is the `EditorCommand::Revert(BufferId)` the ponytail note in the app
+    /// asked for, written as a *method* rather than a variant — it performs no
+    /// effect the pure core cannot, so it has no business on the command channel
+    /// and no business being a keystroke's worth of latency away.
+    ///
+    /// Goes through `splice` like every other edit, so markers and overlays into
+    /// this buffer are adjusted rather than left naming offsets in text that no
+    /// longer exists. Point moves by *line and column*, not by offset: the whole
+    /// premise is that the text moved, so an offset would drift by however many
+    /// characters were inserted above the cursor, and the line someone was
+    /// reading is what they mean by "where I was".
+    pub fn revert_buffer(&mut self, id: BufferId, text: &str) -> bool {
+        let Some(buffer) = std::iter::once(&mut self.buffer)
+            .chain(self.others.iter_mut())
+            .find(|b| b.id == id)
+        else {
+            return false;
+        };
+        let (line, col) = buffer.cursor_line_col();
+        let end = buffer.len_chars();
+        buffer.splice(0, end, text);
+        buffer.move_to_line_col(line, col);
+        // `splice` sets it and is wrong to: the buffer now holds exactly what is
+        // on disk, which is the definition of unmodified.
+        buffer.modified = false;
+        // Spans describe text that is gone. The live buffer gets a fresh parse
+        // from the revision bump below; a parked one is colourless until it is
+        // looked at, which beats colouring the wrong characters.
+        buffer.highlights.clear();
+        self.revision += 1;
+        true
+    }
+
+    // --- end of the term-agent block ------------------------------------------
 
     /// The focused frame.
     pub fn frame(&self) -> &frame::Frame {
@@ -1224,16 +1450,18 @@ impl Editor {
     /// Park the live cursor and scroll on the focused window. Must run before
     /// anything changes which window is focused.
     fn sync_window(&mut self) {
-        let (cursor, scroll, lines, id) = (
+        let (cursor, scroll, lines, cols, id) = (
             self.buffer.cursor,
             self.scroll,
             self.viewport_lines,
+            self.wrap_cols,
             self.buffer.id,
         );
         let w = self.frame_mut().current_window_mut();
         w.cursor = cursor;
         w.scroll = scroll;
         w.viewport_lines = lines;
+        w.wrap_cols = cols;
         w.buffer = id;
     }
 
@@ -1251,6 +1479,7 @@ impl Editor {
         self.buffer.cursor = w.cursor.min(self.buffer.len_chars());
         self.scroll = w.scroll;
         self.viewport_lines = w.viewport_lines;
+        self.wrap_cols = w.wrap_cols;
         // Deliberately *not* clearing highlights: this is a buffer swap, not
         // an edit, and the incoming buffer's spans still describe its own
         // unchanged text. Clearing here is what made a split lose its colours
@@ -1299,6 +1528,107 @@ impl Editor {
         w.cursor = cursor;
         w.scroll = scroll;
     }
+
+    // --- lisp-api: buffers with no file behind them --------------------------
+    //
+    // `show_special` above makes a *generated* buffer — read-only, one per kind,
+    // re-rendered from state. These two make and unmake ordinary ones, which is
+    // what a Lisp author needs and what `*scratch*` already is.
+
+    /// Show a buffer called `name`, making it if it is not open yet.
+    ///
+    /// Idempotent by *name*, which is the contract every caller wants: a
+    /// `messages-buffer` command run twice shows one buffer and rewrites it,
+    /// rather than stacking a second one nobody can tell from the first. It is
+    /// also the contract `switch-to-buffer` and `with-current-buffer` already
+    /// match on, so a created buffer is reachable by every route the others are.
+    pub fn create_buffer(&mut self, name: String) {
+        if self.buffer.name() == name {
+            return;
+        }
+        if let Some(i) = self.others.iter().position(|b| b.name() == name) {
+            self.switch_buffer(i + 1);
+            return;
+        }
+        // Stack the outgoing buffer unless it is a throwaway — the same rule
+        // `load` follows, so opening a scratchpad from an empty editor does not
+        // leave an untitled husk in the switcher.
+        self.sync_window();
+        if !self.buffer.is_pristine() {
+            self.buffer.saved_scroll = self.scroll;
+            let mut fresh = Buffer::from_str("");
+            fresh.id = self.next_buffer_id;
+            self.next_buffer_id += 1;
+            let previous = std::mem::replace(&mut self.buffer, fresh);
+            self.others.insert(0, previous);
+        }
+        self.buffer.given_name = Some(name);
+        self.buffer.kind = BufferKind::Text;
+        self.buffer.path = None;
+        self.buffer.text = Rope::from_str("");
+        self.buffer.cursor = 0;
+        self.buffer.modified = false;
+        self.buffer.undo.clear();
+        self.buffer.redo.clear();
+        self.buffer.markers.clear();
+        self.buffer.overlays.clear();
+        self.buffer.highlights.clear();
+        // No hook: `fundamental-mode-hook` firing on every scratchpad would be a
+        // surprise, and Lisp that wants one calls `set-major-mode` itself — it
+        // is one line, and it is the line that says which mode it meant.
+        self.buffer.major_mode = FUNDAMENTAL.into();
+        self.buffer.minor_modes.clear();
+        self.scroll = 0;
+        self.revision += 1;
+        self.mode = Mode::Normal;
+        let id = self.buffer.id;
+        let w = self.frame_mut().current_window_mut();
+        w.buffer = id;
+        w.cursor = 0;
+        w.scroll = 0;
+    }
+
+    /// Kill the buffer at `index` in [`Editor::buffer_names`]; 0 is the live one.
+    ///
+    /// The last buffer is refused, as in Emacs: something has to be on screen.
+    /// Every window still showing the dead buffer — in *any* frame, not only the
+    /// focused one — is moved onto the live buffer, because a `Window.buffer`
+    /// naming nothing is a pane the renderer cannot draw.
+    pub fn kill_buffer(&mut self, index: usize) {
+        if self.others.is_empty() {
+            self.status = "cannot kill the last buffer".into();
+            return;
+        }
+        if index > self.others.len() {
+            self.status = "no such buffer".into();
+            return;
+        }
+        let gone = if index == 0 {
+            // Killing the live one: the most recently visited other takes its
+            // place, which is where `switch_buffer` would have gone anyway.
+            let incoming = self.others.remove(0);
+            let outgoing = std::mem::replace(&mut self.buffer, incoming);
+            self.scroll = self.buffer.saved_scroll;
+            self.mode = self.buffer.kind.mode();
+            outgoing
+        } else {
+            self.others.remove(index - 1)
+        };
+        let (live, cursor, scroll) = (self.buffer.id, self.buffer.cursor, self.scroll);
+        for frame in &mut self.frames {
+            for w in &mut frame.windows {
+                if w.buffer == gone.id {
+                    w.buffer = live;
+                    w.cursor = cursor;
+                    w.scroll = scroll;
+                }
+            }
+        }
+        self.revision += 1;
+        self.status = format!("killed {}", gone.name());
+    }
+
+    // --- end of the lisp-api block -------------------------------------------
 
     /// The one and only document mutator.
     pub fn apply(&mut self, cmd: EditorCommand) {
@@ -1358,6 +1688,14 @@ impl Editor {
                 self.status = format!("yanked {n} chars");
             }
             EditorCommand::Paste { after } => self.paste(after),
+            // Arrows are the same motion `j`/`k` are, so they follow the same
+            // rows: which key you reached for must not change what a wrapped
+            // paragraph does.
+            EditorCommand::MoveCursor(d @ (Direction::Up | Direction::Down))
+                if self.visual_lines() =>
+            {
+                self.buffer.cursor = self.visual_target(d == Direction::Down, 1, self.cursor_vcol());
+            }
             EditorCommand::MoveCursor(d) => self.buffer.move_cursor(d),
             EditorCommand::MoveTo(i) => self.buffer.cursor = i.min(self.buffer.len_chars()),
             EditorCommand::ScrollLines(d) => self.scroll_lines(d),
@@ -1525,6 +1863,41 @@ impl Editor {
                     self.prune_images();
                 }
             }
+
+            // --- lisp-api ----------------------------------------------------
+            EditorCommand::CreateBuffer(name) => self.create_buffer(name),
+            EditorCommand::KillBuffer(index) => self.kill_buffer(index),
+            EditorCommand::SetLanguage(lang) => {
+                self.buffer.language = lang;
+                // The app re-highlights off the revision counter, so a language
+                // that changed with the text untouched would not be seen until
+                // the next keystroke.
+                self.buffer.highlights.clear();
+                self.revision += 1;
+            }
+            EditorCommand::ReadFromMinibuffer {
+                id,
+                label,
+                completing,
+            } => {
+                let mut prompt = Prompt::new(PromptKind::Lisp { id, completing }, &label, Vec::new());
+                // Nothing previews, so nothing has to be restored on Escape.
+                prompt.origin = None;
+                self.prompt = Some(prompt);
+            }
+            EditorCommand::PromptItem(text) => {
+                if let Some(p) = self.prompt.as_mut() {
+                    if matches!(p.kind, PromptKind::Lisp { .. }) {
+                        p.push_item(text);
+                    }
+                }
+            }
+            EditorCommand::WhichKey(row) => match row {
+                Some(r) => self.which_key.push(r),
+                None => self.which_key.clear(),
+            },
+            // --- end of the lisp-api block ------------------------------------
+
             // The app intercepts these; reaching `apply` means nothing is listening.
             EditorCommand::CallLisp(name) => {
                 self.status = format!("no Lisp runtime to call {name}")
@@ -1897,8 +2270,104 @@ impl Editor {
         self.revision += 1;
     }
 
+    // --- visual lines -----------------------------------------------------
+    //
+    // A *visual* line is one row of the grid: a buffer line that does not fit
+    // across the window occupies several. The config's `j` is
+    // `evil-next-visual-line`, so a wrapped paragraph moves the way it reads
+    // rather than the way it is stored — press `j` in the middle of a long line
+    // and you land on the row below, not four screenfuls of prose later.
+    //
+    // Everything here is arithmetic over `display::expand_line`, the *same*
+    // function the renderer lays a line out with, because a `j` that computed
+    // cells differently would put the cursor where the block is not drawn. The
+    // only thing core cannot work out is how many cells fit — `wrap_cols`, which
+    // the renderer parks alongside `viewport_lines`.
+
+    /// Whether motion counts screen rows. Wrapping off means one row per line
+    /// and this whole path is the identity; `wrap_cols == 0` means nothing has
+    /// drawn yet, which is every headless test.
+    pub(crate) fn visual_lines(&self) -> bool {
+        self.settings.line_overflow == LineOverflow::Wrap && self.wrap_cols > 0
+    }
+
+    /// The cells of buffer line `line`, exactly as the renderer expands them.
+    ///
+    /// ponytail: overlays are not applied, so a `display` substitution — an
+    /// org-modern bullet, ghost text — shifts the renderer's columns and not
+    /// these, and `j` down a line carrying one can land a character off. Ceiling:
+    /// only lines with a substitution, and only by the length difference.
+    /// Upgrade path: `substitute` moves into `display` too and this takes the
+    /// buffer's overlays, which is the same list the renderer already walks.
+    fn line_cells(&self, line: usize) -> Vec<display::Cell> {
+        let start = self.buffer.line_start(line);
+        let text = self
+            .buffer
+            .slice_string(start, start + self.buffer.line_len(line));
+        display::expand_line(&text, self.settings.tab_width)
+    }
+
+    /// Cell column the cursor is drawn in, *within its display row* — the thing
+    /// a vertical run holds on to. Not a character column: on a line of CJK the
+    /// two differ by a factor of two, and holding the wrong one walks the cursor
+    /// sideways down the screen.
+    pub(crate) fn cursor_vcol(&self) -> usize {
+        let (line, col) = self.buffer.cursor_line_col();
+        display::visual_col(&self.line_cells(line), col) % self.wrap_cols.max(1)
+    }
+
+    /// Char offset `n` display rows below (`down`) or above the cursor, landing
+    /// in cell column `vcol`.
+    ///
+    /// Walks row by row rather than computing an index, because a buffer line's
+    /// height depends on its own contents and there is no closed form. `n` is a
+    /// count and counts are small; the walk touches one line per row crossed.
+    pub(crate) fn visual_target(&self, down: bool, n: usize, vcol: usize) -> usize {
+        let cols = self.wrap_cols.max(1);
+        let buf = &self.buffer;
+        let (mut line, col) = buf.cursor_line_col();
+        let mut cells = self.line_cells(line);
+        let mut row = display::visual_col(&cells, col) / cols;
+        for _ in 0..n {
+            // Crossing into another buffer line goes through `step_line`, which
+            // steps over anything a fold is hiding — the rows of a folded line
+            // are not drawn, so they are not rows to move through either.
+            match (down, row) {
+                (true, r) if r + 1 < display::wrap_row_count(cells.len(), cols) => row += 1,
+                (false, r) if r > 0 => row -= 1,
+                _ => match self.step_line(line, down) {
+                    // The first or last visible row: stop, exactly as `j` on the
+                    // last line already does.
+                    l if l == line => break,
+                    l => {
+                        line = l;
+                        cells = self.line_cells(line);
+                        row = match down {
+                            true => 0,
+                            false => display::wrap_row_count(cells.len(), cols) - 1,
+                        };
+                    }
+                },
+            }
+        }
+        // Past the end of a short row is the end of it, which on the last row of
+        // a line is the end of the line — the same clamp `move_to_line_col` does
+        // in characters, done in cells because that is the unit `vcol` is in.
+        let want = (row * cols + vcol).min(cells.len());
+        buf.line_start(line) + display::char_at_cell(&cells, want, buf.line_len(line))
+    }
+
     /// In Normal mode the cursor sits *on* a character, never past the last one.
     fn clamp_cursor(&mut self) {
+        // ...and never on a line a fold is hiding, whatever put it there — a
+        // fold made around point, an undo, a Lisp `goto-char`. It comes back to
+        // the fold's own first line, which is the one still drawn. This runs at
+        // the end of every `apply`, so it is the backstop behind `step_line`
+        // rather than a second copy of it.
+        let start = self.buffer.line_start(self.buffer.cursor_line_col().0);
+        if let Some(head) = fold_hiding(self.buffer.overlays(), start) {
+            self.buffer.cursor = head;
+        }
         if self.mode == Mode::Insert {
             self.buffer.cursor = self.buffer.cursor.min(self.buffer.len_chars());
             return;
@@ -2250,4 +2719,224 @@ mod tests {
         feed(&mut ed, &[Key::Char('v'), Key::Char('l')]);
         assert_eq!(ed.selection(), Some((0, 2)));
     }
+
+    // --- lisp-api ------------------------------------------------------------
+
+    /// `from_token` is only worth having if it is the *exact* inverse of
+    /// `token`: the string a config reads out of `(key-bindings)` is the string
+    /// it sends to the shell, and a vocabulary that agreed only mostly would be
+    /// worse than none.
+    #[test]
+    fn every_key_survives_being_spelled_and_read_back() {
+        let all = [
+            Key::Char('a'),
+            Key::Char('A'),
+            Key::Char(' '),
+            Key::Char('-'),
+            Key::Ctrl('c'),
+            Key::Meta('x'),
+            Key::CtrlMeta('j'),
+            Key::CtrlEnter,
+            Key::CtrlMetaEnter,
+            Key::MetaBackspace,
+            Key::Enter,
+            Key::Tab,
+            Key::Backspace,
+            Key::Esc,
+            Key::Left,
+            Key::Right,
+            Key::Up,
+            Key::Down,
+        ];
+        for key in all {
+            assert_eq!(Key::from_token(&key.token()), Some(key), "{}", key.token());
+        }
+        // A chord is folded to lower case on the way out, so that is what comes
+        // back — `token` is the canonical spelling and this agrees with it.
+        assert_eq!(Key::from_token("C-A"), Some(Key::Ctrl('a')));
+        // A *sequence* is not a key. `normalize_keys` owns those.
+        assert_eq!(Key::from_token("g d"), None);
+        assert_eq!(Key::from_token("C-xy"), None);
+        assert_eq!(Key::from_token("M-"), None);
+        assert_eq!(Key::from_token(""), None);
+    }
+
+    /// A buffer with no file behind it, which is what `*Messages*` and every
+    /// other generated-by-Lisp listing needs.
+    #[test]
+    fn a_created_buffer_is_named_addressable_and_idempotent() {
+        let mut ed = Editor::new();
+        ed.apply(EditorCommand::CreateBuffer("*notes*".into()));
+        assert_eq!(ed.buffer.name(), "*notes*");
+        assert!(ed.buffer.path.is_none());
+        // An ordinary text buffer, not a generated one: Lisp owns it, so it has
+        // to be writable.
+        assert!(!ed.buffer.kind.is_generated());
+        ed.apply(EditorCommand::SetMode(Mode::Insert));
+        ed.apply(EditorCommand::InsertText("hello".into()));
+        assert_eq!(ed.buffer.text.to_string(), "hello");
+
+        // Twice is once: a command that fills a buffer must not stack a second
+        // copy nobody can tell from the first.
+        ed.apply(EditorCommand::CreateBuffer("*notes*".into()));
+        assert_eq!(ed.buffer.text.to_string(), "hello");
+        assert_eq!(
+            ed.buffer_names().iter().filter(|n| n.starts_with("*notes*")).count(),
+            1
+        );
+        // ...and it is reachable by name from somewhere else, which is what
+        // `switch-to-buffer` and `with-current-buffer` match on.
+        ed.apply(EditorCommand::CreateBuffer("*other*".into()));
+        assert_eq!(ed.buffer.name(), "*other*");
+        ed.apply(EditorCommand::CreateBuffer("*notes*".into()));
+        assert_eq!(ed.buffer.name(), "*notes*");
+
+        // The language is settable, so a created buffer can be coloured — the
+        // difference between this and a scratchpad written to disk first.
+        ed.apply(EditorCommand::SetLanguage(Some("lisp".into())));
+        assert_eq!(ed.buffer.language.as_deref(), Some("lisp"));
+        ed.apply(EditorCommand::SetLanguage(None));
+        assert!(ed.buffer.language.is_none());
+    }
+
+    #[test]
+    fn killing_a_buffer_never_leaves_a_window_pointing_at_it() {
+        let mut ed = Editor::new();
+        ed.apply(EditorCommand::CreateBuffer("*a*".into()));
+        ed.apply(EditorCommand::SplitWindow(frame::Split::Columns));
+        ed.apply(EditorCommand::CreateBuffer("*b*".into()));
+        let doomed = ed.buffer.id;
+        // Both panes are showing *b*: one because it is focused, and the other
+        // because the split copied the buffer that was there.
+        ed.apply(EditorCommand::KillBuffer(0));
+        assert_ne!(ed.buffer.id, doomed);
+        for frame in &ed.frames {
+            for w in &frame.windows {
+                assert!(ed.buffer_by_id(w.buffer).is_some());
+                assert_ne!(w.buffer, doomed);
+            }
+        }
+
+        // By index, too — 0 is the live one, anything else is a position in
+        // `buffer-names`.
+        let named: Vec<String> = ed.buffer_names();
+        let at = named.iter().position(|n| n == "*a*").expect("*a* is open");
+        ed.apply(EditorCommand::KillBuffer(at));
+        assert!(!ed.buffer_names().iter().any(|n| n == "*a*"));
+
+        // The last one is refused: something has to be on screen.
+        while !ed.others.is_empty() {
+            ed.apply(EditorCommand::KillBuffer(0));
+        }
+        let last = ed.buffer.id;
+        ed.apply(EditorCommand::KillBuffer(0));
+        assert_eq!(ed.buffer.id, last);
+        assert_eq!(ed.status, "cannot kill the last buffer");
+    }
+
+    /// The prompt whose answer goes back to Lisp. Core's half of it: open one,
+    /// feed it candidates, and check that both accepting and cancelling produce
+    /// the call that reaches the continuation — a cancel that said nothing would
+    /// leave the closure parked in the image forever.
+    #[test]
+    fn a_lisp_prompt_answers_its_continuation_either_way() {
+        let mut ed = fresh("");
+        ed.apply(EditorCommand::ReadFromMinibuffer {
+            id: 7,
+            label: "Name: ".into(),
+            completing: false,
+        });
+        assert!(!ed.prompt.as_ref().unwrap().kind.completes());
+        let out = {
+            let mut out = Vec::new();
+            for k in [Key::Char('a'), Key::Char('b'), Key::Enter] {
+                out = ed.handle_key(k);
+            }
+            out
+        };
+        assert_eq!(
+            out,
+            vec![EditorCommand::CallLisp("(%prompt-reply 7 \"ab\")".into())]
+        );
+        assert!(ed.prompt.is_none());
+
+        // Escape answers NIL rather than nothing at all.
+        ed.apply(EditorCommand::ReadFromMinibuffer {
+            id: 8,
+            label: "Name: ".into(),
+            completing: false,
+        });
+        assert_eq!(
+            ed.handle_key(Key::Esc),
+            vec![EditorCommand::CallLisp("(%prompt-reply 8 nil)".into())]
+        );
+
+        // ...and backspacing past the start is the same gesture.
+        ed.apply(EditorCommand::ReadFromMinibuffer {
+            id: 9,
+            label: "Name: ".into(),
+            completing: false,
+        });
+        assert_eq!(
+            ed.handle_key(Key::Backspace),
+            vec![EditorCommand::CallLisp("(%prompt-reply 9 nil)".into())]
+        );
+
+        // A completing prompt draws its box, keeps the order Lisp gave, and
+        // answers the highlighted candidate rather than the typed text.
+        ed.apply(EditorCommand::ReadFromMinibuffer {
+            id: 10,
+            label: "Pick: ".into(),
+            completing: true,
+        });
+        for c in ["alpha", "beta", "gamma"] {
+            ed.apply(EditorCommand::PromptItem(c.into()));
+        }
+        {
+            let p = ed.prompt.as_ref().unwrap();
+            assert!(p.kind.completes());
+            assert_eq!(p.current(), Some("alpha"));
+            assert_eq!(p.matches.len(), 3);
+        }
+        let out = {
+            let mut out = Vec::new();
+            for k in [Key::Char('g'), Key::Char('a'), Key::Enter] {
+                out = ed.handle_key(k);
+            }
+            out
+        };
+        assert_eq!(
+            out,
+            vec![EditorCommand::CallLisp("(%prompt-reply 10 \"gamma\")".into())]
+        );
+
+        // The answer crosses as Lisp *source*, so it has to survive READ.
+        ed.apply(EditorCommand::ReadFromMinibuffer {
+            id: 11,
+            label: "s: ".into(),
+            completing: false,
+        });
+        let out = {
+            let mut out = Vec::new();
+            for k in [Key::Char('"'), Key::Char('\\'), Key::Enter] {
+                out = ed.handle_key(k);
+            }
+            out
+        };
+        assert_eq!(
+            out,
+            vec![EditorCommand::CallLisp(
+                r#"(%prompt-reply 11 "\"\\")"#.into()
+            )]
+        );
+
+        // A candidate arriving after the prompt has gone is dropped rather than
+        // landing in whatever picker is up next.
+        ed.open_prompt(PromptKind::Buffer);
+        let before = ed.prompt.as_ref().unwrap().items.len();
+        ed.apply(EditorCommand::PromptItem("stray".into()));
+        assert_eq!(ed.prompt.as_ref().unwrap().items.len(), before);
+    }
+
+    // --- end of the lisp-api block -------------------------------------------
 }

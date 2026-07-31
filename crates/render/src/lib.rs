@@ -16,6 +16,12 @@
 //! and `line_h` is `recommended_line_spacing()`. Layout therefore assumes a
 //! monospace font; the font search below only offers monospace faces.
 //!
+//! A *character* is not a cell. `漢` and `😀` are two cells wide, a combining
+//! mark is zero, and [`char_cells`] is the only thing allowed to have an opinion
+//! about which. Every offset crossing into core stays a **character** index —
+//! that is what the rope, the markers and the whole Lisp API are counted in —
+//! and [`expand_line`] is the one place the two units meet.
+//!
 //! One `Renderer` is one OS window, drawing one [`zemacs_core::Frame`]. Where
 //! the panes go is not decided here: [`Renderer::render`] asks `Frame::panes`
 //! for rectangles inside [`Renderer::content_area`] and draws a document, a
@@ -39,10 +45,11 @@ use sdl2::render::{BlendMode, Texture, TextureCreator, WindowCanvas};
 use sdl2::surface::Surface;
 use sdl2::ttf::{Font, Hinting, Sdl2TtfContext};
 use sdl2::video::WindowContext;
+use zemacs_core::display::{char_cells, expand_line, str_cells, visual_col, wrap_row_count};
 use zemacs_core::modeline;
 use zemacs_core::{
-    Buffer, BufferKind, CompletionStyle, Editor, HlKind, ImageId, LineOverflow, Mode, Overlay,
-    Settings, Span, Window,
+    fold_hiding, fold_starts_in, Buffer, BufferKind, CompletionStyle, Editor, HlKind, ImageId,
+    LineOverflow, Mode, Overlay, Settings, Span, Window,
 };
 use zemacs_term::Screen;
 
@@ -67,6 +74,11 @@ const CENTER_MAX_COLS: i32 = 100;
 /// Alpha of the scrim painted over the frame before a popup. Enough to push the
 /// document back, not enough to hide it.
 const DIM_ALPHA: u8 = 130;
+
+/// Drawn on the visible head of a fold. Emacs writes `...`; one ellipsis costs
+/// one column instead of three and reads the same, which matters because it is
+/// spent out of the line's own text.
+const FOLD_MARKER: char = '…';
 
 /// Monospace faces to try, in order. Earlier entries win.
 ///
@@ -240,10 +252,11 @@ impl Renderer {
         scale_point(dpi_scale(&self.canvas), x, y)
     }
 
-    /// Draw frame `frame_index` of the editor. Writes `viewport_lines` back —
-    /// per window, and on the editor from the focused pane — because only the
-    /// renderer knows how many lines actually fit and the core scroll logic
-    /// needs it.
+    /// Draw frame `frame_index` of the editor. Writes `viewport_lines` and
+    /// `wrap_cols` back — per window, and on the editor from the focused pane —
+    /// because only the renderer knows how many lines actually fit or how many
+    /// cells a line has before it wraps, and core needs both: one to clamp
+    /// scrolling, the other so `j` and `k` can move by visual line.
     ///
     /// The app calls `Editor::sync_focused_window` first, so every window's
     /// `cursor`/`scroll` is live and no pane needs a special case.
@@ -287,7 +300,7 @@ impl Renderer {
             let rows = doc_lines(pane, status_h, self.line_h);
             // Wrapping breaks the one-row-per-line assumption this used to be a
             // division by, so the lines have to be laid out to be counted.
-            let lines = editor.frames[frame_index]
+            let laid_out = editor.frames[frame_index]
                 .window(p.window)
                 .map(|w| (w.buffer, w.scroll))
                 .and_then(|(id, scroll)| {
@@ -296,16 +309,22 @@ impl Renderer {
                     let doc = doc_rect(pane, status_h);
                     let cols =
                         visible_cols(doc.w - gutter_w(buf, set, self.cell_w), self.cell_w);
-                    Some(visible_lines(buf, scroll, rows, cols, set))
-                })
-                .unwrap_or(rows);
+                    Some((visible_lines(buf, scroll, rows, cols, set), cols))
+                });
+            // `cols` goes back too, and it is not decoration: `j` and `k` move
+            // by *visual* line, and where a visual line breaks is this number.
+            // Core has no other way to learn it — the width of a cell is a font
+            // fact and the gutter's width is a layout one.
+            let (lines, cols) = laid_out.unwrap_or((rows, 0));
             if let Some(w) = editor.frames[frame_index].window_mut(p.window) {
                 w.viewport_lines = lines;
+                w.wrap_cols = cols;
             }
             // Core clamps scrolling against this one, and it belongs to
             // whichever window is being typed into.
             if focused && p.window == current {
                 editor.viewport_lines = lines;
+                editor.wrap_cols = cols;
             }
         }
 
@@ -379,6 +398,7 @@ impl Renderer {
         // are drawn once over everything — and only on the frame that owns the
         // keyboard, or every open frame would show the same M-x box.
         if focused {
+            self.draw_which_key(editor, area.w, area.h, status_h);
             self.draw_completion(editor, area.w, area.h, status_h);
         }
 
@@ -465,6 +485,11 @@ impl Renderer {
         // monotonic cursor walks them alongside the lines — no rescan per line.
         let mut si = 0usize;
         let rows = doc_lines(pane, status_h, self.line_h);
+        // Relative numbers count *down* to the cursor as well as up from it, so
+        // the row it is on has to be known before the first row is drawn. Per
+        // window: each pane counts from its own cursor, which is what makes an
+        // inactive split's gutter describe itself rather than the focused pane.
+        let cursor_row = cursor_pane_row(buf, win.scroll, (cur_line, cur_col), cols, set);
 
         // `row` is a display row in the pane, `line` a buffer line: with
         // wrapping the two advance at different rates.
@@ -473,6 +498,20 @@ impl Renderer {
             let start = buf.line_start(line);
             let len = buf.line_len(line);
             let end = start + len;
+
+            // A folded line occupies no row at all — the one thing an overlay
+            // could not do before, since every other payload replaces cells and
+            // this makes them stop existing. `row` is deliberately not advanced:
+            // the pane's rows are spent on lines that are drawn.
+            //
+            // The highlight cursor is *not* advanced past it either, and must
+            // not be: `spans_for_line` only retires a span that ends before the
+            // line it is asked about, so skipping here leaves the walk exactly
+            // where the next drawn line needs it.
+            if fold_hiding(overlays, start).is_some() {
+                line += 1;
+                continue;
+            }
 
             let (next, runs) = spans_for_line(spans, si, start, end);
             si = next;
@@ -485,10 +524,11 @@ impl Renderer {
             //
             // An overlay reaching onto later lines substitutes on the first one
             // and blanks the rest: one image, then the empty rows its own source
-            // lines have become. ponytail — a proper multi-line display would
-            // have to change how many rows a line occupies, and rows are a fixed
-            // height here.
+            // lines have become.
             let mut images: Vec<(usize, zemacs_core::ImageId)> = Vec::new();
+            // Rows this line must own whatever its text says — the one thing in
+            // the renderer that makes a row's height variable. See `need` below.
+            let mut tall = 1usize;
             if !ov_runs.is_empty() {
                 let mut subs: Vec<(usize, usize, String)> = Vec::new();
                 for &(s, e, o) in &ov_runs {
@@ -500,6 +540,20 @@ impl Renderer {
                         _ if o.start < start => String::new(), // continuation row
                         (Some((id, img)), _) => {
                             images.push((s, *id));
+                            // A tall image grows the line it starts on rather
+                            // than painting over the text below it. A *multi*-
+                            // line fragment already owns one blank row per
+                            // further source line it covers — the arm above is
+                            // what blanked them — so only the shortfall is
+                            // charged here. That is why `\begin{equation}`,
+                            // whose three source lines usually already hold it,
+                            // looks exactly as it did, while a `$$…$$` written
+                            // on one line stops overwriting its neighbour.
+                            let last = buf.text.char_to_line(o.end.saturating_sub(1));
+                            let blanked = last.saturating_sub(line);
+                            let want =
+                                image_rows(img.height, img.depth, self.line_h, self.ascent);
+                            tall = tall.max(want.saturating_sub(blanked).max(1));
                             " ".repeat(image_cells(img.width, self.cell_w))
                         }
                         (None, Some(d)) => d.clone(),
@@ -532,12 +586,27 @@ impl Renderer {
                 })
                 .collect();
 
-            // Rows this line wants, and how many of them are left in the pane.
-            // ponytail: a wrapped line taller than the remaining rows is cut at
+            // Rows this line wants: what its text needs, and never fewer than
+            // what an image on it needs. *This is the whole of "rows of variable
+            // height"* — a `max` on one integer rather than a table, because
+            // nothing else in the renderer has an opinion about how tall a row
+            // is and an image is the only thing that ever wanted one.
+            //
+            // ponytail: a line taller than the rows left in the pane is cut at
             // the bottom edge, because `scroll` counts buffer lines and there is
-            // no row to scroll to. Ceiling: a paragraph-length line at the foot
-            // of a short pane. Upgrade path: a scroll position of (line, row).
-            let need = if wrap { wrap_row_count(cells.len(), cols) } else { 1 };
+            // no row to scroll to. Ceiling: a paragraph-length line, or a
+            // full-page equation, at the foot of a short pane. Upgrade path: a
+            // scroll position of (line, row).
+            //
+            // ponytail: `visible_lines` and `cursor_pane_row` below still count
+            // a line's *text* rows only, so a pane showing a display equation
+            // reports a line or two more than it draws and a relative gutter
+            // number below one is short by the rows the image took. That is the
+            // ceiling core already has — it lays a line out with no overlays at
+            // all, see boundary.org — and closing it is handing both of them the
+            // overlay list this loop is already walking.
+            let text_rows = if wrap { wrap_row_count(cells.len(), cols) } else { 1 };
+            let need = text_rows.max(tall);
             let fits = need.min(rows - row);
 
             // Only the focused window of the focused frame gets a cursor: two
@@ -549,6 +618,8 @@ impl Renderer {
             // last column to the marker; the tail is simply not reachable.
             // Upgrade path: an `hscroll` alongside `scroll`.
             let marker = (!wrap).then(|| truncation_marker(cells.len(), cols)).flatten();
+            // This line is the visible head of a fold, so it says so.
+            let folds_here = fold_starts_in(overlays, start, end);
 
             let mut ri = 0usize;
             for (r, (rs, re)) in wrap_rows(cells.len(), cols).take(fits).enumerate() {
@@ -579,19 +650,28 @@ impl Renderer {
                     }
                 }
 
-                // The number belongs to the buffer line, not to each of the
-                // rows it occupies: repeating it down a wrapped line would read
-                // as several lines, so continuation rows get a blank gutter.
-                // After the stripe, which is painted across the gutter too.
-                if set.line_numbers && r == 0 {
+                // An *absolute* number belongs to the buffer line, not to each
+                // of the rows it occupies: repeating it down a wrapped line
+                // would read as several lines, so continuation rows get a blank
+                // gutter. A *relative* one is a fact about the row — it counts
+                // screen lines, which is what `display-line-numbers-type
+                // 'visual` means — so every row gets one. After the stripe,
+                // which is painted across the gutter too.
+                if set.line_numbers && (r == 0 || set.relative_line_numbers) {
                     let c = if line == cur_line { num_cur_c } else { num_c };
-                    self.draw_str(&format!("{:>digits$}", line + 1), doc.x, y, c);
+                    let n = gutter_number(line, row + r, cursor_row, set.relative_line_numbers);
+                    self.draw_str(&format!("{n:>digits$}"), doc.x, y, c);
                 }
 
                 if block_cursor {
                     if let Some(cc) = cursor_col {
                         let x = x0 + cc as i32 * self.cell_w;
-                        self.draw_cursor(x, y, self.cell_w, pane, cursor_c);
+                        // As wide as the character under it. A one-cell block on
+                        // 漢 covers half a glyph and knocks out the whole of it,
+                        // so the character under the cursor would vanish. A
+                        // tab's cells are spaces, so this leaves tabs at one.
+                        let w = cells.get(rs + cc).map_or(1, |&(c, _)| char_cells(c).max(1));
+                        self.draw_cursor(x, y, w as i32 * self.cell_w, pane, cursor_c);
                     }
                 }
 
@@ -630,6 +710,16 @@ impl Renderer {
                     };
                     self.draw_char(LineOverflow::MARKER, x0 + mc as i32 * self.cell_w, y, c);
                 }
+                // The fold indicator, one glyph past the head line's own text on
+                // the last row it occupies, in the same accent-tinted shade the
+                // truncation marker gets: both are the renderer admitting there
+                // is more than it drew. ponytail: on a line that exactly fills
+                // the pane it lands on the last column and covers a character,
+                // which is the same trade the truncation marker already makes.
+                if folds_here && r + 1 == fits && cols > 0 {
+                    let col = shown.min(cols - 1);
+                    self.draw_char(FOLD_MARKER, x0 + col as i32 * self.cell_w, y, marker_c);
+                }
 
                 if !block_cursor {
                     if let Some(cc) = cursor_col {
@@ -664,7 +754,7 @@ impl Renderer {
             if y + self.line_h > doc.y + doc.h {
                 break;
             }
-            let n = text.chars().count() as i32;
+            let n = str_cells(text) as i32;
             let x = doc.x + center_col(text, cols) as i32 * self.cell_w;
             if *selected {
                 self.fill(
@@ -744,7 +834,7 @@ impl Renderer {
         // the mode stay put as the file name and the status message change
         // length. Dropped whole rather than clipped when the pane is too narrow
         // to hold both: half a percentage is worse than none.
-        let right_cols: usize = right.iter().map(|s| s.text.chars().count()).sum();
+        let right_cols: usize = right.iter().map(|s| str_cells(&s.text)).sum();
         let left_budget = cols.saturating_sub(right_cols + 1);
         self.draw_segments(&left, x, y, left_budget, color, editor);
         if right_cols + 1 <= cols {
@@ -774,7 +864,9 @@ impl Renderer {
                 return;
             }
             let text = truncate(&seg.text, left);
-            left -= text.chars().count();
+            // Cells, matching what `truncate` measured — a character count here
+            // would let a segment of combining marks underflow `left`.
+            left -= str_cells(&text);
             let color = match seg.face {
                 Some(kind) => rgb(editor.theme.color(kind, editor.settings.foreground)),
                 None => default,
@@ -901,6 +993,76 @@ impl Renderer {
         }
     }
 
+    // --- which-key ---------------------------------------------------------
+
+    /// What continues the half-typed key sequence, in a grid above the status
+    /// line.
+    ///
+    /// A sibling of [`Renderer::draw_completion`] and not a reuse of it: the two
+    /// share a *shape* — full width, bottom edge on the status strip, one rule
+    /// along the top — and nothing else. A completion box has an input line, a
+    /// selection and a count; this has none of those, because it is not a
+    /// question. It is a hint about a keystroke the keymap is still going to
+    /// receive.
+    ///
+    /// Which is the whole reason it is drawn here rather than assembled in Lisp
+    /// out of things Lisp can already draw with. `message` is one line, and a
+    /// prompt — the only other multi-row surface — would *swallow* the next key.
+    /// Overlays are the other tempting answer and are also wrong: an overlay is
+    /// anchored to a range of buffer text and moves when you type in front of
+    /// it, and none of this describes the document.
+    ///
+    /// Yields to an open prompt rather than stacking under it: `M-x` puts a box
+    /// in the same place, and two panels arguing over the bottom of the window
+    /// is worse than either.
+    fn draw_which_key(&mut self, editor: &Editor, w: i32, h: i32, status_h: i32) {
+        let items = &editor.which_key;
+        if items.is_empty() || editor.prompt.is_some() {
+            return;
+        }
+        let (bg, fg) = (editor.settings.background, editor.settings.foreground);
+        let panel_c = rgb(mix(bg, fg, 0.07));
+        let rule_c = rgb(mix(bg, fg, 0.20));
+        let key_c = rgb(editor.theme.color(HlKind::Keyword, fg));
+        let label_c = rgb(mix(bg, fg, 0.78));
+
+        // One document line kept visible above the panel, as the completion box
+        // does, so it can never eat the whole window.
+        let avail = (h - status_h).max(self.line_h);
+        let room = ((avail - self.line_h - 2 * PADV) / self.line_h).max(0) as usize;
+        if room == 0 {
+            return;
+        }
+        let widest = items.iter().map(|s| str_cells(s)).max().unwrap_or(0);
+        let cols = ((w - 2 * PAD).max(0) / self.cell_w.max(1)) as usize;
+        let rows = which_key_rows(widest, items.len(), cols, room);
+        let col_w = (widest + WHICH_KEY_GUTTER) as i32 * self.cell_w;
+
+        let box_h = 2 * PADV + rows as i32 * self.line_h;
+        let (bx, by) = (0, avail - box_h);
+        self.fill(bx, by, w, box_h, panel_c);
+        self.fill(bx, by, w, 1, rule_c);
+
+        for (i, item) in items.iter().enumerate() {
+            // Column-major: reading a which-key is scanning a column for the key
+            // you want, so the alphabet has to run *down* rather than across.
+            let (col, row) = (i / rows, i % rows);
+            let x = bx + PAD + col as i32 * col_w;
+            // Once a column starts past the right edge every later one does too,
+            // so this is a `break`. ponytail: the entries in it are simply not
+            // drawn — Lisp has already capped the list at `*which-key-limit*`
+            // and said in the status line how many it left out.
+            if x + col_w > w - PAD && col > 0 {
+                break;
+            }
+            let y = by + PADV + row as i32 * self.line_h;
+            let (k, label) = item.split_once(' ').unwrap_or((item, ""));
+            let end = self.draw_str(k, x, y, key_c);
+            let left = ((w - PAD - end).max(0) / self.cell_w.max(1)) as usize;
+            self.draw_str(&truncate(label, left), end + self.cell_w, y, label_c);
+        }
+    }
+
     // --- primitives -------------------------------------------------------
 
     /// Confine every following draw to `a`. Nothing else in the renderer knows
@@ -996,29 +1158,29 @@ impl Renderer {
     /// a second texture. Straight (unpremultiplied) alpha, which is what
     /// [`BlendMode::Blend`] expects and what `zemacs-latex` promises.
     ///
-    /// Vertical placement is the whole point of `Image::depth`: an image no
-    /// taller than the line sits *on the baseline*, so `$x_1$` hangs below it
-    /// exactly as the surrounding text's descenders do. A taller one — display
-    /// math, which always has a line to itself — is hung from the top of its own
-    /// row instead, because growing upward from the baseline would put it over
-    /// the lines *above*, while the rows below it are the fragment's own source
-    /// lines and are already blank.
+    /// Vertical placement is the whole point of `Image::depth`, and there is now
+    /// one rule for every size: **the image's baseline lands on the baseline of
+    /// the last row it needs**. `$x_1$` is shorter than the ascent, needs one
+    /// row, and so hangs its `depth` pixels below the text baseline exactly as
+    /// the surrounding descenders do. A display equation needs several, and
+    /// claims them *upward* from that baseline — which is safe only because
+    /// [`Renderer::draw_document`] has grown the line it starts on to hold them,
+    /// so upward means into rows the fragment owns rather than over the text
+    /// above. Before rows could vary in height this had to hang from the top of
+    /// its single row and hope the fragment's own blank source lines caught it.
     ///
-    /// ponytail: no reflow either way. Nothing to the right of an image moves,
+    /// ponytail: no *horizontal* reflow. Nothing to the right of an image moves,
     /// so an image wider than the cells its substitution reserved paints over
     /// the text after it — which is only ever a rounding cell, since the
     /// reservation is `ceil(width / cell_w)`. The clip rect keeps it inside the
-    /// pane. Upgrade path is a per-line table of cell advances, which is also
-    /// what wide characters want.
+    /// pane. Upgrade path is a per-line table of cell advances.
     fn draw_image(&mut self, editor: &Editor, id: ImageId, x: i32, y: i32) {
         let Some(image) = editor.image(id) else {
             return;
         };
         let (w, h, depth) = (image.width, image.height, image.depth as i32);
-        let iy = match h as i32 {
-            ih if ih <= self.line_h => y + self.ascent + depth - ih,
-            _ => y,
-        };
+        let rows = image_rows(h, image.depth, self.line_h, self.ascent) as i32;
+        let iy = y + (rows - 1) * self.line_h + self.ascent + depth - h as i32;
         // Split borrows: the cache needs `&mut images` while uploading needs the
         // creator, and blitting needs `&mut canvas`.
         let Renderer {
@@ -1050,6 +1212,10 @@ impl Renderer {
     /// `draw_str`, optionally in the bold face. Returns the x just past the
     /// last cell. Bold is *metrically* the same — the cell width never changes,
     /// so a bold run cannot shift the columns after it.
+    ///
+    /// A wide character advances two cells and a combining mark none, exactly as
+    /// in the document: a buffer named `日本語.txt` has to measure the same on the
+    /// modeline as it does in the switcher, or one of them wraps early.
     fn draw_weighted(&mut self, s: &str, x: i32, y: i32, color: Color, bold: bool) -> i32 {
         let mut x = x;
         for c in s.chars() {
@@ -1058,7 +1224,7 @@ impl Renderer {
             } else {
                 self.draw_char(c, x, y, color);
             }
-            x += self.cell_w;
+            x += char_cells(c) as i32 * self.cell_w;
         }
         x
     }
@@ -1086,7 +1252,7 @@ impl Renderer {
 
     /// `draw_str`, but `x` is where the text should *end*. Same glyph path.
     fn draw_right(&mut self, s: &str, x: i32, y: i32, color: Color) {
-        let w = s.chars().count() as i32 * self.cell_w;
+        let w = str_cells(s) as i32 * self.cell_w;
         self.draw_str(s, x - w, y, color);
     }
 
@@ -1576,13 +1742,28 @@ fn center_popup(w: i32, h: i32, status_h: i32, line_h: i32, cell_w: i32, want: u
     }
 }
 
+/// Cells between one which-key column and the next.
+const WHICH_KEY_GUTTER: usize = 2;
+
+/// Rows a which-key panel wants for `n` entries of at most `widest` cells, in a
+/// panel `cols` cells across and with room for `max_rows`.
+///
+/// As *few* rows as the width allows, filled column-major when drawn. Entries
+/// are short — `f +file` — so a which-key that is taller than it is wide has
+/// stopped being a hint and become a menu, which is the thing the status line
+/// was already failing to be.
+fn which_key_rows(widest: usize, n: usize, cols: usize, max_rows: usize) -> usize {
+    let columns = (cols / (widest + WHICH_KEY_GUTTER).max(1)).max(1);
+    n.div_ceil(columns).clamp(1, max_rows.max(1))
+}
+
 /// `s` cut to `cols` characters, ellipsised when anything was lost.
 ///
 /// Counts *characters*: candidates are file paths and Lisp symbol names, so a
 /// byte-wise cut would both mis-measure a non-ASCII row and panic on a split
 /// codepoint.
 fn truncate(s: &str, cols: usize) -> String {
-    if s.chars().count() <= cols {
+    if str_cells(s) <= cols {
         return s.to_string();
     }
     match cols {
@@ -1591,7 +1772,24 @@ fn truncate(s: &str, cols: usize) -> String {
         // ponytail: truncates the tail, so two long paths sharing a prefix look
         // identical. Ceiling: deep directory trees. Upgrade path: elide the
         // middle, keeping the basename.
-        n => s.chars().take(n - 1).chain(['…']).collect(),
+        //
+        // Cells, not characters: a wide character that would only half fit is
+        // dropped rather than cut, since half a glyph is what pushes everything
+        // after it one column right.
+        n => {
+            let mut out = String::new();
+            let mut used = 0;
+            for c in s.chars() {
+                let w = char_cells(c);
+                if used + w > n - 1 {
+                    break;
+                }
+                used += w;
+                out.push(c);
+            }
+            out.push('…');
+            out
+        }
     }
 }
 
@@ -1601,10 +1799,11 @@ fn title_of(label: &str) -> &str {
 }
 
 /// Column at which to start drawing `s` so it lands centered in `cols` columns.
-/// Counts *characters* — the dashboard banner is box-drawing art, so a byte
-/// count would push it a third of the way off screen.
+/// Counts *cells* — the dashboard banner is box-drawing art, so a byte count
+/// would push it a third of the way off screen and a character count would
+/// mis-centre any row with an emoji in it.
 fn center_col(s: &str, cols: usize) -> usize {
-    cols.saturating_sub(s.chars().count()) / 2
+    cols.saturating_sub(str_cells(s)) / 2
 }
 
 /// Box-drawing / block-element art versus prose. Lets the renderer tint the
@@ -1615,26 +1814,6 @@ fn is_banner_line(s: &str) -> bool {
             .all(|c| c == ' ' || ('\u{2500}'..='\u{259f}').contains(&c))
 }
 
-/// Visual cells for one line: `(glyph, index of the source char in the line)`.
-/// A tab becomes a run of spaces up to the next tab stop, every one of them
-/// pointing back at the tab so cursor/selection/highlight math still works in
-/// source-char offsets.
-fn expand_line(line: &str, tab_width: usize) -> Vec<(char, usize)> {
-    let tw = tab_width.max(1);
-    let mut out = Vec::with_capacity(line.len());
-    for (i, c) in line.chars().enumerate() {
-        match c {
-            '\t' => {
-                for _ in 0..(tw - out.len() % tw) {
-                    out.push((' ', i));
-                }
-            }
-            '\n' | '\r' => {}
-            _ => out.push((c, i)),
-        }
-    }
-    out
-}
 
 // --- line overflow ---------------------------------------------------------
 //
@@ -1642,21 +1821,16 @@ fn expand_line(line: &str, tab_width: usize) -> Vec<(char, usize)> {
 // a tab is several cells and a `→` is one, so wrapping on anything else puts
 // the break in the wrong place (or, for bytes, mid-codepoint).
 
-/// Display rows one line of `len` cells occupies in a pane `cols` wide.
-///
-/// Always at least one, so an empty line still has a row for its gutter number
-/// and its cursor. `cols == 0` — a pane narrower than its own line numbers —
-/// is the infinite-loop case: it yields one row rather than dividing by zero,
-/// and the caller advances past the line either way.
-fn wrap_row_count(len: usize, cols: usize) -> usize {
-    match cols {
-        0 => 1,
-        c => len.div_ceil(c).max(1),
-    }
-}
-
 /// The cell range `[start, end)` shown on each display row of a line of `len`
 /// cells, in order. Truncation takes the first of these and nothing else.
+///
+/// ponytail: the break is at exactly `cols`, so a wide character whose first
+/// cell is the last column is cut in half — its glyph is clipped at the pane
+/// edge and its continuation blank starts the next row. Emacs moves the whole
+/// character down. Ceiling: a CJK paragraph in a narrow pane, where every other
+/// row ends on a half glyph. Upgrade path: this takes the cell list rather than
+/// a length, and backs the break off by one when it lands on a continuation
+/// cell — which is also what a per-line table of advances would give it.
 fn wrap_rows(len: usize, cols: usize) -> impl Iterator<Item = (usize, usize)> {
     (0..wrap_row_count(len, cols)).map(move |r| {
         let s = (r * cols).min(len);
@@ -1716,13 +1890,18 @@ fn cursor_pos(vc: usize, cols: usize, rows: usize) -> (usize, usize) {
 /// height 1) report the pane's full row capacity, exactly as before wrapping
 /// existed. A single line taller than the whole pane still reports 1, which is
 /// what keeps scrolling able to step over it.
+///
+/// A height of **0** is a folded line, and is the reason this adds `h` rather
+/// than `h.max(1)`: such a line spans a buffer line and occupies no row, so it
+/// has to be counted as a line — or `scroll` could never step over a fold — and
+/// must not be charged a row.
 fn lines_in_rows(heights: impl IntoIterator<Item = usize>, rows: usize) -> usize {
     let (mut used, mut lines) = (0usize, 0usize);
     for h in heights {
         if used >= rows {
             break;
         }
-        used += h.max(1);
+        used += h;
         lines += 1;
     }
     lines + rows.saturating_sub(used)
@@ -1732,15 +1911,84 @@ fn lines_in_rows(heights: impl IntoIterator<Item = usize>, rows: usize) -> usize
 /// the iterator is lazy and the count stops as soon as the pane is full — so a
 /// 10k-line file costs one screenful, same as drawing it.
 fn visible_lines(buf: &Buffer, scroll: usize, rows: usize, cols: usize, set: &Settings) -> usize {
-    if set.line_overflow == LineOverflow::Truncate {
-        return rows; // one row per line; the general path would agree, slower
+    let wrap = set.line_overflow == LineOverflow::Wrap;
+    // Truncation with nothing folded is one row per line, and the general path
+    // below would agree with it more slowly. A fold breaks that identity, which
+    // is why this is not simply the overflow mode.
+    if !wrap && !buf.overlays().iter().any(|o| o.fold) {
+        return rows;
     }
-    let heights = (scroll..buf.len_lines()).map(|l| {
-        let start = buf.line_start(l);
-        let text = buf.slice_string(start, start + buf.line_len(l));
-        wrap_row_count(expand_line(&text, set.tab_width).len(), cols)
-    });
+    let heights = (scroll..buf.len_lines()).map(|l| line_rows(buf, l, cols, wrap, set.tab_width));
     lines_in_rows(heights, rows)
+}
+
+/// Display rows buffer line `l` occupies: none at all when a fold is hiding it,
+/// one when the pane truncates, and its wrapped height otherwise.
+///
+/// The counting twin of the drawing loop, and the reason folding is a *line*
+/// mechanism rather than another overlay payload: everything else an overlay
+/// carries replaces cells with cells, and this is a height of zero.
+fn line_rows(buf: &Buffer, l: usize, cols: usize, wrap: bool, tab_width: usize) -> usize {
+    if fold_hiding(buf.overlays(), buf.line_start(l)).is_some() {
+        return 0;
+    }
+    match wrap {
+        true => wrap_row_count(line_cells(buf, l, tab_width).len(), cols),
+        false => 1,
+    }
+}
+
+/// The cells of buffer line `l`. The renderer's one entry into
+/// [`zemacs_core::display`], and the same call `Editor::line_cells` makes — `j`
+/// and the glyph it lands on have to be laid out by the same function.
+fn line_cells(buf: &Buffer, l: usize, tab_width: usize) -> Vec<(char, usize)> {
+    let start = buf.line_start(l);
+    expand_line(&buf.slice_string(start, start + buf.line_len(l)), tab_width)
+}
+
+/// Pane row a window's cursor is drawn on, counting from the top of the pane.
+///
+/// Needed *before* the row loop: a relative number on a row above the cursor
+/// counts down to it, so it cannot be discovered on the way past. Costs one
+/// `expand_line` per line between the top of the pane and the cursor — work the
+/// loop below is about to do anyway, and bounded by the pane's height.
+fn cursor_pane_row(
+    buf: &Buffer,
+    scroll: usize,
+    (cur_line, cur_col): (usize, usize),
+    cols: usize,
+    set: &Settings,
+) -> usize {
+    let wrap = set.line_overflow == LineOverflow::Wrap;
+    // The same per-line height the drawing loop and `visible_lines` use, so a
+    // folded line between the top of the pane and the cursor costs no row here
+    // either — otherwise every relative number below a fold would be off by the
+    // lines it hid.
+    let height = |l: usize| line_rows(buf, l, cols, wrap, set.tab_width);
+    let above: usize = (scroll..cur_line).map(height).sum();
+    if !wrap {
+        return above;
+    }
+    let cells = line_cells(buf, cur_line, set.tab_width);
+    let within = cursor_pos(visual_col(&cells, cur_col), cols, height(cur_line).max(1)).0;
+    above + within
+}
+
+/// What the gutter says on pane row `row`, which is showing buffer line `line`.
+///
+/// Absolute is the buffer line number. Relative is the distance in **visual**
+/// rows from the cursor's row — `display-line-numbers-type 'visual`, which is
+/// what the config sets, and the only reading that agrees with `j` and `k` now
+/// that they move by row: `3j` must land on the row the gutter says `3`.
+///
+/// The cursor's own row keeps its absolute number, which is vim's
+/// `number relativenumber` pair and Emacs'
+/// `display-line-numbers-current-absolute`.
+fn gutter_number(line: usize, row: usize, cursor_row: usize, relative: bool) -> usize {
+    match relative && row != cursor_row {
+        true => row.abs_diff(cursor_row),
+        false => line + 1,
+    }
 }
 
 /// Digits reserved for the line-number gutter. Sized from the whole file so the
@@ -1756,31 +2004,6 @@ fn gutter_w(buf: &Buffer, set: &Settings, cell_w: i32) -> i32 {
     match set.line_numbers {
         true => (gutter_digits(buf) as i32 + 1) * cell_w,
         false => 0,
-    }
-}
-
-/// Visual column of source char `src`; the end of the line if it is past it
-/// (which is where the cursor sits on an empty line, or at EOL in insert mode).
-///
-/// The *first* cell at or after `src`, not the cell for `src` exactly: a
-/// [`substitute`]d range has no cell of its own for the characters it hides, and
-/// a cursor inside one belongs at the front of what replaced them. On a line
-/// with no overlays every source char still has a cell, so this is the same
-/// answer it has always given.
-fn visual_col(cells: &[(char, usize)], src: usize) -> usize {
-    match cells.iter().position(|&(_, i)| i >= src) {
-        // The ordinary answer, and the only one on a line with no overlays.
-        Some(k) if cells[k].1 == src => k,
-        // A source char with no cell of its own, because something replaced the
-        // range it was in. The cursor belongs at the *front* of what replaced
-        // it: landing after it would put the cursor a character further right
-        // than the buffer says it is.
-        Some(_) => cells.iter().rposition(|&(_, i)| i < src).map_or(0, |k| {
-            cells.iter().position(|&(_, i)| i == cells[k].1).unwrap_or(k)
-        }),
-        // Past the last character — where the cursor sits on an empty line, or
-        // at EOL in insert mode.
-        None => cells.len(),
     }
 }
 
@@ -1823,6 +2046,20 @@ fn overlay_face(runs: &[OverlayRun], src: usize) -> (Option<HlKind>, Option<HlKi
 /// narrower than a cell still hides the character it replaced.
 fn image_cells(width: u32, cell_w: i32) -> usize {
     (width as usize).div_ceil(cell_w.max(1) as usize).max(1)
+}
+
+/// Display rows a bitmap needs, under the rule that its baseline lands on the
+/// baseline of the *last* of them.
+///
+/// The vertical twin of [`image_cells`], and the only reason a row's height is
+/// not a constant. One row already offers `ascent` pixels above the baseline —
+/// which is every inline fragment, since `$x_1$` is set at the text's own size —
+/// and anything taller than that buys whole further rows above it. `depth` is
+/// the part that hangs *below* the baseline and is therefore free: it lands in
+/// the last row's descender space, exactly where a `g` puts its tail.
+fn image_rows(height: u32, depth: u32, line_h: i32, ascent: i32) -> usize {
+    let above = (height as i32 - depth as i32).max(0) - ascent;
+    1 + (above.max(0) as usize).div_ceil(line_h.max(1) as usize)
 }
 
 /// Replace the cells of each `(start, end, text)` — line-relative *source* char
@@ -1966,30 +2203,34 @@ mod tests {
         assert!(runs.is_empty());
     }
 
+    // --- wide characters --------------------------------------------------
+    //
+    // What a cell *is* belongs to `zemacs_core::display` and is tested there,
+    // because `j` and `k` read the same functions. These are the renderer's own
+    // consequences of it.
+
+    /// Emoji are the case that used to walk the cursor off the end of a line:
+    /// four of them are eight cells, not four, so the cursor on the third lands
+    /// on the second row of a four-column pane.
     #[test]
-    fn tabs_expand_to_the_next_tab_stop() {
-        assert_eq!(expand_line("\tx", 4).len(), 5);
-        // "ab\tc": two chars, then 2 spaces to reach column 4, then 'c'.
-        let cells = expand_line("ab\tc", 4);
-        assert_eq!(
-            cells.iter().map(|&(c, _)| c).collect::<String>(),
-            "ab  c"
-        );
-        // Every expanded space maps back to the tab at source index 2.
-        assert_eq!(cells[2].1, 2);
-        assert_eq!(cells[3].1, 2);
-        assert_eq!(cells[4].1, 3);
-        // tab_width 0 must not divide by zero.
-        assert_eq!(expand_line("\t", 0).len(), 1);
+    fn the_cursor_follows_a_wide_character_across_a_wrap() {
+        let cells = expand_line("😀😀😀😀", 4);
+        assert_eq!(cells.len(), 8);
+        assert_eq!(wrap_row_count(cells.len(), 4), 2);
+        assert_eq!(cursor_pos(visual_col(&cells, 3), 4, 2), (1, 2));
     }
 
+    /// Chrome measures in cells too — a CJK candidate that fit "by character
+    /// count" would run off the end of its box.
     #[test]
-    fn visual_col_follows_tab_expansion() {
-        let cells = expand_line("\tfn", 4);
-        assert_eq!(visual_col(&cells, 0), 0); // the tab itself
-        assert_eq!(visual_col(&cells, 1), 4); // 'f' after the tab stop
-        assert_eq!(visual_col(&cells, 3), 6); // past EOL -> end of the line
-        assert_eq!(visual_col(&expand_line("", 4), 0), 0);
+    fn chrome_measures_wide_text_in_cells() {
+        assert_eq!(truncate("日本語", 6), "日本語");
+        assert_eq!(truncate("日本語", 5), "日本…");
+        // Cut at 4: 日本 is 4 cells, so only 日 plus the ellipsis fits in 3.
+        assert_eq!(truncate("日本語", 4), "日…");
+        // A wide character that would only half fit is dropped, never halved.
+        assert_eq!(truncate("a漢b", 3), "a…");
+        assert_eq!(center_col("日本", 10), 3);
     }
 
     // --- overlays ---------------------------------------------------------
@@ -2003,6 +2244,7 @@ mod tests {
             background: None,
             display: None,
             image: None,
+            fold: false,
         }
     }
 
@@ -2110,6 +2352,114 @@ mod tests {
         assert_eq!(image_cells(11, 10), 2);
         // A degenerate cell width must not divide by zero.
         assert_eq!(image_cells(11, 0), 11);
+    }
+
+    /// Rows of variable height, as the one integer they turned out to be.
+    ///
+    /// `line_h = 20`, `ascent = 15`: a row offers 15 pixels above the baseline
+    /// and 5 below, which is roughly what a 14pt monospace face reports.
+    #[test]
+    fn an_image_claims_rows_above_its_baseline_and_none_below() {
+        let rows = |h, depth| image_rows(h, depth, 20, 15);
+        // Everything that fits under the ascent is one row — every inline
+        // fragment, since `$x_1$` is typeset at the text's own size.
+        assert_eq!(rows(0, 0), 1);
+        assert_eq!(rows(15, 0), 1);
+        // ...including one that is *taller than the line* but hangs the excess
+        // below the baseline, which is exactly what `depth` is for. This is the
+        // case the old `h <= line_h` test got wrong.
+        assert_eq!(rows(19, 4), 1);
+        // Past the ascent, whole rows, and they are claimed upward.
+        assert_eq!(rows(16, 0), 2);
+        assert_eq!(rows(35, 0), 2);
+        assert_eq!(rows(36, 0), 3);
+        // Depth is free: it lands in the last row's descender space.
+        assert_eq!(rows(40, 5), 2);
+        // Degenerate inputs must neither divide by zero nor go below one row.
+        assert_eq!(rows(0, 99), 1);
+        assert_eq!(image_rows(100, 0, 0, 15), 86);
+    }
+
+    /// The placement rule, spelled the way [`Renderer::draw_image`] computes it,
+    /// so the two cannot drift: the image's baseline is the last row's baseline.
+    #[test]
+    fn a_tall_image_grows_into_its_own_rows_and_never_over_the_line_above() {
+        let (line_h, ascent) = (20, 15);
+        let iy = |h: i32, depth: i32| {
+            let rows = image_rows(h as u32, depth as u32, line_h, ascent) as i32;
+            (rows - 1) * line_h + ascent + depth - h
+        };
+        // An inline fragment sits on the baseline and hangs `depth` below it —
+        // 15 - 12 = 3 pixels down from the top of its one row.
+        assert_eq!(iy(12, 0), 3);
+        assert_eq!(iy(19, 4), 0);
+        // A display equation never starts above the top of the block it was
+        // given, which is the whole point: `>= 0` is "does not paint over the
+        // line above", and `< line_h` is "does not leave a blank row under it".
+        for h in 1..400 {
+            let top = iy(h, 0);
+            assert!((0..line_h).contains(&top), "{h}px starts at {top}");
+        }
+    }
+
+    /// A folded line occupies no row, which is the one thing an overlay could
+    /// not say before: every other payload swaps cells for cells, and this makes
+    /// rows stop existing.
+    ///
+    /// Asserted through `visible_lines` rather than through `line_rows`, because
+    /// the number that matters is the one core clamps `scroll` against — a fold
+    /// that hid rows without also being counted as the buffer lines it spans
+    /// would make the bottom of the file unreachable.
+    #[test]
+    fn a_folded_line_occupies_no_row_but_is_still_a_line() {
+        let text = "a\nb\nc\nd\ne\nf\n";
+        let set = Settings::default(); // truncating, one row per drawn line
+        let plain = Buffer::from_str(text);
+        // Four rows of pane, nothing folded: four lines.
+        assert_eq!(visible_lines(&plain, 0, 4, 20, &set), 4);
+
+        // Fold "b" and "c" under "a" — chars 0..5 of "a\nb\nc\n…".
+        let mut ed = Editor::new();
+        ed.buffer = Buffer::from_str(text);
+        let id = ed.make_overlay(0, 5);
+        ed.apply(zemacs_core::EditorCommand::Overlay(
+            zemacs_core::OverlayEdit::Fold(id, true),
+        ));
+        // Six buffer lines now fit in four rows: a, (b), (c), d, e, f — the two
+        // hidden ones cost nothing and are still counted, so `scroll` can step
+        // past them.
+        assert_eq!(visible_lines(&ed.buffer, 0, 4, 20, &set), 6);
+        // The contrast, in a two-row pane: two lines without the fold, four
+        // with it, because two of the four are free.
+        assert_eq!(visible_lines(&plain, 0, 2, 20, &set), 2);
+        assert_eq!(visible_lines(&ed.buffer, 0, 2, 20, &set), 4);
+        // The head line is drawn, the two under it are not, the rest are.
+        let folded = |l: usize| fold_hiding(ed.buffer.overlays(), ed.buffer.line_start(l));
+        assert_eq!((folded(0), folded(1), folded(2), folded(3)),
+                   (None, Some(0), Some(0), None));
+        // ...and it says so, on the line that is still drawn.
+        assert!(fold_starts_in(ed.buffer.overlays(), 0, 1));
+        assert!(!fold_starts_in(ed.buffer.overlays(), 2, 3));
+    }
+
+    /// The which-key panel is a *grid*, and this is all there is to it: how
+    /// short can it be and still fit across the window.
+    #[test]
+    fn a_which_key_panel_is_as_short_as_the_window_is_wide() {
+        // Eight `f +file`-sized entries: 9 cells each, 11 with the gutter.
+        let rows = |cols, room| which_key_rows(9, 8, cols, room);
+        assert_eq!(rows(120, 10), 1); // ten columns fit: one row
+        assert_eq!(rows(44, 10), 2); // four fit: two rows
+        assert_eq!(rows(30, 10), 4); // two fit
+        // Narrower than one column still draws one per row rather than none.
+        assert_eq!(rows(4, 10), 8);
+        assert_eq!(rows(0, 10), 8);
+        // ...and never taller than the room above the status line. The tail is
+        // dropped; Lisp has already said how many it left out.
+        assert_eq!(rows(30, 3), 3);
+        assert_eq!(rows(30, 0), 1);
+        // A degenerate width must not divide by zero.
+        assert_eq!(which_key_rows(0, 3, 0, 10), 3);
     }
 
     // --- line overflow ----------------------------------------------------
@@ -2347,6 +2697,44 @@ mod tests {
         assert_eq!(visible_lines(&buf, 0, 0, 10, &set), 0);
         // A pane with no columns must not hang: every line is one row.
         assert_eq!(visible_lines(&buf, 0, 5, 0, &set), 4 + 1);
+    }
+
+    // --- the gutter -------------------------------------------------------
+
+    /// `display-line-numbers-type 'visual`: a relative number is a distance in
+    /// *screen* rows, so a wrapped line above the cursor counts once per row it
+    /// occupies. Anything else and `3j` lands somewhere other than the row the
+    /// gutter labelled `3`.
+    #[test]
+    fn relative_line_numbers_count_visual_lines() {
+        let wrap = Settings {
+            line_overflow: LineOverflow::Wrap,
+            ..Settings::default()
+        };
+        // Ten columns: line 0 is one row, line 1 is three, line 2 is one.
+        let buf = Buffer::from_str("short\n0123456789abcdefghijABCDE\nlast");
+        let cols = 10;
+        // Cursor on the last line, which is therefore pane row 4: 1 + 3 above.
+        assert_eq!(cursor_pane_row(&buf, 0, (2, 0), cols, &wrap), 4);
+        // Every row of the wrapped line gets its own number, counting up to the
+        // cursor: rows 1, 2, 3 are 3, 2, 1 away — *not* "line 2 is 1 away".
+        let label = |row| gutter_number(1, row, 4, true);
+        assert_eq!((label(1), label(2), label(3)), (3, 2, 1));
+        // The cursor's own row keeps the absolute buffer line number.
+        assert_eq!(gutter_number(2, 4, 4, true), 3);
+        // ...and with relative off, so does every row.
+        assert_eq!(gutter_number(1, 3, 4, false), 2);
+
+        // Scrolled to the middle of the file, the count is from the top of the
+        // pane, so the same cursor is on row 3.
+        assert_eq!(cursor_pane_row(&buf, 1, (2, 0), cols, &wrap), 3);
+        // And the cursor inside a wrapped line lands on that line's own row.
+        assert_eq!(cursor_pane_row(&buf, 0, (1, 15), cols, &wrap), 2);
+
+        // Truncating, every line is one row and this is the old arithmetic.
+        let cut = Settings::default();
+        assert_eq!(cursor_pane_row(&buf, 0, (2, 0), cols, &cut), 2);
+        assert_eq!(cursor_pane_row(&buf, 1, (2, 0), cols, &cut), 1);
     }
 
     #[test]

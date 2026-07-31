@@ -108,6 +108,13 @@ pub struct Window {
     pub scroll: usize,
     /// Lines that fit, written by the renderer each frame.
     pub viewport_lines: usize,
+    /// Cells of text this window has across, gutter already taken out — written
+    /// by the renderer each frame, exactly as `viewport_lines` is and for the
+    /// same reason: only the renderer knows how wide a cell is in pixels or how
+    /// many digits the line numbers claimed. It is what makes a *visual* line a
+    /// thing core can reason about, and `0` means "nothing has drawn this window
+    /// yet", which every reader treats as "no wrapping".
+    pub wrap_cols: usize,
 }
 
 /// An OS window holding a tree of editor windows.
@@ -127,6 +134,7 @@ impl Frame {
                 cursor: 0,
                 scroll: 0,
                 viewport_lines: 24,
+                wrap_cols: 0,
             }],
             layout: Layout::Leaf(0),
             current: 0,
@@ -166,6 +174,7 @@ impl Frame {
             cursor: current.cursor,
             scroll: current.scroll,
             viewport_lines: current.viewport_lines,
+            wrap_cols: current.wrap_cols,
         });
         replace_leaf(&mut self.layout, current.id, |leaf| Layout::Split {
             dir,

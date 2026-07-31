@@ -1,0 +1,447 @@
+#+TITLE: Recipes
+#+SUBTITLE: the things people actually write
+
+Everything here goes in =~/.config/zemacs/init.lisp= (or whichever file the
+editor loads), under =(in-package :zemacs)=. Reload with =M-x reload-config= — no
+restart.
+
+A few names below come from the shipped config rather than from the host:
+=define-leader= and =define-key-everywhere= (=runtime/init.lisp=), and
+=define-derived-mode=, =define-minor-mode=, =set-mode-local=, =define-mode-key=,
+=add-auto-mode=, =derived-mode-p= (=runtime/modes/modes.lisp=). They are ordinary
+Lisp and yours to replace; the host API is [[file:reference.org][reference.org]].
+
+* A command bound to a key
+
+A command is a zero-argument function in the =ZEMACS= package. That is the entire
+mechanism: no =interactive=, no registration, no macro.
+
+#+begin_src lisp
+(defun insert-date ()
+  "Insert today's date at point."
+  (multiple-value-bind (s m h day month year) (get-decoded-time)
+    (declare (ignore s m h))
+    (insert (format nil "~d-~2,'0d-~2,'0d" year month day))))
+
+(define-key "normal" "SPC i d" "insert-date")
+(define-key "insert" "C-c d"   "insert-date")
+#+end_src
+
+The command name is a *string* in the binding, because the same namespace also
+holds the editor's built-in verbs — ="find-file"= there means the prompt, not the
+Lisp primitive that takes a path.
+
+For =M-x= to offer it, the name has to be published. =runtime/init.lisp= does that
+for every zero-argument function in the package at the end of the file:
+
+#+begin_src lisp
+(refresh-commands)     ; or (register-command "insert-date") for just this one
+#+end_src
+
+* Wrapping the region
+
+The canonical shape. One =replace-region= rather than a delete and an insert,
+because a keystroke can land between two primitives and cannot land inside one.
+
+#+begin_src lisp
+(defun surround-region (left right)
+  "Wrap the selection in LEFT and RIGHT."
+  (let ((r (region)))
+    (if r
+        (replace-region (car r) (cdr r)
+                        (concatenate 'string left (region-text) right))
+        (message "no selection"))))
+
+(defun org-bold ()   (surround-region "*" "*"))
+(defun org-italic () (surround-region "/" "/"))
+(defun org-code ()   (surround-region "~" "~"))
+
+;; Only in org buffers, and only with something selected.
+(define-key "org-mode" "SPC m b" "org-bold")
+(define-key "org-mode" "SPC m i" "org-italic")
+(define-key "org-mode" "SPC m c" "org-code")
+#+end_src
+
+Same shape, one line up in generality — comment out a block selection, back to
+front so the earlier offsets stay valid while the later ones move:
+
+#+begin_src lisp
+(defun comment-block ()
+  "Prefix every line of a visual-block selection with the mode's comment marker."
+  (let ((prefix (if (derived-mode-p 'lisp-mode) ";; " "// ")))
+    (dolist (r (reverse (region-ranges)))
+      (insert-at (car r) prefix))))
+#+end_src
+
+* A mode hook
+
+The editor fires exactly one kind of hook: when a buffer's major mode becomes X,
+it calls =X-hook= if that function exists. Everything else is built on it.
+
+The lazy version, when you own the mode:
+
+#+begin_src lisp
+(define-derived-mode markdown-mode text-mode
+  (message "markdown"))                 ; the entry body
+
+(set-mode-local 'markdown-mode 'line-overflow "wrap")  ; reverts on the way out
+(define-mode-key 'markdown-mode "SPC m b" "org-bold")  ; inherited by children
+(add-auto-mode ".md" 'markdown-mode)
+
+(defun markdown-mode-exit-hook ()       ; yours to define; the machinery fires it
+  (message "left markdown"))
+#+end_src
+
+Prefer =set-mode-local= over doing work in the body. Settings are *global* in the
+editor, so a hook that calls =(set-line-overflow "wrap")= directly would leave
+every other mode having to set it back. A claim is recomputed from baseline +
+ancestors + active minor modes whenever the modes change, which is order-proof.
+
+Two traps:
+
+- Do *not* hand-write =(defun org-mode-hook ...)= after loading =runtime/modes/=.
+  =define-derived-mode= generates that function; replacing it silently detaches
+  exit hooks, inheritance and mode-local settings for that mode. Put the code in
+  the mode body or in =X-exit-hook=.
+- There is no *general* =add-hook=, and only one function can be =X-hook=. To add
+  behaviour to a mode somebody else defined, wrap it:
+
+#+begin_src lisp
+(let ((old (and (fboundp 'rust-mode-hook) (fdefinition 'rust-mode-hook))))
+  (defun rust-mode-hook ()
+    (when old (funcall old))
+    (message "rust")))
+#+end_src
+
+* A minor mode
+
+#+begin_src lisp
+(define-minor-mode focus-mode
+  "Hide the line numbers and wrap, for reading."
+  (:on  (message "focus on"))
+  (:off (message "focus off")))
+
+(set-mode-local 'focus-mode 'line-numbers nil)
+(set-mode-local 'focus-mode 'line-overflow "wrap")
+
+(define-key-everywhere "SPC t f" "focus-mode")
+#+end_src
+
+The bodies are optional and most minor modes need neither: what a minor mode
+usually wants to change is a setting, and a setting is claimed declaratively.
+
+A minor mode gets a keymap for free — =(define-key "focus-mode" ...)= binds in its
+buffers only, and minor modes are consulted *before* the major mode, most
+recently enabled first.
+
+Toggling from Lisp goes through the generated command, not the primitive:
+=(focus-mode)= runs the bodies, =(set-minor-mode "focus-mode" t)= only flips the
+flag.
+
+* A theme
+
+A theme is an ordinary Lisp file of colour calls, so *loading one is applying
+it*. Every theme sets every face, which is what makes switching work — nothing is
+left behind from the one before.
+
+#+begin_src lisp
+;;;; themes/gruvbox.lisp
+(in-package :zemacs)
+
+(set-background 0.16 0.16 0.16)
+(set-foreground 0.92 0.86 0.70)
+
+(set-syntax-color "keyword"  0.98 0.29 0.20)
+(set-syntax-color "function" 0.72 0.73 0.15)
+(set-syntax-color "type"     0.98 0.74 0.18)
+(set-syntax-color "string"   0.72 0.73 0.15)
+(set-syntax-color "number"   0.83 0.53 0.61)
+(set-syntax-color "comment"  0.57 0.51 0.45)
+;; ... and the rest of (face-list)
+
+(set-syntax-color "modeline"          0.24 0.22 0.21)
+(set-syntax-color "modeline-inactive" 0.20 0.19 0.18)
+(set-syntax-color "modeline-text"     0.92 0.86 0.70)
+(set-modeline-relief 2)
+#+end_src
+
+Because dired and magit colour themselves out of the same faces as source code —
+a directory is a =type=, a size is a =number= — a theme reaches every buffer without
+knowing dired exists.
+
+To check you have covered everything — a face nothing has set answers with the
+foreground colour, because that is the fallback:
+
+#+begin_src lisp
+(defun unthemed-faces ()
+  "Faces still falling back to the foreground colour."
+  (let ((fg (foreground)))
+    (message (format nil "~{~a~^ ~}"
+                     (remove-if-not (lambda (f) (equal (syntax-color f) fg))
+                                    (face-list))))))
+#+end_src
+
+(=default= will always be in that list: =set-foreground= sets it deliberately.)
+
+* A custom dashboard
+
+The banner is plain text and the renderer centres it. Building it rather than
+pasting it means the screen says something true about *this* boot:
+
+#+begin_src lisp
+(defun %banner ()
+  (format nil "~%    z e m a c s~%~%    ~a ~a on ~a~%    ~a buffer~:p open~%"
+          (lisp-implementation-type)
+          (lisp-implementation-version)
+          (string-downcase (software-type))
+          (length (buffer-list))))
+
+(dashboard-banner (%banner))
+
+(clear-dashboard-items)
+(dashboard-item #\f "Find file"           "find-file")
+(dashboard-item #\s "Scratch buffer"      "lisp-scratch")
+(dashboard-item #\g "Git status"          "magit-status")
+(dashboard-item #\p "Search project"      "search-project")
+(dashboard-item #\c "Edit configuration"  "config")
+(dashboard-item #\r "Reload configuration" "reload-config")
+(dashboard-item #\q "Quit"                "quit")
+#+end_src
+
+An item's action is a command string, so built-in verbs and your own functions
+sit on it on equal footing. =clear-dashboard-items= first, or a reload doubles the
+list.
+
+To refresh the banner later — it is a snapshot, not a template — call
+=dashboard-banner= again from a command or a hook.
+
+* A status widget
+
+Readers make the image able to describe itself, which is most of what a
+=which-key= or a =describe-mode= is:
+
+#+begin_src lisp
+(defun describe-here ()
+  "Everything true of this buffer, in one line."
+  (message (format nil "~a  ~a~@[ +~{~a~^,~}~]  ~a:~a  ~a chars~:[~; [ro]~]"
+                   (buffer-name) (major-mode) (minor-modes)
+                   (line-number) (column) (point-max)
+                   (buffer-read-only-p))))
+
+(defun describe-mode-keys ()
+  "Every binding that applies in this buffer's major mode."
+  (let ((mode (major-mode)))
+    (message (format nil "~{~a~^  ~}"
+                     (mapcar #'second
+                             (remove-if-not (lambda (b) (string= (first b) mode))
+                                            (key-bindings)))))))
+
+(define-leader "SPC h h" "describe-here")
+(define-leader "SPC h k" "describe-mode-keys")
+#+end_src
+
+* Search and replace across the buffer
+
+One call, one undo step. The computation is Lisp's; the atomicity is the
+primitive's.
+
+#+begin_src lisp
+(defun tabs-to-spaces ()
+  "Expand every tab to the buffer's tab width."
+  (let ((n (replace-all (string #\Tab) (make-string (tab-width) :initial-element #\Space))))
+    (message (format nil "expanded ~a tab~:p" n))))
+#+end_src
+
+For something =replace-all= cannot express — a replacement that depends on the
+match, say — build the whole new text yourself and still apply it once.
+=buffer-lines= is the line-oriented starting point; it drops the empty line a
+rope reports after a trailing newline, which =(line-count)= does not:
+
+#+begin_src lisp
+(defun number-lines ()
+  "Prefix every line with its number."
+  (let ((i 0))
+    (replace-region 0 (point-max)
+                    (format nil "~{~a~%~}"
+                            (mapcar (lambda (line)
+                                      (format nil "~3d  ~a" (incf i) line))
+                                    (buffer-lines))))))
+#+end_src
+
+* Jumping around
+
+=find-file= lands a frame later, so a =goto-char= on the next line would move the
+cursor in the buffer you were *leaving*. =find-file-at= is the one command that
+opens and jumps:
+
+#+begin_src lisp
+(defun open-todo ()
+  (find-file-at "~/notes/todo.org:1:"))
+#+end_src
+
+Within a buffer, markers survive edits and integers do not — so a command that
+edits *around* point restores it with =save-excursion=:
+
+#+begin_src lisp
+(defun indent-buffer-two ()
+  "Add two spaces to the front of every line, staying where you are."
+  (save-excursion
+    (dolist (start (reverse (loop for i from 1 to (length (buffer-lines))
+                                  collect (line-start i))))
+      (insert-at start "  "))))
+#+end_src
+
+=save-excursion= does *not* help across a whole-buffer =replace-region=: that is a
+deletion covering the marker, and no marker survives it. A command that rewrites
+the buffer wholesale has to remember the line number instead:
+
+#+begin_src lisp
+(defun sort-buffer-lines ()
+  "Sort the lines, and come back to the line number you were on."
+  (let ((line (line-number)))
+    (replace-region 0 (point-max)
+                    (format nil "~{~a~%~}" (sort (buffer-lines) #'string<)))
+    (goto-line line)))
+#+end_src
+
+* Advice
+
+There is no advice framework because Common Lisp does not need one.
+
+#+begin_src lisp
+;; Strip trailing whitespace on every save.
+(defvar *real-save-file* (fdefinition 'save-file)
+  "DEFVAR, not DEFPARAMETER: a config reload must not capture the wrapper.")
+
+(defun save-file (&optional path)
+  (unless (buffer-read-only-p)
+    (replace-region 0 (point-max)
+                    (format nil "~{~a~%~}"
+                            (mapcar #'string-right-trim-spaces (buffer-lines)))))
+  (funcall *real-save-file* path))
+
+(defun string-right-trim-spaces (s) (string-right-trim '(#\Space #\Tab) s))
+#+end_src
+
+Three rules, two of them learned the hard way in =runtime/modes/modes.lisp=:
+
+1. Capture the old definition in a =DEFVAR=, never a =DEFPARAMETER=. A config reload
+   re-runs the file, and re-capturing would store the *wrapper* as the original
+   and recurse until the stack ran out.
+2. The wrapper must actually call the original, or the primitive stops reaching
+   the editor at all.
+3. *A built-in verb cannot be advised.* Core resolves =quit=, =find-file=,
+   =delete-window=, =magit-status= and the rest of =BUILTIN_COMMANDS= before it ever
+   asks the image, so redefining a Lisp function of that name changes nothing a
+   key binding does. =save-file= above is advisable precisely because it is *not*
+   a built-in verb — a key bound to ="save-file"= falls through to =(save-file)= in
+   the image.
+
+To find out which side a name is on: if it is in =BUILTIN_COMMANDS= in
+=crates/core/src/evil.rs=, it is the editor's; otherwise a key bound to it calls
+your function.
+
+* Reading another buffer
+
+#+begin_src lisp
+(defun scratch-length ()
+  (message (format nil "~a chars in the scratch buffer"
+                   (with-current-buffer "*scratch*" (point-max)))))
+#+end_src
+
+This genuinely switches the editor to that buffer and back — zemacs has one live
+buffer. Keep the body short, and prefer it for reading rather than editing: a
+keystroke landing while the body runs is typed into the wrong buffer.
+
+* Talking to git and dired
+
+#+begin_src lisp
+(defun stage-and-commit ()
+  "Stage everything and open a commit message."
+  (magit "stage-all")
+  (magit "commit"))
+
+(define-leader "SPC g c" "stage-and-commit")
+#+end_src
+
+Both land on the next turn of the main loop, in the order sent, so this works —
+but anything reading the result has to happen in a later command, not on the
+next line.
+
+* A language server
+
+One line. The registry is keyed by major mode, and nothing in Rust has to know
+the name:
+
+#+begin_src lisp
+(lsp-register-server 'rust-mode "rust-analyzer")
+(lsp-register-server 'go-mode "gopls")
+(lsp-register-server 'c-mode "clangd" "--background-index" "--clang-tidy")
+#+end_src
+
+The server starts the first time you touch a buffer in that mode, and stops with
+=M-x lsp-stop=. One server per *project*, found by walking up for a =.git= or a
+build file, so two Rust projects open at once get one =rust-analyzer= each.
+
+Diagnostics land as data, and drawing them is yours:
+
+#+begin_src lisp
+(push (lambda (path)
+        (when (string= path (buffer-file-name))
+          (message (format nil "~d problem~:p in ~a"
+                           (length (lsp-diagnostics path)) path))))
+      *lsp-diagnostics-functions*)
+#+end_src
+
+* Talking to any JSON-RPC child
+
+The language server client is written on top of a pipe that has nothing to do
+with LSP. Anything that speaks JSON-RPC over stdin and stdout — an agent, a
+typesetting daemon, a linter with a server mode — is reachable the same way,
+and none of it needs a rebuild.
+
+#+begin_src lisp
+(defvar *helper* nil)
+
+(defun helper-start ()
+  (setf *helper*
+        (rpc-start "my-tool" :args '("--serve")
+                   :cwd (lsp-project-root (buffer-file-name))
+                   :on-notify (lambda (conn method params)
+                                (declare (ignore conn))
+                                (when (string= method "tool/progress")
+                                  (message (format nil "~a%" (jget params "percent"))))))))
+
+(defun helper-ask ()
+  "Send the region and insert what comes back."
+  (let ((m (point-marker)))
+    (rpc-request *helper* "tool/rewrite"
+                 (jobj "text" (region-text) "style" "terse")
+                 (lambda (result error)
+                   (if error
+                       (message (format nil "tool: ~a" (jget error "message")))
+                       (let ((p (marker-position m)))
+                         (when p (insert-at p (jget result "text")))
+                         (delete-marker m)))))))
+#+end_src
+
+Two things to notice, and they are the whole shape of writing one of these:
+
+1. *The callback runs later*, on a turn of the Lisp queue of its own. It cannot
+   return a value to =helper-ask=, and by the time it runs the buffer has moved —
+   which is why the position is held in a *marker* rather than an integer.
+2. *Nothing blocks.* The request goes out, your command returns, and the editor
+   keeps taking keystrokes. That is the same contract as everything else here;
+   see [[file:threading.org][threading.org]].
+
+* Things that will not work
+
+| What                                   | Why                                                     |
+|----------------------------------------+---------------------------------------------------------|
+| =(find-file "x") (buffer-name)=          | =find-file= lands a frame later. Use =find-file-at=, or a mode hook. |
+| =(delete-region a b) (insert s)=         | Not atomic. Use =replace-region=.                          |
+| =(read-string "name: ")=                 | =(open-prompt "file")= puts a picker up, but the answer never comes back to Lisp. See [[file:boundary.org][boundary.org]]. |
+| =(kill-buffer "x")=                      | No such command exists. See [[file:boundary.org][boundary.org]].              |
+| =(re-search-forward "fo+")=              | No regexp engine in ECL. =search-forward= is literal.      |
+| =(length (buffer-string))=               | Counts bytes on a non-ASCII buffer. Use =(point-max)=.      |
+| =(loop)=                                 | Wedges the image; the editor survives but no later Lisp runs. |

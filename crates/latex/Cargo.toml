@@ -1,0 +1,13 @@
+[package]
+name = "zemacs-latex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+
+# Pure Rust, so a preview costs no C toolchain and no SDL2_image. dvipng's
+# output is a tiny 4-bit palette PNG; this crate expands it to RGBA for us.
+png = "0.18"

@@ -4,10 +4,21 @@
 //! targets but never mutates it. Everything it decides comes back as
 //! [`EditorCommand`]s for [`Editor::apply`].
 //!
+//! With exactly one exception, and it earns its keep: replaying a macro applies
+//! each key's commands before feeding the next, because a macro is a recording
+//! of *decisions* and every decision after the first has to see what the one
+//! before it did. `apply` is still the only writer — see [`Editor::replay`].
+//!
 //! Lookup order for every key, which is what makes the Lisp config authoritative:
-//! prompt line → pending literal (`r`, `f`) → **user keymap** → built-in grammar.
+//! prompt line → pending literal (`r`, `f`, `"`, `m`, `` ` ``, `q`, `@`) →
+//! **user keymap** → built-in grammar.
 
-use crate::{frame, Direction, Editor, EditorCommand, Key, Mode, Prompt, PromptKind};
+use crate::{
+    frame, BufferId, Direction, Editor, EditorCommand, Insertion, Key, MarkerId, Mode, Prompt,
+    PromptKind,
+};
+use regex::Regex;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +49,10 @@ pub(crate) struct Pending {
     pub find: Option<char>,
     /// Awaiting the replacement char of `r`.
     pub replace: bool,
+    /// Awaiting the literal argument of `"`, `m`, `` ` ``, `'`, `q` or `@` —
+    /// and *which* of them is waiting is the character itself, since none of
+    /// them needs any other state to finish.
+    pub literal: Option<char>,
 }
 
 impl Pending {
@@ -47,6 +62,7 @@ impl Pending {
         self.keys.clear();
         self.find = None;
         self.replace = false;
+        self.literal = None;
     }
 
     fn count(&self) -> usize {
@@ -69,11 +85,79 @@ impl Pending {
         if self.replace {
             s.push('r');
         }
+        if let Some(l) = self.literal {
+            s.push(l);
+        }
         if s.is_empty() {
             String::new()
         } else {
             format!("   [{s}]")
         }
+    }
+}
+
+/// How deep `@` may nest before it is called a runaway.
+///
+/// A macro that replays itself is the obvious way to write one, and it is a
+/// *stack* overflow rather than an error the grammar could see coming — replay
+/// re-enters `handle_key`. So the depth is capped instead of the recursion
+/// detected: `@a` containing `@a` is legitimate right up until it does not
+/// terminate, and nothing short of running it can tell the two apart.
+const MACRO_DEPTH: usize = 20;
+
+/// The vim state that outlives a keystroke: registers, macros, marks.
+///
+/// One struct rather than six fields on [`Editor`], because it is *this* file
+/// that reads every one of them and none of it is the document — `apply` has
+/// no business in any of it.
+#[derive(Default)]
+pub(crate) struct Vim {
+    /// `"a`–`"z`, and whatever else was typed after `"`. The **unnamed**
+    /// register is still `Editor::register` and is deliberately not in here:
+    /// vim fills it on every yank and delete whatever register you named, so
+    /// there are genuinely two things and not one map with a default key.
+    registers: HashMap<char, (String, bool)>,
+    /// The register named for the *next* verb, consumed by it.
+    pending: Option<char>,
+    macros: HashMap<char, Vec<Key>>,
+    /// Which register `q` is currently filling, and what it has so far.
+    recording: Option<(char, Vec<Key>)>,
+    /// What `@@` repeats — the last macro *replayed*, not the last recorded.
+    last_macro: Option<char>,
+    /// Current `@` nesting, against [`MACRO_DEPTH`].
+    depth: usize,
+    /// `ma` — one marker per (buffer, letter).
+    ///
+    /// Keyed by buffer because vim's lowercase marks are per file and a marker
+    /// only resolves in the buffer it was made in: a mark set elsewhere would
+    /// otherwise read as this buffer's. ponytail: nothing removes the entry
+    /// when a buffer goes away, so a long session leaks a handful of dead
+    /// (id, char) pairs. They read as "mark not set", which is the right
+    /// answer anyway; move the map onto `Buffer` if that ever stops being true.
+    marks: HashMap<(BufferId, char), MarkerId>,
+}
+
+impl Vim {
+    /// Write a register. **Uppercase appends**, as vim does — `"Ayy` adds to
+    /// whatever `"ayy` put there.
+    fn write(&mut self, name: char, text: String, linewise: bool) {
+        if !name.is_ascii_uppercase() {
+            self.registers.insert(name, (text, linewise));
+            return;
+        }
+        let slot = self.registers.entry(name.to_ascii_lowercase()).or_default();
+        // A linewise append has to land on its own line: without this, `"Ayy`
+        // twice gives one long line rather than the two that were yanked.
+        if (slot.1 || linewise) && !slot.0.is_empty() && !slot.0.ends_with('\n') {
+            slot.0.push('\n');
+        }
+        slot.0.push_str(&text);
+        slot.1 |= linewise;
+    }
+
+    /// Read a register. `"A` reads `"a`: only *writing* distinguishes the case.
+    fn read(&self, name: char) -> Option<&(String, bool)> {
+        self.registers.get(&name.to_ascii_lowercase())
     }
 }
 
@@ -136,12 +220,51 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "dired-refresh",
     "ace-window",
     "search-line",
+    "search-project",
+    "project-find-file",
+    "project-switch",
+    "project-dired",
+    "project-compile",
+    "project-test",
+    "project-root",
+    "project-forget",
+    "magit-toggle",
+    "magit-amend",
+    "magit-fetch",
+    "magit-stash",
+    "magit-stash-pop",
+    "magit-rebase-continue",
+    "magit-rebase-skip",
+    "magit-rebase-abort",
+    "terminal",
+    "terminal-normal",
+    "terminal-close",
     "quit",
 ];
 
 impl Editor {
     /// Translate one key into zero or more commands.
     pub fn handle_key(&mut self, key: Key) -> Vec<EditorCommand> {
+        // `q` ends a recording, and is the one key a macro must never contain —
+        // replaying it would start a recording over the top of itself. Checked
+        // before anything else looks at the key, and only where `q` could have
+        // *started* one: in a prompt or in Insert it is just a letter.
+        if key == Key::Char('q') && self.recording_here() {
+            return self.stop_recording();
+        }
+        // Record the keys, not the commands. A replay then re-runs the
+        // *decisions* — the second `dw` deletes whatever word the cursor is on
+        // now, which is the whole reason anyone records a macro.
+        //
+        // Nothing is recorded during a replay: `@a` typed while recording must
+        // go in as `@a` and not as its expansion, or the macro grows by its own
+        // length every time it runs.
+        if self.vim.depth == 0 {
+            if let Some((_, keys)) = self.vim.recording.as_mut() {
+                keys.push(key);
+            }
+        }
+
         // Ace labels are up: this keystroke picks a window and nothing else.
         if let Some(labels) = self.ace.take() {
             let picked = match key {
@@ -164,7 +287,57 @@ impl Editor {
         if self.mode == Mode::Insert {
             return self.insert_key(key);
         }
+        if self.mode == Mode::Terminal {
+            return self.terminal_key(key);
+        }
         self.normal_key(key)
+    }
+
+    // --- Terminal --------------------------------------------------------
+
+    /// In a terminal the shell owns the keyboard, so this is the one mode whose
+    /// keymap is consulted *instead of* the Evil grammar rather than before it:
+    /// `j` has to type a `j`, and `d` has to type a `d`.
+    ///
+    /// Two ways an editor binding still fires. The Terminal keymap is checked
+    /// first and always wins, so anything at all can be reclaimed by binding it
+    /// in `"terminal"`. Failing that, keys a terminal has no use for — the ones
+    /// carrying Command, plus the two modified Enters — fall through to the
+    /// *Normal* keymap, which is what keeps `M-x`, `C-M-j`, `M-o` and the window
+    /// splits alive inside a shell.
+    ///
+    /// Ctrl is deliberately not in that set. `C-c`, `C-a`, `C-d`, `C-r` and
+    /// `C-w` are the shell's, and a `C-c` that stopped here would mean never
+    /// being able to interrupt a running program.
+    fn terminal_key(&mut self, key: Key) -> Vec<EditorCommand> {
+        let token = key.token();
+        if let Some(action) = self.keymap.get(&(Mode::Terminal, token.clone())).cloned() {
+            return self.run_action(&action);
+        }
+        if key.is_editor_key() {
+            if let Some(action) = self.keymap.get(&(Mode::Normal, token)).cloned() {
+                return self.run_action(&action);
+            }
+        }
+        vec![EditorCommand::TermKey(key)]
+    }
+
+    /// `⌘⌫` — kill the word before point, as one undo step.
+    ///
+    /// Reuses `b`'s notion of a word, so what it removes is exactly what `b`
+    /// would have jumped over. Nothing at the start of the buffer, and nothing
+    /// where `b` would not move, so it can never delete a zero-width range and
+    /// leave a checkpoint behind for it.
+    fn delete_word_backward(&mut self) -> Vec<EditorCommand> {
+        let end = self.buffer.cursor;
+        let start = word_backward(&self.buffer, end);
+        if start >= end {
+            return vec![];
+        }
+        vec![
+            EditorCommand::Checkpoint,
+            EditorCommand::DeleteRange(start, end),
+        ]
     }
 
     // --- Insert ----------------------------------------------------------
@@ -186,6 +359,7 @@ impl Editor {
             )],
             Key::Enter => vec![EditorCommand::InsertNewline],
             Key::Backspace => vec![EditorCommand::DeleteBackward],
+            Key::MetaBackspace => self.delete_word_backward(),
             Key::Left => vec![EditorCommand::MoveCursor(Direction::Left)],
             Key::Right => vec![EditorCommand::MoveCursor(Direction::Right)],
             Key::Up => vec![EditorCommand::MoveCursor(Direction::Up)],
@@ -230,11 +404,17 @@ impl Editor {
                 EditorCommand::MoveTo(at),
             ];
         }
+        if let Some(kind) = self.pending.literal.take() {
+            return self.literal_key(kind, key);
+        }
 
         // 2. Esc always unwinds.
         if key == Key::Esc || key == Key::Ctrl('g') {
             let was_visual = matches!(self.mode, Mode::Visual | Mode::VisualLine);
             self.pending.clear();
+            // A register named for a verb that never came must not attach
+            // itself to whatever you do next.
+            self.vim.pending = None;
             return if was_visual {
                 vec![EditorCommand::SetMode(Mode::Normal)]
             } else {
@@ -265,22 +445,36 @@ impl Editor {
             self.pending.clear();
             return self.run_action(&cmd);
         }
-        if let Some(cmd) = self.keymap.get(&(self.mode, seq.clone())) {
-            // Same namespace as a dashboard action: a built-in verb if it names
-            // one, otherwise a Lisp call. Without this, binding a key to
-            // `find-file` would reach the Lisp primitive of that name, which
-            // wants a path argument and has no way to prompt for one.
-            let action = cmd.clone();
-            self.pending.clear();
-            return self.run_action(&action);
+        // A mode-local *prefix* outranks a global exact binding, for exactly the
+        // reason a mode-local binding does: `C-c` is bound everywhere to
+        // `eval-dwim`, and a Lisp buffer wants the whole `C-c C-e` family under
+        // it. Without this the global binding fires first and the sequence can
+        // never be typed at all.
+        let mode_prefix = self.mode_prefix(&seq);
+        if !mode_prefix {
+            if let Some(cmd) = self.keymap.get(&(self.mode, seq.clone())) {
+                // Same namespace as a dashboard action: a built-in verb if it names
+                // one, otherwise a Lisp call. Without this, binding a key to
+                // `find-file` would reach the Lisp primitive of that name, which
+                // wants a path argument and has no way to prompt for one.
+                let action = cmd.clone();
+                self.pending.clear();
+                return self.run_action(&action);
+            }
         }
-        if self.mode_prefix(&seq)
+        if mode_prefix
             || self
                 .keymap
                 .keys()
                 .any(|(m, k)| *m == self.mode && k.starts_with(&format!("{seq} ")))
         {
-            return vec![]; // a longer binding may still match
+            // A longer binding may still match — and this is the one moment
+            // Lisp cannot see for itself, so which-key is told about it. The
+            // `fboundp` guard means a config that never loaded which-key gets
+            // silence rather than an undefined-function report per prefix key.
+            return vec![EditorCommand::CallLisp(format!(
+                "(when (fboundp 'which-key) (which-key {seq:?}))"
+            ))];
         }
 
         let cmds = self.builtin(&seq, key);
@@ -311,6 +505,14 @@ impl Editor {
             self.desired_col = None;
         }
 
+        // `⌘⌫` kills a word backwards wherever you are, so it does the same
+        // thing in Normal mode as in Insert rather than being dead in half the
+        // editor. Before the motions, which have no claim on it.
+        if seq == "M-<bs>" {
+            self.pending.clear();
+            return Some(self.delete_word_backward());
+        }
+
         // Motions first: they compose with a pending operator.
         if let Some(m) = self.motion(seq, n) {
             return Some(self.resolve(op, m));
@@ -324,6 +526,18 @@ impl Editor {
             // Clear only the key sequence: `count` and `op` have to survive the
             // literal target key so `d2fx` still works.
             self.pending.find = seq.chars().next();
+            self.pending.keys.clear();
+            return None;
+        }
+        // The other keys whose argument is the next keystroke rather than a
+        // motion: a register, a mark, a macro. Same rule as `f` and for the
+        // same reason — ``d`a`` and `"a2dd` both have to survive the letter in
+        // the middle, so only the key sequence is cleared.
+        //
+        // Before the operator-abort below, which is what would otherwise eat
+        // the `` ` `` of ``d`a`` as "not a motion, give up".
+        if matches!(seq, "\"" | "m" | "`" | "'" | "q" | "@") {
+            self.pending.literal = seq.chars().next();
             self.pending.keys.clear();
             return None;
         }
@@ -424,11 +638,8 @@ impl Editor {
                 return None;
             }
             "J" => self.join_lines(n),
-            "p" => vec![EditorCommand::Checkpoint, EditorCommand::Paste { after: true }],
-            "P" => vec![
-                EditorCommand::Checkpoint,
-                EditorCommand::Paste { after: false },
-            ],
+            "p" => self.paste_cmds(true),
+            "P" => self.paste_cmds(false),
             "u" => vec![EditorCommand::Undo],
             "C-r" => vec![EditorCommand::Redo],
 
@@ -456,6 +667,13 @@ impl Editor {
             // --- prompts and meta ---
             ":" => {
                 self.open_prompt(PromptKind::Ex);
+                // vim types the range for you when there is a selection, and
+                // that is also how anyone discovers `:'<,'>s` exists.
+                if self.mode.is_visual() {
+                    if let Some(p) = self.prompt.as_mut() {
+                        p.text = "'<,'>".into();
+                    }
+                }
                 vec![]
             }
             "/" => {
@@ -693,6 +911,9 @@ impl Editor {
             .collect::<Vec<_>>()
             .join("\n");
         let top = ranges[0].0;
+        if let Some(name) = self.vim.pending.take() {
+            self.vim.write(name, text.clone(), false);
+        }
 
         let mut cmds = vec![EditorCommand::SetMode(Mode::Normal)];
         // The register holds the block's text; `linewise` is false because
@@ -717,6 +938,14 @@ impl Editor {
     fn operate(&mut self, op: Op, start: usize, end: usize, linewise: bool) -> Vec<EditorCommand> {
         if start >= end {
             return vec![];
+        }
+        // `"ayy`. Done here rather than through a command because the unnamed
+        // register is written by the `Yank` below *as well* — vim fills `""` on
+        // every yank and delete whatever register you named, so this is an
+        // extra copy and not a redirection.
+        if let Some(name) = self.vim.pending.take() {
+            let text = self.buffer.slice_string(start, end);
+            self.vim.write(name, text, linewise);
         }
         let yank = EditorCommand::Yank {
             start,
@@ -811,29 +1040,230 @@ impl Editor {
         )]
     }
 
+    // --- registers, macros, marks ----------------------------------------
+
+    /// The second half of `"x`, `mx`, `` `x ``, `'x`, `qx` and `@x`: the key is
+    /// data, not a command.
+    fn literal_key(&mut self, kind: char, key: Key) -> Vec<EditorCommand> {
+        let n = self.pending.count();
+        let op = self.pending.op;
+        let Key::Char(c) = key else {
+            self.pending.clear();
+            return vec![];
+        };
+        match kind {
+            // A register names the *next* verb, so this is the one literal that
+            // leaves `count` and `op` alone: `"a2dd` and `2"add` are the same
+            // two lines into the same register.
+            '"' => {
+                self.vim.pending = Some(c);
+                self.pending.keys.clear();
+                vec![]
+            }
+            'm' => {
+                self.pending.clear();
+                self.set_mark(c)
+            }
+            // A mark is a motion, which is why it goes through `resolve`:
+            // ``d`a`` deletes to the exact position and `d'a` deletes lines.
+            '`' | '\'' => {
+                self.pending.clear();
+                match self.mark_motion(kind == '\'', c) {
+                    Some(m) => self.resolve(op, m),
+                    None => vec![EditorCommand::Message(format!("mark not set: {c}"))],
+                }
+            }
+            'q' => {
+                self.pending.clear();
+                self.vim.recording = Some((c, Vec::new()));
+                vec![EditorCommand::Message(format!("recording @{c}"))]
+            }
+            '@' => {
+                self.pending.clear();
+                self.replay(c, n)
+            }
+            _ => {
+                self.pending.clear();
+                vec![]
+            }
+        }
+    }
+
+    /// True where a `q` would end a recording rather than mean a letter.
+    fn recording_here(&self) -> bool {
+        self.vim.recording.is_some()
+            && self.prompt.is_none()
+            && self.ace.is_none()
+            && self.pending.literal.is_none()
+            && self.pending.find.is_none()
+            && !self.pending.replace
+            && (self.mode == Mode::Normal || self.mode.is_visual())
+    }
+
+    fn stop_recording(&mut self) -> Vec<EditorCommand> {
+        let Some((name, keys)) = self.vim.recording.take() else {
+            return vec![];
+        };
+        let n = keys.len();
+        self.vim.macros.insert(name, keys);
+        vec![EditorCommand::Message(format!("recorded {n} keys into @{name}"))]
+    }
+
+    /// `@a`, and `@@` for whatever ran last.
+    ///
+    /// The keys go back through `handle_key`, and the commands are applied
+    /// **here** rather than handed to the caller: every motion is computed
+    /// against the document as it is *now*, so the second `dw` of a replay has
+    /// to see what the first one did. Returning them all in one batch would
+    /// compute every key against the text as it stood before the macro started,
+    /// and a two-line macro would delete the same word twice.
+    ///
+    /// This is the one place `handle_key` mutates the document, and it is not a
+    /// crack in the rule — it is still `Editor::apply` doing the writing, just
+    /// with the replay driving the loop instead of the app. Commands core
+    /// cannot carry out itself travel back up as usual, so a macro can still
+    /// open a file or call Lisp.
+    fn replay(&mut self, name: char, count: usize) -> Vec<EditorCommand> {
+        let name = match name {
+            '@' => match self.vim.last_macro {
+                Some(n) => n,
+                None => return vec![EditorCommand::Message("no macro to repeat".into())],
+            },
+            n => n,
+        };
+        let Some(keys) = self.vim.macros.get(&name).cloned() else {
+            return vec![EditorCommand::Message(format!("empty macro: @{name}"))];
+        };
+        if self.vim.depth >= MACRO_DEPTH {
+            return vec![EditorCommand::Message(format!("@{name} nested too deeply"))];
+        }
+        self.vim.last_macro = Some(name);
+        self.vim.depth += 1;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            for key in keys.iter().copied() {
+                for cmd in self.handle_key(key) {
+                    if cmd.needs_app() {
+                        out.push(cmd);
+                    } else {
+                        self.apply(cmd);
+                    }
+                }
+            }
+        }
+        self.vim.depth -= 1;
+        out
+    }
+
+    /// `ma`. A *marker*, so the mark still names its character after an edit
+    /// above it — which is the whole difference between this and remembering an
+    /// offset.
+    fn set_mark(&mut self, name: char) -> Vec<EditorCommand> {
+        let slot = (self.buffer.id, name);
+        // Replacing a mark frees the marker it used, or `ma` in a loop leaves
+        // one dead marker per press in the buffer for `splice` to walk.
+        if let Some(old) = self.vim.marks.remove(&slot) {
+            self.delete_marker(old);
+        }
+        let id = self.make_marker(self.buffer.cursor, Insertion::Stay);
+        self.vim.marks.insert(slot, id);
+        vec![EditorCommand::Message(format!("mark {name} set"))]
+    }
+
+    /// `` `a `` is the exact position, `'a` is the line — vim's distinction,
+    /// and the reason they are two keys rather than one.
+    ///
+    /// ponytail: only the letters. Vim's `` `` `` (where you were), `'<`/`'>`
+    /// (the last selection) and the uppercase file-marks need a jump list, a
+    /// selection history and a cross-buffer marker table respectively — three
+    /// features, none of them this one.
+    fn mark_motion(&self, linewise: bool, name: char) -> Option<Motion> {
+        let at = self
+            .vim
+            .marks
+            .get(&(self.buffer.id, name))
+            .copied()
+            .and_then(|id| self.marker_position(id))?;
+        Some(match linewise {
+            true => {
+                let line = self.buffer.text.char_to_line(at.min(self.buffer.len_chars()));
+                Motion {
+                    target: self.buffer.first_non_blank(line),
+                    span: Span::Linewise,
+                }
+            }
+            false => Motion {
+                target: at,
+                span: Span::Exclusive,
+            },
+        })
+    }
+
+    /// `p`, and `"ap` out of a named register.
+    ///
+    /// A named paste loads the register into the unnamed one, pastes, and puts
+    /// back what was there: vim leaves `""` untouched by `"ap`, and
+    /// `EditorCommand::Paste` has no register to paste from otherwise.
+    /// ponytail: the day `Paste` grows a register field — it lives in the one
+    /// file this file cannot freely edit — these four commands become one.
+    fn paste_cmds(&mut self, after: bool) -> Vec<EditorCommand> {
+        let Some(name) = self.vim.pending.take() else {
+            return vec![EditorCommand::Checkpoint, EditorCommand::Paste { after }];
+        };
+        let Some((text, linewise)) = self.vim.read(name).cloned() else {
+            return vec![EditorCommand::Message(format!("register {name} is empty"))];
+        };
+        vec![
+            EditorCommand::Checkpoint,
+            EditorCommand::SetRegister { text, linewise },
+            EditorCommand::Paste { after },
+            EditorCommand::SetRegister {
+                text: self.register.clone(),
+                linewise: self.register_linewise,
+            },
+        ]
+    }
+
     // --- search ----------------------------------------------------------
+
+    /// Where the pattern next matches, wrapping at the end of the buffer.
+    /// Char offsets in and out; the engine works in bytes, so the conversion
+    /// happens here and nowhere else.
+    ///
+    /// ponytail: the pattern is compiled and the rope flattened on every call,
+    /// and incremental search calls it once per keystroke rather than once per
+    /// `n`. Both are a whole-buffer allocation for what is usually a match a
+    /// few characters away. Cache the compiled pattern and feed the engine the
+    /// rope's chunks when a large file starts to feel it.
+    fn search_pos(&self, pat: &str, from: usize, forward: bool) -> Option<usize> {
+        let re = compile(pat, false)?;
+        let hay = self.buffer.text.to_string();
+        let start = self
+            .buffer
+            .text
+            .char_to_byte(from.min(self.buffer.len_chars()));
+        let hit = if forward {
+            (re.find_at(&hay, start).map(|m| m.start())).or_else(|| re.find(&hay).map(|m| m.start()))
+        } else {
+            // The last match that begins before us — `find_iter` is
+            // left-to-right and non-overlapping, so `take_while` is exactly
+            // "everything behind the cursor".
+            let backwards = || re.find_iter(&hay).map(|m| m.start());
+            (backwards().take_while(|&s| s < start).last()).or_else(|| backwards().last())
+        };
+        hit.map(|b| self.buffer.text.byte_to_char(b))
+    }
 
     fn search_from(&mut self, from: usize, forward: bool) -> Vec<EditorCommand> {
         if self.last_search.is_empty() {
             return vec![EditorCommand::Message("no previous search".into())];
         }
-        let hay = self.buffer.text.to_string();
         let pat = self.last_search.clone();
-        // char offsets, so map through byte positions once.
-        let byte_of = |ci: usize| self.buffer.text.char_to_byte(ci.min(self.buffer.len_chars()));
-        let start_b = byte_of(from);
-        let hit = if forward {
-            hay[start_b..]
-                .find(&pat)
-                .map(|b| b + start_b)
-                .or_else(|| hay.find(&pat))
-        } else {
-            hay[..start_b]
-                .rfind(&pat)
-                .or_else(|| hay.rfind(&pat))
-        };
-        match hit {
-            Some(b) => vec![EditorCommand::MoveTo(self.buffer.text.byte_to_char(b))],
+        if compile(&pat, false).is_none() {
+            return vec![EditorCommand::Message(format!("bad pattern: {pat}"))];
+        }
+        match self.search_pos(&pat, from, forward) {
+            Some(at) => vec![EditorCommand::MoveTo(at)],
             None => vec![EditorCommand::Message(format!("pattern not found: {pat}"))],
         }
     }
@@ -884,8 +1314,16 @@ impl Editor {
         match p.kind {
             PromptKind::Ex => self.ex_command(&p.text),
             PromptKind::Search => {
-                self.last_search = p.text;
-                self.search_from(self.buffer.cursor + 1, true)
+                // An empty pattern reuses the last one, as vim does: a stray
+                // `/` RET must not throw away what `n` was following.
+                let origin = p.origin.unwrap_or(self.buffer.cursor);
+                if !p.text.is_empty() {
+                    self.last_search = p.text;
+                }
+                // From the origin, not from the cursor — the incremental
+                // preview has already moved the cursor onto the match, and
+                // searching from *there* would land on the one after it.
+                self.search_from(origin + 1, true)
             }
             PromptKind::Command => {
                 let name = p.value();
@@ -917,6 +1355,19 @@ impl Editor {
                 Some(&line) => vec![EditorCommand::MoveTo(self.buffer.first_non_blank(line))],
                 None => vec![],
             },
+            // A project file, or a project root — which opens as a directory,
+            // and a directory is dired. One prompt, both gestures.
+            PromptKind::ProjectFile => match p.current() {
+                Some(path) => vec![EditorCommand::OpenFile(path.into())],
+                None => vec![],
+            },
+            // `path:line:text`, ripgrep's own format. Opening the file is the
+            // app's job, and so is the jump — core cannot know how long the
+            // file will be until it has been read.
+            PromptKind::Grep => match p.current() {
+                Some(hit) => vec![EditorCommand::OpenAt(hit.to_string())],
+                None => vec![],
+            },
         }
     }
 
@@ -928,6 +1379,20 @@ impl Editor {
         };
         if !p.kind.previews() {
             return vec![];
+        }
+        // Incremental search: there is no candidate list to highlight, so what
+        // the cursor follows is the match itself, recomputed on every
+        // keystroke. Falling back to the origin rather than staying put is
+        // deliberate — a pattern that has stopped matching should look like it
+        // has, and typing one more character then un-typing it must be a
+        // round trip.
+        if p.kind == PromptKind::Search {
+            let origin = p.origin.unwrap_or(self.buffer.cursor);
+            let pat = p.text.clone();
+            let at = (!pat.is_empty())
+                .then(|| self.search_pos(&pat, origin + 1, true))
+                .flatten();
+            return vec![EditorCommand::MoveTo(at.unwrap_or(origin))];
         }
         match p.matches.get(p.selected) {
             Some(&line) => vec![EditorCommand::MoveTo(self.buffer.first_non_blank(line))],
@@ -965,6 +1430,9 @@ impl Editor {
             PromptKind::Buffer => ("Buffer: ", self.buffer_names()),
             // The app fills these in as the path is typed; core does no IO.
             PromptKind::File => ("Find file: ", Vec::new()),
+            // Likewise, but from ripgrep rather than from a directory read.
+            PromptKind::Grep => ("Search project: ", Vec::new()),
+            PromptKind::ProjectFile => ("Project file: ", Vec::new()),
             PromptKind::Ex => (":", Vec::new()),
             PromptKind::Search => ("/", Vec::new()),
             // One item per line, in order, so `matches[selected]` is the line
@@ -988,8 +1456,149 @@ impl Editor {
         self.prompt = Some(prompt);
     }
 
+    /// `:[range]s/pat/rep/[flags]` — `None` when the line is not a substitute.
+    ///
+    /// The whole substitution is one `Checkpoint`, one `DeleteRange` and one
+    /// `InsertText` over the affected lines: the shape `rs_replace_region`
+    /// uses, and the reason `u` reverses a `:%s` in one press instead of once
+    /// per match. Building the new text first and splicing it in once is also
+    /// the only version that is *correct* — every command in a returned batch
+    /// is computed against the pre-edit buffer, so a loop of per-match deletes
+    /// would aim every one of them at stale offsets.
+    fn substitute(&mut self, line: &str) -> Option<Vec<EditorCommand>> {
+        // The range. Nothing is the current line, `%` the whole buffer, and
+        // `'<,'>` — which `:` in visual mode types for you — the selection.
+        // ponytail: no `1,5`, no `.`/`$`, no marks and no offsets. Each is a
+        // small parser and none of them is reachable from a keystroke today.
+        let whole = (0, self.buffer.len_lines().saturating_sub(1));
+        // `None` here is only ever "`'<,'>` with nothing selected", which falls
+        // back to the current line rather than silently doing the whole buffer.
+        let (rest, lines) = match line {
+            l if l.starts_with('%') => (&l[1..], Some(whole)),
+            l if l.starts_with("'<,'>") => (&l[5..], self.selection_lines()),
+            l => (l, Some(self.line_range(1))),
+        };
+        let mut head = rest.chars();
+        if head.next() != Some('s') {
+            return None;
+        }
+        // Vim takes any non-alphanumeric as the delimiter, which is what makes
+        // `:s#a/b#c#` writable. Requiring one is also what keeps `:set` and
+        // `:split` out of here.
+        let delim = head
+            .next()
+            .filter(|c| !c.is_alphanumeric() && !c.is_whitespace())?;
+        let parts = split_delim(&rest[1 + delim.len_utf8()..], delim);
+
+        let mut global = false;
+        let mut fold = false;
+        for f in parts.get(2).map_or("", |s| s.as_str()).chars() {
+            match f {
+                'g' => global = true,
+                'i' => fold = true,
+                // ponytail: `c` (confirm) and `n` (count only) both want a
+                // prompt whose answer comes *back*, which core has no shape
+                // for. Refused rather than ignored — a silently dropped `c`
+                // is a whole-buffer replace nobody agreed to.
+                other => {
+                    return Some(vec![EditorCommand::Message(format!(
+                        "unsupported :s flag: {other}"
+                    ))])
+                }
+            }
+        }
+
+        // An empty pattern means the last search, as in vim — `/foo` then
+        // `:s//bar/` is the idiom, and it is free.
+        let pat = match parts.first().map_or("", |s| s.as_str()) {
+            "" => self.last_search.clone(),
+            p => p.to_string(),
+        };
+        if pat.is_empty() {
+            return Some(vec![EditorCommand::Message("no previous search".into())]);
+        }
+        let Some(re) = compile(&pat, fold) else {
+            return Some(vec![EditorCommand::Message(format!("bad pattern: {pat}"))]);
+        };
+        self.last_search = pat.clone();
+        let rep = vim_replacement(parts.get(1).map_or("", |s| s.as_str()));
+
+        let (first, last) = lines.unwrap_or_else(|| self.line_range(1));
+        let (start, end) = (self.buffer.line_start(first), self.buffer.line_end(last));
+        let region = self.buffer.slice_string(start, end);
+
+        // Line by line, because `:s` is a line-oriented command: without `g` it
+        // is the *first* match on each line, and `^`/`$` anchor to the line and
+        // not to the region.
+        let mut count = 0usize;
+        let mut changed = None;
+        let mut out: Vec<String> = Vec::new();
+        for text in region.split('\n') {
+            let hits = re.find_iter(text).count();
+            if hits == 0 {
+                out.push(text.to_string());
+                continue;
+            }
+            count += if global { hits } else { 1 };
+            changed = Some(out.len());
+            let new = match global {
+                true => re.replace_all(text, rep.as_str()),
+                false => re.replace(text, rep.as_str()),
+            };
+            out.push(new.into_owned());
+        }
+        let Some(changed) = changed else {
+            return Some(vec![EditorCommand::Message(format!(
+                "pattern not found: {pat}"
+            ))]);
+        };
+        // vim leaves the cursor on the last line it touched, which for `:%s` is
+        // the difference between "it worked" and being thrown to the top of the
+        // file. Counted in the *new* text, since that is what will be there.
+        let at = start + out[..changed].iter().map(|l| l.chars().count() + 1).sum::<usize>();
+
+        let mut cmds = Vec::new();
+        if self.mode.is_visual() {
+            cmds.push(EditorCommand::SetMode(Mode::Normal));
+        }
+        cmds.extend([
+            EditorCommand::Checkpoint,
+            EditorCommand::DeleteRange(start, end),
+            // `DeleteRange` leaves the cursor at `start` — except on an empty
+            // range, which it refuses outright. Say it, rather than relying on
+            // it, or `:s/^/# /` on a blank line inserts wherever point was.
+            EditorCommand::MoveTo(start),
+            EditorCommand::InsertText(out.join("\n")),
+            EditorCommand::MoveTo(at),
+            EditorCommand::Message(match count {
+                1 => "1 substitution".to_string(),
+                n => format!("{n} substitutions"),
+            }),
+        ]);
+        Some(cmds)
+    }
+
+    /// `count` lines starting at the cursor's, as an inclusive line range.
+    fn line_range(&self, count: usize) -> (usize, usize) {
+        let (line, _) = self.buffer.cursor_line_col();
+        let last = self.buffer.len_lines().saturating_sub(1);
+        (line, (line + count.max(1) - 1).min(last))
+    }
+
+    /// The inclusive line range of the visual selection, if there is one.
+    fn selection_lines(&self) -> Option<(usize, usize)> {
+        let (a, b) = self.selection()?;
+        let to_line = |c: usize| self.buffer.text.char_to_line(c.min(self.buffer.len_chars()));
+        Some((to_line(a), to_line(b.saturating_sub(1))))
+    }
+
     fn ex_command(&mut self, line: &str) -> Vec<EditorCommand> {
         let line = line.trim();
+        // Substitute before the split below: `s/a/b/g` has no whitespace in it,
+        // so the generic parse would take the whole line for a command name.
+        if let Some(cmds) = self.substitute(line) {
+            return cmds;
+        }
         let (cmd, arg) = match line.split_once(char::is_whitespace) {
             Some((c, a)) => (c, a.trim()),
             None => (line, ""),
@@ -1136,9 +1745,25 @@ impl Editor {
                 vec![EditorCommand::Dired(other["dired-".len()..].to_string())]
             }
             "dired" => vec![EditorCommand::Dired("open".into())],
+            // `terminal-normal` and `terminal-insert` go to the app like every
+            // other verb: stepping out of the shell means loading the scrollback
+            // into the buffer, and core has no scrollback to load.
+            other if other.starts_with("project-") => {
+                vec![EditorCommand::Project(other["project-".len()..].to_string())]
+            }
+            other if other.starts_with("terminal-") => {
+                vec![EditorCommand::Term(other["terminal-".len()..].to_string())]
+            }
+            "terminal" | "term" | "shell" => vec![EditorCommand::Term("open".into())],
             // `consult-line`: pick a line by fuzzy match, with live preview.
             "search-line" | "consult-line" | "goto-line" => {
                 self.open_prompt(PromptKind::Line);
+                vec![]
+            }
+            // `consult-ripgrep`: the same gesture across the whole project.
+            // Candidates arrive from a subprocess, which the app runs.
+            "search-project" | "consult-ripgrep" | "ripgrep" | "grep" => {
+                self.open_prompt(PromptKind::Grep);
                 vec![]
             }
             // `ace-window`: with two windows there is nothing to choose, so it
@@ -1165,6 +1790,123 @@ impl Editor {
             other => vec![EditorCommand::CallLisp(format!("({other})"))],
         }
     }
+}
+
+// --- regex ---------------------------------------------------------------
+
+/// The characters vim and PCRE disagree about, and they disagree *only* about
+/// the backslash: in vim's default magic level `(` `)` `{` `}` `|` `+` `?` are
+/// literal text and `\(` `\)` … are the operators. Exactly backwards.
+const SWAPPED: &str = "(){}|+?";
+
+/// A vim pattern, translated into the dialect the `regex` crate speaks.
+///
+/// Worth doing rather than telling everyone to write PCRE, because the whole
+/// value of `/` is that it takes what your fingers already know: `\(foo\|bar\)`
+/// has to mean a group, and `foo(1)` has to find a literal `foo(1)`. Swapping
+/// the backslash on [`SWAPPED`], mapping `\<`/`\>` onto `\b` and honouring
+/// `\c` is all of the difference that gets used.
+///
+/// Returns the pattern and whether it asked for case folding.
+///
+/// ponytail: the ceiling is everything vim spells with a backslash that has no
+/// PCRE spelling at all — `\zs`/`\ze` (match boundaries inside a match),
+/// `\{-}` (non-greedy), `\%(`, `\%V`, `\&`, and the `\v`/`\V`/`\M` magic-level
+/// switches. Each passes straight through and therefore fails to compile,
+/// which is the honest failure: you get "bad pattern" and not a silently
+/// different match. Add them here, one at a time; there is nowhere else they
+/// could go. Also passing through unchanged, and meaning the wrong thing:
+/// `~` (vim's "the last replacement") is a literal tilde here.
+fn vim_regex(pat: &str) -> (String, bool) {
+    let mut out = String::with_capacity(pat.len() + 8);
+    let mut fold = false;
+    let mut chars = pat.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                None => out.push_str("\\\\"),
+                Some('<' | '>') => out.push_str("\\b"),
+                Some('=') => out.push('?'),
+                Some('c') => fold = true,
+                Some('C') => {}
+                Some(e) if SWAPPED.contains(e) => out.push(e),
+                // `\.`, `\*`, `\[`, `\\`, and the classes `\w` `\s` `\d` `\b`,
+                // all of which already mean the same thing in both.
+                Some(e) => {
+                    out.push('\\');
+                    out.push(e);
+                }
+            },
+            c if SWAPPED.contains(c) => {
+                out.push('\\');
+                out.push(c);
+            }
+            // `.` `*` `[` `]` `^` `$` need no help: same character, same job.
+            c => out.push(c),
+        }
+    }
+    (out, fold)
+}
+
+fn compile(pat: &str, ignore_case: bool) -> Option<Regex> {
+    let (src, fold) = vim_regex(pat);
+    let src = match fold || ignore_case {
+        true => format!("(?i){src}"),
+        false => src,
+    };
+    Regex::new(&src).ok()
+}
+
+/// Vim writes `\1` for a capture and `&` for the whole match; the `regex` crate
+/// writes `${1}` and `${0}`. Braced, so `\1x` is group 1 followed by an `x`
+/// rather than a group named `1x`.
+fn vim_replacement(rep: &str) -> String {
+    let mut out = String::with_capacity(rep.len());
+    let mut chars = rep.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(d @ '0'..='9') => out.push_str(&format!("${{{d}}}")),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(e) => out.push(e),
+                None => {}
+            },
+            '&' => out.push_str("${0}"),
+            // A literal `$` in the replacement, which is the engine's sigil.
+            '$' => out.push_str("$$"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Split on unescaped `delim`, dropping the backslash from `\<delim>` only.
+///
+/// Every other escape has to reach the engine intact — `\/` is a literal slash
+/// in `:s/a\/b/c/`, but `\.` is still "any dot" and must not become one.
+fn split_delim(s: &str, delim: char) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut escaped = false;
+    for c in s.chars() {
+        let tail = parts.last_mut().expect("never empty");
+        match (escaped, c) {
+            (true, c) => {
+                if c != delim {
+                    tail.push('\\');
+                }
+                tail.push(c);
+                escaped = false;
+            }
+            (false, '\\') => escaped = true,
+            (false, c) if c == delim => parts.push(String::new()),
+            (false, c) => tail.push(c),
+        }
+    }
+    if escaped {
+        parts.last_mut().expect("never empty").push('\\');
+    }
+    parts
 }
 
 fn expand_tilde(p: &str) -> String {
@@ -1252,6 +1994,112 @@ mod tests {
 
     fn keys(s: &str) -> Vec<Key> {
         s.chars().map(Key::Char).collect()
+    }
+
+    /// In a terminal the shell owns the keyboard. Every one of these would
+    /// otherwise be an editor command, and `d` deleting a word instead of
+    /// reaching the shell is the whole bug this guards.
+    #[test]
+    fn terminal_mode_hands_keys_to_the_shell() {
+        let mut ed = fresh("");
+        ed.apply(EditorCommand::SetMode(Mode::Terminal));
+        for key in [
+            Key::Char('d'),
+            Key::Char('j'),
+            Key::Char(':'),
+            Key::Esc,
+            Key::Enter,
+            // C-c above all: reaching the editor instead would mean never being
+            // able to interrupt a running program.
+            Key::Ctrl('c'),
+        ] {
+            assert_eq!(
+                ed.handle_key(key),
+                vec![EditorCommand::TermKey(key)],
+                "{key:?} must go to the shell"
+            );
+        }
+        assert_eq!(ed.mode, Mode::Terminal, "and none of them leaves the mode");
+    }
+
+    /// ...but there has to be a way out, and it comes from the Terminal keymap
+    /// so `init.lisp` chooses it.
+    #[test]
+    fn the_terminal_keymap_is_the_way_out() {
+        let mut ed = fresh("");
+        ed.apply(EditorCommand::BindKey {
+            mode: "terminal".into(),
+            keys: "C-M-t".into(),
+            command: "terminal-normal".into(),
+        });
+        ed.apply(EditorCommand::SetMode(Mode::Terminal));
+        // The app does the mode change, because stepping out means loading the
+        // scrollback into the buffer and core has no scrollback to load.
+        assert_eq!(
+            ed.handle_key(Key::CtrlMeta('t')),
+            vec![EditorCommand::Term("normal".into())]
+        );
+
+        // A *Ctrl* binding from another mode must not be consulted here — that
+        // is what stops a global `C-c` stealing SIGINT from the shell.
+        ed.apply(EditorCommand::BindKey {
+            mode: "normal".into(),
+            keys: "C-c".into(),
+            command: "eval-dwim".into(),
+        });
+        assert_eq!(
+            ed.handle_key(Key::Ctrl('c')),
+            vec![EditorCommand::TermKey(Key::Ctrl('c'))]
+        );
+    }
+
+    /// ...but a Command-based binding *is*, so the editor stays reachable from
+    /// inside a shell. This is the difference between the two halves of the
+    /// policy, and the reason it is Command and not Ctrl.
+    #[test]
+    fn command_keys_fall_through_to_the_normal_keymap_in_a_terminal() {
+        let mut ed = fresh("");
+        for (keys, command) in [("M-x", "execute-command"), ("C-M-j", "switch-buffer")] {
+            ed.apply(EditorCommand::BindKey {
+                mode: "normal".into(),
+                keys: keys.into(),
+                command: command.into(),
+            });
+        }
+        ed.apply(EditorCommand::SetMode(Mode::Terminal));
+
+        // `M-x` opens its prompt rather than typing an `x` at the shell.
+        ed.handle_key(Key::Meta('x'));
+        assert!(ed.prompt.is_some(), "M-x must still work inside a terminal");
+        ed.apply(EditorCommand::SetMode(Mode::Terminal));
+        ed.prompt = None;
+
+        ed.handle_key(Key::CtrlMeta('j'));
+        assert!(
+            ed.prompt.is_some(),
+            "C-M-j must reach the buffer switcher, not the shell"
+        );
+        ed.prompt = None;
+
+        // The plain keys are untouched by all of this: they still type.
+        ed.apply(EditorCommand::SetMode(Mode::Terminal));
+        assert_eq!(
+            ed.handle_key(Key::Char('x')),
+            vec![EditorCommand::TermKey(Key::Char('x'))]
+        );
+    }
+
+    #[test]
+    fn a_terminal_buffer_is_read_only_and_named() {
+        let mut ed = fresh("");
+        ed.show_special(BufferKind::Terminal, "$ ls\n");
+        assert_eq!(ed.buffer.name(), "*terminal*");
+        assert!(ed.buffer.kind.is_generated());
+        assert_eq!(ed.mode, Mode::Terminal);
+        // Typing at it does not edit the flattened grid: the shell owns what is
+        // on screen, and an edit would be silently overwritten next frame.
+        ed.apply(EditorCommand::InsertText("nope".into()));
+        assert_eq!(ed.buffer.text.to_string(), "$ ls\n");
     }
 
     #[test]
@@ -1375,7 +2223,57 @@ mod tests {
             .collect::<Vec<_>>()
             .iter()
             .flat_map(|&k| ed.handle_key(k))
+            // Every key of a sequence but the last is a prefix, and a prefix
+            // now hands what is pending to which-key. That is not what any of
+            // these tests is asking about.
+            .filter(|c| !matches!(c, EditorCommand::CallLisp(s) if s.contains("which-key")))
             .collect()
+    }
+
+    /// The shipped config's `C-c r` — the binding TODO.org asked for and that
+    /// was impossible until a mode-local prefix started outranking a global
+    /// exact binding. Written against the real pair of bindings, because what
+    /// makes it work is precisely that they collide.
+    #[test]
+    fn org_c_c_r_previews_rather_than_evaluating() {
+        let mut ed = fresh("(the-line)");
+        ed.apply(EditorCommand::BindKey {
+            mode: "normal".into(),
+            keys: "C-c".into(),
+            command: "eval-dwim".into(),
+        });
+        ed.apply(EditorCommand::BindKey {
+            mode: "org-mode".into(),
+            keys: "C-c r".into(),
+            command: "org-latex-preview".into(),
+        });
+
+        // Not an org buffer: `C-c` is still whole, and still evaluates — which
+        // it does by handing the *line* to Lisp, so that is what to look for.
+        let cmds = ed.handle_key(Key::Ctrl('c'));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, EditorCommand::CallLisp(s) if s.contains("(the-line)"))),
+            "C-c outside org-mode must still evaluate the line, got {cmds:#?}"
+        );
+
+        ed.buffer.major_mode = "org-mode".into();
+        // Now `C-c` is a prefix and must *not* fire the global binding. The one
+        // thing it may emit is which-key's own report that a prefix is pending.
+        let cmds = ed.handle_key(Key::Ctrl('c'));
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| matches!(c, EditorCommand::CallLisp(s) if s.contains("(the-line)"))),
+            "C-c in org-mode must wait for the next key, got {cmds:#?}"
+        );
+        // ...and the sequence completes to the org command.
+        let cmds = ed.handle_key(Key::Char('r'));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, EditorCommand::CallLisp(s) if s.contains("org-latex-preview"))),
+            "C-c r in org-mode must preview, got {cmds:#?}"
+        );
     }
 
     #[test]
@@ -2315,6 +3213,280 @@ mod tests {
         feed(&mut ed, &keys("q"));
         feed(&mut ed, &[Key::Enter]);
         assert!(ed.should_quit);
+    }
+
+    // --- registers, macros, marks ----------------------------------------
+
+    #[test]
+    fn a_named_register_keeps_its_own_text_and_uppercase_appends() {
+        let mut ed = fresh("aaa\nbbb\nccc");
+        feed(&mut ed, &keys("\"ayy")); // register a: "aaa\n"
+        feed(&mut ed, &keys("j\"Ayy")); // uppercase appends: "aaa\nbbb\n"
+        assert_eq!(ed.register, "bbb\n", "the unnamed one gets every yank too");
+
+        feed(&mut ed, &keys("G\"ap"));
+        assert_eq!(ed.buffer.text.to_string(), "aaa\nbbb\nccc\naaa\nbbb");
+        // ...and pasting a *named* register does not disturb the unnamed one,
+        // so the plain `p` that follows still pastes what was yanked last.
+        assert_eq!(ed.register, "bbb\n");
+        feed(&mut ed, &keys("p"));
+        assert_eq!(ed.buffer.text.to_string(), "aaa\nbbb\nccc\naaa\nbbb\nbbb");
+    }
+
+    #[test]
+    fn a_named_register_survives_a_yank_into_another_one() {
+        let mut ed = fresh("aaa\nbbb");
+        feed(&mut ed, &keys("\"ayy")); // a: "aaa\n"
+        feed(&mut ed, &keys("j\"byy")); // b: "bbb"
+        feed(&mut ed, &keys("\"aP"));
+        assert_eq!(ed.buffer.text.to_string(), "aaa\naaa\nbbb");
+        // an empty register pastes nothing rather than the last yank
+        let before = ed.buffer.text.to_string();
+        feed(&mut ed, &keys("\"zp"));
+        assert_eq!(ed.buffer.text.to_string(), before);
+        assert!(ed.status.contains("register z is empty"));
+    }
+
+    #[test]
+    fn a_macro_records_keys_and_replays_the_decisions() {
+        let mut ed = fresh("one two\nthree four\nfive six");
+        // `qq dw j0 q` — kill the first word of a line and drop to the next.
+        feed(&mut ed, &keys("qqdwj0q"));
+        assert_eq!(ed.buffer.text.to_string(), "two\nthree four\nfive six");
+
+        // The replay deletes *this* line's first word, not the one recorded —
+        // which is the difference between recording keys and recording commands.
+        feed(&mut ed, &keys("@q"));
+        assert_eq!(ed.buffer.text.to_string(), "two\nfour\nfive six");
+        // `@@` repeats it without naming the register again
+        feed(&mut ed, &keys("@@"));
+        assert_eq!(ed.buffer.text.to_string(), "two\nfour\nsix");
+    }
+
+    /// The recorder sits ahead of the prompt branch, so a macro can contain a
+    /// whole ex command. `q` typed *into* a prompt is a letter, not a stop key.
+    #[test]
+    fn a_macro_can_contain_an_ex_command() {
+        let mut ed = fresh("foo\nfoo\nfoo\n");
+        feed(&mut ed, &keys("qs"));
+        feed(&mut ed, &[Key::Char(':')]);
+        feed(&mut ed, &keys("s/foo/bar/"));
+        feed(&mut ed, &[Key::Enter]);
+        feed(&mut ed, &keys("jq"));
+        assert_eq!(ed.buffer.text.to_string(), "bar\nfoo\nfoo\n");
+        assert!(ed.prompt.is_none());
+
+        feed(&mut ed, &keys("@s"));
+        assert_eq!(ed.buffer.text.to_string(), "bar\nbar\nfoo\n");
+    }
+
+    #[test]
+    fn a_counted_replay_runs_the_macro_that_many_times() {
+        let mut ed = fresh("abcdef");
+        feed(&mut ed, &keys("qzxq")); // record a single `x`
+        assert_eq!(ed.buffer.text.to_string(), "bcdef");
+        feed(&mut ed, &keys("3@z"));
+        assert_eq!(ed.buffer.text.to_string(), "ef");
+    }
+
+    /// The obvious way to write a macro that never ends, and it would be a
+    /// *stack* overflow rather than a hang — `@` re-enters `handle_key`.
+    #[test]
+    fn a_macro_that_replays_itself_stops_instead_of_overflowing() {
+        let text = "x".repeat(60);
+        let mut ed = fresh(&text);
+        feed(&mut ed, &keys("qax@aq")); // record: delete a char, then run @a
+        feed(&mut ed, &keys("@a"));
+
+        assert_eq!(
+            ed.buffer.len_chars(),
+            // one delete per level, and the deepest level refuses instead of
+            // recursing. The first `x` is the one typed while recording.
+            text.len() - super::MACRO_DEPTH - 1,
+        );
+        assert!(
+            ed.messages.iter().any(|m| m.contains("nested too deeply")),
+            "and it says why it stopped: {:?}",
+            ed.messages
+        );
+    }
+
+    /// The point of building marks on markers rather than on offsets: `ma`
+    /// still names its character after the text above it changes length.
+    #[test]
+    fn a_mark_survives_an_edit_above_it() {
+        let mut ed = fresh("alpha\nbeta\ngamma");
+        feed(&mut ed, &keys("jjma"));
+        assert_eq!(ed.buffer.cursor, 11);
+
+        feed(&mut ed, &keys("ggdd")); // "alpha\n" goes, six characters above it
+        feed(&mut ed, &[Key::Char('`'), Key::Char('a')]);
+        assert_eq!(ed.buffer.cursor, 5);
+        assert_eq!(ed.buffer.slice_string(5, 10), "gamma", "the same character");
+
+        // `'a` is the line, not the position — vim's distinction between the
+        // two keys, and the reason both exist.
+        feed(&mut ed, &keys("$"));
+        feed(&mut ed, &[Key::Char('\''), Key::Char('a')]);
+        assert_eq!(ed.buffer.cursor_line_col(), (1, 0));
+
+        // an unset mark says so rather than jumping somewhere arbitrary
+        feed(&mut ed, &[Key::Char('`'), Key::Char('z')]);
+        assert!(ed.status.contains("mark not set"));
+    }
+
+    #[test]
+    fn a_mark_is_a_motion_an_operator_can_take() {
+        let mut ed = fresh("aaa\nbbb\nccc\nddd");
+        feed(&mut ed, &keys("jjma")); // mark line 2
+        feed(&mut ed, &keys("gg"));
+        feed(&mut ed, &[Key::Char('d'), Key::Char('\''), Key::Char('a')]);
+        assert_eq!(ed.buffer.text.to_string(), "ddd", "`d'a` is linewise");
+    }
+
+    // --- regex, :s and incremental search --------------------------------
+
+    #[test]
+    fn search_is_a_regex_in_vims_dialect() {
+        let mut ed = fresh("foo123\nbar(x)\nbaz");
+        feed(&mut ed, &[Key::Char('/')]);
+        feed(&mut ed, &keys("[0-9]\\+"));
+        feed(&mut ed, &[Key::Enter]);
+        assert_eq!(ed.buffer.cursor, 3);
+
+        // `(` is literal at vim's magic level, so this finds text and not a group
+        feed(&mut ed, &[Key::Char('/')]);
+        feed(&mut ed, &keys("(x)"));
+        feed(&mut ed, &[Key::Enter]);
+        assert_eq!(ed.buffer.cursor_line_col(), (1, 3));
+
+        // a pattern the engine cannot compile is refused, not silently literal
+        feed(&mut ed, &[Key::Char('/')]);
+        feed(&mut ed, &keys("[unclosed"));
+        feed(&mut ed, &[Key::Enter]);
+        assert!(ed.status.contains("bad pattern"), "{}", ed.status);
+    }
+
+    #[test]
+    fn the_vim_dialect_swaps_exactly_the_characters_that_disagree() {
+        use super::{vim_regex, vim_replacement};
+        // unescaped groupers are literal text in vim...
+        assert_eq!(vim_regex("foo(1)").0, "foo\\(1\\)");
+        // ...and the escaped ones are the operators.
+        assert_eq!(vim_regex("\\(a\\|b\\)\\+").0, "(a|b)+");
+        assert_eq!(vim_regex("\\<word\\>").0, "\\bword\\b");
+        // everything both dialects already agree about passes through
+        assert_eq!(vim_regex("^a.*\\.rs$").0, "^a.*\\.rs$");
+        assert!(vim_regex("\\cFoo").1, "\\c asks for folding");
+
+        assert_eq!(vim_replacement("[&]"), "[${0}]");
+        assert_eq!(vim_replacement("\\2-\\1"), "${2}-${1}");
+        assert_eq!(vim_replacement("$5"), "$$5", "a literal dollar stays one");
+    }
+
+    /// One `u` for the whole `:%s`, not one per match. The reason the
+    /// substitution is a single delete-and-insert over the affected lines.
+    #[test]
+    fn a_substitution_is_one_undo_step_however_many_matches() {
+        let mut ed = fresh("foo foo\nfoo bar\nbaz foo\n");
+        feed(&mut ed, &[Key::Char(':')]);
+        feed(&mut ed, &keys("%s/foo/X/g"));
+        feed(&mut ed, &[Key::Enter]);
+        assert_eq!(ed.buffer.text.to_string(), "X X\nX bar\nbaz X\n");
+
+        feed(&mut ed, &keys("u"));
+        assert_eq!(ed.buffer.text.to_string(), "foo foo\nfoo bar\nbaz foo\n");
+        feed(&mut ed, &keys("u"));
+        assert!(
+            ed.status.contains("already at oldest"),
+            "four matches, one undo step"
+        );
+    }
+
+    #[test]
+    fn substitute_ranges_and_flags() {
+        // no range is the current line, and no `g` is the first match on it
+        let mut ed = fresh("aa aa\naa aa\n");
+        feed(&mut ed, &[Key::Char(':')]);
+        feed(&mut ed, &keys("s/aa/Z/"));
+        feed(&mut ed, &[Key::Enter]);
+        assert_eq!(ed.buffer.text.to_string(), "Z aa\naa aa\n");
+
+        // `i` folds case, and a capture comes back as `\1`
+        let mut ed = fresh("Hello World\n");
+        feed(&mut ed, &[Key::Char(':')]);
+        feed(&mut ed, &keys("s/\\(hello\\) \\(world\\)/\\2 \\1/i"));
+        feed(&mut ed, &[Key::Enter]);
+        assert_eq!(ed.buffer.text.to_string(), "World Hello\n");
+
+        // a delimiter that is not `/`, so a path needs no escaping
+        let mut ed = fresh("/usr/bin\n");
+        feed(&mut ed, &[Key::Char(':')]);
+        feed(&mut ed, &keys("s#/usr#/opt#"));
+        feed(&mut ed, &[Key::Enter]);
+        assert_eq!(ed.buffer.text.to_string(), "/opt/bin\n");
+
+        // no match changes nothing and says so
+        feed(&mut ed, &[Key::Char(':')]);
+        feed(&mut ed, &keys("%s/nowhere/x/"));
+        feed(&mut ed, &[Key::Enter]);
+        assert_eq!(ed.buffer.text.to_string(), "/opt/bin\n");
+        assert!(ed.status.contains("not found"));
+
+        // and the ex commands that are not substitutes still parse
+        let mut ed = fresh("");
+        feed(&mut ed, &[Key::Char(':')]);
+        feed(&mut ed, &keys("q"));
+        feed(&mut ed, &[Key::Enter]);
+        assert!(ed.should_quit);
+    }
+
+    #[test]
+    fn colon_in_visual_mode_substitutes_over_the_selection() {
+        let mut ed = fresh("foo\nfoo\nfoo\n");
+        feed(&mut ed, &keys("Vj"));
+        feed(&mut ed, &[Key::Char(':')]);
+        assert_eq!(
+            ed.prompt.as_ref().unwrap().text,
+            "'<,'>",
+            "vim types the range for you"
+        );
+        feed(&mut ed, &keys("s/foo/bar/"));
+        feed(&mut ed, &[Key::Enter]);
+        assert_eq!(ed.buffer.text.to_string(), "bar\nbar\nfoo\n");
+        assert_eq!(ed.mode, Mode::Normal, "and the selection is done with");
+    }
+
+    /// `/` moves as you type; Escape puts you back where you started.
+    #[test]
+    fn incremental_search_moves_as_you_type_and_escape_comes_back() {
+        let mut ed = fresh("alpha\nbeta\ngamma\ndelta");
+        feed(&mut ed, &[Key::Char('/')]);
+        feed(&mut ed, &keys("gam"));
+        assert_eq!(ed.buffer.cursor_line_col().0, 2, "the cursor follows along");
+
+        // a pattern that has stopped matching goes back to the origin, so
+        // "no match" looks like no match
+        feed(&mut ed, &keys("XYZ"));
+        assert_eq!(ed.buffer.cursor, 0);
+        feed(&mut ed, &[Key::Backspace, Key::Backspace, Key::Backspace]);
+        assert_eq!(ed.buffer.cursor_line_col().0, 2, "and un-typing comes back");
+
+        feed(&mut ed, &[Key::Esc]);
+        assert_eq!(ed.buffer.cursor, 0, "escape restores the origin");
+        assert!(ed.prompt.is_none());
+
+        // RET commits where the preview was — not one match further on — and
+        // leaves `n` and `N` walking from there.
+        feed(&mut ed, &[Key::Char('/')]);
+        feed(&mut ed, &keys("a"));
+        assert_eq!(ed.buffer.cursor, 4);
+        feed(&mut ed, &[Key::Enter]);
+        assert_eq!(ed.buffer.cursor, 4);
+        feed(&mut ed, &keys("n"));
+        assert_eq!(ed.buffer.cursor, 9);
+        feed(&mut ed, &keys("N"));
+        assert_eq!(ed.buffer.cursor, 4);
     }
 
     #[test]

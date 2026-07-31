@@ -1,31 +1,330 @@
-* Done
-- [X] Buffers / windows / frames, splits, *dashboard* as a buffer
-- [X] Lisp evaluation from the live buffer, C-c everywhere
-- [X] Emacs-style beveled modeline, faces settable from init.lisp
-- [X] M-x running arbitrary Lisp, with fuzzy completion
-- [X] Completion popups: consult-style from the bottom, telescope-style centered
-- [X] Multiple buffers + `SPC j j` switcher
-- [X] Meta bindings (Command first, Option fallback) + buffer magnification
-- [X] Bootstrap zemacs editor, evil mode, GUI (SDL2)
+#+TITLE: zemacs — what is left
+#+STARTUP: overview
+
+Tracked against the real =~/.emacs.d=, so "missing" means missing *relative to
+what is actually used every day*, not relative to Emacs in the abstract.
+Ordered by what unblocks the most, not by what is easiest.
+
+* BLOCKING — one hole, many features
+
+** DONE Overlays
+=crates/core/src/overlay.rs=: a range that moves with the text, built out of
+the marker machinery (one =adjust_pos=, two callers), carrying a face, a
+background, a =display= substitution, an image — and, in the image rather than
+in Rust, any Lisp object at all.
+
+*No text properties, and there will not be any.* Emacs has both because
+properties live in the buffer's string data; a rope of characters is what makes
+every offset here a character index, and threading a plist through it would buy
+an inheritance rule most configs turn off. One mechanism.
+
+The Lisp API is =make-overlay=, =overlay-put=, =overlay-get=, =overlay-position=,
+=overlays-in=, =overlays-at=, =delete-overlay=, =remove-overlays= — one C primitive
+(the handle has to come back), everything else =%do= and =%query=.
+
+Now unblocked and still to write, all of it in Lisp: org-modern bullets
+(=display=), org-appear (=display=, cleared on the fragment under point), avy hint
+labels, copilot ghost text, flymake in the gutter, LSP inlay hints. Code
+folding still needs a Rust hole of its own — an overlay hides *cells*, not
+*lines*.
+
+** DONE Inline images in a buffer
+Overlay property =image=, whose value is a handle from =(latex-preview source)=.
+Pixels live in =Editor::images= keyed by a hash of the job, so the renderer's
+texture survives a re-preview; placement uses the baseline depth =crates/latex=
+reports, so =$x_1$= hangs below the line.
+
+=org-latex-preview= is *written in Lisp*, in =runtime/init.lisp=, over two
+primitives: =(latex-fragments)= to find them and =(latex-preview src)= to
+rasterise one.
+
+Bound to =C-c r= — as asked — and also to =SPC m l=. This needed the precedence
+change =lisp-mode= made for its own =C-c C-e= family: a mode-local *prefix* now
+outranks a global exact binding, so =C-c= waits for the next key in an org
+buffer and still evaluates on its own everywhere else. Nothing was given up.
+
+*** TODO Rows of variable height
+What inline images actually want, and what wide characters want too. Today an
+image reserves =ceil(width / cell_w)= blank cells and reflows nothing, and one
+taller than a line is hung from the top of its row rather than the baseline so
+a display equation grows downward over its own blank rows instead of upward
+over the lines above.
+
+** DONE A JSON-RPC subprocess layer
+=crates/rpc=: spawn a long-lived child, =Content-Length=-framed JSON on its
+stdin and stdout, requests / responses / notifications in both directions,
+stderr drained, the child dying reported. Three threads per child (reader,
+writer, stderr) so nothing can block the editor, and a reply reaches Lisp the
+way a mode hook does — the main loop turns each message into a form and queues
+it for the Lisp thread. The Lisp side is =runtime/rpc.lisp=, and a config can
+drive an arbitrary JSON-RPC child without touching Rust.
+*** DONE LSP (eglot equivalent) — pylsp and clangd
+All of it in Lisp, in =runtime/lsp.lisp=: handshake, didOpen/didChange/
+didSave/didClose, definition, diagnostics. A third server is one
+=(lsp-register-server 'rust-mode "rust-analyzer")= in your config — untested
+here only because the two shipped are the two it was proved against.
+Sync is full-text; see the ceiling in =docs/boundary.org=.
+*** TODO xref — find references, and a *xref* results buffer
+Go-to-definition is done (=lsp-goto-definition=, bound to =g d=). References
+need somewhere to put a list, which is the same hole =project-find-dir= has.
+*** TODO flymake — diagnostics in the gutter
+The *data* is done: =(lsp-diagnostics)= answers
+=((LINE COLUMN SEVERITY MESSAGE SOURCE) ...)= and
+=*lsp-diagnostics-functions*= fires when it changes. Only the drawing is
+missing, and overlays now exist for it — a =background= overlay per diagnostic
+range, hung off =*lsp-diagnostics-functions*=, is Lisp. Today they are an
+echo-area summary, =lsp-diagnostics-at-point=, and =lsp-list-diagnostics=.
+*** TODO AI mode with multi-agent support
+*** TODO Latexify / MathSync integration
+
+* CONTRADICTS THE EXISTING CONFIG
+Worse than missing: these are *wrong* rather than absent, so muscle memory
+fights them.
+
+** TODO =j= / =k= should move by visual line
+Config uses =evil-next-visual-line= with =display-line-numbers-type 'visual=.
+zemacs moves by buffer line. Felt immediately once wrapping is on. Line
+numbers must count visual lines too, so "relative" means relative *visual*.
+
+** TODO Free the Option key for unicode
+=mac-option-modifier 'none= is set: Option is deliberately kept for composing
+characters. zemacs still treats it as a Meta fallback and eats it. Drop Option
+from the Meta test in =key_from_keydown=.
+
+** TODO =C-d= is unbound in the config, half-page scroll here
+
+* EDITOR BASICS STILL MISSING
+Roughly in the order they would be hit.
+
+** DONE System clipboard
+=select-enable-clipboard t= means the unnamed register *is* the clipboard, so
+that is what it is: =yy= here pastes into a browser and =⌘C= there is what =p=
+puts back. Core owns the register and cannot reach the window system, so the
+mirror lives in the app layer — pushed once a frame off a revision counter (an
+integer compare, not a string diff), pulled on SDL's =ClipboardUpdate= event
+rather than by polling the window server sixty times a second.
+Text arriving from outside is treated as linewise only if it ends in a newline,
+which is what =yy= would have produced. Not done: the =+= and =*= registers as
+*separate* registers, and the X11 primary selection.
+** DONE Named registers (only the unnamed one exists)
+=""ayy"=, =""ap"=, =""aP"= and the delete/change/yank verbs. Uppercase appends, as
+vim does, and the unnamed register is still filled by every yank whatever
+register was named. Not done: =:registers=, the numbered =0=–=9= ring, the
+read-only =%= / =:= / =.= registers, and the clipboard registers =+= / =*= — which
+want the clipboard that is still the first item on this list.
+** DONE Macros — =q= to record, =@= to replay
+=q<reg>= records, =q= stops, =@<reg>= replays and =@@= repeats. Keys are recorded,
+not commands, so a replay re-runs the *decisions*. Nesting is capped at 20 —
+=@a= that contains =@a= is a stack overflow rather than a hang, and nothing short
+of running it can tell a legitimate nested macro from a runaway one.
+** DONE Marks — =ma=, backtick-a
+Distinct from the markers that now exist: those are the mechanism, this is the
+vim-facing feature on top.
+Backtick is the exact position, ='= the line, and both compose with an operator
+(=d'a=). One marker per (buffer, letter), so a mark set in one file cannot be
+read in another. Not done: backtick-backtick (wants a jump list), ='<= / ='>=
+(wants a selection history), and the uppercase file-marks (want a marker table
+that outlives a buffer).
+** DONE Regex, and =:s= substitute — search is literal substring today
+Search is =regex=, through a translation of vim's dialect: at vim's magic level
+=(= is literal text and =\(= is a group, exactly backwards from PCRE, so the
+backslash is swapped on =(){}|+?= and =\<=/=\>= become =\b=. =:s/pat/rep/=, =:%s= and
+=:'<,'>s= (which =:= in visual mode types for you), with the =g= and =i= flags. The
+whole substitution is one =Checkpoint= and one splice, so =u= reverses a =:%s= in
+one press. The ceiling is written down at =vim_regex=: =\zs=, =\ze=, =\{-}=, =\%(=
+and the =\v= magic levels all fail to compile rather than mean something else.
+** DONE Incremental search — =/= should move as you type
+The cursor follows the match on every keystroke, a pattern that stops matching
+falls back to the origin, Escape restores it and RET commits where the preview
+was — not one match further on. =PromptKind::previews= is the flag; the prompt
+already reported its keystrokes, it just had nothing to say about a search.
+** TODO Wide characters
+Every character is assumed one cell (=cell_w= is the advance of =M=). CJK,
+emoji and combining marks misalign cursor and selection. A correctness bug,
+not a feature gap.
+** TODO Backups — config keeps 20 versions, zemacs keeps none
+Auto-save itself is *done*: every modified buffer is copied to
+=~/.config/zemacs/auto-save/#!mangled!path#= every 30 s, the copy is deleted on
+a real save, and opening a file whose copy is newer says so. Numbered backups
+of the previous *saved* version are the separate half, and are still missing.
+** TODO Auto-revert on external change (=global-auto-revert-mode= is on)
+** TODO =M-x= with arguments — it calls =(name)= and so offers zero-arg only
+** TODO Confirmation before destructive git verbs
+=rebase-abort=, =reset --hard=, =discard=, =stash drop=, =branch -D= are all
+reachable and none asks. =r a= is bound *today* and discards a whole rebase
+silently.
+
+* PACKAGES WITH NO EQUIVALENT
+** TODO avy
+Bound to =/= in the config, so the primary jump key currently does the wrong
+thing. Overlays now exist, so this is pure Lisp: an overlay per candidate with
+a =display= of its label and a =face=, the target hung off it as an ordinary Lisp
+property, then read one key and jump. Watch the ceiling first — overlays are a
+linearly scanned =Vec=, and one per hit is exactly what that was sized against.
+** DONE which-key
+=runtime/modes/which-key.lisp=, off =(key-bindings)= — a reader, so there is no
+shadow keymap to go stale. The one thing Lisp could not see was *that a prefix
+is pending*, which is three lines in =normal_key= handing the sequence over as
+=(which-key "SPC f")=, guarded by =fboundp=. One status line rather than a panel:
+a real popup wants overlays, and this function is the only thing that changes
+when it gets one.
+** TODO corfu — in-buffer completion popup
+** TODO orderless — space-separated matching
+The filter is subsequence-only, so =fn main= matches nothing useful.
+** DONE marginalia — annotations beside candidates
+=M-x= candidates now carry their docstring and their key. No new column in the
+Rust minibuffer: a candidate is already *the source of a call* (core runs an
+unrecognised one as =(candidate)=), so the annotation rides inside a =#| |#=
+block comment, which reads as nothing. =register-command= is wrapped in
+=which-key.lisp= to add it, so every route into the list is covered at once.
+** TODO embark — act on the thing under point, or under a candidate
+** TODO Code folding (treesit-fold)
+** TODO org-roam (+ org-roam-ui)
+** TODO org-modern bullets
+Parsing is *done* in =crates/syntax= (=bullets()=, level and marker range) and
+the substitution is *done* (=(overlay-put ov 'display "◉")=). What is left is a
+reader for =bullets()= beside =latex-fragments= — same argument, same file — and
+about ten lines of Lisp in an =org-mode-hook=.
+** TODO org-appear — reveal markup under the cursor
+Overlays do the hiding; what is missing is a hook on cursor movement, which
+the editor still reports nothing for.
+** TODO parinfer-style structural Lisp editing
+Not parinfer, but the ground under it is laid: =runtime/modes/lisp-mode.lisp=
+classifies every character once (code / string / comment / quoted), which is
+what =#\\(= and =";)"= need, and =forward-sexp=, =backward-sexp=, =match-paren=,
+=kill-sexp=, forward slurp and forward barf are built on it. Parinfer proper is
+the *inverse* — indentation driving the parens — and wants a hook on every
+edit, which the editor still reports nothing for.
+** TODO jinx — spell checking
+** TODO jupyter
+** TODO A git-based package manager
+** TODO A server/daemon architecture (=emacsclient=)
+Config runs Emacs as a daemon, including two macOS workarounds: SIGUSR1
+unwinding and a parked 1×1 frame for bug#18705.
+** TODO A =*Messages*= buffer — the log exists (capped at 500), nothing shows it
+
+* NEW ~EditorCommand~ VARIANTS THE LISP API NEEDS
+Found by auditing what is reachable from the image. Each is genuinely
+impossible today, not merely awkward — the API agent could not add them
+because the enum lives in ~crates/core/src/lib.rs~.
+
+** TODO ~CreateBuffer~ — a buffer with no file behind it
+Only ~OpenFile~ makes one; ~show_special~ is a method, not a command.
+** TODO ~KillBuffer~
+** TODO A prompt whose answer comes *back* to Lisp
+Every ~PromptKind~ has its destination fixed in core, so there is no
+~read-string~ / ~completing-read~ — which is what most interactive commands
+in a real config are built out of. Probably the most valuable of these.
+** DONE Read the unnamed register (~Editor::register~ is private, no accessor)
+=(register)= answers =(TEXT . LINEWISE-P)=, or NIL when it is empty. One reader
+and one accessor — the accessor existed anyway once the clipboard needed to
+mirror the register, so this closed itself.
+** TODO ~TermKey~ from Lisp — ~Key~ has no string spelling to send
+** TODO Call a built-in verb by name — ~run_action~ is private, so Lisp can
+   *bind* ~"magit-status"~ but not *call* it
+** TODO Group N edits into one undo step — every mutator checkpoints, and
+   there is no "begin group"
+
+* WIRING — built but not connected
+** TODO TRAMP into =find-file= / =save-file= / dired
+=crates/tramp= is finished and tested against a real sshd. =tramp::parse= is
+the hook: =None= means local, and it is a 5-byte prefix check.
+** TODO The rest of the Magit surface
+Library has =plan_last=/=plan_onto= (rebase todo composition), branch
+create/checkout/delete, cherry-pick, revert, reset variants, hunk discard.
+Only a subset is bound: the rest wants a todo-editing buffer and confirmation
+flows first.
+** TODO Project: =project-find-dir=, project-wide replace
+
+* PERFORMANCE
+** TODO Incremental tree-sitter parsing
+Still a full reparse per revision, on a worker thread. Fix is to keep the
+=Tree= per buffer and feed it the changed ranges.
+** TODO Present off-thread, or give up vsync
+With N windows the loop runs at 1/N of the refresh rate.
+
+* THE COMMON LISP MIGRATION
+The goal: as much as possible in Lisp, performance-critical work in Rust.
+The boundary that makes that safe —
+
+- *Rust, touched per frame or per character*: rope and edit primitives,
+  rendering, tree-sitter, terminal emulation, process spawn, file IO.
+- *Lisp, touched once per command*: everything a keystroke triggers.
+
+That is Emacs' own line, and it is why elisp being slow never mattered.
+
+** DONE Wave 1 — widen the primitive channel
+=%do (verb arg a b)= is the write half of =%query=: a verb, an optional
+string, two integers. Adding a command is one =match= arm plus a one-line
+=DEFUN=. =%query= readers gained optional arguments too.
+Remaining ceiling: the shim reads answers as a *base* string, so
+=(length (buffer-string))= counts bytes on a non-ASCII buffer.
+** TODO Wave 2 — rewrite the app plugins as =runtime/plugins/*.lisp=
+=magit.rs=, =dired.rs=, =project.rs=, =term.rs= glue are ~1100 lines of pure
+policy over Rust primitives, none of it per-frame. Delete the Rust as each
+one lands.
+** TODO Wave 3 — the command loop and the evil grammar
+=evil.rs= is ~2400 lines of policy running once per keystroke, so it is
+affordable in Lisp and would make modal editing user-redefinable. It is also
+the most-tested code here, so it moves last.
+
+* UNVERIFIED
+** TODO Do the macOS traffic-light buttons work from the bundle?
+Two fixes went in: =SDL_VIDEO_MAC_FULLSCREEN_SPACES= (without it macOS
+disables zoom outright) and =scripts/bundle.sh=, since a bare Unix binary has
+no application identity and its windows are second-class.
+
+Run =./scripts/bundle.sh && open target/zemacs.app=. Working bundled but not
+unbundled confirms the diagnosis. Dead *bundled* means the problem is
+elsewhere and SDL's Cocoa window creation needs a look.
+
+* UNPORTABLE UNTIL THE ABOVE
+** =lisp/buffer-top.el= (1170 lines, in the existing config)
+Needs overlay counting, text-property run walking, =buffer-undo-list=
+traversal as a cons tree, command-loop timing, and process-output diffing. A
+tour of every internal zemacs lacks. If it ever runs here, the architecture
+is finished.
+
+* DONE
 - [X] Common Lisp machine at the core (embedded ECL on its own thread)
-- [X] Dashboard (recent files + Lisp-defined items)
+- [X] Bootstrap editor, evil mode, GUI (SDL2)
+- [X] Buffers / windows / frames, splits, =*dashboard*= as a buffer
 - [X] Configuration system (init.lisp: theme, keymap, commands, dashboard)
-- [X] Tree sitter highlighting
-- [X] Key binding system (Lisp `define-key`, looked up before the Evil grammar)
-
-* Next
-- Add Magit, Dired, Terminal
-- Add Project.el, Which Key, M-x should spawn central popup (like telescope.nvim)
-- Add Org mode with latex rendering support, Add AI Mode with multi agent support
-- Add org roam, Git based package manager, native ssh support like TRAMP, a server-daemon architecture, custom mode hooks
-- Vertico/consult/marginalia like system, but more customizable and beautiful
-- Avy and ace window replacement, code folding
-- parinfer rust mode like lisp editing
-- Latexify/MathSync integration
-
-* Known gaps in what's built
-- One highlight set per editor, so only the active buffer's pane is coloured
-- Full tree-sitter reparse per edit, on a worker thread (no incremental parse)
-- No text objects (`ciw`, `di(`) and only the unnamed register
-- Lisp can push commands and be called from keys, but cannot yet *read* buffer state
-- `M-x` offers zero-argument commands only, since it calls `(name)` with no args
+- [X] Key binding system (Lisp =define-key=, consulted before the Evil grammar)
+- [X] Tree-sitter highlighting
+- [X] Dashboard (recent files + Lisp-defined items, generated banner)
+- [X] Lisp evaluation from the live buffer, =C-c= everywhere
+- [X] =M-x= running arbitrary Lisp, with fuzzy completion
+- [X] Completion popups: consult-style from the bottom, telescope-style centred
+- [X] Multiple buffers + =SPC j j= switcher
+- [X] Meta bindings (Command first) + buffer magnification
+- [X] Emacs-style bevelled modeline, faces settable from init.lisp
+- [X] Magit — hunk staging, folding, interactive rebase
+- [X] Dired
+- [X] Terminal — real PTY, scrollback, app-cursor keys, mouse reporting
+- [X] project.el equivalent
+- [X] TRAMP over SSH (library; wiring still open above)
+- [X] Custom mode hooks — major/minor modes with settings that revert, in Lisp
+- [X] Lisp reads *and* writes editor state, without blocking the command loop
+- [X] Markers, with all rope mutation funnelled through one =splice=
+- [X] Overlays — one mechanism, no text properties; the payload Rust draws in
+      Rust, the payload only Lisp reads in the image
+- [X] Inline images, and =org-latex-preview= written in Lisp on top of them
+- [X] Modus Vivendi / Vivendi-Tinted / Operandi, reaching dired and magit
+- [X] Modeline: bold, file permissions, position, major mode
+- [X] Font rendering: stem-darkening gamma, light hinting
+- [X] Per-buffer syntax highlighting (was one set per editor — every pane but
+      the active one drew uncoloured)
+- [X] The Lisp extension API and its reference (~docs/~: model, threading,
+      reference, recipes, boundary) — wave 1 of the migration
+- [X] JSON-RPC over a child's stdio (~crates/rpc~), generic: LSP is its first
+      user and not its only one
+- [X] LSP, written in Lisp (~runtime/lsp.lisp~) — pylsp and clangd, with
+      go-to-definition and diagnostics; a third server is one line of config
+- [X] ~after-change-hook~ — the first event the editor reports about the
+      *document* rather than about a mode
+- [X] A real Lisp mode, in Lisp (~runtime/modes/lisp-mode.lisp~): one syntax
+      classification, sexp motion, ~match-paren~, ~kill-sexp~, forward
+      slurp/barf, and Common Lisp indentation
+- [X] A REPL (~runtime/modes/repl.lisp~) evaluating in the *live* image, with a
+      transcript buffer that is still loadable Lisp — SLIME's ~C-c~ family

@@ -14,13 +14,18 @@
 //!   lrwxr-xr-x        11  2026-07-30 09:14  latest -> builds/2026-07
 //! ```
 //!
-//! The load-bearing invariant is that [`render`]'s two returns have the same
-//! number of entries: the UI indexes the line map by cursor line, so a drift of
-//! one means `d` flags the wrong file for deletion. Every line goes through
-//! [`Buf::push`], which is the only place either half is appended to, and every
-//! piece of text a *file* contributed goes through [`fold`] first, because a
-//! newline in a file name is legal on unix and would otherwise turn one entry
-//! into two lines and slide everything after it out of alignment.
+//! The load-bearing invariant is that [`render`]'s line map has one entry per
+//! line of its text: the UI indexes the map by cursor line, so a drift of one
+//! means `d` flags the wrong file for deletion. Every line ends through
+//! [`Buf::end`], which is the only place the map is appended to, and every piece
+//! of text a *file* contributed goes through [`fold`] first, because a newline
+//! in a file name is legal on unix and would otherwise turn one entry into two
+//! lines and slide everything after it out of alignment.
+//!
+//! The third return is the colour: a [`Span`] per run that is not plain
+//! foreground. Dired defines no faces of its own — it borrows the syntax faces a
+//! theme already sets, so a directory is whatever `(set-syntax-color "type" ...)`
+//! says and there is no second palette to keep in step with the first.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,34 +48,76 @@ pub enum Line {
     Text,
 }
 
-/// Render `listing` as buffer text plus one [`Line`] per line of that text.
+/// A face for one run of the dired buffer, named after the [`crate`]-external
+/// highlight class it stands for. Not that enum itself: dired does not depend on
+/// the editor core, and does not want to — the whole of the coupling is the
+/// caller's match from these names onto its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Face {
+    /// The directory being listed.
+    Heading1,
+    /// A directory entry.
+    Type,
+    /// An entry with an execute bit.
+    Function,
+    /// A symlink.
+    Link,
+    /// The size column.
+    Number,
+    /// Permissions, timestamps, and everything else the eye skips.
+    Comment,
+    /// A mark in the left column.
+    Constant,
+    /// The `->` of a symlink.
+    Punctuation,
+}
+
+/// A coloured run of the rendered text, in **char** offsets.
+///
+/// Chars rather than bytes because a name is allowed to hold anything: `café/`
+/// is five characters and six bytes, and a byte offset handed to a renderer that
+/// counts characters would colour the wrong part of the next entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub kind: Face,
+}
+
+/// Render `listing` as buffer text, one [`Line`] per line of that text, and the
+/// [`Span`]s that colour it.
 ///
 /// `marks[i]` is the mark on `entries[i]`: `None`, [`MARK_SELECT`] or
 /// [`MARK_DELETE`]. The slice may be short or empty — a freshly listed directory
 /// has no marks at all, and the line map must not depend on the caller keeping
 /// two vectors in step.
 ///
-/// `text.lines().count() == map.len()`, always.
-pub fn render(listing: &Listing, marks: &[Option<char>]) -> (String, Vec<Line>) {
+/// `text.lines().count() == map.len()`, always. Spans are sorted by `start` and
+/// never overlap; a run that is plain foreground gets none.
+pub fn render(listing: &Listing, marks: &[Option<char>]) -> (String, Vec<Line>, Vec<Span>) {
     let mut buf = Buf::default();
 
     let count = listing.entries.len();
     let hidden = if listing.show_hidden { ", all" } else { "" };
-    buf.push(
+    buf.face(&fold(&listing.dir.to_string_lossy()), Face::Heading1);
+    buf.put("  ");
+    buf.face(
         &format!(
-            "{}  ({count} {}, by {}{hidden})",
-            fold(&listing.dir.to_string_lossy()),
+            "({count} {}, by {}{hidden})",
             if count == 1 { "entry" } else { "entries" },
             listing.sort.label(),
         ),
-        Line::Header,
+        Face::Comment,
     );
+    buf.end(Line::Header);
     buf.push("", Line::Blank);
 
     // Only reachable from a hand-built `Listing`, since `list` always yields at
     // least `..`; still worth a line, so the buffer is never a bare header.
     if listing.entries.is_empty() {
-        buf.push("  (empty)", Line::Text);
+        buf.put("  ");
+        buf.face("(empty)", Face::Comment);
+        buf.end(Line::Text);
     }
 
     for (index, entry) in listing.entries.iter().enumerate() {
@@ -80,20 +127,41 @@ pub fn render(listing: &Listing, marks: &[Option<char>]) -> (String, Vec<Line>) 
             Some(mark) if !mark.is_control() => mark,
             _ => ' ',
         };
-        buf.push(&row(entry, mark), Line::Entry(index));
+        row(&mut buf, entry, mark);
+        buf.end(Line::Entry(index));
     }
 
-    (buf.text, buf.lines)
+    (buf.text, buf.lines, buf.spans)
 }
 
-fn row(entry: &Entry, mark: char) -> String {
-    format!(
-        "{mark} {}  {:>8}  {}  {}",
-        permissions(entry),
-        human_size(entry.len),
-        date(entry.modified),
-        name(entry),
-    )
+/// `{mark} {perms}  {size:>8}  {date}  {name}`, written a column at a time so
+/// each one's span falls out of writing it rather than out of counting columns.
+fn row(buf: &mut Buf, entry: &Entry, mark: char) {
+    // ponytail: one face for both marks, so `*` and `D` are the same colour and
+    // only the letter tells them apart. Emacs gives deletion its own red; that
+    // needs a face this crate cannot reach, since the shared enum is a closed
+    // set of *syntax* classes and there is no spare one that means "danger".
+    match mark {
+        ' ' => buf.put(" "),
+        _ => buf.face(&mark.to_string(), Face::Constant),
+    }
+    buf.put(" ");
+    buf.face(&permissions(entry), Face::Comment);
+
+    let size = human_size(entry.len);
+    buf.put(&" ".repeat(2 + 8usize.saturating_sub(size.chars().count())));
+    buf.face(&size, Face::Number);
+
+    buf.put("  ");
+    let date = date(entry.modified);
+    // Blank when there is no mtime, and colouring blanks says nothing.
+    match date.trim().is_empty() {
+        true => buf.put(&date),
+        false => buf.face(&date, Face::Comment),
+    }
+
+    buf.put("  ");
+    name(buf, entry);
 }
 
 /// `drwxr-xr-x`, `ls -l` style. The type character carries what the trailing
@@ -126,18 +194,37 @@ fn permissions(entry: &Entry) -> String {
     out
 }
 
-fn name(entry: &Entry) -> String {
-    let mut out = fold(&entry.name.to_string_lossy());
+fn name(buf: &mut Buf, entry: &Entry) {
+    let mut text = fold(&entry.name.to_string_lossy());
     // A symlink is marked by its arrow, not by a slash, so the name a user
     // reads is the name they would type.
     if entry.is_dir && !entry.is_symlink {
-        out.push('/');
+        text.push('/');
+    }
+    match face_of(entry) {
+        Some(face) => buf.face(&text, face),
+        None => buf.put(&text),
     }
     if let Some(target) = &entry.link_target {
-        out.push_str(" -> ");
-        out.push_str(&fold(&target.to_string_lossy()));
+        buf.face(" -> ", Face::Punctuation);
+        buf.face(&fold(&target.to_string_lossy()), Face::Comment);
     }
-    out
+}
+
+/// Directory, executable, symlink: the three things a `ls --color` user reads
+/// off the colour instead of off the permission column.
+///
+/// Symlink wins over directory, the same way the `l` in the mode string does — a
+/// link is a link whatever it resolves to. A plain file gets `None` rather than
+/// a "default" span, because a run with no span already renders in the buffer's
+/// foreground and one that says so is one more thing to keep in step with it.
+fn face_of(entry: &Entry) -> Option<Face> {
+    match () {
+        _ if entry.is_symlink => Some(Face::Link),
+        _ if entry.is_dir => Some(Face::Type),
+        _ if entry.mode & 0o111 != 0 => Some(Face::Function),
+        _ => None,
+    }
 }
 
 /// `4.0K`, `1.2M`, and `0` — one decimal until the number would need three
@@ -224,14 +311,42 @@ fn fold(text: &str) -> String {
 struct Buf {
     text: String,
     lines: Vec<Line>,
+    spans: Vec<Span>,
+    /// Char offset of the end of `text`. Tracked rather than recomputed because
+    /// a `String` only knows its length in bytes.
+    at: usize,
 }
 
 impl Buf {
-    /// The only way to append, so text and map cannot drift apart.
-    fn push(&mut self, text: &str, line: Line) {
+    /// Append text in the buffer's plain foreground.
+    fn put(&mut self, text: &str) {
         self.text.push_str(text);
+        self.at += text.chars().count();
+    }
+
+    /// Append text and colour exactly it. Spans come out sorted and disjoint
+    /// because this is the only thing that makes one and it never looks back.
+    fn face(&mut self, text: &str, kind: Face) {
+        let start = self.at;
+        self.put(text);
+        if self.at > start {
+            let end = self.at;
+            self.spans.push(Span { start, end, kind });
+        }
+    }
+
+    /// Terminate the line. The only place `lines` grows, so text and map cannot
+    /// drift apart.
+    fn end(&mut self, line: Line) {
         self.text.push('\n');
+        self.at += 1;
         self.lines.push(line);
+    }
+
+    /// A whole line at once, uncoloured.
+    fn push(&mut self, text: &str, line: Line) {
+        self.put(text);
+        self.end(line);
     }
 }
 
@@ -307,8 +422,11 @@ mod tests {
             assert_eq!(permissions(&link), "lrwxrwxrwx");
         }
         // A symlink to a directory is an arrow, not a slash.
-        assert_eq!(name(&dir), "src/");
-        assert_eq!(name(&link), "latest -> builds/x");
+        let mut buf = Buf::default();
+        name(&mut buf, &dir);
+        buf.put("|");
+        name(&mut buf, &link);
+        assert_eq!(buf.text, "src/|latest -> builds/x");
     }
 
     /// The map has to survive a hostile name without the caller's help.
@@ -320,7 +438,7 @@ mod tests {
             show_hidden: false,
             sort: crate::Sort::Name,
         };
-        let (text, map) = render(&listing, &[]);
+        let (text, map, _) = render(&listing, &[]);
         assert_eq!(text.lines().count(), map.len());
         assert!(text.contains("two?lines.txt"), "{text}");
         assert!(text.starts_with("/tmp/dired?test  (2 entries"), "{text}");
@@ -336,10 +454,10 @@ mod tests {
             show_hidden: false,
             sort: crate::Sort::Name,
         };
-        let (long, _) = render(&listing, &[Some(MARK_SELECT), None, Some(MARK_DELETE)]);
+        let (long, ..) = render(&listing, &[Some(MARK_SELECT), None, Some(MARK_DELETE)]);
         // Missing marks, extra marks, and a mark that would break the line.
-        let (short, map) = render(&listing, &[Some(MARK_SELECT)]);
-        let (odd, _) = render(
+        let (short, map, _) = render(&listing, &[Some(MARK_SELECT)]);
+        let (odd, ..) = render(
             &listing,
             &[Some(MARK_SELECT), Some('\n'), Some(MARK_DELETE)],
         );
@@ -360,7 +478,7 @@ mod tests {
             show_hidden: true,
             sort: crate::Sort::Size,
         };
-        let (text, map) = render(&listing, &[]);
+        let (text, map, _) = render(&listing, &[]);
         assert_eq!(text.lines().count(), map.len());
         assert_eq!(map, vec![Line::Header, Line::Blank, Line::Text]);
         assert!(

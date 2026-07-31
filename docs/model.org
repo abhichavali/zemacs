@@ -1,0 +1,199 @@
+#+TITLE: The model
+#+SUBTITLE: buffers, windows, frames, modes
+
+Five things have names in zemacs, and four of them are the Emacs names because
+Emacs picked the vocabulary that distinguishes what actually differs.
+
+* Buffer
+
+Text, plus a cursor into it. A buffer owns:
+
+- the text itself (a rope, in char offsets — *every* offset in the Lisp API is a
+  character index, never a byte and never a line);
+- =cursor=, one char offset;
+- =path=, or =NIL= for a buffer with no file behind it;
+- =modified=;
+- =major-mode=, exactly one, a string;
+- =minor-modes=, a list of strings, in the order they were enabled;
+- its own undo history, so switching files can never let one buffer's =u= restore
+  another's text;
+- its markers (see [[file:reference.org][reference.org]]).
+
+Exactly one buffer is *live* at a time. Readers with no buffer argument —
+=(point)=, =(buffer-string)=, =(major-mode)= — mean the live one, always. There is
+no "current buffer" you can rebind: to read another buffer you switch to it and
+switch back, which is what =with-current-buffer= does and why it is not free.
+
+Buffers are ordered most-recently-visited first. =(buffer-list)= and
+=(buffer-info)= both answer in that order with the live buffer at index 0, which
+is why =switch-to-buffer= can find a buffer by name and why switching back after
+=with-current-buffer= is reliable.
+
+** Kinds
+
+A buffer has a *kind*, which the editor sets and Lisp only reads through
+=(buffer-read-only-p)=:
+
+| Kind             | Name             | Notes                                        |
+|------------------+------------------+----------------------------------------------|
+| Text             | the file name    | An ordinary file.                            |
+| Scratch          | =*scratch*=        | Real buffer, present from boot.              |
+| Dashboard        | =*dashboard*=      | The startup screen. Generated.               |
+| Magit            | =*magit*=          | Git status. Generated.                       |
+| CommitMessage    | =COMMIT_EDITMSG=   | A commit being written.                      |
+| Dired            | =*dired*=          | A directory listing. Generated.              |
+| Terminal         | =*terminal*=       | A shell on a PTY. Generated.                 |
+
+*Generated* buffers are read-only: their text is re-rendered from state, so an
+edit would be silently thrown away on the next refresh. =Editor::apply= refuses
+any mutating command in one and sets the status line instead — which means
+=(insert "x")= in a dired buffer is a no-op with a message, not an error your
+=handler-case= will catch. Check =(buffer-read-only-p)= if it matters.
+
+* Window
+
+A viewport onto a buffer. A window has its *own* cursor and scroll position, so
+the same buffer shown in two windows scrolls independently.
+
+Windows live in a binary tree per frame: a leaf is a window, a split is two
+subtrees plus the fraction of the space the first one gets. =(window-list)=
+flattens the focused frame's windows to =(ID NAME)= pairs; =(window-id)= is the
+focused one; =select-window= takes an id.
+
+The live buffer belongs to the *focused* window. Changing focus parks the live
+cursor and scroll onto the window being left and adopts the new one's — which is
+why =other-window= can change which buffer =(buffer-name)= answers about.
+
+* Frame
+
+An OS window, holding a tree of windows. =(frame-count)= is how many there are,
+=(frame-index)= which one has focus, =select-frame= moves focus, =new-frame= opens
+one on the dashboard.
+
+=delete-frame= is the one window command that needs the application: core removes
+the frame from its list, but only the app layer can take the OS window down with
+it. It therefore lands a frame later — see [[file:threading.org][threading.org]].
+
+* Major and minor modes
+
+A *major mode* is a string, one per buffer, and is a fact about the *document*:
+=notes.org= is in =org-mode= whether you are typing in it or not. The editor picks
+it from the file's language (=foo.rs= → =rust-mode=) and falls back to
+=fundamental-mode=.
+
+*Minor modes* are a list on top, most recently enabled last. Nothing is built in;
+they exist because a buffer can carry names and a key can be bound to one.
+
+Both are settable from Lisp: =(set-major-mode "org-mode")=, =(set-minor-mode
+"visual-line" t)=.
+
+** The one event the editor reports
+
+When a buffer's major mode *becomes* X, the editor asks the image to call the
+Lisp function =X-hook= if one is defined. Turning a minor mode on or off asks for
+=X-on-hook= / =X-off-hook=.
+
+There is one more, and it is about the *document* rather than about a mode:
+=after-change-hook=, called whenever the live buffer's revision moves — every
+keystroke while editing, and once when a file is opened. It carries no
+arguments and no delta; it is what document synchronisation in
+[[file:reference.org][the LSP client]] is built on, and =*after-change-functions*= is the list it runs so
+that more than one thing can want it.
+
+That is the entire hook contract — there is no =add-hook=, no =before-save-hook=,
+no buffer-switch hook.
+
+Everything else you would expect from Emacs' mode system is built *in Lisp*, on
+top of that one event, in =runtime/modes/modes.lisp=: exit hooks, inheritance,
+settings that revert when a mode is left, choosing a mode from a filename.
+
+#+begin_src lisp
+(define-derived-mode rust-mode prog-mode)       ; inherits prog-mode's settings and keys
+(set-mode-local 'org-mode 'line-overflow "wrap"); reverts when org-mode is left
+(define-mode-key 'prog-mode "SPC t w" "visual-line") ; inherited by children
+(define-minor-mode visual-line "Wrap long lines.")
+(add-auto-mode ".md" 'text-mode)
+(derived-mode-p 'prog-mode)                     ; about the live buffer
+(minor-mode-p 'visual-line)
+(defun org-mode-exit-hook () (message "left org"))
+#+end_src
+
+Two consequences worth knowing before you write a hook:
+
+1. =define-derived-mode= *generates* =X-hook=. A hand-written =(defun org-mode-hook
+   ...)= after it replaces the generated one and silently detaches the machinery
+   for that mode. Put your code in the mode's body, or in =X-exit-hook=, which is
+   yours.
+2. Switching *buffers* fires no hook, because the editor reports none. Settings
+   claimed by a mode therefore follow the last mode *entered*, not the buffer you
+   are looking at. Two org buffers are fine; flipping between an org buffer and a
+   rust one is not. This is recorded as a ceiling in [[file:boundary.org][boundary.org]].
+
+* Modal state
+
+The vim layer. =(evil-state)= answers one of:
+
+: "normal" "insert" "visual" "visual-line" "visual-block"
+: "dashboard" "magit" "dired" "terminal"
+
+and =(set-evil-state "normal")= moves it. These are the same names =define-key=
+takes for its first argument.
+
+This is a *different axis* from the major mode, and confusing them is the most
+common mistake:
+
+| Question                       | Reader           | Example        |
+|--------------------------------+------------------+----------------|
+| What kind of document is this? | =(major-mode)=     | ="org-mode"=     |
+| What are the keys doing?       | =(evil-state)=     | ="visual"=       |
+
+The modal state is *editor-global*, not per buffer. Switching to a buffer sets
+the state from its kind — entering =*dired*= puts you in ="dired"=, leaving it puts
+you back in ="normal"=.
+
+Three of the states are not really modes at all but keymaps for generated
+buffers. ="terminal"= is the odd one: it is the only state whose keymap is
+consulted *instead of* the vim grammar rather than before it, because =d=, =j= and
+above all =C-c= have to reach the shell.
+
+* Selections
+
+=(region)= answers =(BEG . END)= in char offsets, or =NIL= when nothing is selected —
+so =(when (region) ...)= reads the way =(when (use-region-p) ...)= does in Emacs.
+The range is *inclusive of the character under the cursor*, as Visual mode draws
+it: selecting =a= then pressing =l= over =abcdef= gives =(0 . 2)=, which is ="ab"=.
+
+Visual-block mode selects several disjoint runs rather than one. =(region)= gives
+the bounding span, which is almost never what you want there; =(region-ranges)=
+gives the actual list, one =(BEG . END)= per line.
+
+#+begin_src lisp
+(region)          ; => (0 . 4) or NIL
+(region-ranges)   ; => ((0 . 4)) — or ((2 . 5) (12 . 15) (20 . 23)) in block mode
+(region-text)     ; => "abcd", or NIL
+#+end_src
+
+* Faces and the theme
+
+There is one colour table, shared by syntax highlighting, the modeline, org
+markup, dired and magit. =(face-list)= is the whole closed vocabulary;
+=(syntax-color "keyword")= reads one back as =(R G B)=; =(set-syntax-color "keyword"
+r g b)= writes one. Components are 0.0–1.0 and are clamped.
+
+That sharing is deliberate: a directory in dired is a =type= and a file size is a
+=number=, so a theme that only knows about source code colours dired for free.
+
+* Settings
+
+Settings are *global*, not per buffer: there is one =line-overflow= for the
+editor, not one per window. Everything settable is now also readable, which is
+what lets a config compute from the current value:
+
+#+begin_src lisp
+(set-font-size (+ (font-size) 2))
+#+end_src
+
+The mode machinery in =runtime/modes/= uses that global-ness deliberately: a mode
+*claims* a setting, and the effective value is recomputed from baseline +
+ancestors + active minor modes whenever the modes change. Recomputing rather
+than save/restore pairs is what makes it order-proof.

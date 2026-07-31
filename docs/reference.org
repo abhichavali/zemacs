@@ -1,0 +1,930 @@
+#+TITLE: Reference
+#+SUBTITLE: every primitive, reader and helper
+
+Everything below lives in the =ZEMACS= package, and everything except the
+=%=-prefixed internals is exported, so both =(point)= and =(zemacs:point)= read.
+Anything the editor evaluates for you already has =*package*= bound to =ZEMACS=; a
+file you =LOAD= yourself wants =(in-package :zemacs)= at the top.
+
+The =%= prefix means "internal": =%query=, =%do=, =%save-file= and =%make-marker= are
+reachable unqualified from inside =ZEMACS= (or as =zemacs::%do=), but they are not
+exported and =refresh-commands= deliberately keeps them out of =M-x=.
+
+* Conventions
+
+- *Offsets are characters*, counted from 0, never bytes and never lines. The one
+  exception is line *numbers*, which are 1-based, matching what =(line-number)=
+  reports and what the gutter draws.
+- *Failure is =NIL=*, never an error. An unknown reader answers =NIL=; an unknown
+  =%do= verb reports in the status line. A config written against a newer zemacs
+  degrades instead of failing to load.
+- *Out-of-range arguments are clamped, not rejected.* =(buffer-substring 0
+  most-positive-fixnum)= means "to the end", and a reversed pair is put in order.
+- *Writers return =NIL=* unless the table says otherwise.
+- Three mechanisms are marked in the tables, because they behave differently:
+  =P= a C primitive, =R= a reader (answers from the live editor), =H= a Lisp helper
+  built out of the other two. =A= marks the commands that need the app layer and
+  therefore land a frame later — see [[file:threading.org][threading.org]].
+
+* Position
+
+| Form                          |   | Answers                                              |
+|-------------------------------+---+------------------------------------------------------|
+| =(point)=                       | R | Cursor offset.                                       |
+| =(point-min)=                   | R | Always 0.                                            |
+| =(point-max)=                   | R | Offset past the last character = character count.    |
+| =(buffer-size)=                 | R | Same as =point-max=.                                   |
+| =(line-number)=                 | R | 1-based line the cursor is on.                       |
+| =(column)=                      | R | 0-based column.                                      |
+| =(line-count)=                  | R | Number of lines, counting the empty one after a trailing newline: 3 for ="a\nb\n"=. |
+| =(line-start &optional line)=   | R | Offset of the first character of =line= (1-based), or of the cursor's line. |
+| =(line-end &optional line)=     | R | Offset just past the last character, *newline excluded*. |
+| =(goto-char n)=                 | P | Move the cursor. Clamped to the buffer.              |
+| =(goto-line n)=                 | H | Start of 1-based line =n=.                             |
+| =(beginning-of-line)=           | H | =(goto-char (line-start))=                             |
+| =(end-of-line)=                 | H | =(goto-char (line-end))=                               |
+
+#+begin_src lisp
+;; "alpha\nbeta\ngamma\n", cursor on line 2
+(list (point) (line-number) (column))  ; => (8 2 2)
+(line-start 2)                         ; => 6
+(line-end 2)                           ; => 10
+(line-string 9999)                     ; => ""  — clamped to the last line
+#+end_src
+
+*Watch the Normal-mode clamp.* In Normal mode the cursor sits *on* a character,
+never past the last one, so =goto-char= to =(line-end)= is pulled back by one. On
+line 3 of the buffer above:
+
+#+begin_src lisp
+(goto-line 3)
+(end-of-line)
+(list (point) (line-end))              ; => (15 16)
+#+end_src
+
+That is the editor's rule, not a rounding error. In Insert mode there is no
+clamp. Anything computing a range should use =(line-end)= and not =(point)= after
+an =end-of-line=.
+
+* Reading text
+
+| Form                            |   | Answers                                        |
+|---------------------------------+---+------------------------------------------------|
+| =(buffer-string)=                 | R | The whole buffer.                              |
+| =(buffer-substring beg end)=      | R | =[beg, end)=. Clamped and ordered.               |
+| =(line-string &optional line)=    | R | One line, newline excluded.                    |
+| =(buffer-lines)=                  | H | Every line as a list, newlines excluded, *without* the empty trailing one. |
+| =(search-forward pattern &optional start)= | H | Offset of the first =pattern= at or after =start= (default point), or =NIL=. |
+| =(search-backward pattern &optional start)= | H | Offset of the last =pattern= ending at or before =start=, or =NIL=. |
+
+Search is *literal*. ECL ships no regexp engine, so =cl:search= is what there is.
+Both helpers answer in character offsets even though the buffer arrives as UTF-8
+bytes, so the result feeds straight into =goto-char=.
+
+=buffer-lines= is the line-oriented starting point, and exists because a rope
+counts the empty line after a trailing newline: =(line-count)= on ="a\nb\n"= is 3
+and =(buffer-lines)= is =("a" "b")=. Anything iterating over lines wants the second.
+
+#+begin_src lisp
+(buffer-lines)                  ; => ("alpha" "beta" "gamma")
+#+end_src
+
+#+begin_src lisp
+;; Jump to the next TODO, or say there isn't one.
+(defun next-todo ()
+  (let ((hit (search-forward "TODO" (1+ (point)))))
+    (if hit (goto-char hit) (message "no more TODOs"))))
+#+end_src
+
+* Writing text
+
+| Form                              |   | Effect                                          |
+|-----------------------------------+---+-------------------------------------------------|
+| =(insert text)=                     | P | Insert at point, moving it. One undo step.      |
+| =(insert-at pos text)=              | H | Insert at =pos= without moving point. One undo step. |
+| =(delete-region beg end)=           | P | Delete =[beg, end)=. Ordered and clamped. One undo step. |
+| =(replace-region beg end text)=     | P | Delete then insert, *atomically*. One undo step. |
+| =(delete-line &optional line)=      | H | Delete a whole line, newline included.          |
+| =(replace-all from to)=             | H | Replace every occurrence. Answers how many. One undo step. |
+| =(undo)= / =(redo)=                   | H | One step through this buffer's history.         |
+
+=replace-region= is the atomic primitive the whole design points at. Anything
+that must not be interrupted halfway is written as one call to it:
+
+#+begin_src lisp
+(defun surround-region (left right)
+  "Wrap the selection in LEFT and RIGHT."
+  (let ((r (region)))
+    (if r
+        (replace-region (car r) (cdr r)
+                        (concatenate 'string left (region-text) right))
+        (message "no selection"))))
+#+end_src
+
+=insert-at= is =replace-region= over an empty range, which is why it neither moves
+point nor leaves a gap a keystroke could land in.
+
+=replace-all= builds the entire new buffer text in Lisp and issues *one*
+=replace-region=. It answers the number of replacements and leaves point where it
+was (clamped):
+
+#+begin_src lisp
+(replace-all "foo" "bar")   ; => 7
+#+end_src
+
+Its one cost: replacing the whole buffer is a deletion that swallows every
+marker, so none of them survives it — they collapse onto position 0, or onto
+the end for one made with =advance=. If you hold markers, do a targeted
+=replace-region= per hit instead and accept the extra undo steps.
+
+* Markers
+
+A char offset names a character only until the next edit. A marker names it
+afterwards too, because every edit in the editor is a splice and every splice
+adjusts the markers.
+
+| Form                                 |   | Answers                                       |
+|--------------------------------------+---+-----------------------------------------------|
+| =(make-marker &optional pos advance)=  | H | A handle (an integer). =pos= defaults to point. |
+| =(point-marker)=                       | H | =(make-marker)=.                                |
+| =(marker-position m)=                  | R | Where it is now, or =NIL= if deleted or in another buffer. |
+| =(set-marker m pos)=                   | P | Move it.                                      |
+| =(delete-marker m)=                    | P | Drop it.                                      |
+| =(goto-marker m)=                       | H | Move point there; answers the position, or =NIL=. |
+| =(save-excursion &body body)=          | H | Run =body=, then put point back. Answers =body='s value. |
+
+=advance= is the insertion type: with =NIL= (the default, as in Emacs) the marker
+*stays* when text is inserted exactly at it; with anything else it rides along.
+
+A handle answers =NIL= once it is deleted, or while the buffer it belongs to is
+not the live one — so =(when (marker-position m) ...)= is the idiom, the same
+shape as =region=. Holding one too long is a mistake a config makes, never one it
+can crash on.
+
+#+begin_src lisp
+(let ((m (progn (goto-char 6) (point-marker))))
+  (goto-char 0)
+  (insert "XY")
+  (marker-position m))     ; => 8 — still the same word
+#+end_src
+
+=save-excursion= is built on a marker rather than an integer, so an edit *in front
+of* point inside the body still puts the cursor back on the same character:
+
+#+begin_src lisp
+(save-excursion
+  (goto-char 0)
+  (insert ";; generated\n"))
+;; point is back where it was, on the same character
+#+end_src
+
+Two caveats, both from the module's own docs:
+
+- =(make-marker)= puts a marker *at point* rather than nowhere. There is no
+  positionless state, so Emacs' =(make-marker)= then =(set-marker m p)= is
+  =(make-marker p)= here.
+- The insertion type is fixed at creation; there is no
+  =set-marker-insertion-type=.
+- Undo restores a whole snapshot rather than replaying edits backwards, so a
+  marker beyond the restored end is *clamped* onto it rather than restored
+  exactly. It is never outside the document, which is the invariant a marker
+  owes its holder.
+
+* Overlays
+
+A marker names a position across an edit. An overlay names a *range* across one,
+and carries something with it — a colour, a substituted string, an image, or any
+Lisp object at all. It is a marker pair plus a property list, which is exactly
+how it is built.
+
+| Form                            |   | Answers                                                  |
+|---------------------------------+---+----------------------------------------------------------|
+| =(make-overlay beg end)=          | P | A handle (an integer), or =NIL= for an empty range.         |
+| =(overlay-put ov prop value)=     | H | Sets a property. Answers =value=.                          |
+| =(overlay-get ov prop)=           | H | Reads one back, or =NIL=.                                  |
+| =(overlay-position ov)=           | R | =(START . END)=, or =NIL= if it is gone or in another buffer. |
+| =(overlay-start ov)=              | H | =(car (overlay-position ov))=                              |
+| =(overlay-end ov)=                | H | =(cdr (overlay-position ov))=                              |
+| =(overlays-in beg end)=           | R | =(ID START END)= per overlay *overlapping* the range, oldest first. |
+| =(overlays-at pos)=               | H | =(overlays-in pos (1+ pos))=                               |
+| =(delete-overlay ov)=             | H | Drops it and its properties.                             |
+| =(remove-overlays &optional beg end)= | H | Drops *every* overlay overlapping the range. Whole buffer by default. |
+
+There are *no text properties*. Emacs has both because properties live in the
+buffer's string data and therefore survive a copy into the kill ring; a rope of
+characters is what makes every offset here a character index, and threading a
+plist through it would give that up to buy an inheritance rule most configs turn
+off. One mechanism, and this is it.
+
+** The four properties the renderer draws
+
+| Property     | Value                        | Effect                                    |
+|--------------+------------------------------+-------------------------------------------|
+| =face=         | a name from =(face-list)=      | Foreground of the covered text.           |
+| =background=   | a name from =(face-list)=      | Background of the covered cells.          |
+| =display=      | a string                     | Drawn *instead of* the covered text.      |
+| =image=        | a handle from =latex-preview=  | Drawn instead of the covered text, as a bitmap. |
+
+=NIL= clears any of them. A colour is a *face name*, not an =(R G B)= — the theme
+already owns that vocabulary, so an overlay recolours itself when a theme is
+loaded, and an overlay wanting a colour no face has must =set-syntax-color= a
+spare face first.
+
+Priority, where two things claim the same cell:
+
+1. an overlay's =face= / =background= beats the syntax highlight;
+2. among overlapping overlays the *most recently made* wins, and per attribute —
+   one that sets only a background leaves an earlier one's foreground alone;
+3. the selection and the cursor beat both. They are claims about the editor
+   rather than about the text, and nothing a config paints may hide them.
+
+Overlapping =display= substitutions are not composed: the one that starts first
+wins and the rest are ignored.
+
+** Every other property
+
+Anything. A property the renderer has never heard of is stored *in the image*, in
+=*overlay-properties*=, so its value may be a closure, a structure, a hash table —
+whatever an avy hint, a copilot completion or a flymake diagnostic wants to hang
+off the range. It never crosses into Rust, so it never has to survive being
+printed and re-read.
+
+#+begin_src lisp
+(let ((ov (make-overlay (region-beginning) (region-end))))
+  (overlay-put ov 'face "keyword")
+  (overlay-put ov 'jump-to (point-marker))       ; only Lisp sees this
+  (overlay-get ov :jump-to))                     ; 'jump-to and :jump-to are one key
+#+end_src
+
+Property names are compared as *keywords*, so =face=, =:face= and a symbol read in
+another package are the same property.
+
+** Two things to know before holding one
+
+- An overlay whose text is deleted is *deleted with it*. Emacs would keep a
+  zero-width overlay; here every payload is about the text underneath, and a
+  =display= string over no text is a ghost. =(overlay-position ov)= answering =NIL= is
+  how you find out, the same shape =marker-position= has.
+- Text typed at the *front* of an overlay lands inside it; text typed at the
+  *back* lands outside. Those are Emacs' defaults and they are fixed — there is no
+  =front-advance= / =rear-advance= pair.
+
+* LaTeX previews
+
+| Form                    |   | Answers                                                    |
+|-------------------------+---+------------------------------------------------------------|
+| =(latex-fragments)=       | R | =(START END DISPLAY-P)= per fragment in the buffer, in order. |
+| =(latex-preview source)=  | P | An image handle for an =image= overlay property, or =NIL=.     |
+
+Together with overlays these are the whole of =org-latex-preview=, which is
+written in Lisp in =runtime/init.lisp= and is worth reading as the shape of a
+feature here: Rust finds the fragments and rasterises one, Lisp decides which
+ones and what to do with the result.
+
+=latex-fragments= is org's notion of a fragment — =$…$=, =\(…\)=, =$$…$$=, =\[…\]= and
+=\begin{env}…\end{env}= — found in prose only, so a =$= inside a =#+begin_src= block
+is a dollar sign. =DISPLAY-P= is =T= for the ones that want a line of their own.
+
+=latex-preview= shells out to =latex= and =dvipng=, which means:
+
+- it is *slow the first time* — a few hundred milliseconds — and instant
+  afterwards, from a cache on disk that survives a restart;
+- it blocks *the image*, not the editor. Frames keep being drawn and keystrokes
+  keep being handled while a screenful of equations is typeset, which is the
+  whole reason Lisp has a thread of its own;
+- it answers =NIL= and puts the reason in the status line when TeX is not
+  installed or the fragment does not compile;
+- the handle is derived from the fragment, the size and the colour, so previewing
+  the same fragment twice costs nothing at all.
+
+The image is rasterised to match the text it sits in and placed against the
+*baseline*, so =$x_1$= hangs below the line the way a descender does. A fragment
+taller than one line is hung from the top of its row instead, because rows are a
+fixed height here and it would otherwise grow up over the lines above.
+
+* The region
+
+| Form                 |   | Answers                                                  |
+|----------------------+---+----------------------------------------------------------|
+| =(region)=             | R | =(BEG . END)=, or =NIL= with nothing selected.               |
+| =(region-beginning)=   | H | =(car (region))=                                           |
+| =(region-end)=         | H | =(cdr (region))=                                           |
+| =(region-text)=        | H | The text, or =NIL=.                                        |
+| =(region-ranges)=      | R | One =(BEG . END)= per line; a single-element list outside block mode. |
+
+The range is inclusive of the character under the cursor, as Visual mode draws
+it. In visual-block mode =(region)= is the *bounding* span, which is almost never
+what you want — use =region-ranges=, and work back to front so earlier offsets
+stay valid:
+
+#+begin_src lisp
+(defun comment-block ()
+  "Prefix every line of a block selection with `;; '."
+  (dolist (r (reverse (region-ranges)))
+    (insert-at (car r) ";; ")))
+#+end_src
+
+* Buffers
+
+| Form                                  |   | Answers                                           |
+|---------------------------------------+---+---------------------------------------------------|
+| =(buffer-name)=                         | R | Display name of the live buffer.                  |
+| =(buffer-file-name)=                    | R | Its path, or =NIL=.                                 |
+| =(buffer-modified-p)=                   | R | =T= / =NIL=.                                          |
+| =(buffer-read-only-p)=                  | R | =T= for a generated buffer (dashboard, magit, dired, terminal). |
+| =(buffer-list)=                         | R | Display names, live buffer first, modified ones carrying =" [+]"=. |
+| =(buffer-info)=                         | R | =(NAME FILE MODIFIED-P MAJOR-MODE)= per buffer, same order, names unmarked. |
+| =(buffer-names)=                        | H | Just the names.                                   |
+| =(buffer-index name)=                   | H | Its position in that list, or =NIL=.                |
+| =(switch-to-buffer name)=               | H | Switch by name. =T=, or =NIL= and a message.          |
+| =(with-current-buffer name &body body)= | H | Switch, run =body=, switch back. Answers =body='s value, or =NIL= if there is no such buffer. |
+
+=buffer-list= is the switcher's list and is right for a menu; =buffer-info= is the
+same buffers with their fields apart and is right for anything that has to
+*match* a name.
+
+#+begin_src lisp
+(buffer-names)                     ; => ("main.rs" "*dashboard*" "*scratch*")
+(buffer-info)
+;; => (("main.rs" "/src/main.rs" T "rust-mode")
+;;     ("*dashboard*" NIL NIL "fundamental-mode")
+;;     ("*scratch*" NIL NIL "fundamental-mode"))
+
+(defun modified-buffers ()
+  "Report which buffers have unsaved changes."
+  (let ((dirty (remove-if-not #'third (buffer-info))))
+    (message (if dirty
+                 (format nil "unsaved: ~{~a~^, ~}" (mapcar #'first dirty))
+                 "everything saved"))))
+#+end_src
+
+=with-current-buffer= genuinely *shows* the other buffer while the body runs —
+zemacs has one live buffer, and switching is the only way to reach another one's
+text. Keep the body short, and prefer it for reading:
+
+#+begin_src lisp
+(with-current-buffer "*scratch*" (buffer-string))
+#+end_src
+
+Two buffers with the same base name are indistinguishable to it, and the first
+one wins.
+
+*Not reachable from Lisp*: creating a buffer that has no file behind it, and
+killing one. See [[file:boundary.org][boundary.org]]. The shipped workaround for the first is
+=lisp-scratch=, which writes a real file and opens it.
+
+* Windows and frames
+
+| Form                       |    | Effect / answer                                      |
+|----------------------------+----+------------------------------------------------------|
+| =(window-list)=              | R  | =(ID NAME)= per window of the focused frame.            |
+| =(window-id)=                | R  | Id of the focused window.                            |
+| =(window-scroll)=            | R  | First visible line, 0-based.                         |
+| =(window-height)=            | R  | Lines that fit in the viewport.                      |
+| =(split-window-right)=       | H  | Split side by side; the new window takes focus.      |
+| =(split-window-below)=       | H  | Split stacked; the new window takes focus.           |
+| =(delete-window)=            | H  | Close the focused one. The last one cannot be closed. |
+| =(other-window)=             | H  | Focus the next in tree order, wrapping.              |
+| =(select-window id)=         | H  | Focus by id.                                         |
+| =(scroll-lines n)=           | H  | Scroll the view; negative is toward the top.         |
+| =(frame-count)=              | R  | Number of OS windows.                                |
+| =(frame-index)=              | R  | Which one has focus, 0-based.                        |
+| =(new-frame)=                | H  | Open one, showing the dashboard.                     |
+| =(select-frame i)=           | H  | Focus by index.                                      |
+| =(delete-frame)=             | HA | Close the focused frame; the last one quits.         |
+
+The split names describe the *result*, not the divider, because "horizontal
+split" means opposite things in vim and Emacs.
+
+#+begin_src lisp
+(defun window-report ()
+  (message (format nil "~a of ~a: ~{~a~^ | ~}"
+                   (1+ (frame-index)) (frame-count)
+                   (mapcar #'second (window-list)))))
+
+;; Open a second pane and put the scratch buffer in it.
+(defun scratch-beside ()
+  (split-window-right)
+  (switch-to-buffer "*scratch*"))
+#+end_src
+
+* Modes
+
+| Form                        |   | Effect / answer                                |
+|-----------------------------+---+------------------------------------------------|
+| =(major-mode)=                | R | The live buffer's major mode, a string.        |
+| =(minor-modes)=               | R | Its minor modes, oldest first.                 |
+| =(set-major-mode name)=       | P | Set it. Fires =name-hook=.                       |
+| =(set-minor-mode name on)=    | P | Turn one on or off. Fires =name-on-hook= / =name-off-hook=. |
+| =(evil-state)=                | R | The modal state: ="normal"=, ="insert"=, ="visual"=, … |
+| =(set-evil-state name)=       | P | Move to a state. An unknown name reports.      |
+
+The mode *machinery* — =define-derived-mode=, =define-minor-mode=, =set-mode-local=,
+=define-mode-key=, =add-auto-mode=, =derived-mode-p=, =minor-mode-p= — is not part of
+the host API. It is ordinary Lisp shipped in =runtime/modes/modes.lisp=, built on
+top of the one hook above, and documented in that file's header and in
+[[file:model.org][model.org]].
+
+* Keys and commands
+
+| Form                             |   | Effect                                                |
+|----------------------------------+---+-------------------------------------------------------|
+| =(define-key mode keys command)=   | P | Bind =keys= to =command= in =mode=.                          |
+| =(key-bindings)=                   | R | Every binding as =(MODE KEYS COMMAND)=, sorted.          |
+| =(where-is command)=               | H | Just the bindings for one command.                    |
+| =(register-command name)=          | P | Offer =name= in =M-x=.                                    |
+| =(clear-commands)=                 | P | Empty the =M-x= list — call it before republishing.     |
+| =(command-list)=                   | R | What =M-x= currently offers.                             |
+
+** =mode=
+
+Either a *modal state* — ="normal"= ="insert"= ="visual"= ="visual-line"=
+="visual-block"= ="dashboard"= ="magit"= ="dired"= ="terminal"= (with the aliases
+="vline"=, ="vblock"=, ="git"=, ="term"=) — or *any other string*, which is taken to
+name a major or minor mode and applies only in its buffers.
+
+That is one primitive covering both: =(define-key "org-mode" "SPC m b" "org-bold")=
+needs nothing new. An unknown mode name is not an error, since a binding may be
+made long before the mode it belongs to is entered.
+
+** =keys=
+
+Space-separated tokens. A token is a literal character, =SPC=, a modifier chord,
+or a bracketed name:
+
+: a  A  1  SPC  -  +
+: C-x  M-o  C-M-j
+: <ret>  <tab>  <bs>  <esc>  <left>  <right>  <up>  <down>
+: C-<ret>  C-M-<ret>  M-<bs>
+
+Spacing is normalised, so ="gd"= and ="g d"= are the same sequence. A single
+unseparated token containing =-= or starting with =<= is left alone, which is why
+=<tab>= is one key and not five. An unseparated *mix* like ="g<tab>"= is not
+supported — write ="g <tab>"=.
+
+** =command=
+
+The same namespace as a dashboard action. It is a *built-in verb* if it names
+one, otherwise it is called as the Lisp form =(command)= — with no arguments,
+which is why a command is a zero-argument function.
+
+Built-in verbs, resolved by the editor before the image is asked:
+
+| Verb                                        | What it does                         |
+|---------------------------------------------+--------------------------------------|
+| =quit=                                        | Quit.                                |
+| =find-file=                                   | Open the file prompt.                |
+| =execute-command= / =M-x=                       | Open the command prompt.             |
+| =switch-buffer=                               | Open the buffer prompt.              |
+| =search-line= / =consult-line= / =goto-line=      | Pick a line by fuzzy match.          |
+| =search-project= / =consult-ripgrep= / =grep=     | Ripgrep across the project.          |
+| =split-window-right= / =split-window-below=     | Split.                               |
+| =delete-window= / =other-window= / =ace-window=   | Windows.                             |
+| =new-frame= / =delete-frame=                    | Frames.                              |
+| =eval-buffer= / =eval-region= / =eval-last-sexp=  | Evaluate live buffer text.           |
+| =eval-dwim=                                   | Selection, else the form under point, else the buffer. |
+| =magit-*=                                     | A git verb.                          |
+| =dired= / =dired-*=                             | A dired verb.                        |
+| =terminal= / =term= / =shell= / =terminal-*=        | The shell.                           |
+| =config=                                      | Open the init file.                  |
+| =open:PATH=                                   | Open a specific path (=~/= expanded).  |
+| =scratch=                                     | Leave the dashboard.                 |
+| =<something>-mode=                            | Set the major mode, unless a Lisp command of that name is registered. |
+
+Anything else is =(that-name)= in the image.
+
+The precedence when a key is pressed is: bindings for the buffer's *minor* modes
+(most recently enabled first), then its *major* mode, then the current modal
+state's map, then the built-in vim grammar. So config always wins, and a
+mode-local binding wins over a global one.
+
+That holds for a mode-local *sequence* too: while one is still being typed, an
+exactly matching global binding does not fire. =C-c= is bound everywhere to
+=eval-dwim=, and =(define-key "lisp-mode" "C-c C-e" ...)= is what makes =C-c= a
+prefix in Lisp buffers and nowhere else. Without it the global binding would
+fire on the first key and the sequence could never be reached.
+
+While a sequence is pending the editor calls =(which-key KEYS)= in the image, if
+something has defined it — that is the whole hook =runtime/modes/which-key.lisp=
+hangs from, and a config that does not define =which-key= never notices.
+
+#+begin_src lisp
+(where-is "find-file")
+;; => (("normal" "SPC f f" "find-file") ...)  — one row per mode it is bound in
+
+(defun describe-mode-keys ()
+  "Every binding that applies in this buffer's major mode."
+  (let ((mode (major-mode)))
+    (message (format nil "~{~a~^  ~}"
+                     (mapcar #'second
+                             (remove-if-not (lambda (b) (string= (first b) mode))
+                                            (key-bindings)))))))
+#+end_src
+
+*Note the collisions.* =goto-line=, =dired= and =terminal= are built-in verbs *and*
+Lisp functions here. A key bound to the string reaches the verb; the Lisp
+function is what Lisp calls. They do compatible things — the verb prompts, the
+function takes an argument — which is the same split Emacs has.
+
+* Prompts
+
+| Form                  |   | Effect                            |
+|-----------------------+---+-----------------------------------|
+| =(open-prompt kind)=    | P | Put one of the editor's pickers up. |
+
+=kind= is one of ="file"=, ="buffer"=, ="command"= (=M-x=), ="line"= (=consult-line=),
+="grep"= (ripgrep), ="project-file"=, ="ex"= (=:=) or ="search"= (=/=). Unknown names
+report. Aliases: =":"= for ex, ="/"= for search, ="m-x"= for command, ="project"= for
+project-file.
+
+#+begin_src lisp
+(defun find-file-here ()
+  (message "pick a file")
+  (open-prompt "file"))
+#+end_src
+
+*What the answer does is fixed by the kind* — a file is opened, a command is run,
+a line is jumped to. Lisp gets no continuation, so this is "put the picker up",
+not =read-string=. A command that needs an answer back cannot be written; see
+[[file:boundary.org][boundary.org]].
+
+* The dashboard
+
+| Form                                |   | Effect                                    |
+|-------------------------------------+---+-------------------------------------------|
+| =(dashboard-banner text)=             | P | The centred banner. Plain text; newlines allowed. |
+| =(clear-dashboard-items)=             | P | Empty the item list.                      |
+| =(dashboard-item key label action)=   | P | Add one. =key= may be =#\f= or ="f"=.          |
+| =(show-dashboard)=                    | P | Show it.                                  |
+
+=action= is a command string, exactly as in =define-key=.
+
+#+begin_src lisp
+(clear-dashboard-items)
+(dashboard-item #\f "Find file"  "find-file")
+(dashboard-item #\s "Scratch"    "lisp-scratch")
+(dashboard-item #\g "Git status" "magit-status")
+(dashboard-item #\q "Quit"       "quit")
+#+end_src
+
+* Appearance
+
+Every setting now has both halves. Writers are primitives, readers are readers.
+
+| Write                                 | Read                        | Notes                             |
+|---------------------------------------+-----------------------------+-----------------------------------|
+| =(set-font-size n)=                     | =(font-size)= → float         | Clamped 4–400.                    |
+| =(set-background r g b)=                | =(background)= → =(R G B)=      | Components 0.0–1.0, clamped.      |
+| =(set-foreground r g b)=                | =(foreground)= → =(R G B)=      | Also sets the =default= face.       |
+| =(set-syntax-color face r g b)=         | =(syntax-color face)=         | =NIL= for an unknown face.          |
+| —                                     | =(face-list)=                 | The whole closed vocabulary.      |
+| =(set-line-numbers on)=                 | =(line-numbers-p)=            | Whether the gutter is drawn.      |
+| =(set-relative-line-numbers on)=        | =(relative-line-numbers-p)=   | Count from the cursor. Orthogonal. |
+| =(set-tab-width n)=                     | =(tab-width)=                 | Clamped 1–16.                     |
+| =(set-line-overflow mode)=              | =(line-overflow)=             | ="truncate"= or ="wrap"=.            |
+| =(set-completion-style style)=          | =(completion-style)=          | ="minibuffer"=, ="bottom"=, ="center"=. |
+| =(set-modeline-relief n)=               | =(modeline-relief)=           | Emacs' =:box :line-width=. Signed: positive raises, negative *sinks*. Clamped ±16. |
+| =(set-modeline-pad n)=                  | =(modeline-pad)=              | Pixels. Clamped 0–64.             |
+
+Anything =NIL= is false and only =NIL= is false, as in Lisp.
+
+The faces are one closed set shared by syntax highlighting, the modeline, org
+markup, dired and magit:
+
+: keyword function type string number comment constant variable operator
+: punctuation default modeline modeline-inactive modeline-text
+: heading-1 heading-2 heading-3 bold italic link code markup
+
+An unknown face name reports in the status line rather than erroring.
+
+#+begin_src lisp
+(set-font-size (+ (font-size) 2))          ; magnify
+(syntax-color "keyword")                   ; => (0.78 0.57 0.94)
+
+(defun dim-comments ()
+  "Halve the brightness of the comment face."
+  (let ((c (syntax-color "comment")))
+    (apply #'set-syntax-color "comment" (mapcar (lambda (v) (/ v 2)) c))))
+#+end_src
+
+Aliases the writers accept: line overflow takes ="truncated"= / ="off"= / ="nil"= for
+truncate and ="wrapped"= / ="on"= / ="t"= for wrap; completion style takes ="echo"= /
+="none"=, ="consult"=, and ="centre"= / ="telescope"= / ="popup"=.
+
+* Files
+
+| Form                        |    | Effect                                                |
+|-----------------------------+----+-------------------------------------------------------|
+| =(find-file path)=            | PA | Open a file. A directory opens dired.                 |
+| =(find-file-at hit)=          | HA | Open =path:line:text= — what ripgrep prints — and land on the line. |
+| =(save-file &optional path)=  | HA | Save in place, or to =path=.                            |
+
+All three land a frame later. =(find-file "x")= immediately followed by
+=(buffer-name)= still reports the old buffer; that is the point of
+=find-file-at=, and the reason a mode hook is the right place to react to an
+open. See [[file:threading.org][threading.org]].
+
+* Git, dired and the terminal
+
+Core has no git, no filesystem and no processes in it. These hand a verb to the
+app layer, which does the work and feeds the result back as buffer text.
+
+| Form                   |    | Verbs                                                        |
+|------------------------+----+--------------------------------------------------------------|
+| =(magit verb)=           | HA | ="status"= ="stage"= ="unstage"= ="stage-all"= ="unstage-all"= ="commit"= ="commit-finish"= ="push"= ="pull"= ="refresh"= |
+| =(dired verb)=           | HA | ="open"= ="up"= ="enter"= ="mark"= ="unmark"= ="toggle-marks"= ="flag-delete"= ="execute"= ="rename"= ="copy"= ="mkdir"= ="toggle-hidden"= ="refresh"= |
+| =(terminal verb)=        | HA | ="open"= ="close"=                                              |
+
+#+begin_src lisp
+(defun git-refresh-and-report ()
+  (magit "refresh")
+  (message "refreshed"))     ; runs first: the git verb lands a frame later
+#+end_src
+
+The same verbs are reachable as command strings (=magit-status=, =dired-enter=,
+=terminal-close=), which is what the shipped bindings use.
+
+* Undo, the register and the clipboard
+
+| Form                                      |   | Effect                                |
+|-------------------------------------------+---+---------------------------------------|
+| =(undo)= / =(redo)=                           | H | One step through this buffer's history. |
+| =(copy-region beg end &optional linewise)=  | H | Copy into the unnamed register — what =p= pastes. |
+| =(set-register text &optional linewise)=    | H | Put literal text there.               |
+| =(register)=                                | R | =(TEXT . LINEWISE-P)=, or =NIL= when it is empty. |
+| =(paste &optional after)=                   | H | Paste before point, or after it. One undo step. |
+
+=linewise= is vim's distinction: a linewise register pastes as whole lines above
+or below the current one rather than into it.
+
+** The register is the system clipboard
+
+=select-enable-clipboard t= is what the config asks for, so there is no separate
+kill ring: the unnamed register and the system clipboard are mirrored. =yy= here
+is pasteable in a browser, and =⌘C= there is what the next =p= puts back — and
+=(register)= therefore reads whatever was copied *anywhere*, not only what this
+editor yanked.
+
+The mirror is in the app layer, because core cannot reach the window system:
+pushed once a frame off a revision counter, pulled on the window system's own
+"the clipboard changed" event rather than by polling it. Text arriving from
+outside is treated as linewise only if it ends in a newline — which is what =yy=
+would have produced, and the best a bare string can be asked.
+
+Named registers (=""ayy"=) are vim-side only and are *not* mirrored; the =+= and
+=*= registers do not exist as separate registers, because with this setting they
+would be aliases for the one that already is the clipboard.
+
+* Messages and control
+
+| Form              |   | Effect                                                   |
+|-------------------+---+----------------------------------------------------------|
+| =(message text)=    | P | Status line, and appended to the log.                    |
+| =(messages &optional n)= | R | The last =n= messages, or all of them. Capped at 500.  |
+| =(status)=          | R | What the status line last said.                          |
+| =(quit)=            | P | Quit the editor.                                         |
+
+=message= takes a string, so =format= does the work:
+
+#+begin_src lisp
+(message (format nil "~a lines, ~a chars" (line-count) (point-max)))
+#+end_src
+
+=(messages)= is =*Messages*=: the status line only ever shows the last one, so this
+is the only record that a message which was immediately replaced was ever
+produced at all.
+
+* Evaluating
+
+| Form                    |   | Effect                                                    |
+|-------------------------+---+-----------------------------------------------------------|
+| =(eval-string s)=         | H | Read and evaluate every form in =s=, echo the last non-=NIL= value, report errors. |
+| =(load-init path)=        | H | =LOAD= with a =handler-case= around it.                       |
+
+These are what the editor calls; you rarely call them yourself. The config-level
+=%eval-file=, =reload-config=, =edit-config=, =lisp-scratch= and =eval-file-dwim= live in
+=runtime/init.lisp= and are yours to replace.
+
+* Subprocesses and JSON-RPC
+
+A long-lived child, spoken to in JSON-RPC 2.0 over its stdin and stdout. Rust
+owns the pipe — spawning, =Content-Length= framing, id allocation, draining the
+child's stderr, noticing it die — and *nothing else*. Which request to send and
+what to do with the reply is Lisp, in =runtime/rpc.lisp=.
+
+This is a different thing from =(terminal "open")=: a PTY is a screen a program
+draws on, and this is a pipe you ask questions down.
+
+Load it before use — the shipped =init.lisp= does:
+
+#+begin_src lisp
+(load (merge-pathnames "rpc.lisp" *runtime-dir*))
+#+end_src
+
+| Form                                                |   | Answers                                                     |
+|-----------------------------------------------------+---+-------------------------------------------------------------|
+| =(rpc-start program &key args cwd name on-notify on-request on-exit)= | H | A connection handle, or =NIL= if the program could not be started. |
+| =(rpc-request conn method params callback)=           | H | The request id. =callback= is called with =(RESULT ERROR)= later. |
+| =(rpc-notify conn method &optional params)=           | H | =T= when it went out.                                         |
+| =(rpc-respond conn id result &optional error)=        | H | Answer a request the *child* made.                            |
+| =(rpc-stop conn)=                                     | H | Hang up. Queued messages are written first.                 |
+| =(rpc-live-p conn)=                                   | H | =T= while the child is running.                               |
+| =(rpc-connections)=                                   | H | =((CONN NAME) ...)=                                           |
+
+** The handlers
+
+All three run on the Lisp thread, later, and take the connection first:
+
+: (on-notify  CONN METHOD PARAMS)
+: (on-request CONN ID METHOD PARAMS)     ; must answer with rpc-respond
+: (on-exit    CONN REPORT)               ; REPORT carries the child's last stderr
+
+A request with no =on-request= is answered =-32601= automatically, because
+JSON-RPC insists a request be answered even to refuse it — a server left waiting
+on one sits there forever.
+
+** How a reply reaches Lisp
+
+=rpc-request= returns *before the child has been asked*, so there is no value for
+it to return. What happens instead:
+
+1. a reader thread in Rust parses the frame and pushes it onto a channel;
+2. the main thread drains that channel once a frame, turns the JSON into a Lisp
+   form, and queues =(%rpc-event CONN KIND FORM)= for the Lisp thread — the same
+   route a mode hook takes;
+3. =%rpc-event= looks the id up in the connection's pending table and calls the
+   closure parked under it.
+
+No foreign thread ever calls into ECL and nothing blocks the editor, which is
+the contract in [[file:threading.org][threading.org]]. The cost is that *your callback runs later, on a
+turn of the Lisp queue of its own*: it cannot return a value to whoever asked,
+so write it as a continuation.
+
+** JSON
+
+Decoding is Rust's; a message arrives already =READ=:
+
+| JSON      | Lisp           | JSON       | Lisp                    |
+|-----------+----------------+------------+-------------------------|
+| =null=      | =NIL=            | =[a, b]=     | =(a b)=                   |
+| =true=      | =T=              | ={"k": v}=   | =(("k" . v))= — an alist  |
+| =false=     | =NIL=            | number     | integer or double       |
+
+Encoding is Lisp's, because building a request *is* protocol:
+
+| Form                        |   | Answers                                              |
+|-----------------------------+---+------------------------------------------------------|
+| =(json-encode x)=             | H | JSON text. =NIL= → =null=, =T= → =true=, =:false= → =false=, =:empty-object= → ={}=, =:empty-array= → =[]=. |
+| =(json-string s)=             | P | =s= as a JSON string literal, quotes and escapes included. |
+| =(jobj "k" v ...)=            | H | An object from alternating keys and values.          |
+| =(jarr a b ...)=              | H | An array.                                            |
+| =(jget object &rest keys)=    | H | Walk a decoded object. =NIL= for anything not there — never signals. |
+
+#+begin_src lisp
+(json-encode (jobj "position" (jobj "line" 3 "character" 0)))
+; => {"position":{"line":3,"character":0}}
+
+(jget msg "params" "range" "start" "line")   ; => 3, or NIL
+#+end_src
+
+*Three things arrive as =NIL=* — =false=, =null= and an empty array or object — so a
+reader cannot tell "absent" from "explicitly false". Nothing in LSP depends on
+the difference; the upgrade is =:false= / =:null= keywords in the decoder.
+
+*Whether a list encodes as an object or an array is inferred*: a list whose first
+element is a cons with an atom in its car is an alist. =jobj= and =jarr= make that
+unambiguous, and hand-written literals mostly do too — =((1 2) (3 4))= is the
+shape that gets it wrong.
+
+* Language servers
+
+The eglot equivalent, written entirely in Lisp on top of the above, in
+=runtime/lsp.lisp=. Nothing in Rust knows what a language server is.
+
+*Adding one is a single line in your config:*
+
+#+begin_src lisp
+(lsp-register-server 'rust-mode "rust-analyzer")
+(lsp-register-server 'go-mode "gopls")
+#+end_src
+
+=pylsp= and =clangd= ship registered. A server that is not installed reports in the
+status line the first time a buffer in its mode is touched, and nothing else
+breaks.
+
+| Form                              |   | Effect                                                    |
+|-----------------------------------+---+-----------------------------------------------------------|
+| =(lsp)=                             | H | Start a server for the live buffer, or say why not.       |
+| =(lsp-stop)= =(lsp-restart)=          | H | =didClose=, =shutdown=, =exit=, then hang up.                   |
+| =(lsp-status)=                      | H | What is running, and where.                               |
+| =(lsp-goto-definition)=             | H | Jump to the definition under the cursor. Bound to =g d=.    |
+| =(lsp-diagnostics &optional path)=  | H | =((LINE COLUMN SEVERITY MESSAGE SOURCE) ...)=. =LINE= is 1-based, =COLUMN= 0-based, =SEVERITY= 1 error … 4 hint. |
+| =(lsp-diagnostics-at-point)=        | H | Echo the diagnostics on this line. =SPC l e=.               |
+| =(lsp-list-diagnostics)=            | H | All of them in a buffer, as =path:line:message=. =SPC l E=.  |
+| =(lsp-register-server mode program &rest args)= | H | Which server serves which major mode.         |
+| =(lsp-project-root path)=           | H | Where a server is started: up to the first =.git=, =Cargo.toml=, =pyproject.toml= … |
+| =(lsp-path-uri path)= =(lsp-uri-path uri)= | H | =file:= URIs, percent-encoded. =NIL= for a URI this editor cannot open. |
+| =*lsp-diagnostics-functions*=       |   | Called with a path when its diagnostics change. **Where flymake attaches.** |
+
+** =after-change-hook=
+
+The one event the editor reports about the *document*, and what drives document
+synchronisation. It is called with no arguments whenever the live buffer's
+revision moves — every keystroke in a buffer being edited, and once when a file
+is opened. =*after-change-functions*= is the list it runs, so this file and your
+config can both hang something off it.
+
+#+begin_src lisp
+(push (lambda () (when (> (point-max) 100000) (message "big file")))
+      *after-change-functions*)
+#+end_src
+
+It carries no *delta*, which is why =textDocument/didChange= sends the whole
+buffer. See the ceiling in [[file:boundary.org][boundary.org]].
+
+* The escape hatch
+
+Both halves of the bridge are one C entry point each, and both are exported. If
+a name is missing but the underlying reader or verb exists, call them directly.
+
+** =(%query name a b)=
+
+Answers =name= with up to two integer arguments. Rust answers with a *string of
+Lisp source* and the shim =READ=s it, which is how one C signature returns
+integers, strings, =NIL=, conses and lists alike. An unknown name answers =NIL=.
+
+Its ceiling is arguments: two integers, no strings. Anything needing a string
+argument is a command.
+
+** =(%do verb arg a b)=
+
+Issues the command named by =verb=, with an optional string and up to two
+integers. =NIL= for =arg= means absent. An unknown verb reports =no such command:
+...= in the status line.
+
+| Verb                                       | =arg=   | =a=          | =b=   |
+|--------------------------------------------+-------+------------+-----|
+| ="undo"= ="redo"=                              | —     | —          | —   |
+| ="switch-buffer"=                            | —     | index      | —   |
+| ="split-window-right"= ="split-window-below"=  | —     | —          | —   |
+| ="delete-window"= ="other-window"=             | —     | —          | —   |
+| ="select-window"=                            | —     | window id  | —   |
+| ="new-frame"= ="delete-frame"=                 | —     | —          | —   |
+| ="select-frame"=                             | —     | frame index | —  |
+| ="scroll"=                                   | —     | lines, signed | — |
+| ="yank"= / ="yank-lines"=                      | —     | beg        | end |
+| ="set-register"=                             | text  | linewise?  | —   |
+| ="paste"=                                    | —     | after?     | —   |
+| ="git"= ="dired"= ="term"=                      | verb  | —          | —   |
+| ="open-at"=                                  | =path:line:text= | —  | —   |
+
+Adding a verb is one arm of the =match= in =zemacs_lisp::command_for= plus a
+one-line =DEFUN= in =shim.c= — nothing in C. Adding a reader is one arm of the
+=match= in =zemacs_core::query= plus a name in the list in =QUERIES_FORM=.
+
+** The subprocess primitives
+
+Five, and none of them knows what a protocol is. =runtime/rpc.lisp= is written on
+top of exactly these; anything it can do, you can do.
+
+| Form                                          | Answers                                       |
+|-----------------------------------------------+-----------------------------------------------|
+| =(%rpc-start program args-json cwd)=            | A connection handle, or 0. =args-json= is a JSON array of strings, or ="". |
+| =(%rpc-send conn method params-json reply-p)=   | The request id, or 0 for a notification. =params-json= =NIL= sends no params at all. |
+| =(%rpc-respond conn id-json result-json error-json)= | =NIL=. The id is raw JSON because JSON-RPC allows a string there. |
+| =(%rpc-stop conn)=                              | =NIL=.                                          |
+| =(%json-quote text)=                            | =text= as a JSON string literal.                |
+
+Three of them hand a value back, which is what earns them C entry points rather
+than =%do= verbs; the other two carry more strings than =%do='s single one.
+
+Malformed JSON is *refused* rather than written: a half-written message would
+desynchronise the child for the rest of the session, and the symptom would
+surface three requests later. The refusal is a line in the status line.
+
+* Redefinition, and advice
+
+This is Common Lisp, so there is no advice framework and none is needed:
+=fdefinition= is the mechanism.
+
+#+begin_src lisp
+;; Log every font-size change, and still make it.
+(let ((old (fdefinition 'set-font-size)))
+  (setf (fdefinition 'set-font-size)
+        (lambda (n)
+          (message (format nil "font size -> ~a" n))
+          (funcall old n))))
+#+end_src
+
+That is not a curiosity: =runtime/modes/modes.lisp= makes global settings revert
+when a mode is left by wrapping each setting primitive exactly this way, because
+there was no reader to compare against. Capture the old definition in a =LET= and
+guard against re-wrapping on a config reload — wrapping a wrapper recurses until
+the stack runs out. =DEFVAR= (not =DEFPARAMETER=) is the usual guard, since a
+reload must not re-capture.
+
+*A built-in verb cannot be advised.* Core resolves the names in
+=BUILTIN_COMMANDS= (=crates/core/src/evil.rs=) before it ever asks the image, so
+redefining a Lisp =quit=, =find-file= or =delete-window= changes nothing that a key
+binding, a dashboard item or =M-x= does. Names that are *not* in that list —
+=save-file= among them — fall through to the image and are advisable.

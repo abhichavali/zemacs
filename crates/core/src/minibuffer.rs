@@ -24,6 +24,16 @@ pub enum PromptKind {
     Buffer,
     /// A line of the current buffer to jump to — `consult-line`.
     Line,
+    /// A file (or a project root) from anywhere in the project. Candidates come
+    /// from the app, which knows what a project is; accepting one opens it, and
+    /// a root opens as a directory, which is dired — so switching project and
+    /// finding a file inside one are the same prompt.
+    ProjectFile,
+    /// A match from anywhere in the project — `consult-ripgrep`. Unlike every
+    /// other prompt the candidates come from a subprocess rather than from the
+    /// editor, so they are refreshed by the app as the pattern is typed instead
+    /// of filtered from a fixed list.
+    Grep,
 }
 
 impl PromptKind {
@@ -78,8 +88,15 @@ impl PromptKind {
     /// True when moving the selection should move the *cursor* too, so the
     /// buffer follows the highlighted candidate as you narrow — consult's
     /// preview. Cancelling then has to restore the original position.
+    ///
+    /// `/` is here by a different route to the same place: it has no candidate
+    /// list, so what follows the input is the *match*, recomputed from scratch
+    /// on every keystroke. Both kinds need an `origin` recorded when the prompt
+    /// opens, and both need Escape to go back to it — which is the whole of
+    /// incremental search, and the reason it is a flag on the prompt rather
+    /// than a mode of its own.
     pub fn previews(self) -> bool {
-        matches!(self, PromptKind::Line)
+        matches!(self, PromptKind::Line | PromptKind::Search)
     }
 }
 
@@ -104,6 +121,15 @@ impl Prompt {
     /// previously highlighted would mean typing more of a name walks *away*
     /// from it — the top hit would be found and then skipped.
     pub fn refilter(&mut self) {
+        // A grep prompt's candidates were matched by ripgrep, against the same
+        // pattern and with a far better matcher than this one. Filtering them
+        // again drops real hits: `fn main` is not a subsequence of a line
+        // holding `fn  main`, and a regex is not a subsequence of anything.
+        if self.kind == PromptKind::Grep {
+            self.matches = (0..self.items.len()).collect();
+            self.selected = 0;
+            return;
+        }
         let mut scored: Vec<(u32, usize)> = self
             .items
             .iter()

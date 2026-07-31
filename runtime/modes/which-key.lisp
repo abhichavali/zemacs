@@ -69,9 +69,15 @@ than another prefix."
 (defun %which-key-maps ()
   "The keymaps that apply to the live buffer, in the order the editor consults
 them: minor modes most-recently-enabled first, then the major mode, then the
-modal state's own map. The order is the point — the nearest map holds the
-binding that will actually fire, so it is the one whose label must win."
-  (append (reverse (minor-modes)) (list (major-mode) (evil-state))))
+modal maps. The order is the point — the nearest map holds the binding that will
+actually fire, so it is the one whose label must win.
+
+`evil-keymaps' rather than `evil-state', and that is not a detail: dired, magit
+and the dashboard *layer over* Normal, so `SPC' in a listing reaches the leader
+map and the editor waits for the rest of the sequence. Asking only for the
+state's own name found no rows there and this function reported nothing at all —
+on the dashboard, which is the buffer the editor starts in."
+  (append (reverse (minor-modes)) (list (major-mode)) (evil-keymaps)))
 
 (defun which-key-rows (prefix)
   "(TOKEN . LABEL) for every key that continues PREFIX in the live buffer, each
@@ -88,14 +94,29 @@ token once, nearest keymap first, sorted by key."
     (sort (nreverse rows) #'string< :key #'car)))
 
 (defun which-key (prefix)
-  "Show what continues PREFIX, in the status line.
+  "Show what continues PREFIX: a panel above the status line, and the same
+answer on one line inside it.
 
 Called by the editor the moment a prefix key is pressed — that is the whole
 feature — and by hand from `M-x' or from `which-key-leader' below.
 
-ponytail: one line, because `message' is the only surface Lisp can draw on. A
-real which-key *panel* wants overlays, which live in the renderer; when they
-arrive this function is the only thing that has to change.
+The panel is `which-key-row', which hands the renderer one \"KEY LABEL\" row at
+a time and clears the lot when called with nothing. *Not* overlays, which is the
+answer this docstring used to give and the wrong one: an overlay is anchored to
+a range of buffer text and moves when you type in front of it, and none of this
+is about the document. Not a prompt either, and that one matters — a prompt
+owns the next keystroke, and the next keystroke is precisely what which-key
+exists to help you aim.
+
+Nothing here notices a prefix being resolved or abandoned, because nothing has
+to: the editor empties the panel itself as soon as no key sequence is pending,
+which is one question asked in one place rather than a rule this file would have
+to keep in step with the grammar.
+
+The status line keeps the same one-line summary it always had. Two surfaces for
+one answer on purpose: the panel is the readable one, and the line is what a
+window too short for a panel — or an `M-x which-key-leader' typed with no
+sequence pending at all — still gets.
 
 ponytail: this is the one thing in the editor that runs Lisp per *keystroke*
 rather than per command — every key of a leader sequence but the last. It costs
@@ -104,12 +125,14 @@ is waiting for it. If that ever shows up, the answer is a cache invalidated by
 wrapping `define-key', not a table filled in by hand."
   (let* ((rows (which-key-rows prefix))
          (n (length rows))
-         (shown (subseq rows 0 (min n *which-key-limit*))))
+         (shown (subseq rows 0 (min n *which-key-limit*)))
+         (cells (mapcar (lambda (row) (format nil "~a ~a" (car row) (cdr row))) shown)))
+    (which-key-row)                     ; retire the previous prefix's rows
     (when rows
+      (dolist (cell cells) (which-key-row cell))
       (message
        (format nil "~a-  ~{~a~^   ~}~@[   +~a more~]"
-               prefix
-               (mapcar (lambda (row) (format nil "~a ~a" (car row) (cdr row))) shown)
+               prefix cells
                (when (> n *which-key-limit*) (- n *which-key-limit*)))))))
 
 (defun which-key-leader ()

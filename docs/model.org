@@ -42,13 +42,33 @@ A buffer has a *kind*, which the editor sets and Lisp only reads through
 | Magit            | =*magit*=          | Git status. Generated.                       |
 | CommitMessage    | =COMMIT_EDITMSG=   | A commit being written.                      |
 | Dired            | =*dired*=          | A directory listing. Generated.              |
-| Terminal         | =*terminal*=       | A shell on a PTY. Generated.                 |
+| Terminal         | =*terminal*=, =*claude*=, … | A program on a PTY. Generated. *One per session.* |
 
 *Generated* buffers are read-only: their text is re-rendered from state, so an
 edit would be silently thrown away on the next refresh. =Editor::apply= refuses
 any mutating command in one and sets the status line instead — which means
 =(insert "x")= in a dired buffer is a no-op with a message, not an error your
 =handler-case= will catch. Check =(buffer-read-only-p)= if it matters.
+
+Terminal is the one kind that *comes in more than one*. Every other generated
+kind is a view of a single thing — there is one repository to show a status for
+— so there is one buffer per kind and =show-special= finds it by kind. A terminal
+is not a view: a shell, a =claude= session and an =opencode= session are three live
+children, and folding them onto one buffer would mean opening the second one
+closed the first. So a terminal buffer carries a *name* as well as a kind, and
+that pair is what identifies it:
+
+- a plain shell is =*terminal*=, and =SPC o t= shows the one you already have
+  rather than starting a second — =terminal-new= is how you ask for another;
+- an agent session is named after its harness: =*claude*=, =*cursor*=,
+  =*opencode*=, and a second of the same one is =*claude*<2>=, exactly as Emacs
+  disambiguates two files with the same basename;
+- killing the buffer hangs up on the child, and the child exiting leaves the
+  buffer with its last screenful in it so you can read what it said.
+
+Everything that reads buffers therefore just works on sessions: they are in
+=(buffer-list)=, =switch-to-buffer= reaches them by name, and =C-M-j= walks through
+them like anything else. See [[file:reference.org][reference.org]] for the verbs.
 
 * Window
 
@@ -165,11 +185,26 @@ reports that the buffer is not a file and stays put rather than parking you in a
 mode where every keystroke is refused.
 
 ="terminal"= is the odd one out and is genuinely consulted *instead of* the
-grammar, because =d=, =j= and above all =C-c= have to reach the shell. Its
+grammar, because =d=, =j= and above all =C-c= have to reach the child. Its
 fallthrough is narrower and spelled out in =Key::is_editor_key=: the keys a
 terminal has no use for — Command chords and the two modified Enters — still
 reach the Normal keymap, which is what keeps =M-x= and the window splits alive
 inside a shell.
+
+There is one state for all of them, not one per session: the modal state is
+editor-global, and which *child* a keystroke reaches is decided by which
+terminal buffer is live rather than by the state. So switching to =*claude*=
+puts you in ="terminal"= and types at Claude; switching to =*opencode*= leaves the
+state alone and types at opencode.
+
+That narrow fallthrough is also why AI mode's own keys are all Command chords.
+A binding on a bare key in ="terminal"= is taken away from *every* session and
+from the shell, and you are typing English at an agent — =runtime/modes/ai.lisp=
+therefore claims =C-M-n=, =C-M-b=, =C-M-r=, =C-M-w= and =C-M-a=, none of which any
+terminal program has ever been able to see, and leaves =C-a= itself to readline.
+Note that ="terminal"= consults only its own keymap and *not* the buffer's
+major-mode map, unlike Normal — so =(define-key "ai-mode" ...)= would silently
+never fire inside a session. That is recorded as a ceiling in [[file:boundary.org][boundary.org]].
 
 * Selections
 

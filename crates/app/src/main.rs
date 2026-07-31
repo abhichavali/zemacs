@@ -248,12 +248,13 @@ fn main() -> anyhow::Result<()> {
     let mut last_file_query: Option<String> = None;
     let mut last_grep: Option<String> = None;
     let mut keys: Vec<Key> = Vec::new();
-    // macOS composes text for Option combos (⌥- is –, ⌥= is ≠) and SDL2 has no
-    // hint to turn that off — SDL_MAC_OPTION_AS_ALT is SDL3-only. So an Alt
-    // keydown arms this, and the TextInput that follows is dropped rather than
-    // inserted. Cleared by the next non-Alt keydown, so it can never eat a
-    // character the user actually typed.
-    let mut swallow_text = false;
+    // There used to be a `swallow_text` flag here: an Alt keydown armed it and
+    // the `TextInput` macOS composed from the combo (⌥- is –, ⌥= is ≠) was
+    // dropped, because Option was a Meta fallback and `M--` had already been
+    // dispatched. The config sets `mac-option-modifier 'none`, so that was
+    // backwards — the composed character *is* the thing being asked for. Option
+    // is no longer a modifier here (see `key_from_keydown`) and the text it
+    // produces is now inserted like any other.
     let mut mouse = Mouse::default();
     let mut cursors = Cursors::new();
     let mut magit = Magit::default();
@@ -261,6 +262,8 @@ fn main() -> anyhow::Result<()> {
     let mut term = Term::default();
     let mut project = Project::default();
     let mut last_autosave = Instant::now();
+    let mut last_revert = Instant::now();
+    let mut revert_watch = Revert::default();
     let mut clipboard = Clipboard::new(&video);
 
     'main: loop {
@@ -329,7 +332,6 @@ fn main() -> anyhow::Result<()> {
                     keymod,
                     ..
                 } => {
-                    swallow_text = keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
                     keys.extend(key_from_keydown(kc, keymod, !text_input_on));
                 }
                 Event::MouseButtonDown {
@@ -370,7 +372,7 @@ fn main() -> anyhow::Result<()> {
                         // program in one gesture.
                         if editor.mode == zemacs_core::Mode::Terminal {
                             let (col, row) = cell_at(&editor, &renderers, x, y);
-                            term.mouse(zemacs_term::Mouse {
+                            term.mouse(&editor, zemacs_term::Mouse {
                                 button: zemacs_term::Button::Left,
                                 kind: zemacs_term::MouseKind::Press,
                                 col,
@@ -398,7 +400,7 @@ fn main() -> anyhow::Result<()> {
                         {
                             let (x, y) = renderers[i].to_pixels(x, y);
                             let (col, row) = cell_at(&editor, &renderers, x, y);
-                            term.mouse(zemacs_term::Mouse {
+                            term.mouse(&editor, zemacs_term::Mouse {
                                 button: zemacs_term::Button::Left,
                                 kind: zemacs_term::MouseKind::Release,
                                 col,
@@ -442,7 +444,7 @@ fn main() -> anyhow::Result<()> {
                             // for a program that did not.
                             if mousestate.left() && editor.mode == zemacs_core::Mode::Terminal {
                                 let (col, row) = cell_at(&editor, &renderers, x, y);
-                                term.mouse(zemacs_term::Mouse {
+                                term.mouse(&editor, zemacs_term::Mouse {
                                     button: zemacs_term::Button::Left,
                                     kind: zemacs_term::MouseKind::Drag,
                                     col,
@@ -491,19 +493,17 @@ fn main() -> anyhow::Result<()> {
                         // events, or to send arrow keys to `less`.
                         if editor.mode == zemacs_core::Mode::Terminal {
                             let (col, row) = cell_at(&editor, &renderers, px, py);
-                            term.wheel(-y * SCROLL_LINES, col, row);
+                            term.wheel(&editor, -y * SCROLL_LINES, col, row);
                         } else {
                             let cmd = EditorCommand::ScrollLines(-y * SCROLL_LINES);
                             dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
                         }
                     }
                 }
+                // Every character macOS hands us, including the ones it composed
+                // from an Option combo and the second half of a dead-key pair.
                 Event::TextInput { text, .. } => {
-                    if swallow_text {
-                        swallow_text = false;
-                    } else {
-                        keys.extend(text.chars().map(Key::Char));
-                    }
+                    keys.extend(text.chars().map(Key::Char));
                 }
                 _ => {}
             }
@@ -534,7 +534,6 @@ fn main() -> anyhow::Result<()> {
                 text_input.start();
             } else {
                 text_input.stop();
-                swallow_text = false;
             }
             text_input_on = want_text;
         }
@@ -641,13 +640,24 @@ fn main() -> anyhow::Result<()> {
             renderers.push(renderer);
         }
 
-        // Size the shell to the pane it is actually shown in, then let it catch
-        // up. `sync` is also what answers the child's queries, so it has to run
-        // every frame whether or not the terminal is on screen — a program
-        // asking how big its window is blocks until it is told.
+        // Size each session to the pane it is actually shown in, then let them
+        // all catch up. `sync` is also what answers a child's queries, so it has
+        // to run every frame whether or not the terminal is on screen — a
+        // program asking how big its window is blocks until it is told, and a
+        // background agent that nobody polls is a background agent that hangs.
+        //
+        // Measured out here because `Term` owns no renderer: it says which
+        // buffers it has, this says how big each one's pane is.
         if term.is_live() {
-            let (cols, rows) = terminal_size(&editor, &renderers);
-            term.sync(&mut editor, cols, rows);
+            let sizes: Vec<(zemacs_core::BufferId, usize, usize)> = term
+                .buffers()
+                .into_iter()
+                .map(|id| {
+                    let (cols, rows) = terminal_size(&editor, &renderers, id);
+                    (id, cols, rows)
+                })
+                .collect();
+            term.sync(&mut editor, &sizes);
         }
 
         // Wall-clock rather than keystroke-counted: the loop already runs at
@@ -656,6 +666,14 @@ fn main() -> anyhow::Result<()> {
         if last_autosave.elapsed() >= AUTOSAVE_EVERY {
             autosave_all(&mut editor);
             last_autosave = Instant::now();
+        }
+
+        // Same shape, same argument, one order of magnitude more often: this one
+        // is a `stat` rather than a write, and five seconds is how long a file
+        // is allowed to be stale on screen.
+        if last_revert.elapsed() >= REVERT_EVERY {
+            revert_watch.poll(&mut editor);
+            last_revert = Instant::now();
         }
 
         // After the whole batch, so a yank and the delete before it push once
@@ -724,13 +742,13 @@ fn dispatch(
                     line.push_str(arg);
                 }
                 line.push('\r');
-                term.send(line.into_bytes());
+                term.send(editor, line.into_bytes());
             }
         }
         // Dropped when no shell is running: a keystroke aimed at something that
         // is not there is nothing, not an error worth reporting on every key.
         EditorCommand::TermKey(key) => {
-            term.key(key);
+            term.key(editor, key);
         }
         // dired borrows the file prompt for rename/copy/mkdir, so an answer to
         // one of those is a filename for *it* rather than a file to open.
@@ -739,6 +757,12 @@ fn dispatch(
         }
         // Opening a directory lists it, as `find-file` does in Emacs.
         EditorCommand::OpenFile(path) if path.is_dir() => {
+            // Remembered *before* it is listed, so that browsing to a repository
+            // puts it in the project switcher's history. Without this the only
+            // way into that list was opening a file inside a project, which is
+            // the chicken-and-egg behind "there is no select project" — the
+            // switcher could only ever offer somewhere you had already been.
+            project_remember(&path);
             editor.buffer.path = Some(path);
             dired.run(editor, "open");
         }
@@ -936,14 +960,21 @@ fn refresh_file_completions(editor: &mut Editor, last_query: &mut Option<String>
         return;
     }
     let typed = expand_tilde(&prompt.text);
-    let (dir, _) = match typed.rsplit_once('/') {
+    let (dir, name) = match typed.rsplit_once('/') {
         Some((d, name)) => (if d.is_empty() { "/" } else { d }.to_string(), name),
         None => (".".to_string(), typed.as_str()),
     };
-    if last_query.as_deref() == Some(dir.as_str()) {
+    // Hidden entries appear exactly when you have started typing one. Without
+    // it `~/.config` and `~/.emacs.d` are unreachable from this prompt, which is
+    // half of "look at the entire filesystem"; with it unconditional, every
+    // listing in a repository opens on `.git`. The dot is part of the cache key
+    // because it changes what the listing *is*, not merely how it is filtered.
+    let hidden = name.starts_with('.');
+    let key = format!("{}{dir}", if hidden { "." } else { "" });
+    if last_query.as_deref() == Some(key.as_str()) {
         return;
     }
-    *last_query = Some(dir.clone());
+    *last_query = Some(key);
 
     let mut entries: Vec<String> = std::fs::read_dir(&dir)
         .into_iter()
@@ -967,7 +998,19 @@ fn refresh_file_completions(editor: &mut Editor, last_query: &mut Option<String>
                 path
             }
         })
-        .filter(|p| !p.rsplit('/').next().unwrap_or_default().starts_with('.'))
+        // The trim is load-bearing: a directory's entry carries a trailing `/`,
+        // so the last component of `~/.config/` without it is the *empty
+        // string* — which is how hidden directories slipped through this filter
+        // for as long as it has existed while hidden files did not.
+        .filter(|p| {
+            hidden
+                || !p
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .starts_with('.')
+        })
         .collect();
     entries.sort();
     prompt.set_items(entries);
@@ -1147,6 +1190,174 @@ fn autosave_forget(buffer: &zemacs_core::Buffer) {
 // *before* writing) rather than a knob on this one. Add it when losing the
 // previous saved version actually bites.
 
+// --- auto-revert ---------------------------------------------------------
+//
+// `global-auto-revert-mode` is on in the config: a file that moved underneath
+// the editor — `git checkout`, a formatter, the other end of a rebase, and now
+// a coding agent halfway through a refactor — should be what is on screen, not
+// what used to be.
+//
+// # Polled, and why not watched
+//
+// This used to be one `stat` on the live buffer every five seconds, which was
+// the right size for "a formatter ran". It is the wrong size for an agent: it
+// writes six files in a burst, five of which you are not looking at, and
+// finding out one buffer switch at a time is not "quickly". So the sweep is now
+// *every* buffer with a file behind it, four times a second.
+//
+// `notify` was the obvious alternative and is not used, for three reasons that
+// are about this problem rather than about dependencies in general:
+//
+//  1. On macOS `notify` is FSEvents, which reports *directories* and coalesces
+//     on its own latency window. Learning that a directory changed still leaves
+//     you stat-ing the file to find out whether *this* buffer's file did — so
+//     the watcher does not remove the syscall, it removes the loop around it.
+//  2. The loop it removes is small. N is the number of open buffers — tens, not
+//     thousands — so this is a few dozen `stat`s per tick against a page cache
+//     that already has every one of those inodes hot. The measurable cost of
+//     the old five-second version was zero; this is twenty times as much of
+//     zero.
+//  3. What it would add is a background thread, a per-platform backend, and a
+//     second source of truth about when a file changed — next to the two
+//     safety properties below, which are the whole reason this code is
+//     careful. Those properties are tested; re-deriving them on the far side of
+//     a channel is how you lose one.
+//
+// The condition for changing the answer is a real one and worth writing down:
+// if a project ever opens hundreds of buffers, or if any of them lives on a
+// filesystem where `stat` is a network round trip (`crates/tramp`), the sweep
+// stops being free and a watcher — or simply a longer interval for remote
+// paths — earns itself.
+//
+// Two safety properties survive from the five-second version, and both are the
+// point rather than details:
+//
+//  - a *modified* buffer is never silently clobbered; it gets one message and
+//    keeps its text;
+//  - the comparison is on *content*, not only on the mtime, so the buffer that
+//    just saved a file does not revert itself.
+
+/// Four times a second. Fast enough that an agent's edit is on screen before
+/// you have finished reading the line it changed, and slow enough that it is
+/// still a rounding error next to a frame.
+const REVERT_EVERY: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct Revert {
+    /// The modification time already accounted for, per file. A path is only
+    /// ever compared against its own last-seen stamp, so the *first* sight of
+    /// one records it and reverts nothing — opening a file is not a change to
+    /// it. Keyed by path rather than by buffer id so switching away and back
+    /// does not re-ask a question that was already answered.
+    seen: std::collections::HashMap<PathBuf, std::time::SystemTime>,
+}
+
+impl Revert {
+    /// One `stat` per open file, and a read only where the stamp moved.
+    fn poll(&mut self, editor: &mut Editor) {
+        // A dired listing's `path` is a directory and a magit status is a
+        // rendered view. Neither has a file behind it that could be newer, and
+        // both already refresh on their own verbs. Collected first because the
+        // revert below needs `editor` mutably.
+        let watched: Vec<(zemacs_core::BufferId, PathBuf)> = std::iter::once(&editor.buffer)
+            .chain(editor.others.iter())
+            .filter(|b| !b.kind.is_generated())
+            .filter_map(|b| b.path.clone().map(|p| (b.id, p)))
+            .collect();
+
+        for (id, path) in watched {
+            self.check(editor, id, &path);
+        }
+
+        // Forget files nothing has open any more, so a long session's map does
+        // not grow by every file ever visited. Cheap: it is the same length as
+        // the sweep that just ran.
+        self.seen.retain(|path, _| {
+            std::iter::once(&editor.buffer)
+                .chain(editor.others.iter())
+                .any(|b| b.path.as_deref() == Some(path.as_path()))
+        });
+    }
+
+    fn check(&mut self, editor: &mut Editor, id: zemacs_core::BufferId, path: &Path) {
+        let Ok(stamp) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+            // Gone, or unreadable. Emacs keeps the buffer and stays quiet until
+            // you try to save it; so do we, because the text on screen has just
+            // become the only copy and throwing it away would be the one
+            // unrecoverable move available here.
+            return;
+        };
+        match self.seen.insert(path.to_path_buf(), stamp) {
+            Some(seen) if seen == stamp => return, // untouched since last look
+            Some(_) => {}                          // moved — worth a read
+            None => return,                        // first sight
+        }
+
+        let Some(buffer) = editor.buffer_by_id(id) else {
+            return;
+        };
+        // The one thing a revert must never do. `insert` above already recorded
+        // the new stamp, so this is said once per external change rather than
+        // four times a second until you deal with it.
+        //
+        // ponytail: saving over the newer file afterwards is still allowed and
+        // still silent — that is Emacs' "has changed since visited; save
+        // anyway?", and it belongs with the confirmation flow the destructive
+        // git verbs are waiting on rather than bolted on here.
+        if buffer.modified {
+            editor.apply(EditorCommand::Message(format!(
+                "{} changed on disk — not reverted, this buffer has unsaved changes",
+                display_path(path)
+            )));
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        // A save moves the mtime too, and this is what stops `:w` reverting the
+        // buffer that just wrote the file: the text is identical, so there is
+        // nothing to do. It costs one read of a file that genuinely changed, and
+        // it makes a bare `touch` a no-op — which is the honest answer, since
+        // nothing about the document moved.
+        if text == buffer.text.to_string() {
+            return;
+        }
+        revert(editor, id, path, &text);
+    }
+}
+
+/// Replace buffer `id`'s text with what is on disk, keeping point where it was.
+///
+/// Through `Editor::revert_buffer` rather than by assigning `buffer.text`:
+/// `splice` is the only thing that moves markers and overlays, and reaching
+/// around it is exactly how a marker comes to name an offset in a document that
+/// no longer exists. It also works on a buffer that is *not* live, which is what
+/// lets an agent's whole burst of edits land at once instead of one buffer
+/// switch at a time.
+fn revert(editor: &mut Editor, id: zemacs_core::BufferId, path: &Path, text: &str) {
+    if !editor.revert_buffer(id, text) {
+        return;
+    }
+    // Permissions travel with the content — a `chmod +x` between saves shows up
+    // in the modeline instead of going stale there.
+    let mode = file_mode(path);
+    if let Some(buffer) = std::iter::once(&mut editor.buffer)
+        .chain(editor.others.iter_mut())
+        .find(|b| b.id == id)
+    {
+        buffer.file_mode = mode;
+    }
+    // Loud, because the text changed without anyone typing — and louder still
+    // for a buffer you are not looking at, which is the only notice you get.
+    // ponytail: no checkpoint, so `u` restores the last thing *you* did rather
+    // than the pre-revert text. Emacs discards the undo list here outright; this
+    // keeps it, which is the more forgiving of the two and costs nothing.
+    editor.apply(EditorCommand::Message(format!(
+        "reverted {} — it changed on disk",
+        display_path(path)
+    )));
+}
+
 // --- recent files --------------------------------------------------------
 
 fn recent_path() -> Option<PathBuf> {
@@ -1229,47 +1440,67 @@ fn cell_at(editor: &Editor, renderers: &[Renderer], x: i32, y: i32) -> (usize, u
         return (0, 0);
     };
     let (cell_w, line_h) = renderer.cell_size();
-    let rect = terminal_rect(editor, renderer, index);
+    // The mouse only ever reaches the session whose buffer is live, so that is
+    // the pane the pixels are relative to.
+    let (rect, _) = terminal_rect(editor, renderers, editor.buffer.id);
     let col = ((x - rect.x).max(0) / cell_w.max(1)) as usize;
     let row = ((y - rect.y).max(0) / line_h.max(1)) as usize;
     (col, row)
 }
 
-/// The pane the terminal buffer occupies, or the whole content area if it is
-/// not on screen.
-fn terminal_rect(editor: &Editor, renderer: &Renderer, index: usize) -> Rect {
-    let area = renderer.content_area();
-    editor
-        .frames
-        .get(index)
-        .and_then(|frame| {
-            frame
-                .panes(area)
-                .into_iter()
-                .find(|p| frame.window(p.window).map(|w| w.buffer) == Some(editor.buffer.id))
-                .map(|p| p.rect)
-        })
-        .unwrap_or(area)
+/// The pane buffer `id` occupies and the renderer drawing it, or the focused
+/// frame's whole content area when it is not on screen anywhere.
+///
+/// Every frame is searched, not just the focused one: with sessions in the
+/// plural, an agent running in another OS window still has to be sized to the
+/// pane it is actually in.
+fn terminal_rect<'a>(
+    editor: &Editor,
+    renderers: &'a [Renderer],
+    id: zemacs_core::BufferId,
+) -> (Rect, Option<&'a Renderer>) {
+    for (i, renderer) in renderers.iter().enumerate() {
+        let Some(frame) = editor.frames.get(i) else {
+            continue;
+        };
+        let area = renderer.content_area();
+        let found = frame
+            .panes(area)
+            .into_iter()
+            .find(|p| frame.window(p.window).map(|w| w.buffer) == Some(id))
+            .map(|p| p.rect);
+        if let Some(rect) = found {
+            return (rect, Some(renderer));
+        }
+    }
+    let index = editor.focus_frame.min(renderers.len().saturating_sub(1));
+    match renderers.get(index) {
+        Some(renderer) => (renderer.content_area(), Some(renderer)),
+        None => (Rect { x: 0, y: 0, w: 0, h: 0 }, None),
+    }
 }
 
-/// Columns and rows for the shell, taken from the pane its buffer is shown in.
+/// Columns and rows for the child, taken from the pane its buffer is shown in.
 ///
-/// The pane rather than the window: with a split, sizing the shell to the whole
+/// The pane rather than the window: with a split, sizing the child to the whole
 /// frame means half its output is drawn outside the pane and `clear` leaves
-/// debris. Falls back to the focused frame's content area when the terminal is
-/// not on screen anywhere, so a background shell keeps a sane size.
-fn terminal_size(editor: &Editor, renderers: &[Renderer]) -> (usize, usize) {
-    let index = editor.focus_frame.min(renderers.len().saturating_sub(1));
-    let Some(renderer) = renderers.get(index) else {
+/// debris. Falls back to the focused frame's content area when the session is
+/// not on screen anywhere, so a background agent keeps a sane size rather than
+/// being wrapped to nothing.
+fn terminal_size(
+    editor: &Editor,
+    renderers: &[Renderer],
+    id: zemacs_core::BufferId,
+) -> (usize, usize) {
+    let (rect, renderer) = terminal_rect(editor, renderers, id);
+    let Some(renderer) = renderer else {
         return (80, 24);
     };
     let (cell_w, line_h) = renderer.cell_size();
-    let rect = terminal_rect(editor, renderer, index);
 
     // One line goes to the modeline, and the padding is the renderer's.
     let cols = (rect.w / cell_w.max(1)).max(1) as usize;
-    let rows
-        = ((rect.h / line_h.max(1)) - 1).max(1) as usize;
+    let rows = ((rect.h / line_h.max(1)) - 1).max(1) as usize;
     (cols, rows)
 }
 
@@ -1286,10 +1517,20 @@ fn terminal_size(editor: &Editor, renderers: &[Renderer]) -> (usize, usize) {
 fn key_from_keydown(kc: Keycode, keymod: Mod, raw: bool) -> Option<Key> {
     let shift = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
     let ctrl = keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD);
-    // Command is Meta — the macOS Emacs convention, and unlike Option it does
-    // not compose text, so `⌘-` needs no special handling. Option stays a Meta
-    // fallback for anyone used to it (and for other OSes).
-    let meta = keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD | Mod::LALTMOD | Mod::RALTMOD);
+    // Command is Meta, and *only* Command — the macOS Emacs convention, and
+    // unlike Option it does not compose text, so `⌘-` needs no special handling.
+    //
+    // Option is deliberately absent: the config sets `mac-option-modifier 'none`
+    // because Option is how you type –, ≠ and ü. Claiming it as a Meta fallback
+    // meant `M--` fired *and* the composed – had to be thrown away to stop it
+    // being inserted twice over, so the key was worth one duplicate binding and
+    // cost the whole compose layer. With it dropped, ⌥- reaches `TextInput` as –
+    // wherever text is being typed, and is simply not a modifier anywhere else.
+    //
+    // ponytail: not configurable — one line, and nobody has asked for the
+    // Linux-style `Alt is Meta`. The knob, if it is ever wanted, is a bool set
+    // from Lisp and read here, next to the existing `Set*` commands.
+    let meta = keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD);
     // Enter has a multi-character key name, so `combo_char` cannot spell it —
     // but `C-<ret>` and `C-M-<ret>` are the window splits.
     if matches!(kc, Keycode::Return | Keycode::KpEnter) {
@@ -1484,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn command_is_meta_and_beats_option() {
+    fn command_is_the_only_meta() {
         // ⌘= and ⌘⇧= (which is how you type ⌘+)
         assert_eq!(
             key_from_keydown(Keycode::Equals, Mod::LGUIMOD, false),
@@ -1498,12 +1739,16 @@ mod tests {
             key_from_keydown(Keycode::Minus, Mod::LGUIMOD, false),
             Some(Key::Meta('-'))
         );
-        // Option still works as a fallback...
+        // The bindings people actually press: `M-x` and `M-o`, from ⌘.
         assert_eq!(
-            key_from_keydown(Keycode::Minus, Mod::LALTMOD, false),
-            Some(Key::Meta('-'))
+            key_from_keydown(Keycode::X, Mod::LGUIMOD, false),
+            Some(Key::Meta('x'))
         );
-        // ...and Ctrl+Command is its own key, `C-M-`, not either one alone.
+        assert_eq!(
+            key_from_keydown(Keycode::O, Mod::RGUIMOD, false),
+            Some(Key::Meta('o'))
+        );
+        // Ctrl+Command is its own key, `C-M-`, not either one alone.
         assert_eq!(
             key_from_keydown(Keycode::J, Mod::LGUIMOD | Mod::LCTRLMOD, false),
             Some(Key::CtrlMeta('j'))
@@ -1523,9 +1768,39 @@ mod tests {
             key_from_keydown(Keycode::Return, Mod::NOMOD, false),
             Some(Key::Enter)
         );
-        // Ctrl+Option spells the same key, so either Meta source works.
+    }
+
+    /// `mac-option-modifier 'none`: Option composes characters and must not be
+    /// read as Meta, or ⌥- fires `M--` instead of typing –.
+    #[test]
+    fn option_is_not_a_modifier() {
+        // Where text is being typed (Insert, a prompt) Option produces *nothing*
+        // from the keydown, so the `TextInput` macOS composed — – for ⌥-, ≠ for
+        // ⌥=, ü for ⌥u then u — is the only thing that reaches the buffer.
+        for kc in [Keycode::Minus, Keycode::Equals, Keycode::U, Keycode::N] {
+            assert_eq!(key_from_keydown(kc, Mod::LALTMOD, false), None, "{kc:?}");
+            assert_eq!(key_from_keydown(kc, Mod::RALTMOD, false), None, "{kc:?}");
+        }
+        // Shift with it is the same story: ⌥⇧= is ±, not `M-+`.
+        assert_eq!(
+            key_from_keydown(Keycode::Equals, Mod::LALTMOD | Mod::LSHIFTMOD, false),
+            None
+        );
+        // In a modal mode there is no text input to compose into, so Option is
+        // simply ignored and the key is the key: `⌥j` moves down.
+        assert_eq!(
+            key_from_keydown(Keycode::J, Mod::LALTMOD, true),
+            Some(Key::Char('j'))
+        );
+        // Ctrl still wins on its own, and Option adds nothing to it — this used
+        // to be `C-M-j`.
         assert_eq!(
             key_from_keydown(Keycode::J, Mod::LALTMOD | Mod::RCTRLMOD, false),
+            Some(Key::Ctrl('j'))
+        );
+        // ...and it takes ⌘ to make that `C-M-j` again.
+        assert_eq!(
+            key_from_keydown(Keycode::J, Mod::LALTMOD | Mod::RCTRLMOD | Mod::LGUIMOD, false),
             Some(Key::CtrlMeta('j'))
         );
     }
@@ -1567,6 +1842,206 @@ mod tests {
             Some(true)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reaching `~/.config` is half of "browse the whole filesystem", and not
+    /// opening every listing on `.git` is the other half.
+    #[test]
+    fn dotfiles_appear_only_once_you_type_a_dot() {
+        let dir = std::env::temp_dir().join("zemacs_hidden_test");
+        let _ = std::fs::create_dir_all(dir.join(".config"));
+        std::fs::write(dir.join("plain.txt"), "").unwrap();
+
+        let mut ed = Editor::new();
+        ed.open_prompt(PromptKind::File);
+        let mut last = None;
+
+        ed.prompt.as_mut().unwrap().text = format!("{}/", dir.display());
+        refresh_file_completions(&mut ed, &mut last);
+        let items = &ed.prompt.as_ref().unwrap().items;
+        assert!(items.iter().any(|i| i.ends_with("plain.txt")));
+        assert!(!items.iter().any(|i| i.ends_with(".config/")));
+
+        // ...and the dot re-lists the same directory rather than being filtered
+        // out of the answer it already had.
+        ed.prompt.as_mut().unwrap().text = format!("{}/.", dir.display());
+        refresh_file_completions(&mut ed, &mut last);
+        let items = &ed.prompt.as_ref().unwrap().items;
+        assert!(items.iter().any(|i| i.ends_with(".config/")));
+        assert!(items.iter().any(|i| i.ends_with("plain.txt")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- auto-revert ------------------------------------------------------
+
+    /// Push a file's mtime forward so a revert poll has something to notice.
+    /// Written rather than slept for: two `fs::write`s in the same millisecond
+    /// can share a stamp on a coarse filesystem, and a test that passes because
+    /// nothing happened is worse than no test.
+    fn touch_forward(path: &Path) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(10);
+        file.set_times(std::fs::FileTimes::new().set_modified(later))
+            .unwrap();
+    }
+
+    fn scratch(name: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("zemacs_revert_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// The one thing auto-revert must never do.
+    #[test]
+    fn a_modified_buffer_is_not_reverted_out_from_under_you() {
+        let path = scratch("unsaved.txt", "one\ntwo\nthree\n");
+        let mut ed = Editor::new();
+        open_file(&mut ed, &path, &resolve_init_path());
+        let mut watch = Revert::default();
+        watch.poll(&mut ed); // first sight: records the stamp, reverts nothing
+
+        // typed, not saved
+        ed.apply(EditorCommand::InsertText("edited ".into()));
+        let mine = ed.buffer.text.to_string();
+        assert!(ed.buffer.modified);
+
+        // ...and now the file moves underneath it
+        std::fs::write(&path, "ONE\nTWO\nTHREE\n").unwrap();
+        touch_forward(&path);
+        watch.poll(&mut ed);
+
+        assert_eq!(ed.buffer.text.to_string(), mine, "unsaved edits survive");
+        assert!(ed.buffer.modified, "and the buffer is still dirty");
+        // silence would be worse than the clobbering: you would find out at `:w`
+        assert!(ed.status.contains("changed on disk"), "{}", ed.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The other half: an untouched buffer follows the file, and point stays on
+    /// the line it was on rather than at the offset it was at.
+    #[test]
+    fn an_unmodified_buffer_follows_the_file_and_keeps_point() {
+        let path = scratch("external.txt", "alpha\nbeta\ngamma\n");
+        let mut ed = Editor::new();
+        open_file(&mut ed, &path, &resolve_init_path());
+        let mut watch = Revert::default();
+        watch.poll(&mut ed);
+        ed.buffer.move_to_line_col(2, 1); // on `gamma`
+
+        // Two lines inserted above: an offset would drift, a line number does not.
+        std::fs::write(&path, "one\ntwo\nalpha\nbeta\ngamma\n").unwrap();
+        touch_forward(&path);
+        watch.poll(&mut ed);
+
+        assert_eq!(ed.buffer.text.to_string(), "one\ntwo\nalpha\nbeta\ngamma\n");
+        assert_eq!(ed.buffer.cursor_line_col(), (2, 1));
+        assert!(!ed.buffer.modified, "reverted text is what is on disk");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Writing a file must not revert the buffer that wrote it — the mtime moved
+    /// but the text did not, and a revert would throw point at the top.
+    #[test]
+    fn saving_does_not_revert_the_buffer_that_saved() {
+        let path = scratch("saved.txt", "alpha\nbeta\ngamma\n");
+        let mut ed = Editor::new();
+        open_file(&mut ed, &path, &resolve_init_path());
+        let mut watch = Revert::default();
+        watch.poll(&mut ed);
+
+        ed.buffer.move_to_line_col(2, 0);
+        ed.apply(EditorCommand::InsertText("delta ".into()));
+        let at = ed.buffer.cursor;
+        save_file(&mut ed, None);
+        touch_forward(&path); // a save moves the stamp; make sure it is noticed
+        watch.poll(&mut ed);
+
+        assert_eq!(ed.buffer.text.to_string(), "alpha\nbeta\ndelta gamma\n");
+        assert_eq!(ed.buffer.cursor, at, "point did not move");
+        assert!(!ed.status.contains("reverted"), "{}", ed.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The reason this got faster and wider: an agent rewrites files you are
+    /// not looking at, and a buffer you have to visit before it catches up is a
+    /// buffer that lied to you until you visited it.
+    #[test]
+    fn a_parked_buffer_follows_its_file_without_being_visited() {
+        let one = scratch("parked_one.txt", "alpha\nbeta\n");
+        let two = scratch("parked_two.txt", "gamma\ndelta\n");
+        let mut ed = Editor::new();
+        open_file(&mut ed, &one, &resolve_init_path());
+        open_file(&mut ed, &two, &resolve_init_path()); // `one` is now parked
+        assert_eq!(ed.buffer.path.as_deref(), Some(two.as_path()));
+
+        let mut watch = Revert::default();
+        watch.poll(&mut ed); // first sight of both
+
+        // The agent writes the file nobody is looking at.
+        std::fs::write(&one, "ALPHA\nBETA\nGAMMA\n").unwrap();
+        touch_forward(&one);
+        watch.poll(&mut ed);
+
+        let parked = ed
+            .others
+            .iter()
+            .find(|b| b.path.as_deref() == Some(one.as_path()))
+            .expect("still open");
+        assert_eq!(parked.text.to_string(), "ALPHA\nBETA\nGAMMA\n");
+        assert!(!parked.modified);
+        // ...and the live buffer was not touched in the process.
+        assert_eq!(ed.buffer.text.to_string(), "gamma\ndelta\n");
+        assert!(ed.status.contains("reverted"), "{}", ed.status);
+        let _ = std::fs::remove_file(&one);
+        let _ = std::fs::remove_file(&two);
+    }
+
+    /// The safety property, in the direction that used to be unreachable: an
+    /// unsaved *parked* buffer is not clobbered either.
+    #[test]
+    fn a_modified_parked_buffer_is_left_alone_too() {
+        let one = scratch("parked_dirty.txt", "alpha\n");
+        let two = scratch("parked_other.txt", "beta\n");
+        let mut ed = Editor::new();
+        open_file(&mut ed, &one, &resolve_init_path());
+        ed.apply(EditorCommand::InsertText("typed ".into()));
+        let mine = ed.buffer.text.to_string();
+        open_file(&mut ed, &two, &resolve_init_path());
+
+        let mut watch = Revert::default();
+        watch.poll(&mut ed);
+        std::fs::write(&one, "ONE\n").unwrap();
+        touch_forward(&one);
+        watch.poll(&mut ed);
+
+        let parked = ed
+            .others
+            .iter()
+            .find(|b| b.path.as_deref() == Some(one.as_path()))
+            .expect("still open");
+        assert_eq!(parked.text.to_string(), mine, "unsaved edits survive");
+        assert!(parked.modified);
+        assert!(ed.status.contains("changed on disk"), "{}", ed.status);
+        let _ = std::fs::remove_file(&one);
+        let _ = std::fs::remove_file(&two);
+    }
+
+    /// A long session must not accumulate one map entry per file ever opened.
+    #[test]
+    fn closed_files_are_forgotten() {
+        let path = scratch("forgotten.txt", "x\n");
+        let mut ed = Editor::new();
+        open_file(&mut ed, &path, &resolve_init_path());
+        let mut watch = Revert::default();
+        watch.poll(&mut ed);
+        assert!(watch.seen.contains_key(&path));
+
+        ed.kill_buffer(0);
+        watch.poll(&mut ed);
+        assert!(!watch.seen.contains_key(&path));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

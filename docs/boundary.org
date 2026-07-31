@@ -21,6 +21,7 @@ Concretely:
 | Glyph rasterisation and the frame            | Font size, theme, modeline geometry        |
 | The vim grammar: counts, operators, motions  | Every key binding on top of it             |
 | Window layout arithmetic and hit-testing     | When to split, close, focus                |
+| Characters to cells, and where a line wraps  | Nothing — there is no reader in cells      |
 | Reading and writing files, git, ripgrep, PTYs | Which file, which verb, and what to do next |
 | Mode *storage*: one name plus a list         | The whole mode *system*                     |
 | A child process, JSON framing, JSON decoding | Every protocol spoken down it, LSP included |
@@ -71,13 +72,71 @@ Lisp side cannot work around.
 
 | Missing                              | What is in the way                                                      |
 |--------------------------------------+-------------------------------------------------------------------------|
-| Create a buffer with no file behind it | There is no command for it. =Editor::show_special= is a method, not a command, and the only buffer-creating command is =OpenFile=. The shipped workaround is =lisp-scratch=, which writes a real file and opens it. |
-| Kill a buffer                        | No =KillBuffer= variant exists at all.                                    |
-| Get an answer back from the user     | =(open-prompt kind)= puts any of the editor's pickers up, but every =PromptKind= has a destination fixed in core — a file is opened, a command is run. There is no way to hand the reply to a Lisp continuation, so there is no =read-string= or =completing-read=. |
-| Send a keystroke to the shell        | =TermKey= carries a =Key=, which has no string spelling a primitive could take. |
-| Run a built-in verb by name          | =Editor::run_action= is private and there is no command that means "do the thing this string names". So Lisp can *bind* ="magit-status"= to a key but cannot *call* it — call =(magit "status")= instead, which reaches the same command. |
-| Group several edits into one undo step | Every mutating primitive checkpoints, and there is no "begin group". Build the whole text and make one call — see [[file:threading.org][threading.org]]. |
 | Interrupt a runaway form             | The Lisp thread evaluates one queued form at a time and nothing can preempt it. |
+
+That table used to have seven rows. Six of them were closed by *six =%do= verbs
+and two accessors* — no new C primitive, no new =defprim=, nothing in =shim.c=
+except Lisp — which is the ladder above working exactly as intended: what looked
+like "the Lisp API needs a way in" was, every time, one arm of =command_for= and
+one arm of =Editor::apply=.
+
+| Was missing                          | What closed it                                                          |
+|--------------------------------------+-------------------------------------------------------------------------|
+| Create a buffer with no file behind it | =(create-buffer name &optional language)=, verb ="create-buffer"=. Idempotent by name, applied on the spot, an *ordinary* buffer rather than a generated one. |
+| Kill a buffer                        | =(kill-buffer &optional name)=, verb ="kill-buffer"=. The last one is refused; windows showing it follow the live buffer. |
+| Get an answer back from the user     | =(read-string label callback)= and =(completing-read label candidates callback)=, verbs ="read-from-minibuffer"= and ="prompt-item"=. See below — it is a continuation, not a blocking read. |
+| Send a keystroke to the shell        | =(term-send-key key)=, verb ="term-key"=, over =Key::from_token= — the inverse of the =Key::token= that =key-bindings= already reports. One vocabulary, both directions. |
+| Run a built-in verb by name          | =(call-command name)=, verb ="call"=. =Editor::run_action= is public and answers a *batch*, so the verb is resolved in =rs_do= beside =paste= rather than in =command_for=. |
+| Group several edits into one undo step | *Nothing, deliberately.* See below. |
+
+** The prompt continuation, and why it is not a blocking read
+
+The valuable one, and the only one whose shape needed thinking about. Every
+other =PromptKind= has its destination fixed in core — a file is opened, a
+command is run — and this one hands the reply to a Lisp closure.
+
+It could not be =(setf answer (read-string "Name: "))=. The Lisp thread evaluates
+one queued form at a time, so a primitive that waited on a keystroke would stop
+*the image* — every mode hook, every key bound to a Lisp command, every =M-x= —
+until the question was answered. That is precisely the elisp behaviour
+[[file:threading.org][threading.org]] exists to avoid, and paying it back here for one convenience would
+undo the whole design.
+
+So the answer arrives the way a JSON-RPC reply already does, on purpose rather
+than as a second mechanism: the closure is parked in =*prompt-continuations*=
+under an id, the id rides into core inside the command, and accepting *or
+cancelling* the prompt makes core emit =CallLisp= of =(%prompt-reply ID ANSWER)= —
+the one route core has to reach the image, and the same one a mode hook takes.
+Cancelling replies =NIL= rather than staying silent, so a callback is always
+called exactly once and a command can clean up in it.
+
+The id exists for the same reason =rpc-request='s does: a stale reply is dropped
+rather than delivered to whoever asked most recently.
+
+** Grouping N edits into one undo step: closed by argument, not by a feature
+
+This row is gone because the mechanism should not exist, not because it was
+built.
+
+Every mutating primitive checkpoints *inside itself*, so "begin an undo group"
+means one of two things, and both are worse than the alternative:
+
+- a flag that makes the mutators skip checkpointing until it is cleared — which
+  is left set forever the first time a Lisp error escapes between =begin= and
+  =end=, and an editor that has quietly stopped recording undo is a far worse
+  failure than N undo steps;
+- a nesting counter with the same failure mode plus =unwind-protect= discipline
+  at every call site.
+
+And it would not even buy what it looks like it buys. Grouping makes N edits
+*undo* together; it does nothing about the gap between them, so a keystroke can
+still land in the middle and be typed into a half-finished edit. The thing that
+fixes both is already there: build the whole text in Lisp and apply it with one
+=replace-region=, which is one lock, one undo step and no gap. =replace-all= in
+the standard library is exactly this, and it is why =replace-region= exists next
+to =delete-region= and =insert=.
+
+The table in [[file:threading.org][threading.org]] is the documentation this row wanted.
 
 * Known ceilings that a config will actually feel
 
@@ -97,6 +156,28 @@ so buffer text is its UTF-8 bytes rather than its characters.
 
 Upgrade path: decode into an extended string in =f_query=. Worth doing when a
 config genuinely does arithmetic on non-ASCII text.
+
+** Visual lines reach core through one integer
+
+=crates/render/src/lib.rs=, =Renderer::render=. Where a line wraps depends on the
+font, the pane and the gutter, none of which core can see — so the renderer parks
+=wrap_cols= on each =Window= and on the =Editor= every frame, exactly as it does
+=viewport_lines=, and core does the row arithmetic itself over
+=crates/core/src/display.rs=. That is the whole channel; there is no second one.
+
+Two consequences a config will feel:
+
+- =0= means "nothing has drawn this window yet", which every reader takes as *no
+  wrapping*. A Lisp-only or headless =Editor= moves by buffer line.
+- Core lays a line out *without* overlays, so a =display= substitution — an
+  org-modern bullet, ghost text — shifts the renderer's columns and not core's,
+  and =j= down such a line can land a character off. Upgrade path: =substitute=
+  moves into =display= too and =Editor::line_cells= takes the buffer's overlays,
+  which is the list the renderer already walks.
+
+With an operator pending, =j= and =k= are still *buffer* lines: =dj= deletes two
+whole lines, as in vim. Emacs' =evil-next-visual-line= is an exclusive motion and
+would delete to the same column one row down.
 
 ** Switching buffers fires no hook
 
@@ -149,6 +230,33 @@ trade one mismatch for another, since that spelling means *bytes*.
 are indistinguishable and the first wins. Upgrade path: a reader keyed by buffer
 id, which needs the ids exposed first.
 
+=create-buffer= and =kill-buffer= are matched the same way and inherit the same
+ceiling — which is also what makes =(create-buffer "*Messages*")= idempotent, so
+here it is the feature rather than the shortcut.
+
+** A Lisp prompt left open by another prompt
+
+=crates/lisp/src/shim.c=, =PROMPT_FORM=. A =read-string= is answered on accept
+*and* on cancel, so its continuation is always called — unless Lisp opens a
+second prompt over the top of the first, which replaces the =Prompt= core is
+holding and strands the closure in =*prompt-continuations*=.
+
+A few conses, and only reachable from a config that puts a picker up from inside
+a =read-string= rather than from its callback. =(clrhash *prompt-continuations*)=
+is the sweep; the upgrade path is core replying =NIL= to the prompt it is about
+to discard, which is three lines in =open_prompt=.
+
+** A buffer Lisp made is not read-only
+
+=crates/core/src/lib.rs=, =Editor::create_buffer=. =BufferKind::is_generated= is
+what makes =*magit*= and =*dired*= refuse an edit, and a created buffer is
+deliberately not one of those — Lisp owns it, so it has to be writable. The cost
+is that =*Messages*= can be typed into, and the typing is thrown away the next
+time the command regenerates it.
+
+Upgrade path: a per-buffer read-only flag rather than a kind, which is what
+Emacs has and what a =*xref*= listing will want too.
+
 ** Markers
 
 - =crates/core/src/lib.rs=, =step_history=: undo restores a whole snapshot rather
@@ -179,24 +287,55 @@ id, which needs the ids exposed first.
   =delete-overlay= and =remove-overlays= prune what they remove, but an overlay the
   *editor* deleted — because an edit swallowed its text — leaves a few conses
   behind. The comment above =OVERLAY_FORM= has the one-line sweep.
+- =fold= is the one property that is about *lines*: it makes the lines after the
+  overlay's first stop occupying rows. Two-state only — a fold is closed or open,
+  and opening one opens every fold inside it, which is org's =SUBTREE= and never
+  its =CHILDREN=. Folding is per *buffer line*, so half a line cannot be hidden;
+  the head line is always drawn, and there is no way to fold from the very top of
+  a buffer with nothing above the region.
+
+** Folding does not follow the scroll position exactly
+
+=crates/render/src/lib.rs=, =visible_lines=. A folded line counts as a *line* and
+costs no *row*, which is what lets =scroll= step over a fold — but the pane's row
+budget is checked before each line is charged, so a run of folds at the very
+bottom of the count is not reached. =viewport_lines= then under-reports slightly,
+which lets the view scroll one screen further than it strictly needs to. That is
+the safe direction; the other one would make the end of the file unreachable.
+
+=Window::scroll= is still a *buffer line*, so scrolling to a line that is folded
+lands the pane on the first drawn line after it. Upgrade path is the same one
+wrapped lines want: a scroll position of (line, row).
 
 ** Inline images
 
 =crates/render/src/lib.rs=. An image substitutes =ceil(width / cell_w)= blank cells
-and is blitted over them; nothing to its right moves. So:
+and is blitted over them; nothing to its right moves. So a wide inline image
+overhangs by at most a rounding cell, and a =display= string longer than what it
+replaced pushes nothing — it paints over it.
 
-- a wide inline image overhangs by at most a rounding cell, and a =display= string
-  longer than what it replaced pushes nothing — it paints over it;
-- an image taller than one line is hung from the top of its row rather than from
-  the baseline, because growing upward from the baseline would put a display
-  equation over the *previous* lines. Its own continuation rows are blank, so
-  this is right for display math and would be wrong for a tall inline fragment,
-  which is not a thing anybody writes;
-- a multi-line fragment substitutes on its first line and blanks the rest.
+*Height* is no longer in that list. A line's row count is
+=max(rows its text wraps into, rows the image on it needs)= — the only thing in the
+renderer with an opinion about how tall a row is — and =image_rows= places every
+bitmap by one rule: its baseline lands on the baseline of the last row it was
+given. An inline =$x_1$= is shorter than the ascent, gets one row and hangs its
+depth below the text baseline; a display equation claims whole rows *upward*, into
+rows the line grew to hold rather than over the text above. A fragment spanning
+several source lines already owns a blank row per line — the substitution blanked
+them — and is charged only the shortfall, which is why =\begin{equation}= is
+unchanged.
 
-All three want the same thing: rows of variable height, and a per-line table of
-cell advances. That is also what wide characters want, so they should land
-together.
+Wide characters used to be filed here as wanting the same thing. They turned out
+to want less: a character occupying several *cells* is what a tab already was, so
+=char_cells= and one extra blank cell in =expand_line= was the whole fix.
+
+What is left is that *core* does not see any of it. =visible_lines= and
+=cursor_pane_row= count a line's text rows only, so a pane showing a display
+equation reports a line or two more than it draws (=viewport_lines=, which core
+clamps scrolling against) and a relative gutter number below one is short by the
+rows the image took. That is the same ceiling as "core lays a line out without
+overlays" above, and the upgrade is the same: hand both of them the overlay list
+=draw_document= is already walking.
 
 Uploaded textures are never evicted, and neither are the bitmaps in
 =Editor::images= that outlive... nothing: core drops a bitmap when the last
@@ -222,6 +361,37 @@ choose the colour; they cannot ask for real bold.
 =crates/render/src/lib.rs=: the modeline highlight and shadow shades, and the
 window divider seam, are hardcoded. A theme that wants a coloured seam has no
 reader or writer for it.
+
+** A terminal consults only the =terminal= keymap
+
+=crates/core/src/evil.rs=, =terminal_key=. =normal_key= layers the buffer's minor
+modes, then its major mode, then the modal state, then the grammar. A terminal
+does none of that: it looks in the ="terminal"= map, then — for the keys
+=Key::is_editor_key= reserves — in ="normal"=, and everything else goes to the
+child. So =(define-key "ai-mode" "C-M-r" ...)= is *silently inert* inside a
+session, and the session verbs in =runtime/modes/ai.lisp= are bound in the
+="terminal"= state instead. That is fine while every verb means something in a
+shell too; the fix, when one does not, is the same major/minor lookup
+=normal_key= already does, moved into =terminal_key=.
+
+** One terminal grid reaches the renderer
+
+=crates/app/src/term.rs=, =Term::screen=, and =crates/render/src/lib.rs=, which
+takes a single =Option<&Screen>= for the whole frame and draws it in every pane
+whose buffer is a terminal. Sessions are plural and grids are not, so a *split
+showing two terminal buffers at once* paints the live session's grid in both.
+Everything else about a background session is correct — its buffer text, its
+name, its size, and its own pane the moment you focus it. The upgrade is the
+renderer taking a grid per =BufferId=.
+
+** A parked buffer is reverted but not re-highlighted
+
+=crates/core/src/lib.rs=, =revert_buffer=. Auto-revert now follows every open
+buffer, and a buffer whose text was replaced while parked has its highlight
+spans *cleared* rather than recomputed — the app only asks the syntax thread
+about the live buffer. So a file an agent rewrote is correct and colourless
+until you look at it, at which point the revision bump gets it parsed. The
+upgrade is a parse queue keyed by buffer rather than one slot keyed by revision.
 
 ** M-x offers the readers too
 
@@ -254,18 +424,21 @@ that show up as behaviour rather than as API.
 | ● | =core/lib.rs= (=step_history=)   | Undo clamps markers rather than restoring them exactly.              |
 | ● | =core/lib.rs= (=Key=)            | Three named keys carry modifiers; a bitset at four.                  |
 | ● | =core/marker.rs=               | Markers are a linearly scanned =Vec=.                                  |
-| ● | =core/overlay.rs=              | Colours are face names, not RGB; insertion types fixed at Emacs' defaults; an overlay whose text goes, goes. Linearly scanned =Vec=. |
+| ● | =core/overlay.rs=              | Colours are face names, not RGB; insertion types fixed at Emacs' defaults; an overlay whose text goes, goes. Linearly scanned =Vec=. A fold is two-state and hides whole lines only. |
 | ● | =lisp/shim.c= (overlays)       | The property list is Lisp-side, so an overlay the *editor* deleted leaves its plist behind. |
+| ● | =lisp/shim.c= (=PROMPT_FORM=)    | A Lisp prompt replaced by another prompt never answers its continuation. |
+| ● | =core/lib.rs= (=create_buffer=)  | A buffer Lisp made is writable; there is no per-buffer read-only flag. |
 | ● | =runtime/rpc.lisp=             | =false=, =null=, =[]= and ={}= all decode to =NIL=; object-versus-array is inferred on encode. |
 | ● | =runtime/lsp.lisp=             | Full-text =didChange=; columns are characters, not UTF-16; the diagnostics listing is a plain file that does not re-read. |
 | ● | =runtime/init.lisp=            | Themes are found relative to the config file; no search path.        |
 | ● | =runtime/modes/modes.lisp=     | No buffer-switch hook; settings follow the last mode entered.        |
 | ● | =runtime/modes/modes.lisp=     | The settings baseline starts at the factory default.                 |
-|   | =core/evil.rs=                 | No sticky desired column through a short line for some motions.      |
+|   | =core/evil.rs=                 | No sticky desired column through a short line for some motions; with an operator pending =j=/=k= are buffer lines, not visual ones. |
+|   | =core/lib.rs= (=line_cells=)     | Core lays a line out without overlays, so a =display= substitution moves the renderer's columns and not =j='s. |
 |   | =app/main.rs=                  | Frame focus is a bare assignment, so the live buffer follows the pointer. |
 |   | =app/main.rs=, =syntax/lib.rs=   | Full reparse per revision; ceiling is a few hundred KB.              |
 |   | =syntax/org.rs=                | Single-line emphasis; only the two built-in todo keywords; rescan per keystroke for LaTeX. |
-|   | =render/lib.rs=                | One =Renderer= per process (leaked TTF context); no horizontal scrolling; a wrapped line at the foot of a pane is cut; prompt lands on the focused modeline; input and path text truncate at the tail; highlight, shadow and divider colours hardcoded; an overlay image reserves cells but reflows nothing, and its textures are never evicted. |
+|   | =render/lib.rs=                | One =Renderer= per process (leaked TTF context); no horizontal scrolling; a wrapped line at the foot of a pane is cut; prompt lands on the focused modeline; input and path text truncate at the tail; a which-key column past the right edge is dropped rather than wrapped; highlight, shadow and divider colours hardcoded; an overlay image grows its line's row count but reflows nothing sideways, and its textures are never evicted; core is not told about the rows it took; a fold at the very bottom of the row budget is not counted, and =scroll= is still a buffer line; a wide character straddling the wrap point is cut in half rather than moved down; a control character draws as nothing rather than as =^G=. |
 |   | =dired/lib.rs=, =dired/render.rs= | No watcher or caching; per-comparison allocation in the sort; no cross-device rename; no ACLs; one face for both marks; UTC timestamps. |
 |   | =git/lib.rs=, =git/rebase.rs=    | No =--set-upstream=; a cherry-pick conflict is reported as git's own words; rebase shells out to =sh= and =cp= (unix only) and skips =--rebase-merges= steps. |
 |   | =latex/lib.rs=                 | =\begin{equation}= typesets at the article =\textwidth=; =DefaultHasher= for the preview cache key. |
@@ -283,8 +456,10 @@ that show up as behaviour rather than as API.
 | A primitive with an odd shape | =shim.c= (=f_*= + =defprim= + =PACKAGE_FORM=) and =lib.rs= (=rs_*=). |
 | A built-in verb             | =run_action= and =BUILTIN_COMMANDS= in =crates/core/src/evil.rs=. |
 | A new =EditorCommand=         | =crates/core/src/lib.rs= — and then =needs_app= if the app has to carry it out. |
+| A question to ask the user  | Nothing. =read-string= / =completing-read= in your config, and the rest of the command inside the callback. |
 | An overlay property Lisp alone reads | Nothing. =overlay-put= already stores any object; only the renderer's four cross into Rust. |
-| An overlay property the *renderer* draws | A field on =Overlay= and an arm of =OverlayEdit= in =crates/core/src/overlay.rs=, a verb in =command_for=, a =case= arm in =OVERLAY_FORM=, and the drawing in =crates/render=. |
+| An overlay property the *renderer* draws | A field on =Overlay= and an arm of =OverlayEdit= in =crates/core/src/overlay.rs=, a verb in =command_for=, a =case= arm in =OVERLAY_FORM=, and the drawing in =crates/render=. =fold= is the worked example, and the only one that also had to reach the *motion* code. |
+| A mode that can fold        | Two entries in =*fold-subtree-functions*= / =*fold-all-functions*= and one Lisp function. Nothing in Rust. |
 | A language server           | One =(lsp-register-server 'mode "program")= in your config. Nothing in Rust. |
 | Another JSON-RPC child      | =rpc-start= in Lisp. Nothing in Rust.                        |
 

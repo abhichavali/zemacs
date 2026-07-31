@@ -309,6 +309,56 @@ pub struct Terminal {
     rows: usize,
     title: String,
     exited: bool,
+    /// The child's exit code, once it has one. Kept rather than thrown away
+    /// because a *harness* that dies on the first frame — a bad flag, an
+    /// expired login — is otherwise indistinguishable from a shell you quit on
+    /// purpose, and 127 is the difference between "not installed" and "fine".
+    status: Option<i32>,
+    /// What was spawned, so a session can be restarted with the same command.
+    /// `None` is `$SHELL`.
+    command: Option<Command>,
+}
+
+/// A program to run on the PTY instead of `$SHELL` — how a coding-agent CLI
+/// becomes a terminal buffer. Args are a vector rather than a line because
+/// nothing here should be re-parsing quoting; whoever built the list knows
+/// where the words are.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Command {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl Command {
+    pub fn new(program: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+        }
+    }
+}
+
+/// Where `program` is on `$PATH`, if anywhere.
+///
+/// A bare `which`, in eight lines, so the app can say "cursor-agent is not
+/// installed" rather than forking a PTY that dies before its first frame. A
+/// name containing a separator is a path and is taken as one, which is what
+/// every shell does.
+///
+/// ponytail: no `PATHEXT`, no executable-bit check beyond what `metadata` will
+/// tell us — this is macOS and Linux, and a non-executable file on `$PATH` with
+/// the name of a coding agent is not a case worth code.
+pub fn which(program: &str) -> Option<PathBuf> {
+    if program.contains('/') {
+        let direct = PathBuf::from(program);
+        return direct.is_file().then_some(direct);
+    }
+    std::env::var_os("PATH")?
+        .to_string_lossy()
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| PathBuf::from(dir).join(program))
+        .find(|candidate| candidate.is_file())
 }
 
 /// `Dimensions` without the scrollback, which is all `Term::new` and `resize`
@@ -346,8 +396,31 @@ fn window_size(cols: usize, rows: usize) -> WindowSize {
 impl Terminal {
     /// Start a shell on a new PTY, `cols` by `rows`.
     pub fn spawn(cols: usize, rows: usize, cwd: Option<PathBuf>) -> anyhow::Result<Self> {
+        Self::spawn_command(cols, rows, cwd, None)
+    }
+
+    /// The same, running `command` instead of `$SHELL`.
+    ///
+    /// This is the whole difference between a shell buffer and an AI session:
+    /// the harness *is* the child, so quitting it ends the session and there is
+    /// no shell underneath to be left sitting at a prompt.
+    pub fn spawn_command(
+        cols: usize,
+        rows: usize,
+        cwd: Option<PathBuf>,
+        command: Option<Command>,
+    ) -> anyhow::Result<Self> {
         let (cols, rows) = (cols.max(1), rows.max(1));
         let size = Size { cols, rows };
+        // Checked before the fork rather than after: `tty::new` reports a failed
+        // exec as a bare "No such file or directory" with no hint of *what* was
+        // missing, and a menu that offers a harness has to be able to say the
+        // binary is not there.
+        if let Some(cmd) = &command {
+            if which(&cmd.program).is_none() {
+                anyhow::bail!("{} is not installed (not on $PATH)", cmd.program);
+            }
+        }
 
         let mut env = HashMap::new();
         // Not `alacritty`, which is the default: that terminfo entry only exists
@@ -357,9 +430,15 @@ impl Terminal {
         env.insert("TERM".to_string(), "xterm-256color".to_string());
 
         let options = tty::Options {
-            shell: None, // $SHELL
+            shell: command
+                .clone()
+                .map(|c| tty::Shell::new(c.program, c.args)),
             working_directory: cwd,
-            drain_on_exit: false,
+            // A harness that exits has usually just printed the reason. Draining
+            // means that last screenful is in the grid when the buffer freezes,
+            // instead of the session going blank at the moment it has something
+            // to say.
+            drain_on_exit: true,
             env,
         };
         let pty = tty::new(&options, window_size(cols, rows), 0)?;
@@ -384,6 +463,8 @@ impl Terminal {
             rows,
             title: "terminal".into(),
             exited: false,
+            status: None,
+            command,
         })
     }
 
@@ -478,7 +559,11 @@ impl Terminal {
                     let answer = reply(window_size(self.cols, self.rows));
                     self.send(answer.into_bytes());
                 }
-                Event::ChildExit(_) | Event::Exit => self.exited = true,
+                Event::ChildExit(code) => {
+                    self.exited = true;
+                    self.status = Some(code);
+                }
+                Event::Exit => self.exited = true,
                 // Bell, clipboard, colour queries and cursor-blink changes are
                 // ignored deliberately — none of them has anywhere to go yet.
                 _ => {}
@@ -493,6 +578,17 @@ impl Terminal {
     /// True once the shell has exited, so the app can retire the buffer.
     pub fn exited(&self) -> bool {
         self.exited
+    }
+
+    /// The child's exit code, once there is one.
+    pub fn exit_status(&self) -> Option<i32> {
+        self.status
+    }
+
+    /// What this session is running; `None` for a plain `$SHELL`. Kept so a
+    /// session can be restarted without the app having to remember for it.
+    pub fn command(&self) -> Option<&Command> {
+        self.command.as_ref()
     }
 
     pub fn size(&self) -> (usize, usize) {
@@ -902,5 +998,67 @@ mod tests {
 
         screen.cells[2 * 4] = Cell { c: 'z', ..blank };
         assert_eq!(screen.to_text(), "hi\n\nz");
+    }
+
+    /// The check that lets a menu say "not installed" instead of forking a PTY
+    /// that dies before its first frame. `sh` is on every machine this builds
+    /// on; the negative is a name nothing could plausibly own.
+    #[test]
+    fn which_finds_a_program_on_the_path() {
+        assert!(which("sh").is_some());
+        assert!(which("zemacs-no-such-harness-9f3c").is_none());
+        // A name with a separator is a path, taken as one either way.
+        assert_eq!(which("/bin/sh"), Some(PathBuf::from("/bin/sh")));
+        assert_eq!(which("/bin/zemacs-no-such-harness-9f3c"), None);
+    }
+
+    /// Deliberately *not* a PTY: the failure has to come before the fork, or
+    /// the caller gets "No such file or directory" with no idea what was
+    /// missing.
+    #[test]
+    fn spawning_a_missing_program_reports_the_name() {
+        let Err(err) = Terminal::spawn_command(
+            80,
+            24,
+            None,
+            Some(Command::new("zemacs-no-such-harness-9f3c", vec![])),
+        ) else {
+            panic!("nothing by that name exists, so this must not have spawned");
+        };
+        assert!(
+            err.to_string().contains("zemacs-no-such-harness-9f3c"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("not installed"), "{err}");
+    }
+
+    /// Two PTYs at once, each with its own child, each remembering what it was
+    /// asked to run — the foundation everything else in AI mode stands on.
+    #[test]
+    fn sessions_are_independent() {
+        let one = Terminal::spawn_command(
+            40,
+            10,
+            None,
+            Some(Command::new("cat", vec![])),
+        )
+        .expect("cat exists");
+        let two = Terminal::spawn_command(
+            80,
+            24,
+            None,
+            Some(Command::new("sh", vec!["-c".into(), "sleep 30".into()])),
+        )
+        .expect("sh exists");
+
+        assert_eq!(one.size(), (40, 10));
+        assert_eq!(two.size(), (80, 24), "sizing one does not size the other");
+        assert_eq!(one.command().map(|c| c.program.as_str()), Some("cat"));
+        assert_eq!(two.command().unwrap().args, vec!["-c", "sleep 30"]);
+        assert!(!one.exited() && !two.exited());
+
+        // Dropping one hangs up on *its* child only; the other keeps its PTY.
+        drop(one);
+        assert!(!two.exited());
     }
 }

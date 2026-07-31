@@ -548,12 +548,58 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
             a.max(0) as u64,
             (b > 0).then_some(b as u64),
         )),
+        // Code folding, and the only overlay property that is about *lines*:
+        // the lines after the overlay's first stop occupying rows entirely.
+        // `b` rather than `arg` because the value is a flag, so one overlay can
+        // be folded and unfolded without being remade — which is what org's
+        // headline cycling does.
+        "overlay-fold" => EditorCommand::Overlay(OverlayEdit::Fold(a.max(0) as u64, b != 0)),
         "delete-overlay" => EditorCommand::Overlay(OverlayEdit::Delete(a.max(0) as u64)),
         "remove-overlays" => {
             let (start, end) = ordered(a as c_long, b as c_long);
             EditorCommand::Overlay(OverlayEdit::RemoveIn(start, end))
         }
 
+        // --- lisp-api: the verbs that closed `boundary.org`'s table ----------
+        //
+        // Every one of these fits the envelope, which is the point: the table
+        // said "a new `EditorCommand` variant", and a new variant is *all* it
+        // needed. Nothing below is a C primitive.
+
+        // A buffer with no file behind it. Idempotent by name, so calling it
+        // twice shows one buffer rather than stacking a second.
+        "create-buffer" => EditorCommand::CreateBuffer(arg),
+        // Index into `buffer-list`; 0 is the live buffer, which is the useful
+        // default and the opposite of `switch-buffer`'s.
+        "kill-buffer" => EditorCommand::KillBuffer(n),
+        // An empty name means plain text — `(set-language nil)`.
+        "set-language" => EditorCommand::SetLanguage((!arg.is_empty()).then_some(arg)),
+
+        // `read-string` and `completing-read`. `a` is the continuation id the
+        // image parked its closure under, `b` says whether to draw a candidate
+        // box, and the candidates themselves follow one at a time: the write
+        // envelope carries a single string, and a list is many.
+        "read-from-minibuffer" => EditorCommand::ReadFromMinibuffer {
+            id: a.max(0) as u64,
+            label: arg,
+            completing: b != 0,
+        },
+        "prompt-item" => EditorCommand::PromptItem(arg),
+
+        // One row of the which-key panel, empty string to clear it — the same
+        // one-string-at-a-time shape `prompt-item` has, and for the same reason.
+        // A row is `"KEY LABEL"`; the renderer splits at the first space, which
+        // is unambiguous because a normalised key token never contains one.
+        "which-key" => EditorCommand::WhichKey((!arg.is_empty()).then_some(arg)),
+
+        // A keystroke for the shell. `Key::from_token` is the inverse of the
+        // spelling `key-bindings` already reports, so the string a config reads
+        // out of one is the string it can send — no second vocabulary.
+        "term-key" => match zemacs_core::Key::from_token(&arg) {
+            Some(key) => EditorCommand::TermKey(key),
+            None => EditorCommand::Message(format!("no such key: {arg}")),
+        },
+        // --- end of the lisp-api block ---------------------------------------
         _ => return None,
     })
 }
@@ -562,6 +608,25 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
 pub extern "C" fn rs_do(verb: *const c_char, arg: *const c_char, a: c_long, b: c_long) {
     let verb = unsafe { str_or_empty(verb) };
     let arg = unsafe { str_or_empty(arg) };
+    // lisp-api: one verb answers a *batch* rather than a command, so it is
+    // resolved here rather than in `command_for` — the same place `paste` gets
+    // its checkpoint, and for the same reason: what has to happen is more than
+    // one `EditorCommand`.
+    //
+    // This is "call a built-in verb by name", the row `boundary.org` had for
+    // `run_action` being private. `M-x` and every key binding already resolve a
+    // name this way; Lisp could name one and not run it. The lock is taken for
+    // the resolution and *released* before anything is emitted, because `emit`
+    // takes it again — and each command then goes wherever it belongs, so a
+    // built-in verb that needs the app (`magit-status`, `find-file`) reaches it
+    // down the channel exactly as `(magit "status")` does.
+    if verb == "call" {
+        let cmds = with_editor(|ed| ed.run_action(&arg)).unwrap_or_default();
+        for cmd in cmds {
+            emit(cmd);
+        }
+        return;
+    }
     match command_for(&verb, arg, a as i64, b as i64) {
         // Same reason `insert` checkpoints: a paste a Lisp command makes is one
         // user-level edit, and one `u` has to take all of it back out.
@@ -583,8 +648,10 @@ pub extern "C" fn rs_do(verb: *const c_char, arg: *const c_char, a: c_long, b: c
 /// change, and there is no [`EditorCommand`] for it.
 ///
 /// What the answer *does* is fixed by the kind — a file is opened, a command is
-/// run, a line is jumped to. Lisp gets no continuation, so this is "put the
-/// picker up", not `read-string`.
+/// run, a line is jumped to. So this is "put one of the *editor's* pickers up".
+/// The prompt whose answer comes back to Lisp is a different thing and a
+/// different route: `read-string` and `completing-read`, built on the
+/// `"read-from-minibuffer"` verb, which carries the continuation id.
 #[no_mangle]
 pub extern "C" fn rs_open_prompt(kind: *const c_char) {
     use zemacs_core::PromptKind;

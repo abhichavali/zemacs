@@ -114,7 +114,11 @@ same way Emacs tracks `text-scale-mode-amount' in a variable.")
 
 (set-font-size *font-size*)
 (set-line-numbers t)
-(set-relative-line-numbers nil)   ; t counts from the cursor, vim-style
+;; t counts from the cursor, vim-style — and counts *visual* lines, so with
+;; wrapping on a long paragraph is numbered once per row. That is Emacs'
+;; `display-line-numbers-type 'visual', and it is the reading that agrees with
+;; `j' and `k': `3j' lands on the row labelled 3.
+(set-relative-line-numbers nil)
 (set-tab-width 4)
 
 ;;; What a window does with a line wider than it is.
@@ -270,6 +274,30 @@ key binding or a dashboard item."
         (find-file (namestring *scratch-file*)))
     (error (e) (message (format nil "scratch: ~a" e)))))
 
+;;; ---------------------------------------------------------------------------
+;;; *Messages*
+;;;
+;;; The log has always existed — capped at 500, readable as `(messages)' — and
+;;; nothing showed it. This is the whole of showing it, and there is nothing in
+;;; Rust behind it: `create-buffer' makes a buffer with no file, and unlike
+;;; `find-file' it is applied on the spot, so the very next form writes into the
+;;; buffer it just made rather than into the one you were leaving.
+;;;
+;;; Emacs' `*Messages*' is read-only and appends; this one is an ordinary buffer
+;;; rewritten from the log each time you ask, which is the same thing to look at
+;;; and one form to write.
+
+(defun messages-buffer ()
+  "Show the message log in a buffer, newest at the bottom."
+  (let ((log (messages)))
+    (create-buffer "*Messages*")
+    (replace-region 0 (point-max)
+                    (if log
+                        (format nil "~{~a~%~}" log)
+                        "no messages yet"))
+    (goto-char (point-max))
+    (message (format nil "~a message~:p" (length log)))))
+
 (defun %newest-file (&rest paths)
   "The most recently written of PATHS that exists, or NIL."
   (let ((live (remove-if-not #'probe-file (remove nil paths))))
@@ -309,7 +337,13 @@ build without it still reads this file.")
 (defparameter *hidden-commands*
   (append (when (boundp '*readers*) (symbol-value '*readers*))
           '("make-marker" "point-marker" "load-theme"
-            "buffer-lines" "buffer-names" "beginning-of-line" "end-of-line"))
+            "buffer-lines" "buffer-names" "beginning-of-line" "end-of-line"
+            ;; ...and one that is worse than useless by hand: called with no
+            ;; argument it means "plain text", so `M-x set-language' picked by a
+            ;; stray fuzzy match silently uncolours the buffer. `kill-buffer' is
+            ;; deliberately *not* here — no-argument means the live buffer,
+            ;; which is exactly what Emacs' `C-x k' does.
+            "set-language"))
   "Zero-argument by introspection, but not things to run from M-x: they answer a
 question or build a value for other code, and running one by hand does nothing
 you can see. `*readers*' is the reader set the shim interns, taken wholesale so
@@ -434,6 +468,7 @@ the bindings.")
 (define-leader "SPC j j" "switch-buffer")
 (define-leader "SPC h r" "reload-config")
 (define-leader "SPC h v" "lisp-version")
+(define-leader "SPC h m" "messages-buffer")   ; what Emacs puts on `C-h e'
 (define-leader "SPC b s" "lisp-scratch")
 (define-leader "SPC q q" "quit")
 (define-key-everywhere "C-M-j" "switch-buffer")
@@ -461,6 +496,13 @@ the bindings.")
 ;;; project are the same prompt because opening a root *is* switching to it.
 (define-leader "SPC p f" "project-find-file")
 (define-leader "SPC p p" "project-switch")
+;;; `SPC p o' is the way out of the remembered list: it prompts for a path,
+;;; starting at `~/', and completes a directory at a time as you type — so a
+;;; project you have never opened is reachable without having opened it. What
+;;; you pick opens in dired and joins the `SPC p p' list. `SPC p D' is the same
+;;; gesture inside the current project.
+(define-leader "SPC p o" "project-open")
+(define-leader "SPC p D" "project-find-dir")
 (define-leader "SPC p d" "project-dired")
 (define-leader "SPC p c" "project-compile")   ; cargo build, npm run build, make
 (define-leader "SPC p t" "project-test")
@@ -761,9 +803,10 @@ Fragments already previewed are re-done, so this doubles as `refresh'."
   (define-leader "SPC l s" "lsp-status"))
 
 ;;; ---------------------------------------------------------------------------
-;;; which-key, Common Lisp editing, and a REPL
+;;; which-key, Common Lisp editing, a REPL, and org's markup drawn rather than
+;;; typed
 ;;;
-;;; Three files, loaded in order because each uses the one before it:
+;;; Five files, loaded in order because each uses the one before it:
 ;;;
 ;;;   which-key.lisp  what continues the prefix you just pressed, in the status
 ;;;                   line — and the same table read the other way round, as the
@@ -772,11 +815,33 @@ Fragments already previewed are re-done, so this doubles as `refresh'."
 ;;;                   kill, slurp/barf and indentation commands built on it.
 ;;;   repl.lisp       `C-c C-e' and friends, evaluating in *this* image and
 ;;;                   writing form and value into a transcript buffer.
+;;;   parinfer.lisp   the inverse of that indenter — the indentation says where
+;;;                   the closing parentheses go — on the same scanner.
+;;;   org-modern.lisp `display' overlays: heading stars become bullets, `[X]'
+;;;                   becomes a tick, and `*bold*' shows its asterisks only
+;;;                   while the cursor is in it. Loaded after `lsp.lisp' so it
+;;;                   finds the `after-change-hook' that file installs.
+;;; term-agent:
+;;;   ai.lisp         coding agents — Claude Code, Cursor, opencode — as
+;;;                   ordinary buffers, on the terminal the editor already has.
+;;;                   `C-a' is the menu. The harness list is *data* in that
+;;;                   file, so a fourth tool is one line and no Rust; the resume
+;;;                   flags are each tool's own. It loads last because it uses
+;;;                   `define-leader' and pushes onto `*extra-commands*', which
+;;;                   `refresh-commands' below then publishes.
+;;;
+;;;   org-fold.lisp   code folding's policy half: what an org subtree *is*, and
+;;;                   the `z a' / `z M' / `z R' commands over the one thing Rust
+;;;                   owns — an overlay carrying `fold' makes the lines after
+;;;                   its first stop occupying rows. `*fold-subtree-functions*'
+;;;                   is where another mode joins in.
 ;;;
 ;;; Loaded here rather than next to `modes.lisp' because they use `define-leader'
 ;;; and `define-mode-key', which are defined above this point and not below it.
 (when *runtime-dir*
-  (dolist (file '("modes/which-key.lisp" "modes/lisp-mode.lisp" "modes/repl.lisp"))
+  (dolist (file '("modes/which-key.lisp" "modes/lisp-mode.lisp" "modes/repl.lisp"
+                  "modes/parinfer.lisp" "modes/org-modern.lisp" "modes/org-fold.lisp"
+                  "modes/ai.lisp"))
     (load (merge-pathnames file *runtime-dir*) :verbose nil :print nil)))
 
 ;;; ---------------------------------------------------------------------------

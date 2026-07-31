@@ -91,6 +91,16 @@ pub struct Overlay {
     pub display: Option<String>,
     /// Drawn instead of the covered text, as a bitmap.
     pub image: Option<ImageId>,
+    /// **Hide the lines after this overlay's first one.** The one payload here
+    /// that is about *lines* rather than about cells, and the whole of code
+    /// folding: everything else an overlay carries replaces some characters with
+    /// something else the same shape, and a fold makes rows stop existing.
+    ///
+    /// The line `start` falls on stays drawn — that is the headline, the `fn`
+    /// signature, the `{` — and carries an indicator; every line after it up to
+    /// `end` is skipped by the renderer *and* stepped over by `j`. See
+    /// [`fold_hiding`], which is the one predicate both sides ask.
+    pub fold: bool,
 }
 
 impl Overlay {
@@ -103,8 +113,36 @@ impl Overlay {
             background: None,
             display: None,
             image: None,
+            fold: false,
         }
     }
+}
+
+/// The fold hiding the line that starts at char offset `line_start`, as that
+/// fold's own start offset — `None` when the line is drawn.
+///
+/// The single question folding asks, and both the renderer and `j` ask it, for
+/// the same reason `expand_line` is shared: a line the frame does not draw and
+/// a line the cursor may land on must be the same set, or point disappears.
+///
+/// Strictly *after* the fold's first line: `o.start < line_start` is false for
+/// the line the fold begins on, which is what keeps a headline visible with its
+/// body hidden underneath. And `< o.end` because the range is half-open, so the
+/// line beginning exactly where a fold ends is outside it.
+pub fn fold_hiding(overlays: &[Overlay], line_start: usize) -> Option<usize> {
+    overlays
+        .iter()
+        .find(|o| o.fold && o.start < line_start && line_start < o.end)
+        .map(|o| o.start)
+}
+
+/// True when a fold *begins* inside `[start, end]` — the line that stays drawn
+/// and gets the indicator. Inclusive at the end, so a fold anchored at the
+/// newline still belongs to the line before it rather than to no line at all.
+pub fn fold_starts_in(overlays: &[Overlay], start: usize, end: usize) -> bool {
+    overlays
+        .iter()
+        .any(|o| o.fold && (start..=end).contains(&o.start))
 }
 
 /// A change to an overlay, as it arrives from Lisp.
@@ -121,6 +159,8 @@ pub enum OverlayEdit {
     Background(OverlayId, Option<HlKind>),
     Display(OverlayId, Option<String>),
     Image(OverlayId, Option<ImageId>),
+    /// Fold, or unfold, the lines after this overlay's first one.
+    Fold(OverlayId, bool),
     Delete(OverlayId),
     /// Every overlay overlapping `[start, end)`, as Emacs' `remove-overlays`.
     RemoveIn(usize, usize),
@@ -175,7 +215,8 @@ impl Overlays {
             OverlayEdit::Face(id, _)
             | OverlayEdit::Background(id, _)
             | OverlayEdit::Display(id, _)
-            | OverlayEdit::Image(id, _) => id,
+            | OverlayEdit::Image(id, _)
+            | OverlayEdit::Fold(id, _) => id,
         };
         let Some(o) = self.live.iter_mut().find(|o| o.id == id) else {
             return;
@@ -185,6 +226,7 @@ impl Overlays {
             OverlayEdit::Background(_, k) => o.background = k,
             OverlayEdit::Display(_, s) => o.display = s,
             OverlayEdit::Image(_, i) => o.image = i,
+            OverlayEdit::Fold(_, f) => o.fold = f,
             OverlayEdit::Delete(_) | OverlayEdit::RemoveIn(..) => unreachable!("returned above"),
         }
     }
@@ -338,6 +380,54 @@ mod tests {
         assert_eq!(o.all().len(), 1);
         o.edit(OverlayEdit::Delete(1));
         assert!(o.all().is_empty());
+    }
+
+    /// Folding, as the one predicate the renderer and `j` both ask. "abc\ndef\n
+    /// ghi\njkl" has line starts 0, 4, 8, 12; a fold over `[2, 11)` begins on
+    /// line 0 and reaches into line 2.
+    #[test]
+    fn a_fold_hides_the_lines_after_its_own() {
+        let mut o = overlay(2, 11);
+        o.edit(OverlayEdit::Fold(1, true));
+        let all = o.all();
+        // The line the fold *starts* on is still drawn — it is the headline,
+        // and hiding it would hide the thing you fold from.
+        assert_eq!(fold_hiding(all, 0), None);
+        assert_eq!(fold_hiding(all, 4), Some(2));
+        assert_eq!(fold_hiding(all, 8), Some(2));
+        // Half-open: the line beginning exactly where the fold ends is outside.
+        assert_eq!(fold_hiding(all, 11), None);
+        assert_eq!(fold_hiding(all, 12), None);
+        // ...and the indicator goes on the line the fold begins on, found by
+        // asking with that line's own range.
+        assert!(fold_starts_in(all, 0, 3));
+        assert!(!fold_starts_in(all, 4, 7));
+
+        // An ordinary overlay is not a fold, however much of the buffer it
+        // covers: `fold` is a claim, not a consequence of having a range.
+        let mut plain = overlay(2, 11);
+        plain.edit(OverlayEdit::Display(1, Some("x".into())));
+        assert_eq!(fold_hiding(plain.all(), 4), None);
+        // ...and unfolding is the same edit the other way, so one overlay can
+        // be cycled without being remade.
+        o.edit(OverlayEdit::Fold(1, false));
+        assert_eq!(fold_hiding(o.all(), 4), None);
+    }
+
+    /// A fold is a marker pair like every other overlay, so it *moves* — and a
+    /// fold that stopped covering the text it was folding would hide the wrong
+    /// lines, which is worse than not folding at all.
+    #[test]
+    fn a_fold_follows_the_text_it_hides() {
+        let mut o = overlay(2, 11);
+        o.edit(OverlayEdit::Fold(1, true));
+        o.adjust(0, 0, 4); // four characters typed above it
+        assert_eq!(o.span(1), Some((6, 15)));
+        assert_eq!(fold_hiding(o.all(), 8), Some(6));
+        // Delete everything it covered and the fold goes with it, so nothing is
+        // left hiding lines that are no longer there.
+        o.adjust(6, 9, 0);
+        assert_eq!(fold_hiding(o.all(), 8), None);
     }
 
     #[test]

@@ -38,6 +38,13 @@ zemacs-rpc = { path = "crates/rpc" }
 # scrollback, and libghostty would mean a Zig toolchain in the build.
 alacritty_terminal = "0.25"
 ropey = "1.6"
+
+# How many cells a character occupies. East Asian Width is a 100 KB table that
+# changes with every Unicode revision, so hand-rolling the ranges is a bug farm
+# whose failures are invisible until somebody opens a CJK file. Already in the
+# tree — `alacritty_terminal` measures its own grid with it, so the terminal and
+# the document now agree on what "two cells" means.
+unicode-width = "0.2"
 crossbeam-channel = "0.5"
 anyhow = "1"
 

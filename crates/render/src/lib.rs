@@ -131,6 +131,31 @@ pub struct Renderer {
     /// the texture then sits there costing a few hundred KB of VRAM until exit.
     /// Upgrade path: drop entries `editor.image` no longer resolves.
     images: HashMap<ImageId, Option<Texture<'static>>>,
+    /// Digest of every draw call `render` has made this frame, and the digest of
+    /// the frame that is actually on screen. Equal means the picture did not
+    /// change and [`Renderer::present`] can be skipped — which is the whole
+    /// reason they exist, because a present blocks until the next vertical blank
+    /// and that is where a keystroke's latency goes.
+    ///
+    /// Folded *inside the draw primitives* rather than computed from the editor,
+    /// and that is the load-bearing part: there is no list of "fields that mean a
+    /// redraw" to keep in step with the renderer. Everything that reaches the
+    /// canvas — the clear, `fill`, the two glyph blits, an image, and the clip
+    /// that decides what any of them are allowed to touch — goes through `mark`,
+    /// so a visible change cannot fail to be noticed.
+    ///
+    /// The one rule it cannot enforce for itself: a new primitive that talks to
+    /// `self.canvas` has to fold itself in too, or its pixels become invisible
+    /// to this. `grep 'self.canvas'` in this file is the whole audit.
+    ///
+    /// `None` means "nothing has been shown yet, or somebody invalidated it",
+    /// which forces the next present.
+    drawn: u64,
+    shown: Option<u64>,
+    /// Draw calls in the last frame — one per glyph, fill, blit and clear. Only
+    /// [`Renderer::draw_calls`] reads it, and only the perf report reads that,
+    /// but it costs an increment on a path that is already touching the GPU.
+    draws: u32,
     cell_w: i32,
     line_h: i32,
     /// Pixels from the top of a cell down to the text baseline. Only images need
@@ -189,6 +214,9 @@ impl Renderer {
             font_path,
             point_size,
             glyphs: HashMap::new(),
+            drawn: FNV_SEED,
+            shown: None, // nothing on screen yet, so frame one always presents
+            draws: 0,
             cell_w,
             line_h,
             ascent,
@@ -272,6 +300,19 @@ impl Renderer {
         terminal: Option<&Screen>,
     ) -> anyhow::Result<()> {
         self.sync(editor)?; // cheap no-op; makes an app-side `sync` call optional
+        // Start this frame's digest from the two things that move *every* glyph
+        // rather than one of them: the size the font is open at, and the size of
+        // the canvas they land on. A resize that happens to leave the same
+        // characters at the same coordinates is otherwise indistinguishable.
+        let (out_w, out_h) = self.canvas.output_size().unwrap_or((0, 0));
+        self.drawn = FNV_SEED;
+        self.draws = 0;
+        self.mark([
+            TAG_FRAME,
+            pack(out_w as i32, out_h as i32),
+            u64::from(self.point_size),
+            frame_index as u64,
+        ]);
         // The one thing core cannot work out for itself: how big the em really
         // is once the display's scale factor is in. Parked here rather than
         // asked for, exactly as `viewport_lines` is, and read by the LaTeX
@@ -285,6 +326,8 @@ impl Renderer {
         let bg = editor.settings.background;
         self.canvas.set_draw_color(rgb(bg));
         self.canvas.clear();
+        self.mark([TAG_CLEAR, 0, 0, bits(rgb(bg))]);
+        self.draws += 1;
 
         // Layout once, then two passes: the first needs `&mut editor` to park
         // the row counts, the second only `&`.
@@ -410,6 +453,54 @@ impl Renderer {
     /// lock before getting here.
     pub fn present(&mut self) {
         self.canvas.present();
+        self.shown = Some(self.drawn);
+    }
+
+    /// Whether the frame [`Renderer::render`] just drew differs from the one on
+    /// screen. False means `present` would block for a vertical blank to put up
+    /// a picture identical to the one already there.
+    ///
+    /// Skipping the present leaves the window showing its last presented frame.
+    /// That is not a bet on the back buffer surviving — we clear and redraw the
+    /// whole canvas every frame, so nothing is ever *carried over* into a frame;
+    /// it is only the front buffer standing still, which is what every
+    /// event-driven GUI on every windowing system relies on. What it does assume
+    /// is that a window needing repainting says so, hence [`Renderer::invalidate`].
+    pub fn changed(&self) -> bool {
+        self.shown != Some(self.drawn)
+    }
+
+    /// Force the next `present`, whatever was drawn. For when the system, rather
+    /// than the editor, is the reason the window needs putting up again: exposed,
+    /// resized, un-minimised, moved to another display.
+    pub fn invalidate(&mut self) {
+        self.shown = None;
+    }
+
+    /// Draw calls in the last rendered frame — roughly one per visible character.
+    /// Instrumentation only; see the perf report in the app.
+    pub fn draw_calls(&self) -> u32 {
+        self.draws
+    }
+
+    /// One frame of this window's display, in milliseconds. The loop sleeps this
+    /// long when it has nothing to put on screen, so it wants the real refresh
+    /// rate rather than a guess: on a 120 Hz panel, guessing 60 would double how
+    /// long a change made off the event queue waits to be noticed.
+    ///
+    /// 60 Hz when SDL cannot say. Asked per sleep rather than cached because a
+    /// window can be dragged to a display with a different rate, and the call is
+    /// a field read behind an SDL lock — far cheaper than the sleep it sizes.
+    pub fn frame_ms(&self) -> u32 {
+        let hz = self
+            .canvas
+            .window()
+            .display_mode()
+            .ok()
+            .map(|m| m.refresh_rate)
+            .filter(|hz| *hz > 0)
+            .unwrap_or(60);
+        (1000 / hz).max(1) as u32
     }
 
     // --- document ---------------------------------------------------------
@@ -1065,16 +1156,38 @@ impl Renderer {
 
     // --- primitives -------------------------------------------------------
 
+    /// Fold one draw call's parameters into this frame's digest. FNV-1a: an xor
+    /// and a multiply per word, four words per call. A full screen is three or
+    /// four thousand calls, so the whole frame's digest costs tens of
+    /// microseconds against a 16 ms budget — and buys back a 16 ms present.
+    ///
+    /// It does not have to be collision-proof, only cheap and total: every
+    /// parameter that reaches the canvas goes in, so two frames with the same
+    /// digest drew the same picture short of a 64-bit accident.
+    #[inline]
+    fn mark(&mut self, words: [u64; 4]) {
+        let mut h = self.drawn;
+        for w in words {
+            h = (h ^ w).wrapping_mul(FNV_PRIME);
+        }
+        self.drawn = h;
+    }
+
     /// Confine every following draw to `a`. Nothing else in the renderer knows
     /// about pane boundaries — this is what keeps a long line, a wide selection
     /// or an overhanging glyph inside the window it belongs to.
     fn set_clip(&mut self, a: Area) {
         let r = Rect::new(a.x, a.y, a.w.max(0) as u32, a.h.max(0) as u32);
         self.canvas.set_clip_rect(Some(r));
+        // In the digest even though it draws nothing: it decides what the calls
+        // after it are *allowed* to draw, so two frames whose panes moved can
+        // otherwise issue the identical list of blits.
+        self.mark([TAG_CLIP, pack(a.x, a.y), pack(a.w, a.h), 0]);
     }
 
     fn clear_clip(&mut self) {
         self.canvas.set_clip_rect(None);
+        self.mark([TAG_CLIP, 0, 0, 1]);
     }
 
     /// A cursor rect, trimmed to `pane`. The cursor legitimately sits one cell
@@ -1194,6 +1307,8 @@ impl Renderer {
             .or_insert_with(|| image_texture(textures, image));
         let Some(tex) = slot else { return };
         let _ = canvas.copy(tex, None, Rect::new(x, iy, w, h));
+        self.mark([id, pack(x, iy), pack(w as i32, h as i32), 0]);
+        self.draws += 1;
     }
 
     fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color) {
@@ -1202,6 +1317,8 @@ impl Renderer {
         }
         self.canvas.set_draw_color(color);
         let _ = self.canvas.fill_rect(Rect::new(x, y, w as u32, h as u32));
+        self.mark([TAG_FILL, pack(x, y), pack(w, h), bits(color)]);
+        self.draws += 1;
     }
 
     /// Returns the x just past the last cell, so callers can chain / place a bar.
@@ -1247,6 +1364,11 @@ impl Renderer {
             tex.set_color_mod(color.r, color.g, color.b);
             let q = tex.query();
             let _ = canvas.copy(tex, None, Rect::new(x, y, q.width, q.height));
+            // The glyph's size is a function of the face and the point size, and
+            // the point size is already in the frame seed, so the character and
+            // the weight identify the blit.
+            self.mark([TAG_BOLD ^ u64::from(c), pack(x, y), 0, bits(color)]);
+            self.draws += 1;
         }
     }
 
@@ -1276,8 +1398,32 @@ impl Renderer {
             tex.set_color_mod(color.r, color.g, color.b);
             let q = tex.query();
             let _ = canvas.copy(tex, None, Rect::new(x, y, q.width, q.height));
+            self.mark([u64::from(c), pack(x, y), 0, bits(color)]);
+            self.draws += 1;
         }
     }
+}
+
+/// FNV-1a's constants, and tags that keep one kind of draw call from colliding
+/// with another. The character tags are the code points themselves — every
+/// scalar value is below `TAG_BOLD`, so nothing overlaps.
+const FNV_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+const TAG_BOLD: u64 = 1 << 24;
+const TAG_FRAME: u64 = 1 << 25;
+const TAG_CLEAR: u64 = 1 << 26;
+const TAG_FILL: u64 = 1 << 27;
+const TAG_CLIP: u64 = 1 << 28;
+
+/// Two coordinates in one word, so a draw call is four folds rather than six.
+#[inline]
+fn pack(a: i32, b: i32) -> u64 {
+    (u64::from(a as u32) << 32) | u64::from(b as u32)
+}
+
+#[inline]
+fn bits(c: Color) -> u64 {
+    u64::from(u32::from_be_bytes([c.r, c.g, c.b, c.a]))
 }
 
 /// `None` when the font has no glyph for `c` — cached so we don't retry it.

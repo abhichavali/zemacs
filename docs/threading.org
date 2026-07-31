@@ -1,0 +1,198 @@
+#+TITLE: The threading and locking contract
+#+SUBTITLE: why a slow function does not freeze the editor, and what that costs
+
+This is the one place zemacs deliberately differs from Emacs, and it changes how
+you write commands. Read it before writing anything longer than a one-liner.
+
+* The threads
+
+Three, and none of them waits on another for long:
+
+| Thread     | Owns                                                        |
+|------------+-------------------------------------------------------------|
+| main       | SDL2 input, the renderer, and the =Editor=                     |
+| lisp       | the ECL image and its conservative GC                       |
+| syntax     | tree-sitter; answers with highlight spans                   |
+
+ECL wants a thread it can register with its GC, so it gets a dedicated one. The
+editor can call *into* the image (a key binding firing =CallLisp=, =M-x=, the =C-c=
+evaluator) without ever running Lisp on the UI thread.
+
+The main thread and the Lisp thread share the =Editor= through a mutex. That is
+the only shared state.
+
+* Lisp is not synchronous with the command loop
+
+In Emacs, a slow elisp function freezes redisplay and input until it returns.
+That is the single biggest thing wrong with elisp as an extension language.
+
+Here, nothing waits on a Lisp form. Input keeps being handled and frames keep
+being drawn while your function runs, because the only thing it ever holds is a
+lock nobody keeps across a redraw:
+
+- a primitive takes the editor lock for the duration of *one primitive* — long
+  enough to read a slice or apply an edit, never longer;
+- the main thread holds it for one loop iteration's worth of input handling and
+  drawing, and *releases it before presenting the frame*, which is where a
+  frame's idle time actually is.
+
+So the worst a Lisp primitive ever waits for is one iteration of input plus
+draw. It never waits for the display.
+
+** What a runaway form actually costs
+
+#+begin_src lisp
+(loop)   ; don't
+#+end_src
+
+The editor keeps drawing, keeps taking input, and keeps letting you type. What
+stops is *the image*: the Lisp thread evaluates one queued form at a time, so
+every later form — every key bound to a Lisp command, every =M-x=, every mode
+hook — queues behind the runaway one and never runs. You lose your config, not
+your editor, and you can still save your files and quit.
+
+There is no way to interrupt it from inside zemacs. That is a ceiling, and it is
+listed as one in [[file:boundary.org][boundary.org]].
+
+* A Lisp function is not atomic
+
+This is what the design costs. Two primitives can have a keystroke land between
+them:
+
+#+begin_src lisp
+;; Wrong. A keystroke between these two lines is typed into the gap.
+(delete-region beg end)
+(insert new-text)
+#+end_src
+
+Nothing is *broken* by that — a command that reads point, thinks, and inserts is
+doing what you meant, and the interleaving is usually invisible. But where a
+sequence genuinely must not be interrupted, the fix is not a lock you hold
+across arbitrary Lisp. It is to make it *one* primitive:
+
+#+begin_src lisp
+;; Right. One lock, one undo step, no gap.
+(replace-region beg end new-text)
+#+end_src
+
+That is why =replace-region= exists next to =delete-region= and =insert=, and it is
+the shape of every "wrap the selection in something" command.
+
+** The rule
+
+When a sequence must be all-or-nothing, *build the whole answer in Lisp and
+apply it with one call*. Lisp is where the computation belongs; the primitive is
+where the atomicity belongs.
+
+=replace-all= in the standard library is exactly this: it builds the entire new
+buffer text with =with-output-to-string= and then issues a single =replace-region=
+over the whole buffer. N separate edits would be N undo steps with N windows for
+a keystroke to land in.
+
+** Undo grouping follows the same rule
+
+Each mutating primitive checkpoints first, so each is *one* user-level edit that
+one =u= takes back:
+
+| Primitive                    | Undo steps |
+|------------------------------+------------|
+| =(insert "x")=                 |          1 |
+| =(delete-region a b)=          |          1 |
+| =(replace-region a b "x")=     |          1 |
+| =(insert-at p "x")=            |          1 |
+| =(paste)=                      |          1 |
+| =(insert "a") (insert "b")=    |          2 |
+
+There is no "begin an undo group" primitive, and adding one would not help,
+because the checkpoint is inside each mutator. If you want N changes to undo as
+one, compute the final text and make one call.
+
+* Commands that land a frame later
+
+Most commands are applied *on the spot*, inside the primitive, so a read that
+follows a write sees it:
+
+#+begin_src lisp
+(progn (goto-char 0) (insert "zz") (point))   ; => 2, always
+#+end_src
+
+The exception is the handful of commands the pure core cannot carry out at all —
+they need the filesystem, a subprocess, the Lisp image itself, or an OS window.
+Those go down a channel and land on the *next turn of the main loop*:
+
+: find-file   save-file   find-file-at
+: magit       dired       terminal
+: delete-frame
+
+#+begin_src lisp
+;; Wrong: the reader still sees the buffer you were leaving.
+(find-file "/tmp/x.rs")
+(goto-char 100)
+
+;; Right: one command that opens and jumps, because the jump has to happen
+;; after the file is read and core cannot do the reading.
+(find-file-at "/tmp/x.rs:12:fn main")
+#+end_src
+
+Making them synchronous would mean blocking Lisp on the UI thread, and that
+trade is the whole reason zemacs is not elisp.
+
+If you need to act on a file *after* opening it, hang the work off the mode hook
+that firing will produce, rather than putting it on the next line.
+
+* Errors
+
+A Lisp error is never fatal and never reaches the user as a crash:
+
+- =load-init= wraps the whole config load in a =handler-case=. A broken form
+  reports =init.lisp error: ...= in the status line and *stops loading there* —
+  the forms above it took effect, the ones below did not, and the editor starts.
+- =eval-string= wraps every evaluation from a key, =M-x= or =C-c= the same way and
+  reports =lisp error: ...=.
+- =cl_safe_eval= is the backstop under both.
+
+So a typo in your config costs you the rest of the file, not your editor. Reload
+with =M-x reload-config= after fixing it.
+
+* What gets echoed
+
+=eval-string= reports the value of the *last* form in whatever it evaluated, the
+way =eval-last-sexp= echoes into the echo area — but stays silent when that value
+is =NIL=. Every command that already called =message= returns =NIL=, and echoing it
+would wipe out the message the command just produced.
+
+Values print with =~S= (so ="3"= and =3= are distinguishable) under
+=*print-length* 32=, =*print-level* 4=, =*print-circle* t=, which keeps a huge or
+circular structure from becoming a status line nobody can read.
+
+* Packages
+
+=*package*= is bound to =ZEMACS= around both the =READ= and the =EVAL= of anything the
+editor hands the image. That is why:
+
+- a key binding can name a bare =lisp-version= and reach your =DEFUN=;
+- the scratch buffer works without an =(in-package :zemacs)= line;
+- =(set-tab-width 3)= resolves unqualified from =M-x=.
+
+=LOAD= only binds =*package*= for the duration of the load, so a config file still
+wants its =(in-package :zemacs)= at the top for its own sake.
+
+* Text encoding
+
+Every offset in the API — =(point)=, =(region)=, =buffer-substring=, =goto-char=,
+=search-forward= — is a *character* index. Those are always consistent with each
+other and with the editor, so arithmetic on them is safe.
+
+What is not safe is =cl:length= of buffer text. Strings cross the C boundary as
+UTF-8 bytes in an ECL *base* string, so:
+
+- round-trips are byte-exact: text read out and written back is unchanged,
+  emoji included;
+- but =(length (buffer-string))= counts *bytes* on a non-ASCII buffer. Use
+  =(point-max)= for the character count;
+- and a non-ASCII *literal in a =load=ed file* is an extended string, which will
+  not match non-ASCII buffer text. =(search-forward "café")= from =init.lisp= finds
+  nothing in a buffer that contains =café=. ASCII patterns are unaffected.
+
+This is a documented shortcut with a named upgrade path, not an oversight: see
+[[file:boundary.org][boundary.org]].

@@ -1,0 +1,72 @@
+#+TITLE: zemacs — the Lisp reference
+#+SUBTITLE: a Common Lisp machine that edits text
+
+zemacs is an editor whose configuration language is a live Common Lisp image.
+=runtime/init.lisp= is not a settings file that a program reads — it is a
+program, loaded into an ECL image that runs for as long as the editor does, and
+every function it defines can be named by a key binding, a dashboard item or
+=M-x=.
+
+This directory is the reference for that image: what it can reach, what it
+cannot, and why the line is where it is.
+
+* Read in this order
+
+| File                       | What it answers                                                       |
+|----------------------------+-----------------------------------------------------------------------|
+| [[file:model.org][model.org]]              | What a buffer, window, frame, major mode and modal state are, and how they relate. |
+| [[file:threading.org][threading.org]]          | Why Lisp never freezes the editor, and what that costs you.            |
+| [[file:reference.org][reference.org]]          | Every primitive, reader and helper: arguments, return value, example.  |
+| [[file:recipes.org][recipes.org]]            | The things people actually write, end to end.                         |
+| [[file:boundary.org][boundary.org]]           | What belongs in Lisp, what belongs in Rust, and every known ceiling.   |
+
+If you only read one thing, read [[file:threading.org][threading.org]]. It is the one place zemacs
+deliberately differs from Emacs, and the difference changes how you write
+commands.
+
+* The thirty-second version
+
+Everything lives in the =ZEMACS= package. Your config file starts with
+=(in-package :zemacs)=; anything the editor evaluates for you (a key binding,
+=M-x=, the =C-c= evaluator, the scratch buffer) is read with =*package*= already
+bound to =ZEMACS=, so you never have to qualify a name.
+
+#+begin_src lisp
+(in-package :zemacs)
+
+;; Read the editor.
+(point)                     ; => 42
+(region-text)               ; => "the selection", or NIL
+(major-mode)                ; => "org-mode"
+
+;; Write the editor.
+(insert "hello")
+(replace-region 0 5 "HELLO")
+(set-font-size 22)
+
+;; A command is a zero-argument function. That is the whole mechanism.
+(defun surround-region (left right)
+  (let ((r (region)))
+    (when r
+      (replace-region (car r) (cdr r)
+                      (concatenate 'string left (region-text) right)))))
+
+(defun org-bold () (surround-region "*" "*"))
+(define-key "org-mode" "SPC m b" "org-bold")
+#+end_src
+
+* Where the code is
+
+| Path                         | What is in it                                                        |
+|------------------------------+----------------------------------------------------------------------|
+| =crates/lisp/src/shim.c=       | The C bridge, and the Lisp library installed at boot.                |
+| =crates/lisp/src/lib.rs=       | The Rust side of every primitive; the module docs are the contract.  |
+| =crates/core/src/query.rs=     | The readers. Adding one is one arm of one =match=.                     |
+| =crates/core/src/evil.rs=      | The built-in verbs a key binding can name, in =run_action=.            |
+| =runtime/init.lisp=            | The shipped config. Ordinary Lisp, all of it replaceable.            |
+| =runtime/modes/=               | Major and minor mode machinery, written in Lisp on top of one hook.  |
+
+The tests are executable documentation: =crates/lisp/tests/api.rs=,
+=eval.rs= and =modes.rs= each boot a real image against a real editor and assert
+on what comes out. When this reference and those tests disagree, the tests are
+right.

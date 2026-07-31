@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use zemacs_core::{BufferKind, Editor, EditorCommand};
+use zemacs_core::{BufferKind, Editor, EditorCommand, HlKind};
 use zemacs_git as git;
 
 /// Comment prefix in the commit message buffer, as in `COMMIT_EDITMSG`.
@@ -23,6 +23,10 @@ pub struct Magit {
     repo: Option<PathBuf>,
     /// One entry per line of the status buffer, parallel to its text.
     lines: Vec<git::Line>,
+    /// The status buffer's own state — which sections are folded and which
+    /// files have their diff open. Held across refreshes, because a refresh
+    /// that silently closed everything you had opened would be useless.
+    view: Option<git::View>,
 }
 
 impl Magit {
@@ -42,16 +46,113 @@ impl Magit {
                 self.repo = Some(self.locate(editor)?);
                 self.refresh(editor)
             }
+            // Fold a section, or open a file's diff under it. The one key
+            // that makes the buffer navigable rather than a list.
+            "toggle" => {
+                let repo = self.repo()?.to_path_buf();
+                let line = self.line_at_cursor(editor).cloned();
+                let view = self.view_mut()?;
+                match line {
+                    Some(git::Line::Section(section)) => view.toggle_section(section),
+                    Some(git::Line::File { path, section })
+                    | Some(git::Line::Hunk { path, section, .. }) => {
+                        view.toggle_file(&repo, section, &path)?
+                    }
+                    _ => {}
+                }
+                self.render(editor)
+            }
+            // Staging is line-sensitive: on a hunk it stages *that hunk*, which
+            // is the thing Magit is used for more than any other.
             "stage" | "unstage" => {
                 let repo = self.repo()?.to_path_buf();
-                let path = self
-                    .path_at_cursor(editor)
+                let line = self
+                    .line_at_cursor(editor)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("nothing to {verb} on this line"))?;
-                match verb {
-                    "stage" => git::stage(&repo, &path)?,
-                    _ => git::unstage(&repo, &path)?,
+                match line {
+                    git::Line::Hunk {
+                        path,
+                        section,
+                        index,
+                    } => {
+                        let view = self.view_mut()?;
+                        let diff = view
+                            .diff_of(section, &path)
+                            .ok_or_else(|| anyhow::anyhow!("no diff open for {}", path.display()))?;
+                        if verb == "stage" {
+                            git::stage_hunk(&repo, diff, index)?
+                        } else {
+                            git::unstage_hunk(&repo, diff, index)?
+                        }
+                    }
+                    git::Line::File { path, .. } => {
+                        if verb == "stage" {
+                            git::stage(&repo, &path)?
+                        } else {
+                            git::unstage(&repo, &path)?
+                        }
+                    }
+                    _ => anyhow::bail!("nothing to {verb} on this line"),
                 }
                 self.refresh(editor)
+            }
+            "amend" => {
+                let repo = self.repo()?.to_path_buf();
+                let out = git::amend(&repo, None)?;
+                self.refresh(editor)?;
+                editor.apply(EditorCommand::Message(summarize(&out, "amend")));
+                Ok(())
+            }
+            "fetch" => {
+                let repo = self.repo()?.to_path_buf();
+                let out = git::fetch(&repo)?;
+                self.refresh(editor)?;
+                editor.apply(EditorCommand::Message(summarize(&out, "fetch")));
+                Ok(())
+            }
+            "stash" | "stash-pop" => {
+                let repo = self.repo()?.to_path_buf();
+                let out = match verb {
+                    "stash" => git::stash_push(&repo, "")?,
+                    _ => git::stash_pop(&repo, "stash@{0}")?,
+                };
+                self.refresh(editor)?;
+                editor.apply(EditorCommand::Message(summarize(&out, verb)));
+                Ok(())
+            }
+            // A rebase in flight. `continue` and `skip` can stop again on the
+            // next conflict, which is ordinary progress, not failure — so both
+            // outcomes are reported the same way and the buffer redraws either
+            // way.
+            "rebase-continue" | "rebase-skip" => {
+                let repo = self.repo()?.to_path_buf();
+                let outcome = if verb == "rebase-continue" {
+                    git::rebase_continue(&repo)?
+                } else {
+                    git::rebase_skip(&repo)?
+                };
+                self.refresh(editor)?;
+                editor.apply(EditorCommand::Message(match outcome {
+                    git::RebaseOutcome::Done(msg) => summarize(&msg, "rebase"),
+                    git::RebaseOutcome::Stopped { rebase, .. } => {
+                        if rebase.is_conflicted() {
+                            format!("rebase stopped: {} conflicted", rebase.conflicts.len())
+                        } else {
+                            format!("rebase stopped at {}/{}", rebase.done, rebase.total)
+                        }
+                    }
+                }));
+                Ok(())
+            }
+            // Throws away everything the rebase has done and puts the branch
+            // back. Destructive, hence its own verb and its own key.
+            "rebase-abort" => {
+                let repo = self.repo()?.to_path_buf();
+                git::rebase_abort(&repo)?;
+                self.refresh(editor)?;
+                editor.apply(EditorCommand::Message("rebase aborted".into()));
+                Ok(())
             }
             "stage-all" => {
                 git::stage_all(self.repo()?)?;
@@ -99,13 +200,37 @@ impl Magit {
         }
     }
 
-    /// Re-render the status buffer, keeping it the one `*magit*` buffer.
+    fn view_mut(&mut self) -> anyhow::Result<&mut git::View> {
+        self.view
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no status buffer — run magit-status first"))
+    }
+
+    /// Re-read the repository, then redraw.
     fn refresh(&mut self, editor: &mut Editor) -> anyhow::Result<()> {
         let repo = self.repo()?.to_path_buf();
-        let status = git::status(&repo)?;
-        let (text, lines) = git::render(&status);
+        match self.view.as_mut() {
+            Some(view) => view.refresh(&repo)?,
+            None => self.view = Some(git::View::load(&repo)?),
+        }
+        self.render(editor)
+    }
+
+    /// Redraw from the view as it stands. Folding changed no git state, so
+    /// re-reading the repository for it would be a needless `git status` on
+    /// every `TAB`.
+    fn render(&mut self, editor: &mut Editor) -> anyhow::Result<()> {
+        let view = self
+            .view
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no status buffer — run magit-status first"))?;
+        let (text, lines, spans) = git::render(view);
         self.lines = lines;
         editor.show_special(BufferKind::Magit, &text);
+        // Generated text has no language for the syntax thread, so the status
+        // buffer carries its own spans — in the same faces everything else uses,
+        // so a theme colours magit without knowing magit exists.
+        editor.buffer.highlights = spans.into_iter().map(face_span).collect();
         Ok(())
     }
 
@@ -127,15 +252,11 @@ impl Magit {
         git::repo_root(&from).ok_or_else(|| anyhow::anyhow!("{} is not a git repository", from.display()))
     }
 
-    /// The file named by the line the cursor is on. `None` on a heading or a
-    /// blank, which is why staging there is a message rather than a mistake.
-    fn path_at_cursor(&self, editor: &Editor) -> Option<PathBuf> {
+    /// What the cursor is on. `None` on a blank, which is why acting there is a
+    /// message rather than a mistake.
+    fn line_at_cursor(&self, editor: &Editor) -> Option<&git::Line> {
         let (line, _) = editor.buffer.cursor_line_col();
-        match self.lines.get(line)? {
-            git::Line::File { path, .. } => Some(path.clone()),
-            git::Line::Hunk { path, .. } => Some(path.clone()),
-            _ => None,
-        }
+        self.lines.get(line)
     }
 }
 
@@ -175,6 +296,27 @@ fn strip_comments(text: &str) -> String {
         .filter(|l| !l.trim_start().starts_with(COMMENT))
         .collect();
     body.join("\n").trim().to_string()
+}
+
+/// git names its faces, core owns the enum. Mechanical, and the only place the
+/// two vocabularies meet.
+fn face_span(span: git::Span) -> zemacs_core::Span {
+    use git::Face;
+    zemacs_core::Span {
+        start: span.start,
+        end: span.end,
+        kind: match span.kind {
+            Face::Heading1 => HlKind::Heading1,
+            Face::String => HlKind::String,
+            Face::Keyword => HlKind::Keyword,
+            Face::Link => HlKind::Link,
+            Face::Number => HlKind::Number,
+            Face::Comment => HlKind::Comment,
+            Face::Constant => HlKind::Constant,
+            Face::Bold => HlKind::Bold,
+            Face::Punctuation => HlKind::Punctuation,
+        },
+    }
 }
 
 #[cfg(test)]

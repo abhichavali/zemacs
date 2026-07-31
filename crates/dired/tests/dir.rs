@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use zemacs_dired::{human_size, Line, Listing, Sort, MARK_DELETE, MARK_SELECT};
+use zemacs_dired::{human_size, Face, Line, Listing, Sort, Span, MARK_DELETE, MARK_SELECT};
 
 // ------------------------------------------------------------- scaffolding
 
@@ -108,15 +108,57 @@ fn entry<'a>(listing: &'a Listing, name: &str) -> &'a zemacs_dired::Entry {
         .unwrap_or_else(|| panic!("no entry named {name} in {:?}", names(listing)))
 }
 
-/// The invariant, in one place, since nearly every test wants it.
+/// The invariants, in one place, since nearly every test wants them.
 fn rendered(listing: &Listing, marks: &[Option<char>]) -> (String, Vec<Line>) {
-    let (text, map) = zemacs_dired::render(listing, marks);
+    let (text, map, spans) = zemacs_dired::render(listing, marks);
     assert_eq!(
         text.lines().count(),
         map.len(),
         "text and line map disagree:\n{text}"
     );
+    check_spans(&text, &spans);
     (text, map)
+}
+
+/// Sorted, disjoint, inside the text, and never across a line break — the four
+/// things a renderer walking spans and text together assumes and cannot check.
+fn check_spans(text: &str, spans: &[Span]) {
+    let chars = text.chars().count();
+    let mut previous = 0;
+    for span in spans {
+        assert!(span.start >= previous, "spans out of order at {span:?}");
+        assert!(span.start < span.end, "empty or inverted span {span:?}");
+        assert!(span.end <= chars, "span {span:?} past the end of {chars}");
+        assert!(
+            !slice(text, span).contains('\n'),
+            "span {span:?} crosses a line"
+        );
+        previous = span.end;
+    }
+}
+
+/// What a span covers. By characters, which is the only way its offsets mean
+/// anything, and the reason a test can assert a word rather than a number.
+fn slice(text: &str, span: &Span) -> String {
+    text.chars()
+        .skip(span.start)
+        .take(span.end - span.start)
+        .collect()
+}
+
+/// Every span as the text it covers and its face.
+fn coloured(listing: &Listing, marks: &[Option<char>]) -> Vec<(String, Face)> {
+    let (text, _, spans) = zemacs_dired::render(listing, marks);
+    check_spans(&text, &spans);
+    spans.iter().map(|s| (slice(&text, s), s.kind)).collect()
+}
+
+/// `assert!(faces.contains(...))` with a message that shows what was there.
+fn assert_coloured(faces: &[(String, Face)], text: &str, kind: Face) {
+    assert!(
+        faces.iter().any(|(t, k)| t == text && *k == kind),
+        "expected {text:?} as {kind:?}, got {faces:#?}"
+    );
 }
 
 // ------------------------------------------------------------------ tests
@@ -881,4 +923,132 @@ fn entries_keep_their_real_paths() {
     assert!(!entry.readonly);
     #[cfg(unix)]
     assert_ne!(entry.mode & 0o400, 0, "readable by its owner");
+}
+
+// ------------------------------------------------------------------ colour
+
+#[test]
+fn directory_entries_are_coloured_as_types() {
+    let temp = Temp::new("colour-dirs");
+    temp.dir("src");
+    temp.file("notes.txt", "x\n");
+    let faces = coloured(&list(temp.path()), &[]);
+
+    // `..` is navigation but it is still a directory, and the trailing slash is
+    // part of the name the entry line shows.
+    assert_coloured(&faces, "../", Face::Type);
+    assert_coloured(&faces, "src/", Face::Type);
+    // A plain file is the buffer's foreground and gets no span at all.
+    assert!(
+        !faces.iter().any(|(t, _)| t == "notes.txt"),
+        "a plain file should not be coloured: {faces:#?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn executables_are_coloured_as_functions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = Temp::new("colour-exec");
+    let script = temp.file("run.sh", "#!/bin/sh\n");
+    temp.file("plain.sh", "#!/bin/sh\n");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let faces = coloured(&list(temp.path()), &[]);
+
+    assert_coloured(&faces, "run.sh", Face::Function);
+    assert!(
+        !faces.iter().any(|(t, _)| t == "plain.sh"),
+        "a non-executable file should not be coloured: {faces:#?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_is_a_link_and_its_target_is_dimmed() {
+    let temp = Temp::new("colour-link");
+    let target = temp.dir("builds");
+    symlink(&target, &temp.join("latest"));
+    let faces = coloured(&list(temp.path()), &[]);
+
+    // The link, not the directory it resolves to — the `l` rule, in colour.
+    assert_coloured(&faces, "latest", Face::Link);
+    assert_coloured(&faces, " -> ", Face::Punctuation);
+    assert_coloured(&faces, &target.display().to_string(), Face::Comment);
+}
+
+#[test]
+fn marks_permissions_sizes_and_dates_each_get_their_own_face() {
+    let temp = Temp::new("colour-columns");
+    temp.file("notes.txt", "0123456789\n");
+    let listing = list(temp.path());
+    let index = listing.index_of(OsStr::new("notes.txt")).unwrap();
+    let mut marks = vec![None; listing.entries.len()];
+    marks[index] = Some(MARK_DELETE);
+    let faces = coloured(&listing, &marks);
+
+    assert_coloured(&faces, &MARK_DELETE.to_string(), Face::Constant);
+    assert_coloured(&faces, "11", Face::Number);
+    #[cfg(unix)]
+    assert_coloured(&faces, "-rw-r--r--", Face::Comment);
+    // The mtime is real, so the timestamp column is filled and dimmed.
+    assert!(
+        faces
+            .iter()
+            .any(|(t, k)| *k == Face::Comment && t.len() == 16 && t.starts_with("20")),
+        "no timestamp span: {faces:#?}"
+    );
+    // An unmarked entry contributes no mark span; only the one D exists.
+    assert_eq!(
+        faces.iter().filter(|(_, k)| *k == Face::Constant).count(),
+        1,
+        "{faces:#?}"
+    );
+}
+
+#[test]
+fn the_header_names_the_directory_and_dims_its_summary() {
+    let temp = Temp::new("colour-header");
+    temp.file("one.txt", "x\n");
+    let listing = list(temp.path());
+    let faces = coloured(&listing, &[]);
+
+    assert_coloured(&faces, &temp.path().display().to_string(), Face::Heading1);
+    assert_coloured(&faces, "(2 entries, by name)", Face::Comment);
+}
+
+/// The whole reason the offsets are characters: a name outside ASCII must not
+/// slide every span after it.
+#[test]
+fn span_offsets_are_characters_not_bytes() {
+    let temp = Temp::new("colour-utf8");
+    temp.dir("café");
+    temp.dir("日本語");
+    temp.file("naïve.txt", "x\n");
+    let faces = coloured(&list(temp.path()), &[]);
+
+    // `slice` inside `coloured` counts characters, so these only come out whole
+    // if `render` counted characters too.
+    assert_coloured(&faces, "café/", Face::Type);
+    assert_coloured(&faces, "日本語/", Face::Type);
+    // And the entry *after* the multi-byte ones is still cut in the right place.
+    assert_coloured(&faces, "(4 entries, by name)", Face::Comment);
+    assert!(
+        !faces.iter().any(|(t, _)| t == "naïve.txt"),
+        "a plain file should not be coloured: {faces:#?}"
+    );
+}
+
+/// A control character folds to `?`, one character for one, so the folding
+/// cannot move a span either.
+#[test]
+fn folded_names_keep_their_spans_aligned() {
+    let listing = Listing {
+        dir: PathBuf::from("/tmp"),
+        entries: vec![],
+        show_hidden: false,
+        sort: Sort::Name,
+    };
+    let faces = coloured(&listing, &[]);
+    assert_coloured(&faces, "(empty)", Face::Comment);
 }

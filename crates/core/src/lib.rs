@@ -13,7 +13,11 @@
 pub mod dashboard;
 pub mod evil;
 pub mod frame;
+pub mod marker;
 pub mod minibuffer;
+pub mod modeline;
+pub mod overlay;
+pub mod query;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,7 +26,17 @@ use ropey::Rope;
 
 pub use dashboard::Dashboard;
 pub use frame::{BufferId, Frame, Rect, Window, WindowId};
+pub use marker::{Insertion, MarkerId};
 pub use minibuffer::{CompletionStyle, Prompt, PromptKind};
+pub use overlay::{Image, ImageId, Overlay, OverlayEdit, OverlayId};
+
+/// The editor, as the app and the Lisp image both hold it.
+///
+/// One writer at a time rather than one writer forever: `apply` is still the
+/// only way the document changes, but it is now reachable from the Lisp thread
+/// too. The lock is meant to be held for a single operation — a read, an
+/// `apply`, one frame's drawing — and never across a wait.
+pub type Shared = std::sync::Arc<std::sync::Mutex<Editor>>;
 
 /// Editing mode — the heart of the modal ("Evil") feel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -41,6 +55,11 @@ pub enum Mode {
     Magit,
     /// The directory editor.
     Dired,
+    /// A shell has the keyboard. Almost every key goes to the child process
+    /// rather than to the editor, so this is the one mode whose keymap is
+    /// consulted *instead of* the Evil grammar rather than before it — `d` and
+    /// `j` have to reach the shell.
+    Terminal,
 }
 
 impl Mode {
@@ -54,6 +73,7 @@ impl Mode {
             Mode::Dashboard => "DASHBOARD",
             Mode::Magit => "MAGIT",
             Mode::Dired => "DIRED",
+            Mode::Terminal => "TERM",
         }
     }
 
@@ -68,12 +88,28 @@ impl Mode {
             "dashboard" => Some(Mode::Dashboard),
             "magit" | "git" => Some(Mode::Magit),
             "dired" => Some(Mode::Dired),
+            "terminal" | "term" => Some(Mode::Terminal),
             _ => None,
         }
     }
 
     pub fn is_visual(self) -> bool {
         matches!(self, Mode::Visual | Mode::VisualLine | Mode::VisualBlock)
+    }
+}
+
+impl Key {
+    /// True for the keys a *terminal* has no use for, and which therefore stay
+    /// with the editor even while a shell has the keyboard.
+    ///
+    /// On macOS that is everything involving Command, plus the two modified
+    /// Enters. Ctrl is deliberately excluded: `C-c`, `C-a`, `C-d`, `C-r` and
+    /// `C-w` all belong to the shell, and taking any of them would break it.
+    pub fn is_editor_key(self) -> bool {
+        matches!(
+            self,
+            Key::Meta(_) | Key::CtrlMeta(_) | Key::CtrlEnter | Key::CtrlMetaEnter
+        )
     }
 }
 
@@ -95,11 +131,14 @@ pub enum Key {
     Meta(char),
     /// Both together, `C-M-` in a binding.
     CtrlMeta(char),
-    // ponytail: Enter is the only *named* key that needs modifiers today (the
-    // window splits). Generalize to a modifier bitset over a `Named` enum when
-    // a second one does.
+    // ponytail: three named keys now carry modifiers — the two window splits
+    // and `M-<bs>`. A modifier bitset over a `Named` enum is the real answer and
+    // is getting closer; at four, do it.
     CtrlEnter,
     CtrlMetaEnter,
+    /// `⌘⌫`. Deletes the word before point, and in a terminal is handed to the
+    /// shell, which has its own idea of where a word starts.
+    MetaBackspace,
     Enter,
     Tab,
     Backspace,
@@ -121,6 +160,7 @@ impl Key {
             Key::CtrlMeta(c) => format!("C-M-{}", c.to_ascii_lowercase()),
             Key::CtrlEnter => "C-<ret>".into(),
             Key::CtrlMetaEnter => "C-M-<ret>".into(),
+            Key::MetaBackspace => "M-<bs>".into(),
             Key::Enter => "<ret>".into(),
             Key::Tab => "<tab>".into(),
             Key::Backspace => "<bs>".into(),
@@ -395,6 +435,17 @@ pub enum EditorCommand {
     /// result back as buffer text, the same shape as `OpenFile`.
     Git(String),
 
+    /// A project verb — `"find-file"`, `"switch"`, `"dired"`, `"compile"`,
+    /// `"test"`, `"root"`, `"forget"`. Core has no filesystem in it.
+    Project(String),
+    /// A terminal verb — `"open"` or `"close"`. Core has no processes in it.
+    Term(String),
+    /// A keystroke bound for the shell rather than for the editor. Produced by
+    /// `handle_key` in [`Mode::Terminal`] and consumed by the app, which owns
+    /// the PTY; core never encodes it, since what a terminal wants for a given
+    /// key is terminal knowledge.
+    TermKey(Key),
+
     /// A dired verb — `"open"`, `"up"`, `"enter"`, `"mark"`, `"unmark"`,
     /// `"toggle-marks"`, `"flag-delete"`, `"execute"`, `"rename"`, `"copy"`,
     /// `"mkdir"`, `"toggle-hidden"`, `"refresh"`. Core has no filesystem in it.
@@ -421,7 +472,22 @@ pub enum EditorCommand {
 
     // --- files ---
     OpenFile(PathBuf),
+    /// Open a file and jump to a line, from a `path:line:text` hit — what
+    /// ripgrep prints, and what `consult-ripgrep` picking a match means. One
+    /// command rather than an open followed by a jump, because the jump has to
+    /// happen after the file is read and core cannot do the reading.
+    OpenAt(String),
     SaveFile(Option<PathBuf>),
+
+    /// Change or remove an overlay. Deliberately *not* in
+    /// [`EditorCommand::mutates_document`]: an overlay is drawing rather than
+    /// text, so a face can be put on dired's listing or magit's status without
+    /// the read-only guard refusing it.
+    ///
+    /// Making one is not here — it has to hand a handle back, which a command
+    /// cannot do, so [`Editor::make_overlay`] is a method the way
+    /// [`Editor::make_marker`] is.
+    Overlay(OverlayEdit),
 }
 
 impl EditorCommand {
@@ -445,6 +511,32 @@ impl EditorCommand {
                 | EditorCommand::Redo
                 | EditorCommand::Checkpoint
                 | EditorCommand::SetMode(Mode::Insert)
+        )
+    }
+
+    /// True for the commands `Editor::apply` cannot carry out alone — they need
+    /// the filesystem, a subprocess, the Lisp image, or an OS window, all of
+    /// which live in the app layer.
+    ///
+    /// This is the line the Lisp bridge splits on: everything else a primitive
+    /// applies on the spot, so a read that follows a write sees it. These land
+    /// on the next turn of the main loop instead, which is why
+    /// `(find-file "x")` immediately followed by `(buffer-name)` still reports
+    /// the old buffer. Making them synchronous would mean blocking Lisp on the
+    /// UI thread, and that trade is the whole reason zemacs is not elisp.
+    pub fn needs_app(&self) -> bool {
+        matches!(
+            self,
+            EditorCommand::OpenFile(_)
+                | EditorCommand::SaveFile(_)
+                | EditorCommand::Git(_)
+                | EditorCommand::Dired(_)
+                | EditorCommand::OpenAt(_)
+                | EditorCommand::Project(_)
+                | EditorCommand::Term(_)
+                | EditorCommand::TermKey(_)
+                | EditorCommand::CallLisp(_)
+                | EditorCommand::CloseFrame
         )
     }
 }
@@ -515,6 +607,9 @@ pub enum BufferKind {
     CommitMessage,
     /// A directory listing.
     Dired,
+    /// A shell. Its text is a flattening of the terminal grid, rewritten every
+    /// time the child prints; the grid itself is what gets drawn.
+    Terminal,
 }
 
 impl BufferKind {
@@ -524,6 +619,7 @@ impl BufferKind {
             BufferKind::Dashboard => Mode::Dashboard,
             BufferKind::Magit => Mode::Magit,
             BufferKind::Dired => Mode::Dired,
+            BufferKind::Terminal => Mode::Terminal,
             _ => Mode::Normal,
         }
     }
@@ -532,7 +628,7 @@ impl BufferKind {
     pub fn is_generated(self) -> bool {
         matches!(
             self,
-            BufferKind::Dashboard | BufferKind::Magit | BufferKind::Dired
+            BufferKind::Dashboard | BufferKind::Magit | BufferKind::Dired | BufferKind::Terminal
         )
     }
 }
@@ -557,10 +653,30 @@ pub struct Buffer {
     pub minor_modes: Vec<String>,
     /// Scroll position, parked here while another buffer is on screen.
     pub saved_scroll: usize,
+    /// Unix mode bits of the file behind this buffer, for the modeline. Set by
+    /// the app when the file is read or written; core cannot stat anything.
+    pub file_mode: Option<u32>,
+    /// Syntax spans for *this* buffer's text, recomputed by the app.
+    ///
+    /// Per buffer rather than per editor, and that is the whole point: a split
+    /// showing two files draws both, and parking a buffer keeps its colours
+    /// rather than throwing them away because some other buffer became live.
+    /// Only the live buffer can be edited, so a parked buffer's spans stay
+    /// valid for as long as it is parked.
+    pub highlights: Vec<Span>,
     /// Undo history lives with the buffer, not the editor: switching files
     /// must not let one buffer's `u` restore another's text.
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    /// Markers into *this* text, and they travel with it: the buffer is moved
+    /// between [`Editor::buffer`] and [`Editor::others`] on every switch, so
+    /// riding along is what keeps a marker naming the document it was made in.
+    markers: marker::Markers,
+    /// Overlays over *this* text, travelling with it for the same reason, and
+    /// adjusted by the same `splice`. Per buffer rather than per editor, exactly
+    /// as the undo history is — an overlay is about a document, not about the
+    /// editor that happens to be showing it.
+    overlays: overlay::Overlays,
 }
 
 impl Buffer {
@@ -576,9 +692,23 @@ impl Buffer {
             major_mode: FUNDAMENTAL.into(),
             minor_modes: Vec::new(),
             saved_scroll: 0,
+            file_mode: None,
+            highlights: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
+            markers: marker::Markers::default(),
+            overlays: overlay::Overlays::default(),
         }
+    }
+
+    /// Every overlay on this buffer, in creation order — which is also the
+    /// order the renderer resolves conflicts in, most recent winning.
+    ///
+    /// Public where the markers are not, because the renderer draws *inactive*
+    /// panes too and reaches their buffers through
+    /// [`Editor::buffer_by_id`](Editor::buffer_by_id).
+    pub fn overlays(&self) -> &[overlay::Overlay] {
+        self.overlays.all()
     }
 
     /// Display name for the status line and the buffer switcher.
@@ -592,6 +722,7 @@ impl Buffer {
             (None, BufferKind::Scratch) => "*scratch*".into(),
             (None, BufferKind::Magit) => "*magit*".into(),
             (None, BufferKind::Dired) => "*dired*".into(),
+            (None, BufferKind::Terminal) => "*terminal*".into(),
             (None, BufferKind::CommitMessage) => "COMMIT_EDITMSG".into(),
             (None, BufferKind::Text) => "*untitled*".into(),
         }
@@ -624,6 +755,18 @@ impl Buffer {
         });
         self.text = snap.text;
         self.cursor = snap.cursor.min(self.text.len_chars());
+        // A snapshot is a whole rope, not a diff, so there is no edit to run the
+        // markers through: they keep the positions they had and are pulled back
+        // inside the restored text. Undoing the very edit that moved a marker
+        // therefore leaves it approximately rather than exactly where it was —
+        // but never outside the document, which is the invariant a marker owes
+        // its holder. ponytail: exact would mean recording edits instead of
+        // snapshots, which is a different undo system.
+        self.markers.clamp(self.text.len_chars());
+        // Same argument, and one more consequence: an overlay clamped down to
+        // nothing is dropped, so undoing the insertion of a LaTeX fragment takes
+        // its preview with it rather than leaving an image over other text.
+        self.overlays.clamp(self.text.len_chars());
         self.modified = true;
         true
     }
@@ -681,31 +824,49 @@ impl Buffer {
         start
     }
 
-    fn insert_char(&mut self, c: char) {
-        self.text.insert_char(self.cursor.min(self.len_chars()), c);
-        self.cursor += 1;
+    /// Replace `removed` characters at `start` with `text` — the only place the
+    /// rope is edited, so it is also the only place markers have to be moved.
+    ///
+    /// Every editing operation is a splice, and funnelling them here rather than
+    /// adjusting at each call site is the point: a mutation path that forgets to
+    /// adjust is exactly the bug markers exist to prevent, and one that forgets
+    /// to *splice* does not compile.
+    fn splice(&mut self, start: usize, removed: usize, text: &str) {
+        let start = start.min(self.len_chars());
+        let removed = removed.min(self.len_chars() - start);
+        if removed > 0 {
+            self.text.remove(start..start + removed);
+        }
+        if !text.is_empty() {
+            self.text.insert(start, text);
+        }
+        let inserted = text.chars().count();
+        self.markers.adjust(start, removed, inserted);
+        self.overlays.adjust(start, removed, inserted);
         self.modified = true;
     }
 
+    fn insert_char(&mut self, c: char) {
+        self.insert_text(c.encode_utf8(&mut [0; 4]));
+    }
+
     fn insert_text(&mut self, s: &str) {
-        self.text.insert(self.cursor.min(self.len_chars()), s);
-        self.cursor += s.chars().count();
-        self.modified = true;
+        let at = self.cursor.min(self.len_chars());
+        self.splice(at, 0, s);
+        self.cursor = at + s.chars().count();
     }
 
     fn delete_backward(&mut self) {
         if self.cursor > 0 {
-            self.text.remove(self.cursor - 1..self.cursor);
+            self.splice(self.cursor - 1, 1, "");
             self.cursor -= 1;
-            self.modified = true;
         }
     }
 
     fn delete_forward(&mut self) {
         let (line, col) = self.cursor_line_col();
         if col < self.line_len(line) {
-            self.text.remove(self.cursor..self.cursor + 1);
-            self.modified = true;
+            self.splice(self.cursor, 1, "");
         }
     }
 
@@ -715,9 +876,8 @@ impl Buffer {
         if start >= end {
             return;
         }
-        self.text.remove(start..end);
+        self.splice(start, end - start, "");
         self.cursor = start.min(self.len_chars());
-        self.modified = true;
     }
 
     /// The last complete top-level `(...)` form ending at or before `pos`.
@@ -821,6 +981,24 @@ pub struct Editor {
     pub frames: Vec<frame::Frame>,
     pub focus_frame: usize,
     next_buffer_id: BufferId,
+    next_marker_id: MarkerId,
+    next_overlay_id: OverlayId,
+    /// Every bitmap an overlay can point at, keyed by what produced it — a hash
+    /// of the LaTeX source, the dpi and the colour, so previewing the same
+    /// fragment twice is one entry and the renderer's texture for it survives.
+    ///
+    /// Per *editor* rather than per buffer: it is a cache of rendered pixels,
+    /// like the theme is a table of colours, and nothing about it belongs to one
+    /// document. ponytail: nothing evicts. The set is bounded by the distinct
+    /// fragments a session actually previews, which is small — the day it is
+    /// not, drop entries no buffer's overlays still name.
+    images: HashMap<ImageId, Image>,
+    /// The em, in the device pixels the renderer draws with — `font_size` times
+    /// the display's scale factor, which core cannot know and the renderer parks
+    /// here once a frame, exactly as it does `viewport_lines`. A LaTeX preview
+    /// has to be rasterised at this size or it comes out half-height on a
+    /// Retina display.
+    pub font_px: f32,
     /// Command names published by the Lisp image, for `M-x` completion.
     pub commands: Vec<String>,
     /// Mode hooks waiting to be run. Core records that a hook is due; the app
@@ -844,10 +1022,12 @@ pub struct Editor {
     pub prompt: Option<Prompt>,
     /// Last message, shown in the status line.
     pub status: String,
+    /// Every message, oldest first, capped at [`MESSAGE_LIMIT`]. The status line
+    /// only ever shows the last one, so this is the only record that a message
+    /// which was immediately replaced was ever produced at all.
+    pub messages: Vec<String>,
     pub should_quit: bool,
 
-    /// Highlight spans for the current buffer, recomputed by the app.
-    pub highlights: Vec<Span>,
     /// Bumped on every document mutation; the app re-highlights when it moves.
     pub revision: u64,
 
@@ -871,7 +1051,15 @@ pub struct Editor {
 
     register: String,
     register_linewise: bool,
+    /// clipboard: bumped on every write to the unnamed register, so the app
+    /// layer can tell "the register changed" from "the register is big" with an
+    /// integer compare rather than by diffing the text once a frame.
+    register_revision: u64,
     last_search: String,
+    /// vim-agent: named registers, macros and marks. One field rather than
+    /// five, and the struct lives in [`evil`] with everything else that reads
+    /// it — none of this is the document, so none of it belongs to `apply`.
+    pub(crate) vim: evil::Vim,
 }
 
 impl Default for Editor {
@@ -881,6 +1069,8 @@ impl Default for Editor {
 }
 
 const UNDO_LIMIT: usize = 500;
+/// How many messages [`Editor::messages`] keeps before dropping the oldest.
+pub const MESSAGE_LIMIT: usize = 500;
 
 impl Editor {
     pub fn new() -> Self {
@@ -899,6 +1089,12 @@ impl Editor {
             frames: vec![frame::Frame::new(0)],
             focus_frame: 0,
             next_buffer_id: 2,
+            // 1, so 0 is never a live marker and whatever Lisp coerces to zero
+            // reads as "gone" rather than as somebody else's position.
+            next_marker_id: 1,
+            next_overlay_id: 1,
+            images: HashMap::new(),
+            font_px: Settings::default().font_size,
             commands: Vec::new(),
             pending_hooks: Vec::new(),
             mode: Mode::Dashboard,
@@ -909,8 +1105,8 @@ impl Editor {
             mode_keymap: HashMap::new(),
             prompt: None,
             status: String::from("zemacs — Common Lisp inside."),
+            messages: Vec::new(),
             should_quit: false,
-            highlights: Vec::new(),
             revision: 0,
             scroll: 0,
             viewport_lines: 24,
@@ -920,7 +1116,9 @@ impl Editor {
             desired_col: None,
             register: String::new(),
             register_linewise: false,
+            register_revision: 0,
             last_search: String::new(),
+            vim: evil::Vim::default(), // vim-agent
         }
     }
 
@@ -957,9 +1155,14 @@ impl Editor {
         self.buffer.modified = false;
         self.buffer.undo.clear();
         self.buffer.redo.clear();
+        // Regenerated text, so every marker into the old listing names a line
+        // that may not even be there any more. Overlays go the same way: dired
+        // and magit put their faces back on every refresh anyway.
+        self.buffer.markers.clear();
+        self.buffer.overlays.clear();
         self.buffer.move_to_line_col(line, 0);
         self.mode = kind.mode();
-        self.highlights.clear();
+        self.buffer.highlights.clear();
         self.revision += 1;
 
         let (id, cursor) = (self.buffer.id, self.buffer.cursor);
@@ -1035,7 +1238,11 @@ impl Editor {
         self.buffer.cursor = w.cursor.min(self.buffer.len_chars());
         self.scroll = w.scroll;
         self.viewport_lines = w.viewport_lines;
-        self.highlights.clear();
+        // Deliberately *not* clearing highlights: this is a buffer swap, not
+        // an edit, and the incoming buffer's spans still describe its own
+        // unchanged text. Clearing here is what made a split lose its colours
+        // the moment focus moved between panes.  The revision bump below still
+        // invalidates any parse that was in flight for the outgoing buffer.
         self.revision += 1;
         self.mode = self.buffer.kind.mode();
     }
@@ -1063,7 +1270,11 @@ impl Editor {
         std::mem::swap(&mut self.buffer, &mut incoming);
         self.others.insert(0, incoming);
         self.scroll = self.buffer.saved_scroll;
-        self.highlights.clear();
+        // Deliberately *not* clearing highlights: this is a buffer swap, not
+        // an edit, and the incoming buffer's spans still describe its own
+        // unchanged text. Clearing here is what made a split lose its colours
+        // the moment focus moved between panes.  The revision bump below still
+        // invalidates any parse that was in flight for the outgoing buffer.
         self.revision += 1;
         self.status = format!("switched to {}", self.buffer.name());
         self.mode = self.buffer.kind.mode();
@@ -1122,6 +1333,7 @@ impl Editor {
             } => {
                 self.register = self.buffer.slice_string(start, end);
                 self.register_linewise = linewise;
+                self.register_revision += 1; // clipboard
                 let n = self.register.chars().count();
                 self.status = format!("yanked {n} chars");
             }
@@ -1129,6 +1341,7 @@ impl Editor {
                 let n = text.chars().count();
                 self.register = text;
                 self.register_linewise = linewise;
+                self.register_revision += 1; // clipboard
                 self.status = format!("yanked {n} chars");
             }
             EditorCommand::Paste { after } => self.paste(after),
@@ -1143,7 +1356,17 @@ impl Editor {
                 self.mode = Mode::Dashboard;
                 self.dashboard.selected = 0;
             }
-            EditorCommand::Message(m) => self.status = m,
+            EditorCommand::Message(m) => {
+                // The status line shows one message; the log keeps the rest.
+                // Without it a burst — a config load, a command that reports
+                // twice — is indistinguishable from its last line, and there is
+                // nothing to look at afterwards. This is what `*Messages*` is.
+                if self.messages.len() == MESSAGE_LIMIT {
+                    self.messages.remove(0);
+                }
+                self.messages.push(m.clone());
+                self.status = m;
+            }
             EditorCommand::Quit => self.should_quit = true,
 
             EditorCommand::SetFontSize(s) => self.settings.font_size = s.clamp(4.0, 400.0),
@@ -1276,6 +1499,19 @@ impl Editor {
                         .insert((mode, normalize_keys(&keys)), command);
                 }
             },
+            EditorCommand::Overlay(edit) => {
+                let drops = matches!(
+                    edit,
+                    OverlayEdit::Delete(_) | OverlayEdit::RemoveIn(..) | OverlayEdit::Image(_, None)
+                );
+                self.buffer.overlays.edit(edit);
+                // Only when an overlay could have let go of one: an image nobody
+                // points at is a few hundred KB and a texture the renderer will
+                // never draw again.
+                if drops {
+                    self.prune_images();
+                }
+            }
             // The app intercepts these; reaching `apply` means nothing is listening.
             EditorCommand::CallLisp(name) => {
                 self.status = format!("no Lisp runtime to call {name}")
@@ -1284,7 +1520,16 @@ impl Editor {
             EditorCommand::Dired(verb) => {
                 self.status = format!("no filesystem backend for {verb}")
             }
+            EditorCommand::Term(verb) => self.status = format!("no terminal backend for {verb}"),
+            EditorCommand::Project(verb) => {
+                self.status = format!("no project backend for {verb}")
+            }
+            // Only reachable with no app under core — a keystroke aimed at a
+            // shell that is not there is nothing, not an error worth reporting
+            // on every key.
+            EditorCommand::TermKey(_) => {}
             EditorCommand::OpenFile(p) => self.status = format!("cannot open {}", p.display()),
+            EditorCommand::OpenAt(hit) => self.status = format!("cannot open {hit}"),
             EditorCommand::SaveFile(_) => self.status = "cannot save: no file backend".into(),
         }
         if self.revision != before && !history {
@@ -1326,6 +1571,11 @@ impl Editor {
         self.buffer.modified = false;
         self.buffer.undo.clear();
         self.buffer.redo.clear();
+        // A different document: the markers of the buffer that was here went
+        // with it onto the stack, and any left are stale by the same argument
+        // that clears the undo history.
+        self.buffer.markers.clear();
+        self.buffer.overlays.clear();
         self.buffer.kind = BufferKind::Text;
         // The major mode follows the file, and its hook fires so `init.lisp`
         // can react — `(defun org-mode-hook () ...)` is the whole extension
@@ -1334,7 +1584,7 @@ impl Editor {
         self.buffer.major_mode = major.clone();
         self.buffer.minor_modes.clear();
         self.pending_hooks.push(format!("{major}-hook"));
-        self.highlights.clear();
+        self.buffer.highlights.clear();
         self.revision += 1;
         self.scroll = 0;
         self.mode = Mode::Normal;
@@ -1429,6 +1679,106 @@ impl Editor {
         }
     }
 
+    /// A marker at `pos` in the live buffer, as a handle Lisp can hold.
+    ///
+    /// Ids are handed out per *editor* rather than per buffer, so a handle can
+    /// never name a marker in the buffer you have since switched to: the answer
+    /// for a marker belonging elsewhere is "gone", never someone else's offset.
+    pub fn make_marker(&mut self, pos: usize, insertion: Insertion) -> MarkerId {
+        let id = self.next_marker_id;
+        self.next_marker_id += 1;
+        let pos = pos.min(self.buffer.len_chars());
+        self.buffer.markers.add(id, pos, insertion);
+        id
+    }
+
+    /// Where a marker is now, or `None` if it was deleted, never existed, or
+    /// belongs to a buffer that is not the live one.
+    ///
+    /// Clamped on the way out: the rope is replaced whole by undo and by a
+    /// reload, so the buffer's current length has the last word on any position.
+    pub fn marker_position(&self, id: MarkerId) -> Option<usize> {
+        let n = self.buffer.len_chars();
+        self.buffer.markers.position(id).map(|p| p.min(n))
+    }
+
+    pub fn set_marker(&mut self, id: MarkerId, pos: usize) {
+        let pos = pos.min(self.buffer.len_chars());
+        self.buffer.markers.set(id, pos);
+    }
+
+    pub fn delete_marker(&mut self, id: MarkerId) {
+        self.buffer.markers.remove(id);
+    }
+
+    // --- overlays ---------------------------------------------------------
+    //
+    // Everything that *changes* one is an `EditorCommand::Overlay`, since it
+    // needs no answer. These three are the exceptions: one hands a handle back,
+    // and two are questions.
+
+    /// An overlay over `[start, end)` in the live buffer, as a handle Lisp can
+    /// hold. `0` — never a live overlay — for an empty or inverted range, which
+    /// is what arithmetic in Lisp produces and not something to panic on.
+    ///
+    /// Ids come from the *editor*, like marker ids, so a handle can never name
+    /// an overlay in the buffer you have since switched to.
+    pub fn make_overlay(&mut self, start: usize, end: usize) -> OverlayId {
+        let n = self.buffer.len_chars();
+        let (start, end) = (start.min(n), end.min(n));
+        if start >= end {
+            return 0;
+        }
+        let id = self.next_overlay_id;
+        self.next_overlay_id += 1;
+        self.buffer.overlays.add(id, start, end);
+        id
+    }
+
+    /// `(start, end)` now, or `None` if it was deleted, never existed, or
+    /// belongs to a buffer that is not the live one — the same contract
+    /// [`Editor::marker_position`] has.
+    pub fn overlay_span(&self, id: OverlayId) -> Option<(usize, usize)> {
+        self.buffer.overlays.span(id)
+    }
+
+    /// Every overlay overlapping `[start, end)` of the live buffer, oldest
+    /// first, as `(id, start, end)`.
+    pub fn overlays_in(&self, start: usize, end: usize) -> Vec<(OverlayId, usize, usize)> {
+        self.buffer
+            .overlays
+            .in_range(start, end)
+            .map(|o| (o.id, o.start, o.end))
+            .collect()
+    }
+
+    /// Remember a rendered bitmap under `id`, which the caller derived from
+    /// whatever produced it. Already present is a no-op, which is the point:
+    /// previewing the same fragment twice reuses the renderer's texture.
+    pub fn add_image(&mut self, id: ImageId, image: Image) {
+        self.images.entry(id).or_insert(image);
+    }
+
+    pub fn image(&self, id: ImageId) -> Option<&Image> {
+        self.images.get(&id)
+    }
+
+    pub fn has_image(&self, id: ImageId) -> bool {
+        self.images.contains_key(&id)
+    }
+
+    /// Drop bitmaps no overlay in any buffer still names.
+    fn prune_images(&mut self) {
+        if self.images.is_empty() {
+            return;
+        }
+        let live: std::collections::HashSet<ImageId> = std::iter::once(&self.buffer)
+            .chain(self.others.iter())
+            .flat_map(|b| b.overlays.images())
+            .collect();
+        self.images.retain(|id, _| live.contains(id));
+    }
+
     fn checkpoint(&mut self) {
         let buf = &mut self.buffer;
         if let Some(last) = buf.undo.last() {
@@ -1463,6 +1813,33 @@ impl Editor {
             }
             false => "already at newest change".into(),
         };
+    }
+
+    // --- the unnamed register --------------------------------------------
+    //
+    // clipboard: `select-enable-clipboard t` is set in the config, which in
+    // Emacs means the kill ring *is* the system clipboard. Core cannot talk to
+    // the window system, so it exposes the register and the app layer does the
+    // mirroring — the same division as reading a file.
+
+    /// vim's `""` — what `p` pastes, and what every yank and delete fills.
+    pub fn register(&self) -> (&str, bool) {
+        (&self.register, self.register_linewise)
+    }
+
+    /// Bumped on every write, so a mirror can poll with an integer compare
+    /// rather than by diffing a possibly large string once a frame.
+    pub fn register_revision(&self) -> u64 {
+        self.register_revision
+    }
+
+    /// Fill the register *without* the "yanked N chars" status `SetRegister`
+    /// sets: text arriving from the system clipboard was not yanked here, and
+    /// claiming it was would wipe whatever the last real command reported.
+    pub fn adopt_register(&mut self, text: String, linewise: bool) {
+        self.register = text;
+        self.register_linewise = linewise;
+        self.register_revision += 1;
     }
 
     fn paste(&mut self, after: bool) {
@@ -1554,6 +1931,12 @@ impl Editor {
     }
 
     /// The text the status / prompt line should display.
+    /// The half-typed key sequence, for the modeline. `pending` is private, so
+    /// this is how anything outside core sees a which-key trail.
+    pub fn pending_hint(&self) -> String {
+        self.pending.hint()
+    }
+
     pub fn status_line(&self) -> String {
         if let Some(p) = &self.prompt {
             return p.line();
@@ -1670,6 +2053,182 @@ mod tests {
         assert_eq!(normalize_keys("M-+"), "M-+");
         assert_eq!(normalize_keys("SPC"), "SPC");
         assert_eq!(normalize_keys("-"), "-");
+    }
+
+    /// An editor in Insert mode with one marker, so an edit can be aimed
+    /// anywhere in the text without the Normal-mode cursor clamp getting in the
+    /// way.
+    fn marked(text: &str, at: usize) -> (Editor, MarkerId) {
+        let mut ed = fresh(text);
+        ed.apply(EditorCommand::SetMode(Mode::Insert));
+        let m = ed.make_marker(at, Insertion::Stay);
+        (ed, m)
+    }
+
+    #[test]
+    fn a_marker_still_names_its_character_after_typing_in_front_of_it() {
+        let (mut ed, m) = marked("alpha beta", 6);
+        assert_eq!(ed.buffer.slice_string(6, 10), "beta");
+        ed.apply(EditorCommand::MoveTo(0));
+        ed.apply(EditorCommand::InsertText("xy".into()));
+        assert_eq!(ed.marker_position(m), Some(8));
+        assert_eq!(ed.buffer.slice_string(8, 12), "beta");
+    }
+
+    /// The reason every edit is a splice: a path that forgets to adjust is the
+    /// bug markers exist to prevent, so each of them is checked by name.
+    #[test]
+    fn every_editing_command_moves_a_marker_that_follows_it() {
+        let cases = [
+            (vec![EditorCommand::InsertChar('z')], 6),
+            (vec![EditorCommand::InsertText("zz".into())], 7),
+            (vec![EditorCommand::InsertNewline], 6),
+            (vec![EditorCommand::DeleteForward], 4),
+            (vec![EditorCommand::DeleteRange(0, 2)], 3),
+            (
+                vec![EditorCommand::MoveTo(3), EditorCommand::DeleteBackward],
+                4,
+            ),
+            (
+                vec![
+                    EditorCommand::SetRegister {
+                        text: "pp".into(),
+                        linewise: false,
+                    },
+                    EditorCommand::Paste { after: false },
+                ],
+                7,
+            ),
+        ];
+        for (cmds, want) in cases {
+            let (mut ed, m) = marked("abcdef", 5);
+            for cmd in cmds.clone() {
+                ed.apply(cmd);
+            }
+            assert_eq!(ed.marker_position(m), Some(want), "after {cmds:?}");
+        }
+    }
+
+    #[test]
+    fn a_marker_is_never_past_the_end_of_its_buffer() {
+        let (mut ed, m) = marked("alpha beta", 10);
+        ed.apply(EditorCommand::DeleteRange(0, 10));
+        assert_eq!(ed.marker_position(m), Some(0));
+        assert_eq!(ed.buffer.len_chars(), 0);
+    }
+
+    #[test]
+    fn undo_keeps_markers_inside_the_restored_text() {
+        let (mut ed, m) = marked("alpha", 0);
+        ed.apply(EditorCommand::Checkpoint);
+        ed.apply(EditorCommand::MoveTo(5));
+        ed.apply(EditorCommand::InsertText(" and beta".into()));
+        ed.set_marker(m, 12);
+        ed.apply(EditorCommand::Undo);
+        assert_eq!(ed.buffer.text.to_string(), "alpha");
+        // Undo restores a snapshot rather than replaying the edit backwards, so
+        // a marker beyond the restored end is clamped onto it.
+        assert_eq!(ed.marker_position(m), Some(5));
+
+        // ...and one that still fits keeps the position it had, which is what
+        // makes it survive an undo at all.
+        let (mut ed, m) = marked("alpha beta", 6);
+        ed.apply(EditorCommand::Checkpoint);
+        ed.apply(EditorCommand::MoveTo(0));
+        ed.apply(EditorCommand::InsertText("xy".into()));
+        assert_eq!(ed.marker_position(m), Some(8));
+        ed.apply(EditorCommand::Undo);
+        assert_eq!(ed.marker_position(m), Some(8));
+    }
+
+    #[test]
+    fn markers_belong_to_the_buffer_they_were_made_in() {
+        let (mut ed, m) = marked("alpha", 3);
+        ed.load("elsewhere", Some(PathBuf::from("/tmp/elsewhere")), None);
+        assert_eq!(ed.marker_position(m), None, "another buffer's marker");
+        // Editing the other buffer must not move it either.
+        ed.apply(EditorCommand::SetMode(Mode::Insert));
+        ed.apply(EditorCommand::InsertText("xxxx".into()));
+        ed.switch_buffer(1);
+        assert_eq!(ed.buffer.text.to_string(), "alpha");
+        assert_eq!(ed.marker_position(m), Some(3));
+    }
+
+    #[test]
+    fn a_deleted_marker_reads_as_gone_rather_than_as_a_position() {
+        let (mut ed, m) = marked("alpha", 3);
+        ed.delete_marker(m);
+        assert_eq!(ed.marker_position(m), None);
+        // Deleting it twice, or a handle that was never a marker, is not an error.
+        ed.delete_marker(m);
+        ed.set_marker(m, 1);
+        assert_eq!(ed.marker_position(m), None);
+        assert_eq!(ed.marker_position(9999), None);
+    }
+
+    /// Highlights belong to the buffer, not to the editor. A split showing two
+    /// files draws both, and moving focus between panes must not cost either of
+    /// them its colours — which is what a single editor-wide span list did.
+    #[test]
+    fn highlights_survive_a_buffer_switch() {
+        let mut ed = Editor::new();
+        ed.load("fn main() {}", None, Some("rust".into()));
+        let first = ed.buffer.id;
+        ed.buffer.highlights = vec![Span {
+            start: 0,
+            end: 2,
+            kind: HlKind::Keyword,
+        }];
+
+        // Park it behind another buffer, colour that one too...
+        ed.apply(EditorCommand::SwitchBuffer(1));
+        assert_ne!(ed.buffer.id, first, "a different buffer is live");
+        ed.buffer.highlights = vec![Span {
+            start: 0,
+            end: 1,
+            kind: HlKind::String,
+        }];
+        let second = ed.buffer.id;
+
+        // ...and the parked one still has its own.
+        let parked = ed
+            .others
+            .iter()
+            .find(|b| b.id == first)
+            .expect("the first buffer is parked, not gone");
+        assert_eq!(parked.highlights.len(), 1);
+        assert_eq!(parked.highlights[0].kind, HlKind::Keyword);
+
+        // Coming back keeps them, and does not inherit the other buffer's.
+        let back = ed.buffer_names().iter().position(|n| n.contains("untitled"));
+        let _ = back;
+        ed.apply(EditorCommand::SwitchBuffer(1));
+        assert_eq!(ed.buffer.id, first);
+        assert_eq!(ed.buffer.highlights[0].kind, HlKind::Keyword);
+        assert_ne!(ed.buffer.id, second);
+    }
+
+    /// ...but a buffer whose *text* was replaced has no business keeping spans
+    /// that described the old text.
+    #[test]
+    fn regenerated_text_drops_its_highlights() {
+        let mut ed = Editor::new();
+        ed.load("fn main() {}", None, Some("rust".into()));
+        ed.buffer.highlights = vec![Span {
+            start: 0,
+            end: 2,
+            kind: HlKind::Keyword,
+        }];
+        ed.load("something else entirely", None, None);
+        assert!(ed.buffer.highlights.is_empty());
+
+        ed.buffer.highlights = vec![Span {
+            start: 0,
+            end: 2,
+            kind: HlKind::Keyword,
+        }];
+        ed.show_special(BufferKind::Dired, "a listing");
+        assert!(ed.buffer.highlights.is_empty());
     }
 
     #[test]

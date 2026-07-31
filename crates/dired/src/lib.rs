@@ -9,10 +9,12 @@
 //!   Everything goes through [`std::fs`] — no `ls`, no shelling out. Unlike git,
 //!   there is no porcelain to parse here, and the platform call *is* the API.
 //! * **Presentation** ([`render`]): a pure function from a [`Listing`] plus the
-//!   user's marks to the buffer's *text* plus one [`Line`] per line of that
-//!   text. The UI draws the string and, when the cursor sits on line 12 and the
-//!   user presses `d`, looks up `lines[12]` to learn which file to flag. The two
-//!   returns must therefore always have the same length — see [`render()`].
+//!   user's marks to the buffer's *text*, one [`Line`] per line of that text,
+//!   and the [`Span`]s that colour it. The UI draws the string and, when the
+//!   cursor sits on line 12 and the user presses `d`, looks up `lines[12]` to
+//!   learn which file to flag. Text and map must therefore always have the same
+//!   length — see [`render()`]. The spans name faces ([`Face`]) rather than
+//!   colours, so a dired buffer picks up whatever theme is loaded for free.
 //!
 //! Why an [`OsString`] name and a [`PathBuf`] path on every [`Entry`]: on unix a
 //! file name is bytes, not text, and `b"caf\xe9.rs"` (latin-1) is a perfectly
@@ -38,7 +40,7 @@ use std::time::SystemTime;
 use anyhow::{bail, Context, Result};
 
 pub mod render;
-pub use render::{human_size, render, Line, MARK_DELETE, MARK_SELECT};
+pub use render::{human_size, render, Face, Line, Span, MARK_DELETE, MARK_SELECT};
 
 /// One directory entry, as one line of the dired buffer.
 ///

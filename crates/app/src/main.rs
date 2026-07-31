@@ -17,6 +17,7 @@
 //! both vectors at once, so nothing may remove from one alone.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use sdl2::event::{Event, WindowEvent};
@@ -30,8 +31,12 @@ use zemacs_render::Renderer;
 
 mod dired;
 mod magit;
+mod project;
+mod term;
 use dired::Dired;
 use magit::Magit;
+use project::Project;
+use term::Term;
 
 const RECENT_LIMIT: usize = 10;
 const RECENT_ON_DASHBOARD: usize = 5;
@@ -172,6 +177,27 @@ fn close_frame<R>(editor: &mut Editor, renderers: &mut Vec<R>, index: usize) {
     editor.focus_frame = focus_after_close(focus, index, before);
 }
 
+/// Hints that have to be set *before* `sdl2::init`, because SDL reads them
+/// while it is registering the application with Cocoa.
+///
+/// The green button is the one that needs saying out loud: without
+/// `FULLSCREEN_SPACES`, SDL marks its windows `FullScreenAuxiliary`, macOS
+/// disables zoom, and the button sits there doing nothing. With it, green is
+/// native fullscreen, which is what it means everywhere else on the system.
+///
+/// `MAC_BACKGROUND_APP=0` asks for a *regular* application — one with a dock
+/// icon that can be activated. A process launched straight from a terminal can
+/// otherwise end up as an accessory, and an accessory's windows do not take
+/// keyboard focus properly, which is the same root cause as a new frame not
+/// receiving typing.
+fn mac_window_hints() {
+    sdl2::hint::set("SDL_VIDEO_MAC_FULLSCREEN_SPACES", "1");
+    sdl2::hint::set("SDL_HINT_MAC_BACKGROUND_APP", "0");
+    // Ctrl-click is a right click on this platform, and taking it would make
+    // the trackpad's own secondary click unreachable.
+    sdl2::hint::set("SDL_MAC_CTRL_CLICK_EMULATE_RIGHT_CLICK", "1");
+}
+
 /// Where focus lands once the frame at `closed` is removed from `before`
 /// frames: still on the frame the user was using, shifted down by one if it sat
 /// after the hole, and clamped when the focused frame is the one that went.
@@ -181,6 +207,7 @@ fn focus_after_close(focus: usize, closed: usize, before: usize) -> usize {
 }
 
 fn main() -> anyhow::Result<()> {
+    mac_window_hints();
     let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL init: {e}"))?;
     // One renderer per frame, in frame order. See the module docs.
     let mut renderers = vec![Renderer::new(&sdl, "zemacs", WINDOW_W, WINDOW_H)?];
@@ -198,22 +225,28 @@ fn main() -> anyhow::Result<()> {
     let init_path = resolve_init_path();
     let (tx, rx): (Sender<EditorCommand>, Receiver<EditorCommand>) =
         crossbeam_channel::unbounded();
-    let lisp = zemacs_lisp::spawn(tx, init_path.clone());
+
+    // The editor is shared with the Lisp image, which reads and edits it
+    // directly rather than only being able to shout commands at it. Seeded
+    // before `spawn` so `init.lisp` cannot observe a half-built dashboard.
+    let shared: zemacs_core::Shared = Default::default();
+    {
+        let mut editor = shared.lock().expect("fresh mutex");
+        seed_dashboard(&mut editor, &init_path, &renderers[0].backend());
+        // Any file named on the command line opens instead of the dashboard.
+        if let Some(arg) = std::env::args().nth(1) {
+            open_file(&mut editor, &PathBuf::from(arg), &init_path);
+        }
+    }
+    let lisp = zemacs_lisp::spawn(tx, shared.clone(), init_path.clone());
 
     // Thread three: highlighting. The main thread owns input and drawing, the
     // Lisp thread owns the image, and neither ever waits on a parse.
     let highlighter = zemacs_syntax::spawn_worker();
 
-    let mut editor = Editor::new();
-    seed_dashboard(&mut editor, &init_path, &renderers[0].backend());
-
-    // Any file named on the command line opens instead of the dashboard.
-    if let Some(arg) = std::env::args().nth(1) {
-        open_file(&mut editor, &PathBuf::from(arg), &init_path);
-    }
-
     let mut last_revision = u64::MAX;
     let mut last_file_query: Option<String> = None;
+    let mut last_grep: Option<String> = None;
     let mut keys: Vec<Key> = Vec::new();
     // macOS composes text for Option combos (⌥- is –, ⌥= is ≠) and SDL2 has no
     // hint to turn that off — SDL_MAC_OPTION_AS_ALT is SDL3-only. So an Alt
@@ -225,8 +258,17 @@ fn main() -> anyhow::Result<()> {
     let mut cursors = Cursors::new();
     let mut magit = Magit::default();
     let mut dired = Dired::default();
+    let mut term = Term::default();
+    let mut project = Project::default();
+    let mut last_autosave = Instant::now();
+    let mut clipboard = Clipboard::new(&video);
 
     'main: loop {
+        // Held for this whole iteration except the present at the bottom, which
+        // is where the frame's idle time actually is. A Lisp primitive waits at
+        // most for one iteration's worth of input handling and drawing, never
+        // for the display — that is what keeps a slow config from being felt.
+        let mut editor = shared.lock().unwrap_or_else(|e| e.into_inner());
         keys.clear();
         // At most one window closes per iteration: a close shifts every later
         // frame index down, and the rest of this batch was routed against the
@@ -236,6 +278,12 @@ fn main() -> anyhow::Result<()> {
         for event in pump.poll_iter() {
             match event {
                 Event::Quit { .. } => break 'main,
+                // Event-driven rather than polled: reading the clipboard is a
+                // trip through the window server, and SDL is already watching
+                // it for us. ponytail: if a platform turns out not to raise
+                // this, the fallback is a once-a-second pull beside the
+                // auto-save timer — same call, worse latency.
+                Event::ClipboardUpdate { .. } => clipboard.pull(&mut editor),
                 Event::Window {
                     window_id,
                     win_event,
@@ -262,7 +310,7 @@ fn main() -> anyhow::Result<()> {
                             // live buffer belongs to the focused window, so
                             // core has to park it and adopt the new frame's.
                             let cmd = EditorCommand::FocusFrame(i);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired);
+                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
                         }
                     }
                     WindowEvent::Close => {
@@ -308,10 +356,26 @@ fn main() -> anyhow::Result<()> {
                             &mut renderers,
                             &mut magit,
                             &mut dired,
+                            &mut term,
+                            &mut project,
                         );
                         if let Some(window) = mouse.press(&editor.frames[i], i, area, x, y) {
                             let cmd = EditorCommand::FocusWindow(window);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired);
+                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                        }
+                        // A program that asked for mouse events gets the click:
+                        // that is what makes vim, htop and tmux usable in here.
+                        // Focusing the pane happened first, so clicking into an
+                        // unfocused terminal both focuses it and reaches the
+                        // program in one gesture.
+                        if editor.mode == zemacs_core::Mode::Terminal {
+                            let (col, row) = cell_at(&editor, &renderers, x, y);
+                            term.mouse(zemacs_term::Mouse {
+                                button: zemacs_term::Button::Left,
+                                kind: zemacs_term::MouseKind::Press,
+                                col,
+                                row,
+                            });
                         }
                     }
                 }
@@ -373,10 +437,21 @@ fn main() -> anyhow::Result<()> {
                         editor.focus_frame = i;
                         if let Some(window) = editor.frames[i].window_at(area, px, py) {
                             let cmd = EditorCommand::FocusWindow(window);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired);
+                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
                         }
-                        let cmd = EditorCommand::ScrollLines(-y * SCROLL_LINES);
-                        dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired);
+                        // A terminal has its own scrollback, and while the shell
+                        // has the keyboard the buffer holds only the *visible*
+                        // grid — scrolling that would move through a screenful
+                        // that is already all there is. `wheel` also knows to
+                        // hand the notch to a program that asked for mouse
+                        // events, or to send arrow keys to `less`.
+                        if editor.mode == zemacs_core::Mode::Terminal {
+                            let (col, row) = cell_at(&editor, &renderers, px, py);
+                            term.wheel(-y * SCROLL_LINES, col, row);
+                        } else {
+                            let cmd = EditorCommand::ScrollLines(-y * SCROLL_LINES);
+                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                        }
                     }
                 }
                 Event::TextInput { text, .. } => {
@@ -397,11 +472,11 @@ fn main() -> anyhow::Result<()> {
 
         for key in keys.drain(..) {
             for cmd in editor.handle_key(key) {
-                dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired);
+                dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
             }
         }
         while let Ok(cmd) = rx.try_recv() {
-            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired);
+            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
         }
 
         // Toggle SDL text input to match the mode. This is what stops macOS
@@ -432,11 +507,35 @@ fn main() -> anyhow::Result<()> {
         // changed ranges — worth doing when files get big, not before.
         if editor.revision != last_revision {
             last_revision = editor.revision;
+            // The image's one signal that the document moved. Core reports mode
+            // *entry* and nothing else, so without this a language server could
+            // never learn that a buffer changed — and neither could anything
+            // else a config wants to hang off an edit. Queued through
+            // `pending_hooks` so it takes the same route, and the same
+            // `fboundp` guard, as every other hook.
+            //
+            // ponytail: it carries no *delta*. Lisp is told the buffer changed
+            // and has to read the whole thing back, which is why the LSP client
+            // sends full-text `didChange`. The upgrade is core recording
+            // `(start, old-end, new-end)` per edit — the same record overlays
+            // will want, and worth doing once rather than twice.
+            //
+            // Not for a generated buffer: a terminal rewrites itself as fast as
+            // the shell prints, and a Lisp form per frame of `ls -R` would
+            // starve the image's queue for work no config can act on anyway —
+            // every generated buffer is read-only.
+            if !editor.buffer.kind.is_generated() {
+                editor.pending_hooks.push("after-change-hook".into());
+            }
             match &editor.buffer.language {
                 Some(lang) => {
                     highlighter.request(editor.revision, lang, editor.buffer.text.to_string())
                 }
-                None => editor.highlights.clear(),
+                // A generated buffer colours itself — dired and magit hand their
+                // own spans straight to the editor — so clearing here would
+                // wipe them one frame after they were produced.
+                None if !editor.buffer.kind.is_generated() => editor.buffer.highlights.clear(),
+                None => {}
             }
         }
         // Mode hooks: core records that one is due, the image runs it. Guarded
@@ -449,13 +548,36 @@ fn main() -> anyhow::Result<()> {
             ));
         }
 
+        // Anything a JSON-RPC child said since the last frame. This is the whole
+        // answer to "how does an async reply reach Lisp": a reader thread parses
+        // the child's output and pushes it onto a channel, *this* thread turns
+        // each message into a Lisp form, and the image evaluates it on its own
+        // thread — the same route a mode hook takes, and the only one that never
+        // calls into ECL from a foreign thread.
+        //
+        // `%rpc-event` is guarded exactly as a hook is: a build whose config
+        // never loaded `runtime/rpc.lisp` has nothing to call, and that must be
+        // silence rather than an error per message.
+        while let Some((conn, event)) = zemacs_rpc::poll() {
+            let (kind, form) = match event {
+                zemacs_rpc::Event::Message(v) => (":message", zemacs_rpc::lisp::to_lisp(&v)),
+                zemacs_rpc::Event::Protocol(e) => (":error", zemacs_rpc::lisp::string(&e)),
+                zemacs_rpc::Event::Exited(e) => (":exit", zemacs_rpc::lisp::string(&e)),
+            };
+            lisp.eval(format!(
+                "(let ((h (find-symbol \"%RPC-EVENT\" :zemacs))) \
+                   (when (and h (fboundp h)) (funcall h {conn} {kind} '{form})))"
+            ));
+        }
+
         refresh_file_completions(&mut editor, &mut last_file_query);
+        refresh_grep(&mut editor, &project, &mut last_grep);
 
         // Adopt a result only if the buffer hasn't moved on; if it has, a newer
         // parse is already in flight and the current spans stay up meanwhile.
         if let Some((revision, spans)) = highlighter.poll() {
             if revision == editor.revision {
-                editor.highlights = spans;
+                editor.buffer.highlights = spans;
             }
         }
 
@@ -464,22 +586,65 @@ fn main() -> anyhow::Result<()> {
         // `<2>`, `<3>`; so do we, so they are tellable apart in the dock.
         while renderers.len() < editor.frames.len() {
             let title = format!("zemacs <{}>", renderers.len() + 1);
-            renderers.push(Renderer::new(&sdl, &title, WINDOW_W, WINDOW_H)?);
+            let mut renderer = Renderer::new(&sdl, &title, WINDOW_W, WINDOW_H)?;
+            // Keys are routed to `focus_frame`, not to whichever window the OS
+            // considers frontmost, so a new frame has to claim it here. macOS
+            // does not always send `FocusGained` for a window the application
+            // opened itself, and without this every keystroke kept going to the
+            // frame you opened the new one *from*.
+            renderer.focus();
+            editor.focus_frame = renderers.len();
+            renderers.push(renderer);
         }
+
+        // Size the shell to the pane it is actually shown in, then let it catch
+        // up. `sync` is also what answers the child's queries, so it has to run
+        // every frame whether or not the terminal is on screen — a program
+        // asking how big its window is blocks until it is told.
+        if term.is_live() {
+            let (cols, rows) = terminal_size(&editor, &renderers);
+            term.sync(&mut editor, cols, rows);
+        }
+
+        // Wall-clock rather than keystroke-counted: the loop already runs at
+        // vsync, so an elapsed check is free, and a crash costs at most this
+        // interval's worth of typing either way.
+        if last_autosave.elapsed() >= AUTOSAVE_EVERY {
+            autosave_all(&mut editor);
+            last_autosave = Instant::now();
+        }
+
+        // After the whole batch, so a yank and the delete before it push once
+        // rather than twice — the register only has to be right by the time
+        // anyone outside can ask.
+        clipboard.push(&editor);
 
         // Park the live cursor and scroll on the focused window, once, so every
         // pane in every frame can be drawn from its own `Window`.
         editor.sync_focused_window();
+        let screen = term.screen(&editor);
 
-        // `render` syncs the font itself, and each canvas presents on vsync —
-        // that is what paces this loop, so there is no sleep here. With N
-        // windows it is also N waits per iteration, so the loop runs at 1/N of
-        // the refresh rate. Left alone deliberately: fixing it means presenting
-        // off-thread or giving up vsync, and neither is worth it for two windows.
+        // `render` syncs the font itself. With N windows this is N vsync waits
+        // per iteration, so the loop runs at 1/N of the refresh rate. Left alone
+        // deliberately: fixing it means presenting off-thread or giving up
+        // vsync, and neither is worth it for two windows.
         for (i, renderer) in renderers.iter_mut().enumerate() {
-            renderer.render(&mut editor, i)?;
+            renderer.render(&mut editor, i, screen.as_ref())?;
+        }
+
+        // Drawing is done; the editor is nobody's until the next iteration.
+        // Presenting parks this thread until the next vertical blank, which is
+        // most of the frame, and holding the lock across it would put every
+        // Lisp primitive behind the display.
+        drop(editor);
+        for renderer in renderers.iter_mut() {
+            renderer.present();
         }
     }
+    // Language servers are children of this process and outlive it otherwise —
+    // one stray `clangd` indexing a repository per session, which is the kind of
+    // thing you only notice when the fan starts.
+    zemacs_rpc::stop_all();
     Ok(())
 }
 
@@ -497,9 +662,32 @@ fn dispatch(
     renderers: &mut Vec<Renderer>,
     magit: &mut Magit,
     dired: &mut Dired,
+    term: &mut Term,
+    project: &mut Project,
 ) {
     match cmd {
         EditorCommand::CallLisp(form) => lisp.eval(form),
+        EditorCommand::Term(verb) => term.run(editor, &verb),
+        EditorCommand::Project(verb) => {
+            project.run_verb(editor, &verb);
+            // `compile` and `test` ask for a shell command; running one belongs
+            // to the terminal, which is the only thing here that owns a process.
+            if let Some(command) = project.run.take() {
+                term.run(editor, "open");
+                let mut line = command.program.clone();
+                for arg in &command.args {
+                    line.push(' ');
+                    line.push_str(arg);
+                }
+                line.push('\r');
+                term.send(line.into_bytes());
+            }
+        }
+        // Dropped when no shell is running: a keystroke aimed at something that
+        // is not there is nothing, not an error worth reporting on every key.
+        EditorCommand::TermKey(key) => {
+            term.key(key);
+        }
         // dired borrows the file prompt for rename/copy/mkdir, so an answer to
         // one of those is a filename for *it* rather than a file to open.
         EditorCommand::OpenFile(path) if dired.awaiting_input() => {
@@ -511,6 +699,10 @@ fn dispatch(
             dired.run(editor, "open");
         }
         EditorCommand::OpenFile(path) => open_file(editor, &path, init_path),
+        EditorCommand::OpenAt(hit) => {
+            let root = project.search_root(editor);
+            open_at(editor, &root, &hit, init_path);
+        }
         EditorCommand::SaveFile(path) => save_file(editor, path),
         EditorCommand::Git(verb) => magit.run(editor, &verb),
         EditorCommand::Dired(verb) => {
@@ -544,13 +736,99 @@ fn open_file(editor: &mut Editor, path: &Path, init_path: &Path) {
             let lang = zemacs_syntax::language_for_path(&path);
             let shown = display_path(&path);
             editor.load(&text, Some(path.clone()), lang);
-            editor.apply(EditorCommand::Message(format!("opened {shown}")));
+            editor.buffer.file_mode = file_mode(&path);
+            editor.apply(EditorCommand::Message(match recovery_for(&path) {
+                // Deliberately does not load it: the disk file is what was
+                // asked for, and silently showing different text is worse than
+                // one loud line. The copy is a plain file at a printable path,
+                // so recovering is `:e` on the name in this message —
+                // ponytail: a `recover-file` verb when that gets old.
+                Some(copy) => format!("opened {shown} — newer auto-save at {}", copy.display()),
+                None => format!("opened {shown}"),
+            }));
             remember_recent(&path);
+            project_remember(&path);
         }
         Err(e) => editor.apply(EditorCommand::Message(format!(
             "{}: {e}",
             display_path(&path)
         ))),
+    }
+}
+
+/// Open the file a ripgrep hit names and put the cursor on its line.
+///
+/// The hit is `path:line:text`, so it is split from the *left* twice and no
+/// further — a match whose text contains a colon is the common case, not an
+/// edge one.
+fn open_at(editor: &mut Editor, root: &Path, hit: &str, init_path: &Path) {
+    let mut parts = hit.splitn(3, ':');
+    let (Some(path), Some(line)) = (parts.next(), parts.next()) else {
+        editor.apply(EditorCommand::Message(format!("not a match: {hit}")));
+        return;
+    };
+    // Relative, because ripgrep ran with the project root as its directory.
+    open_file(editor, &root.join(path), init_path);
+    // ripgrep counts from 1. A hit for a file that changed under us lands on
+    // the last line rather than refusing to open it at all.
+    if let Ok(line) = line.parse::<usize>() {
+        let target = line.saturating_sub(1).min(editor.buffer.len_lines());
+        editor.buffer.move_to_line_col(target, 0);
+        editor.buffer.cursor = editor.buffer.first_non_blank(target);
+    }
+}
+
+/// Ask ripgrep for matches. Empty for a pattern too short to be worth running —
+/// one character across a large tree is tens of thousands of hits and a visible
+/// stall.
+fn grep(root: &Path, pattern: &str) -> Vec<String> {
+    const MIN: usize = 2;
+    const LIMIT: usize = 2000;
+    if pattern.trim().len() < MIN {
+        return Vec::new();
+    }
+    // `--` so a pattern starting with a dash is a pattern, not a flag.
+    let out = std::process::Command::new("rg")
+        .current_dir(root)
+        .args(["--line-number", "--no-heading", "--color=never", "--smart-case"])
+        .arg("--max-count=50")
+        .arg("--")
+        .arg(pattern)
+        .output();
+    let Ok(out) = out else {
+        return vec!["ripgrep (rg) is not installed".into()];
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .take(LIMIT)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Re-run ripgrep when the pattern changes.
+///
+/// Mirrors [`refresh_file_completions`]: core does no IO, so the candidates are
+/// pushed in from here. Keyed on the pattern so a keystroke that only moves the
+/// selection does not re-run the search.
+fn refresh_grep(editor: &mut Editor, project: &Project, last: &mut Option<String>) {
+    let Some(prompt) = editor.prompt.as_mut() else {
+        *last = None;
+        return;
+    };
+    if prompt.kind != PromptKind::Grep {
+        *last = None;
+        return;
+    }
+    if last.as_deref() == Some(prompt.text.as_str()) {
+        return;
+    }
+    *last = Some(prompt.text.clone());
+    // Held across the search, since `search_root` needs the editor back.
+    let pattern = prompt.text.clone();
+    let root = project.search_root(editor);
+    let hits = grep(&root, &pattern);
+    if let Some(prompt) = editor.prompt.as_mut() {
+        prompt.set_items(hits);
     }
 }
 
@@ -571,6 +849,7 @@ fn save_file(editor: &mut Editor, path: Option<PathBuf>) {
     match std::fs::write(&target, &text) {
         Ok(()) => {
             editor.buffer.modified = false;
+            editor.buffer.file_mode = file_mode(&target);
             if editor.buffer.path.is_none() {
                 editor.buffer.language = zemacs_syntax::language_for_path(&target);
                 editor.buffer.path = Some(target.clone());
@@ -581,6 +860,7 @@ fn save_file(editor: &mut Editor, path: Option<PathBuf>) {
                 editor.revision += 1;
             }
             remember_recent(&target);
+            autosave_forget(&editor.buffer);
             editor.apply(EditorCommand::Message(format!(
                 "wrote {} ({} bytes)",
                 display_path(&target),
@@ -683,6 +963,146 @@ fn seed_dashboard(editor: &mut Editor, init_path: &Path, backend: &str) {
     );
 }
 
+// --- the system clipboard ------------------------------------------------
+//
+// `select-enable-clipboard t` is set in the config, so the unnamed register and
+// the system clipboard are one thing: `yy` here pastes into a browser, and `⌘C`
+// there is what `p` puts back. Core owns the register and cannot reach the
+// window system, so the mirroring lives here.
+//
+// Push is polled once a frame off `register_revision` — an integer compare, not
+// a string diff. Pull happens only on a paste, because reading the clipboard is
+// a trip through the window server and doing it 60 times a second to answer a
+// question nobody asked is exactly the kind of thing that shows up in a profile.
+
+struct Clipboard {
+    util: sdl2::clipboard::ClipboardUtil,
+    /// The revision already pushed. Also updated after a *pull*, so adopting
+    /// the clipboard's text does not read back as a register change and bounce
+    /// straight out again.
+    pushed: u64,
+}
+
+impl Clipboard {
+    fn new(video: &sdl2::VideoSubsystem) -> Self {
+        Clipboard {
+            util: video.clipboard(),
+            pushed: 0,
+        }
+    }
+
+    fn push(&mut self, editor: &Editor) {
+        let revision = editor.register_revision();
+        if revision == self.pushed {
+            return;
+        }
+        self.pushed = revision;
+        let (text, _) = editor.register();
+        if text.is_empty() {
+            return;
+        }
+        // Silent on failure: no clipboard (the dummy video driver in tests, a
+        // headless session) must not get between someone and their yank.
+        let _ = self.util.set_clipboard_text(text);
+    }
+
+    /// Adopt the clipboard if it says something the register does not. Equal
+    /// text is left alone so a plain `yy p` keeps its linewise-ness — the
+    /// clipboard is a bare string and has no idea whether it holds whole lines.
+    fn pull(&mut self, editor: &mut Editor) {
+        let Ok(text) = self.util.clipboard_text() else {
+            return;
+        };
+        if text.is_empty() || text == editor.register().0 {
+            return;
+        }
+        // Text from outside is linewise only if it looks it — a trailing
+        // newline is what `yy` would have produced, and pasting a whole line
+        // above or below beats pasting it into the middle of the current one.
+        let linewise = text.ends_with('\n');
+        editor.adopt_register(text, linewise);
+        self.pushed = editor.register_revision();
+    }
+}
+
+// --- auto-save -----------------------------------------------------------
+//
+// Emacs writes `#foo.rs#` beside the file; this writes into
+// `~/.config/zemacs/auto-save/` instead, so a project tree never grows litter
+// that its `.gitignore` has to know about. The name is the absolute path with
+// `/` turned into `!` — Emacs' own mangling, and the reason it is recoverable
+// by eye when you need to go looking.
+
+const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
+
+fn autosave_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config/zemacs/auto-save"))
+}
+
+fn autosave_file(path: &Path) -> Option<PathBuf> {
+    let mangled = path.to_string_lossy().replace('/', "!");
+    Some(autosave_dir()?.join(format!("#{mangled}#")))
+}
+
+/// `None` for a buffer with no file behind it: there is nothing to recover
+/// *to*, and a name mangled from an empty path collides with every other one.
+fn autosave_path(buffer: &zemacs_core::Buffer) -> Option<PathBuf> {
+    autosave_file(buffer.path.as_ref()?)
+}
+
+/// Every modified buffer, not just the focused one — the whole point is the
+/// buffer you were *not* looking at when the editor died.
+fn autosave_all(editor: &mut Editor) {
+    // `sync_focused_window` has not run yet this iteration, but auto-save only
+    // reads text and path, and neither is window state.
+    autosave_one(&editor.buffer);
+    for buffer in &editor.others {
+        autosave_one(buffer);
+    }
+}
+
+fn autosave_one(buffer: &zemacs_core::Buffer) {
+    // A dired listing or a magit status is a rendered view, not a document:
+    // recovering one would restore a screenshot over a real file.
+    if !buffer.modified || buffer.kind.is_generated() {
+        return;
+    }
+    let Some(target) = autosave_path(buffer) else {
+        return;
+    };
+    if let Some(dir) = target.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Silent on failure, like `remember_recent`: a full disk must not put a
+    // message in front of someone who is mid-sentence.
+    let _ = std::fs::write(target, buffer.text.to_string());
+}
+
+/// The auto-save copy of `path`, if there is one *and* it is newer than the
+/// file. An older copy is one the last real save already superseded, and
+/// offering it would be offering to go backwards.
+fn recovery_for(path: &Path) -> Option<PathBuf> {
+    let copy = autosave_file(path)?;
+    let saved = std::fs::metadata(&copy).ok()?.modified().ok()?;
+    let on_disk = std::fs::metadata(path).ok()?.modified().ok()?;
+    (saved > on_disk).then_some(copy)
+}
+
+/// Drop the recovery copy once the real file holds the same text. Emacs does
+/// this too — a stale `#file#` left behind is a recovery prompt for an edit
+/// that was already saved.
+fn autosave_forget(buffer: &zemacs_core::Buffer) {
+    if let Some(path) = autosave_path(buffer) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+// ponytail: auto-save only, no numbered backups — the config keeps 20 versions
+// of every file, and that is a separate mechanism (copy the old contents aside
+// *before* writing) rather than a knob on this one. Add it when losing the
+// previous saved version actually bites.
+
 // --- recent files --------------------------------------------------------
 
 fn recent_path() -> Option<PathBuf> {
@@ -723,6 +1143,21 @@ fn remember_recent(path: &Path) {
     let _ = std::fs::write(file, body);
 }
 
+/// Unix mode bits of `path`, for the modeline. `None` for anything that cannot
+/// be stat'd, which is one fewer thing on the strip rather than an error.
+/// Record the project a freshly opened file belongs to, so the switcher's
+/// history is a by-product of use rather than something to curate.
+fn project_remember(path: &Path) {
+    if let Some(found) = zemacs_project::find(path) {
+        zemacs_project::remember(&found.root);
+    }
+}
+
+fn file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).ok().map(|m| m.permissions().mode())
+}
+
 /// `~`-shortened, for anything the user reads.
 fn display_path(path: &Path) -> String {
     let full = path.display().to_string();
@@ -739,6 +1174,60 @@ fn display_path(path: &Path) -> String {
 }
 
 // --- input translation ---------------------------------------------------
+
+/// The cell a pixel lands on, relative to the pane showing the terminal.
+///
+/// The terminal thinks in cells and knows nothing about panes or HiDPI, so this
+/// is where those stop being its problem.
+fn cell_at(editor: &Editor, renderers: &[Renderer], x: i32, y: i32) -> (usize, usize) {
+    let index = editor.focus_frame.min(renderers.len().saturating_sub(1));
+    let Some(renderer) = renderers.get(index) else {
+        return (0, 0);
+    };
+    let (cell_w, line_h) = renderer.cell_size();
+    let rect = terminal_rect(editor, renderer, index);
+    let col = ((x - rect.x).max(0) / cell_w.max(1)) as usize;
+    let row = ((y - rect.y).max(0) / line_h.max(1)) as usize;
+    (col, row)
+}
+
+/// The pane the terminal buffer occupies, or the whole content area if it is
+/// not on screen.
+fn terminal_rect(editor: &Editor, renderer: &Renderer, index: usize) -> Rect {
+    let area = renderer.content_area();
+    editor
+        .frames
+        .get(index)
+        .and_then(|frame| {
+            frame
+                .panes(area)
+                .into_iter()
+                .find(|p| frame.window(p.window).map(|w| w.buffer) == Some(editor.buffer.id))
+                .map(|p| p.rect)
+        })
+        .unwrap_or(area)
+}
+
+/// Columns and rows for the shell, taken from the pane its buffer is shown in.
+///
+/// The pane rather than the window: with a split, sizing the shell to the whole
+/// frame means half its output is drawn outside the pane and `clear` leaves
+/// debris. Falls back to the focused frame's content area when the terminal is
+/// not on screen anywhere, so a background shell keeps a sane size.
+fn terminal_size(editor: &Editor, renderers: &[Renderer]) -> (usize, usize) {
+    let index = editor.focus_frame.min(renderers.len().saturating_sub(1));
+    let Some(renderer) = renderers.get(index) else {
+        return (80, 24);
+    };
+    let (cell_w, line_h) = renderer.cell_size();
+    let rect = terminal_rect(editor, renderer, index);
+
+    // One line goes to the modeline, and the padding is the renderer's.
+    let cols = (rect.w / cell_w.max(1)).max(1) as usize;
+    let rows
+        = ((rect.h / line_h.max(1)) - 1).max(1) as usize;
+    (cols, rows)
+}
 
 /// Where a character comes from depends on the mode.
 ///
@@ -765,6 +1254,10 @@ fn key_from_keydown(kc: Keycode, keymod: Mod, raw: bool) -> Option<Key> {
             (true, false) => return Some(Key::CtrlEnter),
             _ => {}
         }
+    }
+    // Same reason, for `⌘⌫` — kill the word before point.
+    if kc == Keycode::Backspace && meta {
+        return Some(Key::MetaBackspace);
     }
     match (ctrl, meta) {
         // Shift is not consulted for Ctrl combos: `C-a` and `C-A` are one key,
@@ -867,6 +1360,18 @@ fn resolve_init_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole reason for mangling instead of using the basename: two
+    /// `mod.rs` open at once must not auto-save over each other.
+    #[test]
+    fn auto_save_names_are_per_path() {
+        let Some(a) = autosave_file(Path::new("/a/src/mod.rs")) else {
+            return; // no HOME, nothing to name it under
+        };
+        let b = autosave_file(Path::new("/b/src/mod.rs")).expect("HOME is set");
+        assert_ne!(a, b);
+        assert!(a.ends_with("#!a!src!mod.rs#"));
+    }
 
     #[test]
     fn ctrl_keys_translate() {

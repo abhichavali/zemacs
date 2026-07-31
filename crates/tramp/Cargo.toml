@@ -1,0 +1,8 @@
+[package]
+name = "zemacs-tramp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true

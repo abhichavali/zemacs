@@ -7,7 +7,15 @@ build = "build.rs"
 
 [dependencies]
 zemacs-core.workspace = true
+zemacs-rpc.workspace = true
 crossbeam-channel.workspace = true
+# `org-latex-preview` is written in Lisp, so the image runs the pipeline itself:
+# `zemacs-syntax` finds the fragments (its org module is downstream of core,
+# which is why that one reader cannot live in `query.rs`) and `zemacs-latex`
+# turns one into pixels. Both are already in the app's tree, so neither costs a
+# new build.
+zemacs-latex.workspace = true
+zemacs-syntax.workspace = true
 
 [build-dependencies]
 cc = "1"

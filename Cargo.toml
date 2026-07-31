@@ -7,6 +7,11 @@ members = [
     "crates/lisp",
     "crates/git",
     "crates/dired",
+    "crates/project",
+    "crates/term",
+    "crates/latex",
+    "crates/tramp",
+    "crates/rpc",
     "crates/app",
 ]
 
@@ -22,10 +27,26 @@ zemacs-syntax = { path = "crates/syntax" }
 zemacs-lisp = { path = "crates/lisp" }
 zemacs-git = { path = "crates/git" }
 zemacs-dired = { path = "crates/dired" }
+zemacs-project = { path = "crates/project" }
+zemacs-term = { path = "crates/term" }
+zemacs-latex = { path = "crates/latex" }
+zemacs-tramp = { path = "crates/tramp" }
+zemacs-rpc = { path = "crates/rpc" }
 
+# PTY, escape-sequence parsing, cell grid and scrollback in one dependency, and
+# pure Rust — libvterm would mean a C build plus a separate forkpty and its own
+# scrollback, and libghostty would mean a Zig toolchain in the build.
+alacritty_terminal = "0.25"
 ropey = "1.6"
 crossbeam-channel = "0.5"
 anyhow = "1"
+
+# A child process's stdout is untrusted input, and a hand-rolled JSON parser at
+# a trust boundary is a bug farm whose failure mode — a desynchronised stream —
+# only reproduces on someone else's machine. `raw_value` is what lets a request
+# splice already-built params in without parsing them into a tree and printing
+# them back out, which matters because `didChange` carries a whole buffer.
+serde_json = { version = "1", features = ["raw_value"] }
 
 [profile.dev]
 opt-level = 1          # tree-sitter and font rasterization are painful at opt-level 0

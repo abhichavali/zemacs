@@ -1,0 +1,293 @@
+#+TITLE: The boundary
+#+SUBTITLE: what belongs in Lisp, what belongs in Rust, and every known ceiling
+
+* The rule
+
+#+begin_quote
+You should be able to do anything in Lisp, but also do performance-intensive
+stuff in Rust.
+#+end_quote
+
+Which means the Lisp API is judged on *reach*, not on size: nothing about the
+editor should be unreachable from the image. It is not judged on speed, because
+the heavy lifting stays behind primitives.
+
+Concretely:
+
+| In Rust                                     | In Lisp                                    |
+|---------------------------------------------+--------------------------------------------|
+| The rope, and every edit to it               | Which edit to make, and when               |
+| tree-sitter parsing and highlight spans      | What colour each highlight class is        |
+| Glyph rasterisation and the frame            | Font size, theme, modeline geometry        |
+| The vim grammar: counts, operators, motions  | Every key binding on top of it             |
+| Window layout arithmetic and hit-testing     | When to split, close, focus                |
+| Reading and writing files, git, ripgrep, PTYs | Which file, which verb, and what to do next |
+| Mode *storage*: one name plus a list         | The whole mode *system*                     |
+| A child process, JSON framing, JSON decoding | Every protocol spoken down it, LSP included |
+
+The subprocess row is the newest and the same argument. =crates/rpc= spawns the
+child, frames =Content-Length= messages, hands each decoded message to the image
+as a *Lisp form*, and knows nothing about =initialize=, capabilities or
+diagnostics — all of which live in =runtime/lsp.lisp=, where adding a third
+language server is one line and no rebuild.
+
+The mode row is the clearest case. Rust knows a buffer has a =major_mode= string
+and a =minor_modes= list, and that entering a mode means "call =X-hook=". It knows
+nothing about inheritance, exit hooks, mode-local settings, or picking a mode
+from a filename — all of which are Lisp, in =runtime/modes/modes.lisp=, for
+exactly the reason Emacs builds them in elisp rather than in C: *that is the part
+every config wants to bend, and the image is where bending costs nothing.*
+
+* How to decide where a new thing goes
+
+In order. Stop at the first one that works.
+
+1. *Can it be written as a Lisp function over what already exists?* Write it
+   there. =switch-to-buffer=, =save-excursion=, =replace-all=, =where-is= and
+   =buffer-lines= are all in this category, and none of them is a primitive.
+2. *Is it a new question about editor state?* Add a reader: one arm of the
+   =match= in =crates/core/src/query.rs= and one name in the list in =QUERIES_FORM=.
+   Nothing in C.
+3. *Is it a new command whose arguments fit "a verb, maybe a string, up to two
+   integers"?* Add a verb: one arm of =command_for= in =crates/lisp/src/lib.rs= and
+   a one-line =DEFUN= in =shim.c=. Nothing in C.
+4. *Does it need a shape those two envelopes cannot carry* — floats going out, a
+   handle coming back? Then it earns a C primitive. =set-background= (three
+   floats) and =%make-marker= (a handle) are the two kinds.
+5. *Is it hot enough that Lisp doing it per keystroke would be felt?* Then it is
+   Rust, and Lisp gets a knob rather than a hook. Highlighting and layout are
+   here.
+
+The asymmetry is deliberate. Adding to Lisp costs a line. Adding a C primitive
+costs a Rust function, an =extern=, a C wrapper, a =defprim= and an export — five
+places that can drift out of step. A helper beats a primitive; composition beats
+a new entry point.
+
+* What is genuinely unreachable from Lisp
+
+These are not oversights and not shortcuts: each needs a new =EditorCommand=
+variant or a new accessor in =crates/core/src/lib.rs=, which is the one file the
+Lisp side cannot work around.
+
+| Missing                              | What is in the way                                                      |
+|--------------------------------------+-------------------------------------------------------------------------|
+| Create a buffer with no file behind it | There is no command for it. =Editor::show_special= is a method, not a command, and the only buffer-creating command is =OpenFile=. The shipped workaround is =lisp-scratch=, which writes a real file and opens it. |
+| Kill a buffer                        | No =KillBuffer= variant exists at all.                                    |
+| Get an answer back from the user     | =(open-prompt kind)= puts any of the editor's pickers up, but every =PromptKind= has a destination fixed in core — a file is opened, a command is run. There is no way to hand the reply to a Lisp continuation, so there is no =read-string= or =completing-read=. |
+| Send a keystroke to the shell        | =TermKey= carries a =Key=, which has no string spelling a primitive could take. |
+| Run a built-in verb by name          | =Editor::run_action= is private and there is no command that means "do the thing this string names". So Lisp can *bind* ="magit-status"= to a key but cannot *call* it — call =(magit "status")= instead, which reaches the same command. |
+| Group several edits into one undo step | Every mutating primitive checkpoints, and there is no "begin group". Build the whole text and make one call — see [[file:threading.org][threading.org]]. |
+| Interrupt a runaway form             | The Lisp thread evaluates one queued form at a time and nothing can preempt it. |
+
+* Known ceilings that a config will actually feel
+
+These are deliberate shortcuts, marked =ponytail:= in the source. Each names its
+ceiling and its upgrade path where the source does.
+
+** The shim returns bytes, not characters
+
+=crates/lisp/src/shim.c=, =f_query=. Query answers arrive as an ECL *base* string,
+so buffer text is its UTF-8 bytes rather than its characters.
+
+- Round-trips are byte-exact, including emoji.
+- =(length (buffer-string))= counts bytes. Use =(point-max)= for characters.
+- =search-forward= and =search-backward= convert, so their answers are character
+  offsets — but a non-ASCII *literal in a =load=ed file* is an extended string and
+  will not match non-ASCII buffer text at all.
+
+Upgrade path: decode into an extended string in =f_query=. Worth doing when a
+config genuinely does arithmetic on non-ASCII text.
+
+** Switching buffers fires no hook
+
+=runtime/modes/modes.lisp=, =%enter-major-mode=. The editor reports a mode being
+*entered* and never a buffer being *switched*, so settings claimed by a mode
+follow the last mode entered rather than the buffer on screen. Two org buffers
+are fine; flipping between an org buffer and a rust one with =C-M-j= is not.
+
+Upgrade path: a hook on the buffer switch — a line in core, not in Lisp.
+
+** The settings baseline starts at the factory default
+
+=runtime/modes/modes.lisp=, =%wrap-setting-primitives=. The mode system wraps each
+setting primitive to record what a config asked for. A setting changed *before*
+=modes.lisp= is loaded is not seen, so load it above your appearance settings.
+
+This one is now half-closed: every setting has a reader (=(font-size)=,
+=(tab-width)=, =(line-overflow)= …), so the baseline could be read rather than
+assumed. That change belongs in =modes.lisp=.
+
+** A change notification carries no delta
+
+=crates/app/src/main.rs=. The editor now reports =after-change-hook= when the
+document's revision moves, but it reports only *that* it moved — core keeps no
+edit log a reader could walk, so Lisp has to read the buffer back to find out
+what happened.
+
+The visible cost is in =runtime/lsp.lisp=: =textDocument/didChange= sends the
+**whole buffer** on every keystroke rather than a range. That is one buffer copy
+per revision, which is what Emacs paid for years and is not felt below a few
+hundred KB.
+
+Upgrade path: core recording =(start, old-end, new-end)= per edit and handing it
+to the hook. It is the same record overlays want, so it should be built once for
+both rather than approximated by diffing two copies of a buffer here.
+
+** LSP columns are characters, not UTF-16 code units
+
+=runtime/lsp.lisp=. LSP counts a column in UTF-16 code units and this editor
+counts characters, so the two agree exactly on ASCII and disagree on a line with
+an accent before the cursor — a jump lands a column or two off.
+
+Upgrade path: a reader that answers a line's UTF-16 prefix length, which is an
+arm of the =match= in =query.rs=. Negotiating =utf-8= with the server would only
+trade one mismatch for another, since that spelling means *bytes*.
+
+** Buffers are matched by name
+
+=crates/lisp/src/shim.c=, =with-current-buffer=. Two files with the same base name
+are indistinguishable and the first wins. Upgrade path: a reader keyed by buffer
+id, which needs the ids exposed first.
+
+** Markers
+
+- =crates/core/src/lib.rs=, =step_history=: undo restores a whole snapshot rather
+  than replaying edits, so a marker beyond the restored end is *clamped* onto it
+  rather than restored exactly. Never outside the document, which is the
+  invariant a marker owes its holder.
+- =crates/lisp/src/shim.c=: =(make-marker)= puts one *at point* rather than
+  nowhere, and the insertion type is fixed at creation — there is no
+  =set-marker-insertion-type=.
+- =crates/core/src/marker.rs=: markers are a =Vec= scanned linearly, which is right
+  for a few per buffer and wrong for one per hit of a search.
+
+** Overlays
+
+- =crates/core/src/overlay.rs=: an overlay's colours are *face names* from
+  =face-list=, never an =(R G B)=. That is what keeps every overlay writer inside
+  the =%do= envelope and out of C, and what makes an overlay follow =load-theme= for
+  free. An overlay wanting a colour no face has must =set-syntax-color= a spare
+  face first; the upgrade path is a primitive taking three floats, the shape
+  =set-background= already has.
+- The insertion types are fixed at Emacs' defaults — text typed at the front
+  lands inside, text typed at the back lands outside — so there is no
+  =front-advance= / =rear-advance=.
+- An overlay whose text is entirely deleted is deleted with it, where Emacs would
+  keep a zero-width one. Every payload here is *about* the text underneath, and a
+  =display= string over no text is a ghost.
+- =crates/lisp/src/shim.c=: the property list lives in the image, keyed by handle.
+  =delete-overlay= and =remove-overlays= prune what they remove, but an overlay the
+  *editor* deleted — because an edit swallowed its text — leaves a few conses
+  behind. The comment above =OVERLAY_FORM= has the one-line sweep.
+
+** Inline images
+
+=crates/render/src/lib.rs=. An image substitutes =ceil(width / cell_w)= blank cells
+and is blitted over them; nothing to its right moves. So:
+
+- a wide inline image overhangs by at most a rounding cell, and a =display= string
+  longer than what it replaced pushes nothing — it paints over it;
+- an image taller than one line is hung from the top of its row rather than from
+  the baseline, because growing upward from the baseline would put a display
+  equation over the *previous* lines. Its own continuation rows are blank, so
+  this is right for display math and would be wrong for a tall inline fragment,
+  which is not a thing anybody writes;
+- a multi-line fragment substitutes on its first line and blanks the rest.
+
+All three want the same thing: rows of variable height, and a per-line table of
+cell advances. That is also what wide characters want, so they should land
+together.
+
+Uploaded textures are never evicted, and neither are the bitmaps in
+=Editor::images= that outlive... nothing: core drops a bitmap when the last
+overlay naming it goes, and the renderer's texture for it then sits there until
+exit. Bounded by the distinct fragments a session previews, which is small.
+
+** Key sequences
+
+=crates/core/src/lib.rs=, =normalize_keys=. ="gg"= means the sequence =g g=, so an
+unseparated mix like ="g<tab>"= is not supported — write ="g <tab>"=.
+
+Also =Key=: three named keys carry modifiers (=C-<ret>=, =C-M-<ret>=, =M-<bs>=) and
+the enum will become a modifier bitset at four.
+
+** Emphasis is colour-only
+
+=crates/core/src/lib.rs=, =HlKind=. The renderer opens exactly one font face, so
+=bold= and =italic= are carried by colour rather than by weight or slant. Themes can
+choose the colour; they cannot ask for real bold.
+
+** Two render colours are not settable
+
+=crates/render/src/lib.rs=: the modeline highlight and shadow shades, and the
+window divider seam, are hardcoded. A theme that wants a coloured seam has no
+reader or writer for it.
+
+** M-x offers the readers too
+
+=runtime/init.lisp=, =refresh-commands=. It publishes every zero-argument function
+in the package, and the readers are zero-argument functions — so =M-x point=,
+=M-x buffer-info= and =M-x font-size= are all in the list, and all of them work
+(the value is echoed into the status line). If that is noise rather than
+introspection, =*hidden-commands*= in =init.lisp= is the lever.
+
+* Every =ponytail:= in the tree
+
+A snapshot, and a stale one the moment somebody commits. Regenerate it with:
+
+#+begin_src sh
+grep -rn 'ponytail:' crates runtime
+#+end_src
+
+The ones a *Lisp author* can feel are marked ●; the rest are Rust-side ceilings
+that show up as behaviour rather than as API.
+
+| ● | Where                        | Ceiling                                                              |
+|---+------------------------------+----------------------------------------------------------------------|
+| ● | =core/query.rs=                | A query takes two integers and no strings. String arguments are commands. |
+| ● | =lisp/shim.c= (=f_query=)        | Buffer text arrives as UTF-8 bytes in a base string.                 |
+| ● | =lisp/shim.c= (markers)        | =make-marker= is always positioned; insertion type is fixed at creation. |
+| ● | =lisp/shim.c= (=with-current-buffer=) | Buffers matched by name; duplicates collide.                   |
+| ● | =lisp/lib.rs= (=command_for=)    | One primitive for every command fitting "verb + string + two integers". |
+| ● | =core/lib.rs= (=normalize_keys=) | ="gg"= is =g g=; an unseparated mix like ="g<tab>"= is unsupported.       |
+| ● | =core/lib.rs= (=HlKind=)         | Emphasis is colour-only; no real bold or italic.                     |
+| ● | =core/lib.rs= (=step_history=)   | Undo clamps markers rather than restoring them exactly.              |
+| ● | =core/lib.rs= (=Key=)            | Three named keys carry modifiers; a bitset at four.                  |
+| ● | =core/marker.rs=               | Markers are a linearly scanned =Vec=.                                  |
+| ● | =core/overlay.rs=              | Colours are face names, not RGB; insertion types fixed at Emacs' defaults; an overlay whose text goes, goes. Linearly scanned =Vec=. |
+| ● | =lisp/shim.c= (overlays)       | The property list is Lisp-side, so an overlay the *editor* deleted leaves its plist behind. |
+| ● | =runtime/rpc.lisp=             | =false=, =null=, =[]= and ={}= all decode to =NIL=; object-versus-array is inferred on encode. |
+| ● | =runtime/lsp.lisp=             | Full-text =didChange=; columns are characters, not UTF-16; the diagnostics listing is a plain file that does not re-read. |
+| ● | =runtime/init.lisp=            | Themes are found relative to the config file; no search path.        |
+| ● | =runtime/modes/modes.lisp=     | No buffer-switch hook; settings follow the last mode entered.        |
+| ● | =runtime/modes/modes.lisp=     | The settings baseline starts at the factory default.                 |
+|   | =core/evil.rs=                 | No sticky desired column through a short line for some motions.      |
+|   | =app/main.rs=                  | Frame focus is a bare assignment, so the live buffer follows the pointer. |
+|   | =app/main.rs=, =syntax/lib.rs=   | Full reparse per revision; ceiling is a few hundred KB.              |
+|   | =syntax/org.rs=                | Single-line emphasis; only the two built-in todo keywords; rescan per keystroke for LaTeX. |
+|   | =render/lib.rs=                | One =Renderer= per process (leaked TTF context); no horizontal scrolling; a wrapped line at the foot of a pane is cut; prompt lands on the focused modeline; input and path text truncate at the tail; highlight, shadow and divider colours hardcoded; an overlay image reserves cells but reflows nothing, and its textures are never evicted. |
+|   | =dired/lib.rs=, =dired/render.rs= | No watcher or caching; per-comparison allocation in the sort; no cross-device rename; no ACLs; one face for both marks; UTC timestamps. |
+|   | =git/lib.rs=, =git/rebase.rs=    | No =--set-upstream=; a cherry-pick conflict is reported as git's own words; rebase shells out to =sh= and =cp= (unix only) and skips =--rebase-merges= steps. |
+|   | =latex/lib.rs=                 | =\begin{equation}= typesets at the article =\textwidth=; =DefaultHasher= for the preview cache key. |
+|   | =project/*=                    | =--cached= lists deleted-but-staged files; a fixed ignore list rather than =.gitignore=; ripgrep output is fully buffered; lossy path display; a hardcoded constant that is wrong off Apple Silicon; no project-wide replace. |
+|   | =tramp/lib.rs=                 | One worker thread, so operations are strictly ordered; =cp -p= before truncating; filenames containing newlines are lost; one timeout constant; remote-shell unquoting. |
+|   | =rpc/frame.rs=, =rpc/lib.rs=     | Unrecognised header lines are skipped rather than resynchronised past; a stopped child is killed rather than given a grace period. |
+
+* Where to add things
+
+| You want to add            | Touch                                                        |
+|----------------------------+--------------------------------------------------------------|
+| A convenience function      | =LIBRARY_FORM= in =crates/lisp/src/shim.c=, or your own config.  |
+| A reader                    | =crates/core/src/query.rs= (one =match= arm) + =QUERIES_FORM=.    |
+| A command verb              | =command_for= in =crates/lisp/src/lib.rs= + a =DEFUN= in =shim.c=. |
+| A primitive with an odd shape | =shim.c= (=f_*= + =defprim= + =PACKAGE_FORM=) and =lib.rs= (=rs_*=). |
+| A built-in verb             | =run_action= and =BUILTIN_COMMANDS= in =crates/core/src/evil.rs=. |
+| A new =EditorCommand=         | =crates/core/src/lib.rs= — and then =needs_app= if the app has to carry it out. |
+| An overlay property Lisp alone reads | Nothing. =overlay-put= already stores any object; only the renderer's four cross into Rust. |
+| An overlay property the *renderer* draws | A field on =Overlay= and an arm of =OverlayEdit= in =crates/core/src/overlay.rs=, a verb in =command_for=, a =case= arm in =OVERLAY_FORM=, and the drawing in =crates/render=. |
+| A language server           | One =(lsp-register-server 'mode "program")= in your config. Nothing in Rust. |
+| Another JSON-RPC child      | =rpc-start= in Lisp. Nothing in Rust.                        |
+
+Every new primitive, reader or helper gets a test in a *new* file under
+=crates/lisp/tests/=. ECL boots once per process, so there is exactly one =#[test]=
+per test file; a new file is the only way to add one.

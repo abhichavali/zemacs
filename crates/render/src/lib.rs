@@ -31,15 +31,20 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-use sdl2::pixels::Color;
+use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::Rect;
 use sdl2::render::{BlendMode, Texture, TextureCreator, WindowCanvas};
-use sdl2::ttf::{Font, Sdl2TtfContext};
+use sdl2::surface::Surface;
+use sdl2::ttf::{Font, Hinting, Sdl2TtfContext};
 use sdl2::video::WindowContext;
+use zemacs_core::modeline;
 use zemacs_core::{
-    Buffer, BufferKind, CompletionStyle, Editor, HlKind, LineOverflow, Mode, Settings, Span, Window,
+    Buffer, BufferKind, CompletionStyle, Editor, HlKind, ImageId, LineOverflow, Mode, Overlay,
+    Settings, Span, Window,
 };
+use zemacs_term::Screen;
 
 /// Outer margin, in pixels, around the text area and inside the modeline.
 const PAD: i32 = 8;
@@ -98,8 +103,29 @@ pub struct Renderer {
     point_size: u16,
 
     glyphs: HashMap<char, Option<Texture<'static>>>,
+    /// The same font emboldened, with its own cache. SDL_ttf's bold is a style
+    /// on the `Font`, so real and bold text cannot come from one handle — and
+    /// the rasterised glyphs differ, so they cannot share a cache either.
+    bold: Font<'static, 'static>,
+    bold_glyphs: HashMap<char, Option<Texture<'static>>>,
+    /// One texture per overlay image, keyed the way core keys the pixels — by
+    /// what produced them. So a second `org-latex-preview` over the same buffer
+    /// re-uses these rather than re-uploading a screenful of equations, which is
+    /// the whole reason the id is a hash of the job and not a counter.
+    ///
+    /// `None` records an upload that failed, so it is not retried every frame.
+    /// ponytail: nothing evicts, for the same reason nothing evicts core's
+    /// bitmaps — core drops an image when the last overlay naming it goes, and
+    /// the texture then sits there costing a few hundred KB of VRAM until exit.
+    /// Upgrade path: drop entries `editor.image` no longer resolves.
+    images: HashMap<ImageId, Option<Texture<'static>>>,
     cell_w: i32,
     line_h: i32,
+    /// Pixels from the top of a cell down to the text baseline. Only images need
+    /// it — a glyph is blitted at the cell origin — but an inline LaTeX preview
+    /// is *positioned* against the baseline, which is what makes `$x_1$` hang
+    /// below the line instead of floating over it.
+    ascent: i32,
 }
 
 impl Renderer {
@@ -131,21 +157,29 @@ impl Renderer {
         let font_path = find_font()?;
         // Matches `Settings::default().font_size`; `sync` fixes it up on frame one.
         let point_size = scale_point_size(18.0, dpi_scale(&canvas));
-        let font = ttf
+        let mut font = ttf
             .load_font(&font_path, point_size)
             .map_err(|e| anyhow::anyhow!("cannot open font {}: {e}", font_path.display()))?;
+        set_hinting(&mut font);
+        let bold = open_bold(ttf, &font_path, point_size)?;
         let (cell_w, line_h) = metrics(&font);
+
+        let ascent = font.ascent();
 
         Ok(Self {
             canvas,
             ttf,
             textures,
             font,
+            bold,
+            bold_glyphs: HashMap::new(),
+            images: HashMap::new(),
             font_path,
             point_size,
             glyphs: HashMap::new(),
             cell_w,
             line_h,
+            ascent,
         })
     }
 
@@ -162,11 +196,20 @@ impl Renderer {
         self.font = ttf
             .load_font(&path, want)
             .map_err(|e| anyhow::anyhow!("cannot re-open font {}: {e}", path.display()))?;
+        set_hinting(&mut self.font);
+        self.bold = open_bold(ttf, &path, want)?;
         self.point_size = want;
         self.glyphs.clear(); // rasterised at the old size, all of it is stale
+        self.bold_glyphs.clear();
         let (cell_w, line_h) = metrics(&self.font);
         self.cell_w = cell_w;
         self.line_h = line_h;
+        self.ascent = self.font.ascent();
+        // Images are rasterised to match the *text*, so a font-size change makes
+        // every one of them the wrong size — but they are core's, produced by
+        // whoever asked for them, so this only drops the uploads. The next
+        // preview renders at the new size and the stale entries are unreachable.
+        self.images.clear();
         Ok(())
     }
 
@@ -204,8 +247,23 @@ impl Renderer {
     ///
     /// The app calls `Editor::sync_focused_window` first, so every window's
     /// `cursor`/`scroll` is live and no pane needs a special case.
-    pub fn render(&mut self, editor: &mut Editor, frame_index: usize) -> anyhow::Result<()> {
+    ///
+    /// Drawing only — [`Renderer::present`] puts it on screen. They are separate
+    /// because the canvas is vsynced, so `present` parks the thread for most of
+    /// a frame, and the editor lock must not be held across that or every Lisp
+    /// primitive would queue behind the display.
+    pub fn render(
+        &mut self,
+        editor: &mut Editor,
+        frame_index: usize,
+        terminal: Option<&Screen>,
+    ) -> anyhow::Result<()> {
         self.sync(editor)?; // cheap no-op; makes an app-side `sync` call optional
+        // The one thing core cannot work out for itself: how big the em really
+        // is once the display's scale factor is in. Parked here rather than
+        // asked for, exactly as `viewport_lines` is, and read by the LaTeX
+        // primitive so a preview is the size of the text it sits in.
+        editor.font_px = f32::from(self.point_size);
 
         let area = area_of(self.content_area());
         let status_h = modeline_h(self.line_h, &editor.settings);
@@ -218,7 +276,6 @@ impl Renderer {
         // Layout once, then two passes: the first needs `&mut editor` to park
         // the row counts, the second only `&`.
         let Some(frame) = editor.frames.get(frame_index) else {
-            self.canvas.present();
             return Ok(());
         };
         let current = frame.current;
@@ -269,10 +326,19 @@ impl Renderer {
             // selection or an overhanging glyph cannot paint into its
             // neighbour. Cheaper than teaching every primitive about the pane.
             self.set_clip(pane);
-            if buf.kind == BufferKind::Dashboard {
-                self.draw_dashboard(editor, doc_rect(pane, status_h));
-            } else {
-                self.draw_document(editor, buf, win, pane, status_h, active);
+            match (buf.kind, terminal) {
+                (BufferKind::Dashboard, _) => {
+                    self.draw_dashboard(editor, doc_rect(pane, status_h))
+                }
+                // A terminal is drawn from its live grid rather than from the
+                // rope, because per-cell colour and the block cursor are both
+                // gone by the time the grid has been flattened into text. The
+                // rope is still what the buffer switcher reads.
+                (BufferKind::Terminal, Some(screen)) => {
+                    let (bg, fg) = (editor.settings.background, editor.settings.foreground);
+                    self.draw_terminal(screen, doc_rect(pane, status_h), rgb(bg), rgb(fg));
+                }
+                _ => self.draw_document(editor, buf, win, pane, status_h, active),
             }
             self.draw_modeline(editor, buf, modeline_rect(pane, status_h), active);
             self.clear_clip();
@@ -316,8 +382,14 @@ impl Renderer {
             self.draw_completion(editor, area.w, area.h, status_h);
         }
 
-        self.canvas.present();
         Ok(())
+    }
+
+    /// Put the drawn frame on screen. Blocks until the next vertical blank, so
+    /// this is what paces the main loop — and why the caller drops the editor
+    /// lock before getting here.
+    pub fn present(&mut self) {
+        self.canvas.present();
     }
 
     // --- document ---------------------------------------------------------
@@ -354,11 +426,23 @@ impl Renderer {
         } else {
             Vec::new()
         };
-        let spans: &[Span] = if win.buffer == editor.buffer.id {
-            &editor.highlights
-        } else {
-            &[]
-        };
+        // Every pane draws its own buffer's spans. Handing an empty slice to
+        // anything but the live buffer is what used to make a split lose its
+        // colours the moment focus moved.
+        let spans: &[Span] = &buf.highlights;
+        // ...and its own overlays, for the same reason. Empty on nearly every
+        // buffer, and everything below early-outs on that, so a config that
+        // never makes one pays a slice length per line.
+        //
+        // Priority, since two things now claim the same cell:
+        //   1. an overlay's `face` / `background` beats the syntax highlight;
+        //   2. among overlapping overlays the *most recently made* wins, and per
+        //      attribute — one that sets only a background does not wipe an
+        //      earlier one's foreground;
+        //   3. the selection and the cursor beat both, because they are claims
+        //      about the editor rather than about the text and must never be
+        //      paintable over.
+        let overlays: &[Overlay] = buf.overlays();
         let block_cursor = editor.mode != Mode::Insert;
 
         let digits = gutter_digits(buf);
@@ -393,7 +477,45 @@ impl Renderer {
             let (next, runs) = spans_for_line(spans, si, start, end);
             si = next;
 
-            let cells = expand_line(&buf.slice_string(start, end), set.tab_width);
+            let ov_runs = overlays_for_line(overlays, start, end);
+            let mut cells = expand_line(&buf.slice_string(start, end), set.tab_width);
+            // `display` and an image both *replace* the cells they cover, which
+            // is what makes wrapping, the cursor and the selection follow the
+            // substitution instead of having to be told about it separately.
+            //
+            // An overlay reaching onto later lines substitutes on the first one
+            // and blanks the rest: one image, then the empty rows its own source
+            // lines have become. ponytail — a proper multi-line display would
+            // have to change how many rows a line occupies, and rows are a fixed
+            // height here.
+            let mut images: Vec<(usize, zemacs_core::ImageId)> = Vec::new();
+            if !ov_runs.is_empty() {
+                let mut subs: Vec<(usize, usize, String)> = Vec::new();
+                for &(s, e, o) in &ov_runs {
+                    // An image is the more specific claim, so an overlay
+                    // carrying both never shows its `display` string.
+                    let image = o.image.and_then(|i| editor.image(i).map(|img| (i, img)));
+                    let text = match (&image, &o.display) {
+                        (None, None) => continue, // a face-only overlay hides nothing
+                        _ if o.start < start => String::new(), // continuation row
+                        (Some((id, img)), _) => {
+                            images.push((s, *id));
+                            " ".repeat(image_cells(img.width, self.cell_w))
+                        }
+                        (None, Some(d)) => d.clone(),
+                    };
+                    subs.push((s, e, text));
+                }
+                if !subs.is_empty() {
+                    subs.sort_by_key(|&(s, _, _)| s);
+                    cells = substitute(&cells, &subs);
+                    // The blit needs a *column*, and the substitution is what
+                    // decided which one, so this cannot be worked out earlier.
+                    for entry in &mut images {
+                        entry.0 = visual_col(&cells, entry.0);
+                    }
+                }
+            }
 
             // Selection as display-cell ranges, resolved once per line so the
             // row loop only has to clip. `end + 1` is the newline, kept as one
@@ -432,9 +554,23 @@ impl Renderer {
             for (r, (rs, re)) in wrap_rows(cells.len(), cols).take(fits).enumerate() {
                 let y = doc.y + (row + r) as i32 * self.line_h;
                 let cursor_col = cursor_at.and_then(|(cr, cc)| (cr == r).then_some(cc));
+                // The marker replaces the last cell rather than following it:
+                // drawn one column further right it would be the overflow it
+                // exists to warn about.
+                let shown = marker.unwrap_or(re - rs);
 
                 if line == cur_line && selection.is_empty() {
                     self.fill(pane.x, y, pane.w, self.line_h, cur_bg);
+                }
+                // Overlay backgrounds go under the selection and the cursor: a
+                // config painting a range must not be able to hide where the
+                // editor thinks you are.
+                for (col, &(_, src)) in cells[rs..rs + shown].iter().enumerate() {
+                    if let (_, Some(k)) = overlay_face(&ov_runs, src) {
+                        let x = x0 + col as i32 * self.cell_w;
+                        let c = rgb(editor.theme.color(k, fg));
+                        self.fill(x, y, self.cell_w, self.line_h, c);
+                    }
                 }
                 for &s in &sel_cells {
                     if let Some((a, b)) = row_span(s, rs, cols) {
@@ -459,10 +595,6 @@ impl Renderer {
                     }
                 }
 
-                // The marker replaces the last cell rather than following it:
-                // drawn one column further right it would be the overflow it
-                // exists to warn about.
-                let shown = marker.unwrap_or(re - rs);
                 for (col, &(ch, src)) in cells[rs..rs + shown].iter().enumerate() {
                     let x = x0 + col as i32 * self.cell_w;
                     while ri < runs.len() && runs[ri].1 <= src {
@@ -472,12 +604,23 @@ impl Renderer {
                         Some(&(s, _, k)) if s <= src => k,
                         _ => HlKind::Default,
                     };
-                    let color = if block_cursor && cursor_col == Some(col) {
-                        rgb(bg) // knock the glyph out of the cursor block
-                    } else {
-                        rgb(editor.theme.color(kind, fg))
+                    let color = match overlay_face(&ov_runs, src).0 {
+                        _ if block_cursor && cursor_col == Some(col) => rgb(bg), // knocked out of the cursor block
+                        Some(k) => rgb(editor.theme.color(k, fg)),
+                        None => rgb(editor.theme.color(kind, fg)),
                     };
                     self.draw_char(ch, x, y, color);
+                }
+                // Images last of the text, over the blanks their substitution
+                // reserved. One that started on an earlier display row is
+                // skipped rather than clipped — a wrapped line's continuation
+                // has no column for it.
+                for &(vc, id) in &images {
+                    if vc < rs || vc >= re {
+                        continue;
+                    }
+                    let x = x0 + (vc - rs) as i32 * self.cell_w;
+                    self.draw_image(editor, id, x, y);
                 }
                 if let Some(mc) = marker {
                     let c = if block_cursor && cursor_col == Some(mc) {
@@ -588,9 +731,55 @@ impl Renderer {
         } else {
             modeline_fg(editor, is_active)
         });
-        let end = self.draw_str(&truncate(&pane_status(editor, buf, is_active), cols), x, y, color);
+        // A prompt replaces the whole strip — what is being typed matters more
+        // than where the cursor used to be.
         if prompting {
+            let end = self.draw_str(&truncate(&editor.status_line(), cols), x, y, color);
             self.fill(end, y, 2, self.line_h, rgb(set.foreground));
+            return;
+        }
+
+        let (left, right) = modeline::segments(editor, buf, is_active);
+        // The right group is placed from the edge inwards, so the position and
+        // the mode stay put as the file name and the status message change
+        // length. Dropped whole rather than clipped when the pane is too narrow
+        // to hold both: half a percentage is worse than none.
+        let right_cols: usize = right.iter().map(|s| s.text.chars().count()).sum();
+        let left_budget = cols.saturating_sub(right_cols + 1);
+        self.draw_segments(&left, x, y, left_budget, color, editor);
+        if right_cols + 1 <= cols {
+            let rx = rect.x + rect.w - inset - right_cols as i32 * self.cell_w;
+            self.draw_segments(&right, rx, y, right_cols, color, editor);
+        }
+    }
+
+    /// Draw modeline segments left to right, stopping at `cols`.
+    ///
+    /// `default` is the strip's own foreground; a segment naming a face takes
+    /// that face's colour, which is what lets the theme drive the modeline
+    /// through the `set-syntax-color` it already has.
+    fn draw_segments(
+        &mut self,
+        segments: &[modeline::Segment],
+        x: i32,
+        y: i32,
+        cols: usize,
+        default: Color,
+        editor: &Editor,
+    ) {
+        let mut x = x;
+        let mut left = cols;
+        for seg in segments {
+            if left == 0 {
+                return;
+            }
+            let text = truncate(&seg.text, left);
+            left -= text.chars().count();
+            let color = match seg.face {
+                Some(kind) => rgb(editor.theme.color(kind, editor.settings.foreground)),
+                None => default,
+            };
+            x = self.draw_weighted(&text, x, y, color, seg.bold);
         }
     }
 
@@ -730,8 +919,119 @@ impl Renderer {
     /// *past* the last column — end of line in insert mode, see [`cursor_pos`] —
     /// and a whole cell there overhangs the neighbouring pane. The clip rect
     /// would hide it; trimming means we never ask SDL to draw it at all.
+    /// Draw a terminal's cell grid.
+    ///
+    /// Deliberately not the text path. A terminal carries a colour per cell and
+    /// its own cursor, and both are gone by the time the grid has been
+    /// flattened into the buffer's rope — the rope is what the buffer switcher
+    /// and `buffer-string` read, this is what the eye reads.
+    ///
+    /// Rows past the bottom of the pane are dropped rather than scrolled: the
+    /// grid is sized to the pane by `Term::sync`, so an overflowing row means a
+    /// resize is one frame behind, not that there is anything more to show.
+    fn draw_terminal(&mut self, screen: &Screen, doc: Area, bg: Color, cursor: Color) {
+        for row in 0..screen.rows {
+            let y = doc.y + row as i32 * self.line_h;
+            if y + self.line_h > doc.y + doc.h {
+                break;
+            }
+            for col in 0..screen.cols {
+                let x = doc.x + col as i32 * self.cell_w;
+                if x + self.cell_w > doc.x + doc.w {
+                    break;
+                }
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                let cell_bg = Color::RGB(cell.bg[0], cell.bg[1], cell.bg[2]);
+                // Only when it differs from the pane's own background: an 80×24
+                // grid is 1920 fills a frame, nearly all of them the same colour
+                // the pane was already cleared to.
+                if cell_bg != bg {
+                    self.fill(x, y, self.cell_w, self.line_h, cell_bg);
+                }
+                self.draw_char(cell.c, x, y, Color::RGB(cell.fg[0], cell.fg[1], cell.fg[2]));
+                if cell.underline {
+                    self.fill(x, y + self.line_h - 1, self.cell_w, 1, cell_bg);
+                }
+            }
+        }
+
+        // The block cursor last, so it sits over the character it is on and
+        // that character is redrawn in the background colour to stay legible.
+        if let Some((row, col)) = screen.cursor {
+            let (x, y) = (
+                doc.x + col as i32 * self.cell_w,
+                doc.y + row as i32 * self.line_h,
+            );
+            if x + self.cell_w <= doc.x + doc.w && y + self.line_h <= doc.y + doc.h {
+                self.fill(x, y, self.cell_w, self.line_h, cursor);
+                if let Some(cell) = screen.cell(row, col) {
+                    self.draw_char(cell.c, x, y, bg);
+                }
+            }
+        }
+    }
+
+    /// Take the keyboard. macOS does not reliably send `FocusGained` for a
+    /// window the application opened itself, so a new frame has to ask.
+    pub fn focus(&mut self) {
+        self.canvas.window_mut().raise();
+    }
+
+    /// Advance and line height in pixels — what the app divides a pane by to
+    /// tell the shell how many columns and rows it has.
+    pub fn cell_size(&self) -> (i32, i32) {
+        (self.cell_w, self.line_h)
+    }
+
     fn draw_cursor(&mut self, x: i32, y: i32, w: i32, pane: Area, color: Color) {
         self.fill(x, y, w.min(pane.x + pane.w - x), self.line_h, color);
+    }
+
+    /// Blit an overlay image into the row whose top-left is `(x, y)`.
+    ///
+    /// Uploaded once and kept — the id is a hash of the job that produced the
+    /// pixels, so previewing the same equation again is a cache hit rather than
+    /// a second texture. Straight (unpremultiplied) alpha, which is what
+    /// [`BlendMode::Blend`] expects and what `zemacs-latex` promises.
+    ///
+    /// Vertical placement is the whole point of `Image::depth`: an image no
+    /// taller than the line sits *on the baseline*, so `$x_1$` hangs below it
+    /// exactly as the surrounding text's descenders do. A taller one — display
+    /// math, which always has a line to itself — is hung from the top of its own
+    /// row instead, because growing upward from the baseline would put it over
+    /// the lines *above*, while the rows below it are the fragment's own source
+    /// lines and are already blank.
+    ///
+    /// ponytail: no reflow either way. Nothing to the right of an image moves,
+    /// so an image wider than the cells its substitution reserved paints over
+    /// the text after it — which is only ever a rounding cell, since the
+    /// reservation is `ceil(width / cell_w)`. The clip rect keeps it inside the
+    /// pane. Upgrade path is a per-line table of cell advances, which is also
+    /// what wide characters want.
+    fn draw_image(&mut self, editor: &Editor, id: ImageId, x: i32, y: i32) {
+        let Some(image) = editor.image(id) else {
+            return;
+        };
+        let (w, h, depth) = (image.width, image.height, image.depth as i32);
+        let iy = match h as i32 {
+            ih if ih <= self.line_h => y + self.ascent + depth - ih,
+            _ => y,
+        };
+        // Split borrows: the cache needs `&mut images` while uploading needs the
+        // creator, and blitting needs `&mut canvas`.
+        let Renderer {
+            images,
+            textures,
+            canvas,
+            ..
+        } = self;
+        let slot = images
+            .entry(id)
+            .or_insert_with(|| image_texture(textures, image));
+        let Some(tex) = slot else { return };
+        let _ = canvas.copy(tex, None, Rect::new(x, iy, w, h));
     }
 
     fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color) {
@@ -744,12 +1044,44 @@ impl Renderer {
 
     /// Returns the x just past the last cell, so callers can chain / place a bar.
     fn draw_str(&mut self, s: &str, x: i32, y: i32, color: Color) -> i32 {
+        self.draw_weighted(s, x, y, color, false)
+    }
+
+    /// `draw_str`, optionally in the bold face. Returns the x just past the
+    /// last cell. Bold is *metrically* the same — the cell width never changes,
+    /// so a bold run cannot shift the columns after it.
+    fn draw_weighted(&mut self, s: &str, x: i32, y: i32, color: Color, bold: bool) -> i32 {
         let mut x = x;
         for c in s.chars() {
-            self.draw_char(c, x, y, color);
+            if bold {
+                self.draw_bold_char(c, x, y, color);
+            } else {
+                self.draw_char(c, x, y, color);
+            }
             x += self.cell_w;
         }
         x
+    }
+
+    fn draw_bold_char(&mut self, c: char, x: i32, y: i32, color: Color) {
+        if c == ' ' || c == '\t' {
+            return;
+        }
+        let Renderer {
+            bold_glyphs,
+            bold,
+            textures,
+            canvas,
+            ..
+        } = self;
+        let slot = bold_glyphs
+            .entry(c)
+            .or_insert_with(|| glyph_texture(textures, bold, c));
+        if let Some(tex) = slot {
+            tex.set_color_mod(color.r, color.g, color.b);
+            let q = tex.query();
+            let _ = canvas.copy(tex, None, Rect::new(x, y, q.width, q.height));
+        }
     }
 
     /// `draw_str`, but `x` is where the text should *end*. Same glyph path.
@@ -783,6 +1115,15 @@ impl Renderer {
 }
 
 /// `None` when the font has no glyph for `c` — cached so we don't retry it.
+/// How much to darken glyph stems. 1.0 is off; higher is heavier.
+///
+/// FreeType hands back linear coverage, and blending that straight onto a dark
+/// background is what makes light-on-dark text look thin and washed out next to
+/// the same font in a native macOS application. CoreText applies a gamma to the
+/// coverage before blending — this is that, and it is the single biggest reason
+/// text here did not look like text in Emacs.
+const STEM_GAMMA: f32 = 1.45;
+
 fn glyph_texture(
     textures: &'static TextureCreator<WindowContext>,
     font: &Font,
@@ -793,9 +1134,96 @@ fn glyph_texture(
     // origin lines up.
     let mut buf = [0u8; 4];
     let surface = font.render(c.encode_utf8(&mut buf)).blended(Color::WHITE).ok()?;
+    // A known layout to walk: `blended` picks its own, and the alpha byte is
+    // not in the same place in all of them.
+    let mut surface = surface.convert_format(PixelFormatEnum::ARGB8888).ok()?;
+    darken_stems(&mut surface);
+
     let mut tex = textures.create_texture_from_surface(&surface).ok()?;
     tex.set_blend_mode(BlendMode::Blend);
     Some(tex)
+}
+
+/// Upload an overlay bitmap. `None` records a failure so it is not retried on
+/// every frame — the same contract [`glyph_texture`] has for a missing glyph.
+///
+/// `ABGR8888` is SDL's spelling of *byte order* `R G B A` on a little-endian
+/// machine (it is what `SDL_PIXELFORMAT_RGBA32` expands to there), which is the
+/// layout `zemacs_latex::Preview` documents. No `darken_stems`: dvipng already
+/// antialiased against the colour it was given, and a gamma meant for a font
+/// rasteriser's linear coverage would only smear an equation.
+fn image_texture(
+    textures: &'static TextureCreator<WindowContext>,
+    image: &zemacs_core::Image,
+) -> Option<Texture<'static>> {
+    // `Surface::from_data` borrows, and it wants `&mut` even to read — the copy
+    // is one frame's worth of pixels once per image, never per frame.
+    let mut pixels = image.rgba.clone();
+    let surface = Surface::from_data(
+        &mut pixels,
+        image.width,
+        image.height,
+        image.width * 4,
+        PixelFormatEnum::ABGR8888,
+    )
+    .ok()?;
+    let mut tex = textures.create_texture_from_surface(&surface).ok()?;
+    tex.set_blend_mode(BlendMode::Blend);
+    Some(tex)
+}
+
+/// Apply [`STEM_GAMMA`] to a glyph's coverage.
+///
+/// Done once per glyph, on the way into the cache, so this costs nothing per
+/// frame. Fully opaque and fully transparent pixels are already correct and are
+/// left alone; it is the partial coverage along a stem's edge that is too light.
+fn darken_stems(surface: &mut Surface) {
+    // A 256-entry table beats a `powf` per pixel, and a glyph is thousands of
+    // pixels.
+    static CURVE: OnceLock<[u8; 256]> = OnceLock::new();
+    let curve = CURVE.get_or_init(|| {
+        let mut table = [0u8; 256];
+        for (i, slot) in table.iter_mut().enumerate() {
+            let linear = i as f32 / 255.0;
+            *slot = (linear.powf(1.0 / STEM_GAMMA) * 255.0).round() as u8;
+        }
+        table
+    });
+    let _ = surface.with_lock_mut(|pixels: &mut [u8]| {
+        // ARGB8888 is little-endian in memory, so the alpha byte is the last of
+        // each four.
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel[3] = curve[pixel[3] as usize];
+        }
+    });
+}
+
+/// macOS does not hint at all — CoreText positions glyphs on the real outline
+/// and lets the resolution carry it. FreeType's default is full hinting, which
+/// snaps stems to the pixel grid and is why the same font looks subtly wrong
+/// here next to a native application. Light hints vertically only, which keeps
+/// the baseline crisp without distorting letterforms sideways.
+/// The same file, emboldened.
+///
+/// SDL_ttf's `BOLD` is synthetic — FreeType smears the outline rather than
+/// loading a designed bold — which is exactly what is wanted here: the advance
+/// is unchanged, so a bold run occupies the same cells as a plain one and the
+/// modeline's columns do not move when the mode name changes.
+fn open_bold(
+    ttf: &'static Sdl2TtfContext,
+    path: &std::path::Path,
+    point_size: u16,
+) -> anyhow::Result<Font<'static, 'static>> {
+    let mut bold = ttf
+        .load_font(path, point_size)
+        .map_err(|e| anyhow::anyhow!("cannot open font {}: {e}", path.display()))?;
+    set_hinting(&mut bold);
+    bold.set_style(sdl2::ttf::FontStyle::BOLD);
+    Ok(bold)
+}
+
+fn set_hinting(font: &mut Font) {
+    font.set_hinting(Hinting::Light);
 }
 
 fn metrics(font: &Font) -> (i32, i32) {
@@ -944,14 +1372,6 @@ fn line_col(buf: &Buffer, cursor: usize) -> (usize, usize) {
 /// and the prompt while one is open. The others get only their own buffer,
 /// because every other field in that line describes the focused window and
 /// would be the same lie repeated in every pane.
-fn pane_status(editor: &Editor, buf: &Buffer, is_active: bool) -> String {
-    if is_active {
-        return editor.status_line();
-    }
-    let dirty = if buf.modified { " [+]" } else { "" };
-    format!("   {}{dirty}", buf.name())
-}
-
 // --- modeline appearance ---------------------------------------------------
 //
 // Every knob Emacs exposes on `mode-line` lives behind one of the functions
@@ -1341,11 +1761,109 @@ fn gutter_w(buf: &Buffer, set: &Settings, cell_w: i32) -> i32 {
 
 /// Visual column of source char `src`; the end of the line if it is past it
 /// (which is where the cursor sits on an empty line, or at EOL in insert mode).
+///
+/// The *first* cell at or after `src`, not the cell for `src` exactly: a
+/// [`substitute`]d range has no cell of its own for the characters it hides, and
+/// a cursor inside one belongs at the front of what replaced them. On a line
+/// with no overlays every source char still has a cell, so this is the same
+/// answer it has always given.
 fn visual_col(cells: &[(char, usize)], src: usize) -> usize {
-    cells
+    match cells.iter().position(|&(_, i)| i >= src) {
+        // The ordinary answer, and the only one on a line with no overlays.
+        Some(k) if cells[k].1 == src => k,
+        // A source char with no cell of its own, because something replaced the
+        // range it was in. The cursor belongs at the *front* of what replaced
+        // it: landing after it would put the cursor a character further right
+        // than the buffer says it is.
+        Some(_) => cells.iter().rposition(|&(_, i)| i < src).map_or(0, |k| {
+            cells.iter().position(|&(_, i)| i == cells[k].1).unwrap_or(k)
+        }),
+        // Past the last character — where the cursor sits on an empty line, or
+        // at EOL in insert mode.
+        None => cells.len(),
+    }
+}
+
+// --- overlays --------------------------------------------------------------
+
+/// One overlay's claim on a line, in line-relative source char offsets.
+type OverlayRun<'a> = (usize, usize, &'a Overlay);
+
+/// The overlays touching `[start, end)`, clipped to it and rebased to
+/// line-relative char offsets, in creation order.
+///
+/// A linear scan of the whole list per line. ponytail: the same ceiling
+/// `zemacs_core::overlay` names — right for the tens of overlays a config makes
+/// by hand, wrong for one per hit of a search, and the fix is on that side.
+fn overlays_for_line<'a>(overlays: &'a [Overlay], start: usize, end: usize) -> Vec<OverlayRun<'a>> {
+    overlays
         .iter()
-        .position(|&(_, i)| i == src)
-        .unwrap_or(cells.len())
+        .filter(|o| o.end > start && o.start < end)
+        .map(|o| (o.start.max(start) - start, o.end.min(end) - start, o))
+        .collect()
+}
+
+/// The foreground and background in force at line-relative source char `src`.
+///
+/// Later beats earlier, and *per attribute*: an overlay that sets only a
+/// background leaves an earlier one's foreground alone, which is what makes a
+/// highlight and a face stack rather than fight.
+fn overlay_face(runs: &[OverlayRun], src: usize) -> (Option<HlKind>, Option<HlKind>) {
+    let (mut fg, mut bg) = (None, None);
+    for &(s, e, o) in runs {
+        if s <= src && src < e {
+            fg = o.face.or(fg);
+            bg = o.background.or(bg);
+        }
+    }
+    (fg, bg)
+}
+
+/// Cells a bitmap `width` pixels across reserves. At least one, so an image
+/// narrower than a cell still hides the character it replaced.
+fn image_cells(width: u32, cell_w: i32) -> usize {
+    (width as usize).div_ceil(cell_w.max(1) as usize).max(1)
+}
+
+/// Replace the cells of each `(start, end, text)` — line-relative *source* char
+/// offsets — with `text`'s characters, all attributed to `start`.
+///
+/// Attributing them to `start` is what keeps everything else working unchanged:
+/// [`visual_col`] still finds a column for a cursor inside the hidden range, the
+/// highlight cursor still walks monotonically, and wrapping counts the cells
+/// that are actually drawn.
+///
+/// `subs` must be sorted by `start`. Overlapping substitutions are not
+/// composable and are not composed — the one that starts first wins and the rest
+/// are dropped. In practice they never overlap: LaTeX fragments are disjoint by
+/// construction, and so are bullets.
+fn substitute(cells: &[(char, usize)], subs: &[(usize, usize, String)]) -> Vec<(char, usize)> {
+    let mut out = Vec::with_capacity(cells.len());
+    let (mut i, mut si) = (0usize, 0usize);
+    while i < cells.len() {
+        let src = cells[i].1;
+        while si < subs.len() && subs[si].1 <= src {
+            si += 1;
+        }
+        match subs.get(si) {
+            Some((s, e, text)) if *s <= src => {
+                out.extend(text.chars().map(|c| (c, *s)));
+                while i < cells.len() && cells[i].1 < *e {
+                    i += 1;
+                }
+                let e = *e;
+                si += 1;
+                while si < subs.len() && subs[si].0 < e {
+                    si += 1; // started inside the one just applied
+                }
+            }
+            _ => {
+                out.push(cells[i]);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Highlight runs covering `[start, end)`, clipped to it and rebased to
@@ -1472,6 +1990,126 @@ mod tests {
         assert_eq!(visual_col(&cells, 1), 4); // 'f' after the tab stop
         assert_eq!(visual_col(&cells, 3), 6); // past EOL -> end of the line
         assert_eq!(visual_col(&expand_line("", 4), 0), 0);
+    }
+
+    // --- overlays ---------------------------------------------------------
+
+    fn overlay(id: u64, start: usize, end: usize) -> Overlay {
+        Overlay {
+            id,
+            start,
+            end,
+            face: None,
+            background: None,
+            display: None,
+            image: None,
+        }
+    }
+
+    /// What a row would read as, so a substitution can be asserted on the text.
+    fn text_of(cells: &[(char, usize)]) -> String {
+        cells.iter().map(|&(c, _)| c).collect()
+    }
+
+    #[test]
+    fn a_display_string_replaces_the_cells_it_covers() {
+        let cells = expand_line("** heading", 4);
+        // org-modern: the two stars become one glyph, and the space after them
+        // is deliberately outside the range so the text does not move.
+        let subs = vec![(0, 2, "◉".to_string())];
+        let out = substitute(&cells, &subs);
+        assert_eq!(text_of(&out), "◉ heading");
+        // Every cell of the substitution is attributed to its start, so a
+        // cursor anywhere inside the hidden range lands on the first of them...
+        assert_eq!(visual_col(&out, 0), 0);
+        assert_eq!(visual_col(&out, 1), 0);
+        // ...and everything after it keeps a column of its own.
+        assert_eq!(visual_col(&out, 2), 1);
+        assert_eq!(visual_col(&out, 3), 2);
+    }
+
+    /// An image reserves blanks rather than drawing anything here: the blit
+    /// happens over them, and reserving is what stops the text after an equation
+    /// being painted on.
+    #[test]
+    fn a_substitution_can_be_wider_or_narrower_than_what_it_hides() {
+        let cells = expand_line("see $x^2$ here", 4);
+        let wide = substitute(&cells, &[(4, 9, " ".repeat(10))]);
+        assert_eq!(text_of(&wide), format!("see{}here", " ".repeat(12)));
+        let narrow = substitute(&cells, &[(4, 9, "x".to_string())]);
+        assert_eq!(text_of(&narrow), "see x here");
+        // The column the blit goes in, and the one the text after it resumes at.
+        assert_eq!(visual_col(&narrow, 4), 4);
+        assert_eq!(visual_col(&narrow, 9), 5);
+    }
+
+    #[test]
+    fn an_empty_substitution_hides_the_text_entirely() {
+        let cells = expand_line("secret", 4);
+        assert_eq!(text_of(&substitute(&cells, &[(0, 6, String::new())])), "");
+    }
+
+    #[test]
+    fn substitutions_are_applied_in_order_and_overlaps_are_dropped() {
+        let cells = expand_line("abcdefgh", 4);
+        let out = substitute(&cells, &[(1, 3, "X".into()), (5, 7, "Y".into())]);
+        assert_eq!(text_of(&out), "aXdeYh");
+        // The second starts inside the first: first start wins, and the loser is
+        // ignored rather than half-applied.
+        let out = substitute(&cells, &[(1, 5, "X".into()), (3, 7, "Y".into())]);
+        assert_eq!(text_of(&out), "aXfgh");
+    }
+
+    #[test]
+    fn tabs_inside_a_substitution_disappear_with_it() {
+        let cells = expand_line("a\tb", 4);
+        assert_eq!(text_of(&cells), "a   b");
+        assert_eq!(text_of(&substitute(&cells, &[(1, 2, "-".into())])), "a-b");
+    }
+
+    #[test]
+    fn overlay_runs_are_clipped_and_rebased_onto_the_line() {
+        // A buffer where line 2 is chars [6, 10).
+        let overlays = vec![overlay(1, 0, 20), overlay(2, 7, 8), overlay(3, 10, 12)];
+        let runs = overlays_for_line(&overlays, 6, 10);
+        assert_eq!(
+            runs.iter().map(|&(s, e, o)| (o.id, s, e)).collect::<Vec<_>>(),
+            // The third only touches the newline and the line after it.
+            vec![(1, 0, 4), (2, 1, 2)]
+        );
+    }
+
+    #[test]
+    fn the_most_recent_overlay_wins_per_attribute() {
+        let mut first = overlay(1, 0, 4);
+        first.face = Some(HlKind::Keyword);
+        first.background = Some(HlKind::Modeline);
+        let mut second = overlay(2, 2, 4);
+        second.background = Some(HlKind::Comment); // no face of its own
+        let overlays = vec![first, second];
+        let runs = overlays_for_line(&overlays, 0, 4);
+        // Only the first covers cell 0.
+        assert_eq!(
+            overlay_face(&runs, 0),
+            (Some(HlKind::Keyword), Some(HlKind::Modeline))
+        );
+        // Both cover cell 2: the later background wins, and the earlier
+        // foreground survives because the later one never claimed it.
+        assert_eq!(
+            overlay_face(&runs, 2),
+            (Some(HlKind::Keyword), Some(HlKind::Comment))
+        );
+        assert_eq!(overlay_face(&[], 0), (None, None));
+    }
+
+    #[test]
+    fn an_image_reserves_at_least_one_cell() {
+        assert_eq!(image_cells(0, 10), 1);
+        assert_eq!(image_cells(1, 10), 1);
+        assert_eq!(image_cells(10, 10), 1);
+        assert_eq!(image_cells(11, 10), 2);
+        // A degenerate cell width must not divide by zero.
+        assert_eq!(image_cells(11, 0), 11);
     }
 
     // --- line overflow ----------------------------------------------------
@@ -2134,14 +2772,22 @@ mod tests {
         other.modified = true;
         other.path = Some(PathBuf::from("/tmp/notes.org"));
 
-        assert_eq!(pane_status(&ed, &ed.buffer, true), ed.status_line());
+        let text = |buf: &Buffer, active: bool| {
+            let (left, right) = modeline::segments(&ed, buf, active);
+            left.iter()
+                .chain(right.iter())
+                .map(|s| s.text.clone())
+                .collect::<String>()
+        };
 
-        let idle = pane_status(&ed, &other, false);
-        assert!(idle.contains("notes.org") && idle.contains("[+]"), "{idle}");
-        // Nothing about the focused window: mode, position and messages all
-        // describe a window this pane is not.
+        let idle = text(&other, false);
+        assert!(idle.contains("notes.org") && idle.contains('●'), "{idle}");
+        // Nothing about the focused window: the mode, the position and the
+        // messages all describe a window this pane is not.
         assert!(!idle.contains(&ed.buffer.name()), "{idle}");
         assert!(!idle.contains("DASHBOARD"), "{idle}");
+        // ...and the active pane is the one that names the mode.
+        assert!(text(&ed.buffer, true).contains("DASHBOARD"));
     }
 
     #[test]

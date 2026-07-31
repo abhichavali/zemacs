@@ -14,7 +14,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use zemacs_dired as dired;
-use zemacs_core::{BufferKind, Editor, EditorCommand, PromptKind};
+use zemacs_core::{BufferKind, Editor, EditorCommand, HlKind, PromptKind};
 
 #[derive(Default)]
 pub struct Dired {
@@ -250,11 +250,15 @@ impl Dired {
             .iter()
             .map(|e| self.marks.get(&e.name).copied())
             .collect();
-        let (text, lines) = dired::render(&listing, &marks);
+        let (text, lines, spans) = dired::render(&listing, &marks);
         let line = editor.buffer.cursor_line_col().0;
         self.listing = Some(listing);
         self.lines = lines;
         editor.show_special(BufferKind::Dired, &text);
+        // A listing has no language for the syntax thread to parse, so it hands
+        // over its own spans. Same faces as everything else, so a theme reaches
+        // dired without knowing dired exists.
+        editor.buffer.highlights = spans.into_iter().map(face_span).collect();
         editor.buffer.path = Some(dir);
         let target = (line + advance).min(self.lines.len().saturating_sub(1));
         editor.buffer.move_to_line_col(target, 0);
@@ -293,6 +297,26 @@ impl Dired {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
+}
+
+/// dired names its faces, core owns the enum. Mechanical, and the only place
+/// the two vocabularies meet.
+fn face_span(span: dired::Span) -> zemacs_core::Span {
+    use dired::Face;
+    zemacs_core::Span {
+        start: span.start,
+        end: span.end,
+        kind: match span.kind {
+            Face::Heading1 => HlKind::Heading1,
+            Face::Type => HlKind::Type,
+            Face::Function => HlKind::Function,
+            Face::Link => HlKind::Link,
+            Face::Number => HlKind::Number,
+            Face::Comment => HlKind::Comment,
+            Face::Constant => HlKind::Constant,
+            Face::Punctuation => HlKind::Punctuation,
+        },
+    }
 }
 
 /// A bare name stays in `dir`; anything with a separator is taken as written.

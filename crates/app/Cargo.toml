@@ -15,6 +15,9 @@ zemacs-syntax.workspace = true
 zemacs-lisp.workspace = true
 zemacs-git.workspace = true
 zemacs-dired.workspace = true
+zemacs-term.workspace = true
+zemacs-project.workspace = true
+zemacs-rpc.workspace = true
 crossbeam-channel.workspace = true
 anyhow.workspace = true
 # `use-pkgconfig` is required on Apple Silicon: Homebrew's /opt/homebrew/lib is

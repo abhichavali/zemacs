@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 zemacs-core.workspace = true
+zemacs-term.workspace = true
 anyhow.workspace = true
 
 # `use-pkgconfig` is what finds Homebrew's SDL2 on Apple Silicon — /opt/homebrew/lib

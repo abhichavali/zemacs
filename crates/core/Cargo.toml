@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 ropey.workspace = true
+
+# Search and `:s` are regex, and a hand-rolled engine is a bug farm rather than
+# laziness. Already in the lock as a tree-sitter dependency, so this costs no
+# new build. What it does *not* give us is vim's dialect — see `vim_regex`.
+regex = "1"

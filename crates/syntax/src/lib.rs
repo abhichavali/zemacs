@@ -28,6 +28,8 @@
 
 mod org;
 
+pub use org::{bullets, latex_fragment_at, latex_fragments, Bullet, BulletKind, LatexFragment};
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -541,6 +543,214 @@ mod tests {
         assert_eq!(first(src, &spans, HlKind::Heading1), "* Überschrift");
         assert_eq!(first(src, &spans, HlKind::Bold), "café");
         assert!(src.len() > src.chars().count());
+    }
+
+    #[test]
+    fn org_checkboxes_borrow_the_todo_and_done_faces() {
+        let src = "- [ ] open\n- [X] shut\n- [-] partly\n- [q] not a box\n";
+        let spans = highlight("org", src);
+        assert_eq!(all(src, &spans, HlKind::Constant), ["[ ]", "[-]"]);
+        assert_eq!(all(src, &spans, HlKind::Comment), ["[X]"]);
+    }
+
+    // --- org structure ------------------------------------------------------
+
+    /// The text each bullet marker actually covers, so a wrong offset shows up
+    /// as the wrong character rather than as a number nobody can check.
+    fn marker(src: &str, b: &Bullet) -> String {
+        src.chars().skip(b.start).take(b.end - b.start).collect()
+    }
+
+    #[test]
+    fn heading_bullets_carry_their_star_run_and_level() {
+        let src = "* One\n** Two\n***** Deep\nnot a heading\n*bold* line\n";
+        let b = bullets(src);
+        let seen: Vec<_> = b.iter().map(|b| (b.kind, b.level, marker(src, b))).collect();
+        assert_eq!(
+            seen,
+            [
+                (BulletKind::Heading, 1, "*".into()),
+                (BulletKind::Heading, 2, "**".into()),
+                (BulletKind::Heading, 5, "*****".to_string()),
+            ]
+        );
+    }
+
+    /// A list bullet's level is its indent column: that is what nesting *is* in
+    /// org, and what an org-modern renderer cycles glyphs on.
+    #[test]
+    fn list_bullets_report_where_they_are_and_how_deep() {
+        let src = "- top\n  - nested\n+ also\n1. numbered\nnot- one\n";
+        let b = bullets(src);
+        let seen: Vec<_> = b.iter().map(|b| (b.kind, b.level, marker(src, b))).collect();
+        assert_eq!(
+            seen,
+            [
+                (BulletKind::List, 0, "-".into()),
+                (BulletKind::List, 2, "-".into()),
+                (BulletKind::List, 0, "+".to_string()),
+            ]
+        );
+    }
+
+    /// A `-` in a diff block and a `*` in a C comment are not org structure.
+    #[test]
+    fn bullets_inside_a_source_block_are_not_bullets() {
+        let src = "- real\n#+begin_src diff\n- removed\n* not a heading\n#+end_src\n- real too\n";
+        assert_eq!(bullets(src).len(), 2, "{:?}", bullets(src));
+    }
+
+    #[test]
+    fn bullet_offsets_are_chars_not_bytes() {
+        let src = "* Überschrift\n- café\n";
+        let b = bullets(src);
+        assert_eq!(b.iter().map(|b| marker(src, b)).collect::<Vec<_>>(), ["*", "-"]);
+        assert!(src.len() > src.chars().count());
+    }
+
+    // --- org LaTeX fragments ------------------------------------------------
+
+    fn fragments(src: &str) -> Vec<String> {
+        latex_fragments(src).into_iter().map(|f| f.source).collect()
+    }
+
+    #[test]
+    fn every_delimiter_org_uses_is_a_fragment_and_display_is_told_apart() {
+        let src = "inline $E = mc^2$ and \\(a+b\\), display $$x$$ and \\[y\\]\n";
+        let f = latex_fragments(src);
+        assert_eq!(
+            f.iter().map(|f| f.source.clone()).collect::<Vec<_>>(),
+            ["$E = mc^2$", "\\(a+b\\)", "$$x$$", "\\[y\\]"]
+        );
+        assert_eq!(
+            f.iter().map(|f| f.display).collect::<Vec<_>>(),
+            [false, false, true, true]
+        );
+    }
+
+    /// The rule everyone gets wrong. Org wants no whitespace just inside either
+    /// `$`, which is exactly what stops prices, and only punctuation after the
+    /// closer, which stops `$5-$10`.
+    #[test]
+    fn a_dollar_amount_in_prose_is_not_a_fragment() {
+        for src in [
+            "it cost $5 and $10 more\n",
+            "$ x$ and $x $\n",
+            "a $,x$ b\n",
+            "price: $100.\n",
+            "from $5-$10 each\n",
+        ] {
+            assert_eq!(fragments(src), Vec::<String>::new(), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn any_environment_counts_not_just_equation() {
+        let src = "\\begin{align}\na &= b\n\\end{align}\n\
+                   mid\n\\begin{equation*}\nx\n\\end{equation*}\n";
+        let f = latex_fragments(src);
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f.iter().all(|f| f.display));
+        assert!(f[0].source.ends_with("\\end{align}"), "{:?}", f[0].source);
+        assert!(f[1].source.starts_with("\\begin{equation*}"), "{:?}", f[1].source);
+    }
+
+    #[test]
+    fn an_environment_must_open_its_own_line() {
+        assert_eq!(
+            fragments("we write \\begin{align}a\\end{align} inline\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(fragments("  \\begin{align}a\\end{align}\n").len(), 1);
+    }
+
+    #[test]
+    fn a_dollar_inside_a_source_block_or_a_comment_is_not_math() {
+        let src = "#+begin_src sh\necho $HOME and $x$\n#+end_src\n\
+                   # $y$ in a comment\n#+TITLE: $z$\nreal $w$ here\n";
+        assert_eq!(fragments(src), ["$w$"]);
+    }
+
+    #[test]
+    fn an_unterminated_fragment_is_not_a_fragment() {
+        for src in [
+            "half $x of math\n",
+            "$$never closed\n",
+            "\\(open only\n",
+            "\\begin{align}\nx\n",
+            "\\[dangling\n",
+        ] {
+            assert_eq!(fragments(src), Vec::<String>::new(), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn latex_fragment_offsets_are_chars_not_bytes() {
+        let src = "café $x^2$ Überschrift\n";
+        let f = latex_fragments(src);
+        let sliced: String = src.chars().skip(f[0].start).take(f[0].end - f[0].start).collect();
+        assert_eq!(sliced, "$x^2$");
+        assert_eq!(sliced, f[0].source);
+        assert!(src.len() > src.chars().count());
+    }
+
+    /// What `C-c r` asks: "is there a fragment where the cursor is?" — including
+    /// just past the closing delimiter, which is where you land after typing it.
+    #[test]
+    fn latex_fragment_at_finds_the_one_under_the_cursor() {
+        let src = "a $x$ b $$y$$ c\n"; // `$x$` is 2..5, `$$y$$` is 8..13
+        let at = |pos| latex_fragment_at(src, pos).map(|f| f.source);
+        assert_eq!(at(2).as_deref(), Some("$x$"));
+        assert_eq!(at(3).as_deref(), Some("$x$"));
+        assert_eq!(at(5).as_deref(), Some("$x$"));
+        assert_eq!(at(9).as_deref(), Some("$$y$$"));
+        assert_eq!(at(0), None);
+        assert_eq!(at(14), None);
+    }
+
+    /// Same contract the spans have: in order, non-overlapping, in bounds, and
+    /// each `source` really is the text at its own offsets.
+    #[test]
+    fn latex_fragments_are_sorted_disjoint_and_in_bounds() {
+        let src = "#+TITLE: notes with $math$\n\
+                   * A heading with $x_1$ in it\n\
+                   - [ ] an item with \\(y\\) and a price of $20 too\n\
+                   \\begin{align}\na &= b\n\\end{align}\n\
+                   #+begin_src rust\nlet cost = \"$5\"; // $not$ math\n#+end_src\n\
+                   trailing $$\\int_0^1 f$$ and café $\\alpha$\n";
+        let f = latex_fragments(src);
+        assert_eq!(
+            fragments(src),
+            [
+                "$x_1$",
+                "\\(y\\)",
+                "\\begin{align}\na &= b\n\\end{align}",
+                "$$\\int_0^1 f$$",
+                "$\\alpha$",
+            ]
+        );
+        for pair in f.windows(2) {
+            assert!(pair[0].start < pair[0].end, "empty {pair:?}");
+            assert!(pair[0].end <= pair[1].start, "overlap {pair:?}");
+        }
+        let n = src.chars().count();
+        for frag in &f {
+            assert!(frag.end <= n, "past end: {frag:?}");
+            let sliced: String = src.chars().skip(frag.start).take(frag.end - frag.start).collect();
+            assert_eq!(sliced, frag.source);
+        }
+    }
+
+    /// Junk must not hang or panic either — these run the fragment scanner over
+    /// unbalanced delimiters of every kind.
+    #[test]
+    fn org_structure_survives_junk() {
+        for src in ["", "$", "$$", "$$$", "$$$$", "\\", "\\(", "\\[", "\\begin{", "\\begin{}",
+                    "#+begin_src\n$", "\\begin{a}\n$$\n", "$\u{feff}$", "* \n- \n$$\n"] {
+            latex_fragments(src);
+            bullets(src);
+            highlight("org", src);
+        }
     }
 
     /// Everything at once: the contract is sorted, disjoint, in-bounds spans,

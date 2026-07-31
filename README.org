@@ -74,6 +74,21 @@ config:
 
 | =ZEMACS_INIT= | path to an init file, instead of the usual lookup |
 | =ZEMACS_FONT= | path to a monospace =.ttf= / =.ttc=               |
+| =ZEMACS_PERF= | seconds between frame-timing reports on stderr    |
+
+=ZEMACS_PERF=1= puts a line a second on stderr saying where the frame went —
+time waiting for you, handling input, drawing and presenting, plus draw calls
+and, whenever you type, how long a keystroke took to reach the screen:
+
+#+begin_example
+perf: 60 fps (61 frames in 1.0s) | per frame: wait 12.11 input 0.06 draw 2.30 present 1.80 ms, worst 26.6 ms | 0.1 presents, 1336 draw calls
+perf: 6 keys, key to screen 11.7 ms average, 18 ms worst
+#+end_example
+
+It is measured in the real window because it cannot be measured anywhere else:
+=present= blocks until the display's next vertical blank, so what a frame costs
+depends on the monitor. If the editor ever feels slow again, start here rather
+than guessing.
 
 Highlighting covers rust, lisp (=.lisp .cl .asd .el .scm=), python, json, toml,
 c and javascript.

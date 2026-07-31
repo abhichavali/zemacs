@@ -177,6 +177,128 @@ fn close_frame<R>(editor: &mut Editor, renderers: &mut Vec<R>, index: usize) {
     editor.focus_frame = focus_after_close(focus, index, before);
 }
 
+// --- instrumentation -------------------------------------------------------
+
+/// Where the frame went. Off unless `ZEMACS_PERF` is set, in which case it is
+/// the reporting interval in seconds — `ZEMACS_PERF=1 zemacs` puts a line on
+/// stderr once a second and nothing else changes.
+///
+/// This lives in the loop rather than in a benchmark because the number that
+/// matters is not reproducible off-screen: `present` blocks until the display's
+/// next vertical blank, so what a frame costs depends on the monitor, the
+/// compositor and how many windows are open. It stays in the tree for the same
+/// reason — the next time the editor feels slow, this is the difference between
+/// a measurement and an argument.
+///
+/// The `Instant::now` calls are unconditional. Six of them a frame is on the
+/// order of a hundred nanoseconds against a sixteen *millisecond* budget, and
+/// paying it always is worth not having two versions of the loop.
+struct Perf {
+    every: Option<Duration>,
+    since: Instant,
+    frames: u32,
+    /// Parked waiting for the user. On an idle editor this should be nearly the
+    /// whole interval; if it is not, something is redrawing for no reason.
+    idle: Duration,
+    /// Events, keys, commands, hooks and the per-frame housekeeping — and the
+    /// wait for the editor lock, which is where a slow Lisp primitive shows up.
+    input: Duration,
+    /// `render` for every window — the glyphs, on the CPU side.
+    draw: Duration,
+    /// `present` for every window that needed one. Vertical blanks, mostly.
+    present: Duration,
+    worst: Duration,
+    presents: u32,
+    draws: u64,
+    /// The number the user actually feels: from SDL stamping a keystroke to the
+    /// frame answering it reaching the screen. Everything above is where the
+    /// time went; this is whether it mattered.
+    latency: Duration,
+    worst_latency: Duration,
+    keys: u32,
+}
+
+impl Perf {
+    fn new() -> Self {
+        // Anything unparseable means "on, once a second", so `ZEMACS_PERF=1` and
+        // `ZEMACS_PERF=yes` both do the obvious thing.
+        let every = std::env::var("ZEMACS_PERF").ok().map(|v| {
+            Duration::from_secs_f64(v.parse::<f64>().ok().filter(|s| *s > 0.0).unwrap_or(1.0))
+        });
+        Self {
+            every,
+            since: Instant::now(),
+            frames: 0,
+            idle: Duration::ZERO,
+            input: Duration::ZERO,
+            draw: Duration::ZERO,
+            present: Duration::ZERO,
+            worst: Duration::ZERO,
+            presents: 0,
+            draws: 0,
+            latency: Duration::ZERO,
+            worst_latency: Duration::ZERO,
+            keys: 0,
+        }
+    }
+
+    /// A keystroke that reached the screen this frame. `ms` is SDL's own clock
+    /// from the event's timestamp to the present returning, so it counts the
+    /// time the key spent queued while the loop was busy elsewhere — which is
+    /// the half that a faster redraw cannot fix.
+    fn key(&mut self, ms: u32) {
+        if self.every.is_none() {
+            return;
+        }
+        self.keys += 1;
+        self.latency += Duration::from_millis(u64::from(ms));
+        self.worst_latency = self.worst_latency.max(Duration::from_millis(u64::from(ms)));
+    }
+
+    /// One iteration is over. Reports and resets when the interval is up.
+    fn frame(&mut self, started: Instant, presents: u32, draws: u32) {
+        let Some(every) = self.every else { return };
+        self.frames += 1;
+        self.presents += presents;
+        self.draws += u64::from(draws);
+        self.worst = self.worst.max(started.elapsed());
+        let elapsed = self.since.elapsed();
+        if elapsed < every {
+            return;
+        }
+        let n = f64::from(self.frames.max(1));
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / n;
+        eprintln!(
+            "perf: {:.0} fps ({} frames in {:.1}s) | per frame: wait {:.2} input {:.2} draw {:.2} present {:.2} ms, worst {:.1} ms | {:.1} presents, {:.0} draw calls",
+            n / elapsed.as_secs_f64(),
+            self.frames,
+            elapsed.as_secs_f64(),
+            ms(self.idle),
+            ms(self.input),
+            ms(self.draw),
+            ms(self.present),
+            self.worst.as_secs_f64() * 1000.0,
+            f64::from(self.presents) / n,
+            self.draws as f64 / n,
+        );
+        // Only when somebody typed — an idle interval has nothing to say here,
+        // and a zero would read as "instant" rather than "not measured".
+        if self.keys > 0 {
+            eprintln!(
+                "perf: {} keys, key to screen {:.1} ms average, {:.0} ms worst",
+                self.keys,
+                self.latency.as_secs_f64() * 1000.0 / f64::from(self.keys),
+                self.worst_latency.as_secs_f64() * 1000.0,
+            );
+        }
+        *self = Self {
+            every: self.every,
+            since: Instant::now(),
+            ..Self::new()
+        };
+    }
+}
+
 /// Hints that have to be set *before* `sdl2::init`, because SDL reads them
 /// while it is registering the application with Cocoa.
 ///
@@ -214,6 +336,10 @@ fn main() -> anyhow::Result<()> {
     let mut pump = sdl
         .event_pump()
         .map_err(|e| anyhow::anyhow!("SDL event pump: {e}"))?;
+    // Only the perf report reads this, but it has to be SDL's own clock: an
+    // event's timestamp is in it, and the interesting part of a keystroke's life
+    // is over before this loop ever sees the event.
+    let timer = sdl.timer().map_err(|e| anyhow::anyhow!("SDL timer: {e}"))?;
 
     // Text input is toggled per mode — see `wants_text_input`. It is off to
     // begin with because the editor opens on the dashboard.
@@ -265,8 +391,38 @@ fn main() -> anyhow::Result<()> {
     let mut last_revert = Instant::now();
     let mut revert_watch = Revert::default();
     let mut clipboard = Clipboard::new(&video);
+    let mut perf = Perf::new();
+    // Whether the last iteration put anything on screen, which is the same
+    // question as "has this one already been paced": a present blocks until the
+    // display's next vertical blank, and one that did not happen has to be paced
+    // some other way. True to begin with so the first frame goes up at once.
+    let mut presented = true;
 
     'main: loop {
+        // The one place this loop is allowed to be idle, and most of what "the
+        // cursor feels slow" turned out to be. `wait_event_timeout` returns the
+        // *instant* a key, a click or a window event arrives, so a keystroke
+        // that lands here starts its redraw immediately — instead of sitting in
+        // SDL's queue until the loop came back round from a present it was
+        // spending on an unchanged picture anyway.
+        //
+        // The timeout is not a frame clock; nothing the user does needs it. It
+        // bounds one thing only: how long a change made by the *Lisp thread* —
+        // which reaches the editor through the shared mutex and raises no SDL
+        // event — can sit undrawn. One display frame is as long as that should
+        // ever be.
+        //
+        // Before the lock, and that is load-bearing. Parking here holding the
+        // editor would put every Lisp primitive behind the user's next
+        // keystroke, which is precisely what `docs/threading.org` promises never
+        // happens.
+        let idle = Instant::now();
+        let waited = (!presented)
+            .then(|| pump.wait_event_timeout(renderers.first().map_or(16, Renderer::frame_ms)))
+            .flatten();
+        let frame_start = Instant::now();
+        perf.idle += frame_start - idle;
+
         // Held for this whole iteration except the present at the bottom, which
         // is where the frame's idle time actually is. A Lisp primitive waits at
         // most for one iteration's worth of input handling and drawing, never
@@ -277,8 +433,13 @@ fn main() -> anyhow::Result<()> {
         // frame index down, and the rest of this batch was routed against the
         // old ones. Deferring it keeps the whole batch consistent.
         let mut closing: Option<usize> = None;
+        // When the earliest keystroke of this batch was stamped, for the perf
+        // report to subtract from the present at the bottom.
+        let mut typed: Option<u32> = None;
 
-        for event in pump.poll_iter() {
+        // The event the wait above returned is the first of the batch — dropping
+        // it would lose exactly the keystroke that woke us.
+        for event in waited.into_iter().chain(pump.poll_iter()) {
             match event {
                 Event::Quit { .. } => break 'main,
                 // Event-driven rather than polled: reading the clipboard is a
@@ -291,47 +452,61 @@ fn main() -> anyhow::Result<()> {
                     window_id,
                     win_event,
                     ..
-                } => match win_event {
-                    // The window manager decides which frame is current and the
-                    // editor follows it; there is no other source of truth.
-                    //
-                    // ponytail: a bare assignment, so the *live* buffer and
-                    // cursor follow the pointer into the newly focused frame
-                    // instead of that frame's own window being adopted. Core
-                    // does the adopting (`Editor::adopt_window`) but only from
-                    // inside `apply`, and it has no command for "focus frame
-                    // N" — every window command works on `focus_frame`. Fixing
-                    // it properly means an `EditorCommand::FocusFrame(usize)`
-                    // in core, next to `NewFrame`; until then two frames
-                    // showing different buffers swap contents when you click
-                    // between them.
-                    WindowEvent::FocusGained => {
-                        if let Some(i) =
-                            frame_for_window(renderers.iter().map(Renderer::window_id), window_id)
-                        {
-                            // Through the command, not a bare assignment: the
-                            // live buffer belongs to the focused window, so
-                            // core has to park it and adopt the new frame's.
-                            let cmd = EditorCommand::FocusFrame(i);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
-                        }
+                } => {
+                    let frame = frame_for_window(renderers.iter().map(Renderer::window_id), window_id);
+                    // Anything the *window system* says happened is a reason to
+                    // put the frame up again whether or not the editor moved:
+                    // exposed, resized, un-minimised, dragged to another
+                    // display. This is the one case where "the picture is
+                    // identical" is not the same as "the screen is right", and
+                    // it is what the skipped present below is safe *because* of.
+                    // Window events are rare, so the extra present costs nothing
+                    // anyone can measure.
+                    if let Some(i) = frame {
+                        renderers[i].invalidate();
                     }
-                    WindowEvent::Close => {
-                        if let Some(i) =
-                            frame_for_window(renderers.iter().map(Renderer::window_id), window_id)
-                        {
-                            closing.get_or_insert(i);
+                    match win_event {
+                        // The window manager decides which frame is current and
+                        // the editor follows it; there is no other source of
+                        // truth.
+                        //
+                        // ponytail: a bare assignment, so the *live* buffer and
+                        // cursor follow the pointer into the newly focused frame
+                        // instead of that frame's own window being adopted. Core
+                        // does the adopting (`Editor::adopt_window`) but only
+                        // from inside `apply`, and it has no command for "focus
+                        // frame N" — every window command works on
+                        // `focus_frame`. Fixing it properly means an
+                        // `EditorCommand::FocusFrame(usize)` in core, next to
+                        // `NewFrame`; until then two frames showing different
+                        // buffers swap contents when you click between them.
+                        WindowEvent::FocusGained => {
+                            if let Some(i) = frame {
+                                // Through the command, not a bare assignment:
+                                // the live buffer belongs to the focused window,
+                                // so core has to park it and adopt the new
+                                // frame's.
+                                let cmd = EditorCommand::FocusFrame(i);
+                                dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                            }
                         }
+                        WindowEvent::Close => {
+                            if let Some(i) = frame {
+                                closing.get_or_insert(i);
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 // Keys are not routed by window: the editor is global and the
                 // focused frame is where they land.
                 Event::KeyDown {
                     keycode: Some(kc),
                     keymod,
+                    timestamp,
                     ..
                 } => {
+                    typed = Some(typed.map_or(timestamp, |t: u32| t.min(timestamp)));
                     keys.extend(key_from_keydown(kc, keymod, !text_input_on));
                 }
                 Event::MouseButtonDown {
@@ -502,7 +677,12 @@ fn main() -> anyhow::Result<()> {
                 }
                 // Every character macOS hands us, including the ones it composed
                 // from an Option combo and the second half of a dead-key pair.
-                Event::TextInput { text, .. } => {
+                Event::TextInput {
+                    text, timestamp, ..
+                } => {
+                    // Insert mode arrives here rather than as `KeyDown`, and it
+                    // is the most latency-sensitive thing anyone does.
+                    typed = Some(typed.map_or(timestamp, |t: u32| t.min(timestamp)));
                     keys.extend(text.chars().map(Key::Char));
                 }
                 _ => {}
@@ -685,23 +865,63 @@ fn main() -> anyhow::Result<()> {
         // pane in every frame can be drawn from its own `Window`.
         editor.sync_focused_window();
         let screen = term.screen(&editor);
+        perf.input += frame_start.elapsed();
 
-        // `render` syncs the font itself. With N windows this is N vsync waits
-        // per iteration, so the loop runs at 1/N of the refresh rate. Left alone
-        // deliberately: fixing it means presenting off-thread or giving up
-        // vsync, and neither is worth it for two windows.
+        // Every window, every iteration, and `render` syncs the font itself.
+        // Drawing is the cheap half — measured at 2.4 ms for a full screen of
+        // text, against 14 ms of vertical blank below — so nothing here is
+        // conditional. What it produces besides pixels is a digest of every draw
+        // call it made, which is what lets the present be skipped.
+        //
+        // ponytail: an idle editor still redraws at the refresh rate, throwing
+        // the frame away when the digest says it was identical. That is a couple
+        // of milliseconds of CPU per display frame doing nothing, and it buys
+        // the one thing a cheaper test cannot: correctness without a list of
+        // "fields that mean a redraw" to keep in step with the renderer. The
+        // upgrade path is core stamping a generation on every mutation — the
+        // *only* signal that also catches a Lisp primitive editing the buffer
+        // through the shared mutex, which raises no event here — and then this
+        // loop can skip the draw as well as the present, and sleep properly.
+        let drawing = Instant::now();
         for (i, renderer) in renderers.iter_mut().enumerate() {
             renderer.render(&mut editor, i, screen.as_ref())?;
         }
+        perf.draw += drawing.elapsed();
+        let draws: u32 = renderers.iter().map(Renderer::draw_calls).sum();
 
         // Drawing is done; the editor is nobody's until the next iteration.
         // Presenting parks this thread until the next vertical blank, which is
         // most of the frame, and holding the lock across it would put every
         // Lisp primitive behind the display.
         drop(editor);
+        let presenting = Instant::now();
+        let mut presents = 0;
         for renderer in renderers.iter_mut() {
+            // Only what changed. A present of an identical picture costs a whole
+            // vertical blank and shows the user nothing, and it is the frame the
+            // *next* keystroke would rather have been drawn in.
+            //
+            // Measured, since the comment that used to sit here guessed
+            // otherwise: two visible windows both presenting take one vertical
+            // blank between them on macOS/Metal, not two — the second swapchain
+            // has a free drawable and returns at once. So this is not about the
+            // count of presents; it is about not spending a blank at all on a
+            // frame nobody asked for.
+            if !renderer.changed() {
+                continue;
+            }
             renderer.present();
+            presents += 1;
         }
+        presented = presents > 0;
+        perf.present += presenting.elapsed();
+        // A keystroke that changed nothing on screen — `k` at the top of the
+        // buffer — has no latency to report, only a frame that decided not to
+        // happen.
+        if let Some(stamped) = typed.filter(|_| presented) {
+            perf.key(timer.ticks().saturating_sub(stamped));
+        }
+        perf.frame(frame_start, presents, draws);
     }
     // Language servers are children of this process and outlive it otherwise —
     // one stray `clangd` indexing a repository per session, which is the kind of

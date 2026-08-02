@@ -32,6 +32,7 @@
 ;;;;   (math-set-status problem status) rewrite `:ZEMACS_STATUS:'
 ;;;;   (math-response-insert problem text)  replace the Response body
 ;;;;   (math-src-block problem)     (:lang :tangle :body :begin :end), or NIL
+;;;;   (math-problem-tag problem)   the scene `:tag' a click on it comes back as
 ;;;;
 ;;;; A problem plist:
 ;;;;
@@ -119,6 +120,15 @@ whatever version 2 changes.")
 
 (defparameter *math-problem-property* "ZEMACS_PROBLEM"
   "The property that makes a heading a problem. Its value is the kind.")
+
+(defparameter *math-programming-kind* "programming"
+  "The `:ZEMACS_PROBLEM:' value meaning a problem is answered with a program
+rather than in prose.
+
+The only place anything here branches on the *kind*. `math-code.lisp' asks
+whether the problem carries a source block instead, which is the question a
+runner has to ask; a page has to choose which buttons to draw before it has read
+one, and the schema already says which sort of problem this is.")
 
 (defparameter *math-status-property* "ZEMACS_STATUS"
   "The property that carries `todo' or `done'.")
@@ -527,7 +537,16 @@ refusal at the top of this file. Recording what the user says is the whole job.
 Three cases, all one call: the property line is there and is rewritten whole;
 there is a drawer without it, and one line goes into it; there is no drawer, and
 the whole thing goes under the heading. Indentation is carried across so a
-problem nested inside a list keeps its column."
+problem nested inside a list keeps its column.
+
+`with-inhibited-read-only', because a curriculum being *read* is frozen.
+`org-frozen-mode' claims the buffer read-only and `Editor::apply' then refuses
+every write into it — including this one, from Lisp, with nothing said. The lift
+goes here rather than at the call sites because every caller wants it and none of
+them can be expected to remember: a click on a status pill, a transcription
+landing from the photograph watcher, and `SPC m t' are one edit reached three
+ways. Lifting a claim that is not there is a `buffer-read-only-p' and nothing
+else, so an ordinary org buffer pays a reader and no behaviour."
   (let* ((want (string-downcase (string status)))
          (v (coerce (%org-lines) 'vector))
          (n (length v))
@@ -536,23 +555,24 @@ problem nested inside a list keeps its column."
       ((null i) (message "math: that problem has moved — read it again") nil)
       (t (let* ((drawer (%math-drawer-lines v n i))
                 (line (and drawer (%math-property-line v drawer *math-status-property*))))
-           (cond
-             (line (let ((l (aref v line)))
-                     (replace-region (second l) (third l)
-                                     (format nil "~a:~a: ~a" (%math-indent (first l))
-                                             *math-status-property* want))))
-             (drawer (let ((open (aref v (car drawer))))
-                       (replace-region (third open) (third open)
-                                       (format nil "~%~a:~a: ~a"
-                                               (%math-indent (first open))
+           (with-inhibited-read-only
+             (cond
+               (line (let ((l (aref v line)))
+                       (replace-region (second l) (third l)
+                                       (format nil "~a:~a: ~a" (%math-indent (first l))
                                                *math-status-property* want))))
-             (t (let ((head (aref v i)))
-                  (replace-region (third head) (third head)
-                                  (format nil "~%~a:PROPERTIES:~%~a:~a: ~a~%~a:END:"
-                                          (%math-indent (first head))
-                                          (%math-indent (first head))
-                                          *math-status-property* want
-                                          (%math-indent (first head)))))))
+               (drawer (let ((open (aref v (car drawer))))
+                         (replace-region (third open) (third open)
+                                         (format nil "~%~a:~a: ~a"
+                                                 (%math-indent (first open))
+                                                 *math-status-property* want))))
+               (t (let ((head (aref v i)))
+                    (replace-region (third head) (third head)
+                                    (format nil "~%~a:PROPERTIES:~%~a:~a: ~a~%~a:END:"
+                                            (%math-indent (first head))
+                                            (%math-indent (first head))
+                                            *math-status-property* want
+                                            (%math-indent (first head))))))))
            want)))))
 
 (defun %math-response-text (text)
@@ -579,7 +599,11 @@ Idempotent: calling it twice with the same TEXT leaves the buffer identical the
 second time. That is a property of `%math-response-span' stopping at the last
 non-blank line and of `%math-response-text' normalising the trailing newline,
 and it is the property that matters most here — the caller that will use this is
-a capture pass that may well run twice on the same photograph."
+a capture pass that may well run twice on the same photograph.
+
+`with-inhibited-read-only' for the reason `math-set-status' gives at length: the
+buffer a transcription lands in is very often one `org-frozen-mode' has frozen,
+and a write refused by `Editor::apply' is a write that says nothing."
   (let* ((body (%math-response-text text))
          (lines (%org-lines))
          (v (coerce lines 'vector))
@@ -591,21 +615,22 @@ a capture pass that may well run twice on the same photograph."
               (h (find (getf problem :begin) headings
                        :key (lambda (x) (getf x :begin))))
               (span (and h (%math-response-span h headings v (%math-limit lines)))))
-         (cond
-           (span (replace-region (car span) (cdr span) body))
-           (t
-            ;; No Response section. Put one under the last line of the problem
-            ;; that has anything on it, which keeps the blank lines a document
-            ;; already has between problems where they were.
-            (let* ((last (or (position (getf h :end) v :key #'third) i))
-                   (at (loop for j from last downto i
-                             unless (%math-blank-line-p (first (aref v j)))
-                               return j
-                             finally (return i)))
-                   (stars (make-string (1+ (getf h :level)) :initial-element #\*)))
-              (replace-region (third (aref v at)) (third (aref v at))
-                              (format nil "~%~%~a ~a~%~a"
-                                      stars *math-response-heading* body)))))
+         (with-inhibited-read-only
+           (cond
+             (span (replace-region (car span) (cdr span) body))
+             (t
+              ;; No Response section. Put one under the last line of the problem
+              ;; that has anything on it, which keeps the blank lines a document
+              ;; already has between problems where they were.
+              (let* ((last (or (position (getf h :end) v :key #'third) i))
+                     (at (loop for j from last downto i
+                               unless (%math-blank-line-p (first (aref v j)))
+                                 return j
+                               finally (return i)))
+                     (stars (make-string (1+ (getf h :level)) :initial-element #\*)))
+                (replace-region (third (aref v at)) (third (aref v at))
+                                (format nil "~%~%~a ~a~%~a"
+                                        stars *math-response-heading* body))))))
          t)))))
 
 ;;; ---------------------------------------------------------------------------
@@ -726,3 +751,414 @@ switch the curriculum motions off."
   (dolist (name '("math-curriculum-p" "math-units" "math-unit-at-point"
                   "math-problems" "math-problem-at-point"))
     (pushnew name *hidden-commands* :test #'string=)))
+
+;;; ---------------------------------------------------------------------------
+;;; THE PAGE — a curriculum that shows its own state
+;;;
+;;; `org-frozen-mode' draws an org file as a printed page, and the premise of a
+;;; printed page is that it shows no machinery. `:ZEMACS_STATUS:' *is* machinery:
+;;; it lives in a property drawer, `%org-frozen-scan' classifies every drawer
+;;; line `:HIDDEN', and no node is ever built for one. So the one mode in this
+;;; editor built for *reading* a curriculum was the one place a curriculum's
+;;; state could not be seen at all — `math-progress' would put `3/7 problems
+;;; done' in the status line and nothing on the page said which three, and
+;;; `:ZEMACS_PROBLEM:' went with it, so a problem was indistinguishable from any
+;;; other `** Problem' heading.
+;;;
+;;; That was not a bug in either file. It is the correct consequence of "a
+;;; printed page shows no machinery" meeting "the state is stored as machinery",
+;;; and the fix is the one a book makes: the state stops being a drawer and
+;;; becomes **a mark on the problem**. A `✓' beside a heading is not the
+;;; property; it is what the property means.
+;;;
+;;; Three things reach the page, in the order they were needed:
+;;;
+;;;   a mark    every problem carries `✓ done' or `□ todo', and clicking it is
+;;;             `SPC m t' — still the only write in this editor that sets a
+;;;             status, and still the user's.
+;;;   a count   every unit carries its own `2/3', which is `math-progress' said
+;;;             where the reader is looking instead of in a status line they
+;;;             have already scrolled past.
+;;;   a way on  a programming problem gets `▶ run' and `✎ open'; a written one
+;;;             gets `✎ answer', which *leaves the page*.
+;;;
+;;; ** The rule for every callback here: close over the problem
+;;;
+;;; A click is not a keystroke. `math-toggle-status', `math-code-run' and
+;;; `math-code-edit' all start from `(point)', and a scene has no cursor — point
+;;; is wherever the keyboard last left it, which is very likely a different
+;;; problem from the one under the pointer. So every closure below carries the
+;;; problem plist it was built for and none of them re-derives it. `math-set-status'
+;;; and `math-response-insert' already take a problem and re-find its heading
+;;; before writing, so they were correct as they stood; `math-code.lisp' grew the
+;;; two siblings this needs.
+;;;
+;;; ** Why there is no answer box
+;;;
+;;; A scene is read-only and has no cursor, so there is no typing an answer into
+;;; one — `docs/gui.org' lists that among its ceilings and means it. Inventing a
+;;; text widget would mean an editing surface inside the thing built for not
+;;; being one. The two routes that *do* work are a photograph (`SPC m r', which
+;;; never needed the cursor for the text, only for the binding) and going back to
+;;; the manuscript, so `✎ answer' is the second one made obvious rather than left
+;;; to be remembered.
+;;;
+;;; ** Nothing here is a second scanner
+;;;
+;;; Every fact on the page comes from the schema functions above. This section
+;;; adds no reading of org, no heading rule and no property name; it is a
+;;; *rendering* of `math-problems' and `math-units', joined to the heading being
+;;; drawn by a character offset both sides already agree on.
+
+(defparameter *math-page-marks*
+  '(("done" "✓" "string")
+    ("todo" "□" "comment"))
+  "(STATUS GLYPH FACE) per `:ZEMACS_STATUS:' — the mark drawn on a problem.
+
+The glyphs are org-modern's checkbox vocabulary (`*org-modern-checkboxes*'), and
+that is an argument rather than a preference: a reader of this editor already
+reads a tick as done wherever a `- [X]' appears, so a problem's status needs no
+legend beside it.
+
+They are `✓' and `□' rather than the `☑' and `☐' this table shipped with, and
+the reason is not taste. `SFNSMono' is the first entry of the renderer's
+`FONT_CANDIDATES' on a current macOS and its `cmap' does not carry `☑', `☐' or
+`☒' — so those drew *nothing at all*, and a missing glyph reads as a space,
+which is why `☐ todo' looked like a stray indent rather than like a bug. Every
+glyph named here is present in both `SFNSMono' and `Menlo'. Check that before
+changing one: until the renderer falls back to another face for a character the
+first one lacks, a bullet its font does not carry is silently invisible and
+nothing anywhere says why.
+
+A status this table does not list still draws — see `%math-page-mark'.")
+
+(defparameter *math-page-tint* "modeline"
+  "Face whose colour backs a pill or a button on the page.
+
+Borrowed rather than earned, and `*org-frozen-code-face*' makes the same
+admission at length: a scene's colours are face *names* — `Block::background' is
+a number naming an entry of `face-list' — and the theme holds exactly one colour
+already chosen to sit behind text at low contrast. Two costs, both real: a config
+restyling its modeline restyles these with it, and a `todo' pill and a `done'
+pill are the same tint told apart by their glyph and its colour. The upgrade path
+is the one already written down for overlays — a primitive taking three floats,
+the shape `set-syntax-color' has.")
+
+(defparameter *math-page-pad* 5
+  "Logical pixels inside a pill or a button, on every edge.")
+
+(defparameter *math-page-gap* 10
+  "Logical pixels between the marks on a heading — the pill and the buttons.")
+
+(defun %math-page-px (n)
+  "N logical pixels as the device pixels a scene's lengths are in.
+
+`*org-frozen-scale*' is *read* rather than copied. A scene's lengths are device
+pixels and Lisp is not allowed to know the display's scale factor — measuring a
+string in a real font is in the Rust column of the boundary — so that parameter
+is the one number closing the gap, and a second copy of it here would be a second
+number a config had to set and would eventually disagree with the first. 1 when
+that file is not loaded, which is the only case in which nothing here draws
+anyway."
+  (max 0 (round (* n (if (boundp '*org-frozen-scale*)
+                         (symbol-value '*org-frozen-scale*)
+                         1)))))
+
+(defun %math-page-mark (status)
+  "(GLYPH FACE) for STATUS.
+
+The fallback is not decoration. `math-set-status' writes whatever it is handed —
+the refusal at the top of this file — so a curriculum spelling a third state must
+draw as *something*, and a dot in the markup colour is the honest \"there is a
+state here and it is not one of mine\". Without it a `paused' problem would come
+out with no mark at all, which reads as `todo' and is a lie."
+  (or (rest (assoc status *math-page-marks* :test #'string-equal))
+      '("•" "markup")))
+
+(defun %math-page-repeat (s n)
+  "S written N times."
+  (with-output-to-string (out) (dotimes (i (max 0 n)) (write-string s out))))
+
+;;; ---------------------------------------------------------------------------
+;;; One reading per page, not one per heading
+
+(defvar *math-page* nil
+  "The single reading of the buffer the page under construction is drawn from:
+
+    :problems  every problem plist, in document order
+    :units     every unit, each also carrying the `:done' and `:total' of the
+               problems inside it
+    :tags      problem `:begin' -> the scene tag its card was given
+
+NIL when the frozen buffer is not a curriculum, which is most frozen buffers.
+
+It exists because the hook is asked per *heading* and the answer is per
+*document*. `%org-frozen-decorate' runs every function on
+`*org-frozen-node-functions*' once for each heading it builds, so deriving a
+problem from scratch there would be one `buffer-string' and one full outline scan
+per heading — quadratic in the document, on a rebuild that happens every time a
+status changes. One scan per page instead.")
+
+(defvar *math-page-line* nil
+  "The `:line' of the last heading decorated, which is how a *new* page is
+recognised.
+
+The hook has no \"the page starts here\" call and the headings of one page arrive
+in document order, so the first heading whose line is not greater than the last
+one seen is the first heading of a rebuild — and that is the moment to read the
+buffer again. It cannot miss one: within a document the first heading's line is
+never greater than the last's, so `<=' fires on every rebuild including a page
+with exactly one heading and including a switch to a different document.
+
+ponytail: a page boundary inferred rather than told. Ceiling: another function on
+the same hook that walked headings backwards would defeat it, and nothing does —
+`%org-frozen-nodes' is a forward loop over the groups. The upgrade path is a
+`:kind :page' call at the top of `org-frozen-refresh', which is one line there
+and one arm here.")
+
+(defun %math-page-unit (unit problems)
+  "UNIT with the `:done' and `:total' of the problems inside it.
+
+LIST* onto the unit's own plist rather than a new one, so `:id', `:title',
+`:begin' and `:end' are still exactly where `math-units' put them and this is a
+unit that also knows its score."
+  (let* ((inside (remove-if-not
+                  (lambda (p) (and (>= (getf p :begin) (getf unit :begin))
+                                   (<= (getf p :end) (getf unit :end))))
+                  problems))
+         (done (count *math-done* inside
+                      :key (lambda (p) (getf p :status)) :test #'string=)))
+    (list* :done done :total (length inside) unit)))
+
+(defun %math-page-read ()
+  "Everything the page needs about the live buffer, in one scan — or NIL when it
+is not a curriculum.
+
+One `%org-lines' feeds the curriculum test, the outline, the problems and the
+units. That is the same discipline every reader above keeps, and it matters more
+here: this runs inside a page build, so the cost is paid on entering the mode and
+again on every write a program makes into the document."
+  (let ((lines (%org-lines)))
+    (when (math-curriculum-p lines)
+      (let* ((headings (%math-headings lines))
+             (problems (math-problems nil lines)))
+        (list :problems problems
+              :units (mapcar (lambda (u) (%math-page-unit u problems))
+                             (math-units headings))
+              :tags (make-hash-table))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The seam
+
+(defun math-problem-tag (problem)
+  "The scene `:tag' a click on PROBLEM's card is handed back by — an integer, or
+NIL when PROBLEM is NIL.
+
+**This is the seam.** Anything drawing a curriculum as a scene asks here for a
+problem's tag and hangs it on whatever nodes that problem occupies; the editor
+hands the integer back on a click and `%scene-click' routes it to one closure,
+which flips `:ZEMACS_STATUS:' between `todo' and `done'. Nothing on the drawing
+side has to know what a status is or how one is written.
+
+PROBLEM is a plist from `math-problems'. It is a *reading* and the closure does
+not trust it: `math-set-status' re-finds the heading before it writes and says so
+when it has moved, which is what makes a tag surviving one edit into the next
+harmless rather than a write to the wrong place.
+
+**One integer per problem per page.** The answer is remembered in the reading the
+page was built from (`*math-page*'), so a pill and the word inside it can each be
+tagged without allocating twice — which is the reason `scene-tag' is callable by
+hand. Asked outside a page build there is no table and every call allocates,
+which is correct rather than merely tolerated: a tag is only ever meaningful
+against the page that was on screen when it was made.
+
+A page rebuilt after a click gets fresh integers, because `scene-tag' retires the
+last page's table the first time the next page asks for one. That is the same
+reason a prompt id and a JSON-RPC request id are never reused: a stale integer
+must name *nothing* rather than name something new."
+  (when problem
+    (let ((table (getf *math-page* :tags))
+          (key (getf problem :begin)))
+      (or (and table (gethash key table))
+          (let ((tag (scene-tag (lambda () (%math-page-toggle problem)))))
+            (when table (setf (gethash key table) tag))
+            tag)))))
+
+(defun %math-page-toggle (problem)
+  "Flip PROBLEM between `todo' and `done'. What a click on its pill means.
+
+`math-toggle-status' is the keyboard's version and starts from `(point)', which
+is exactly what a scene does not have. This is the same decision reached from the
+problem itself.
+
+The status is read off the plist rather than re-scanned, and that is safe because
+the page is rebuilt after every write: the plist a live pill was drawn from
+describes the document as it is. Two clicks racing one rebuild both compute the
+same target and the second write is the first written twice, which
+`math-set-status' makes a no-op edit rather than a wrong one."
+  (let ((want (if (string= (getf problem :status) *math-done*)
+                  *math-todo* *math-done*)))
+    (when (math-set-status problem want)
+      (message (format nil "~a · ~a" (getf problem :kind) want)))))
+
+(defun %math-page-invoke (name problem)
+  "Call NAME with PROBLEM, or say which file was not loaded.
+
+`math-code.lisp' loads *after* this one — it is written on top of the schema here
+— so the two commands a programming problem's buttons reach cannot be named at
+compile time. FBOUNDP rather than a bare call, because a config that loaded
+`math.lisp' and not `math-code.lisp' is a legal config, and a button that
+signalled into `%scene-click''s handler would report `scene click error' where
+the true sentence is one line long."
+  (if (fboundp name)
+      (funcall name problem)
+      (message (format nil "math: ~(~a~) is in runtime/modes/math-code.lisp, ~
+                            which is not loaded"
+                       name))))
+
+(defun %math-page-answer (problem)
+  "Leave the page with point on PROBLEM.
+
+The one callback that hands control back to the grid, and the honest answer to
+\"how do I write this one\": `goto-char' first, so the cursor is already on the
+heading when the text comes back, and then `org-frozen-toggle', which is what
+`SPC m z' runs. Both travel the same queue the editor drains in order, so the
+move cannot land after the mode change.
+
+The other route into a written answer needs no cursor at all — a photograph, and
+`math-response-insert' writing the transcription — so this is the route for
+somebody with a keyboard and a proof in their head."
+  (goto-char (getf problem :begin))
+  (org-frozen-toggle)
+  (message "the manuscript is back — SPC m z returns to the page"))
+
+;;; ---------------------------------------------------------------------------
+;;; What a heading grows
+
+(defun %math-page-button (label thunk)
+  "LABEL as a box you can click, running THUNK.
+
+The tag goes on the box *and* on the word inside it, which is what `scene-tag'
+exists to be called by hand for. Hit testing may resolve to a block or to a run —
+`docs/gui.org' hangs a `Tag' on both and the two are separate answers — and a
+button hot on its glyphs and cold on its padding is the single thing that makes a
+widget feel broken."
+  (let ((tag (scene-tag thunk)))
+    (block :background *math-page-tint* :pad (%math-page-px *math-page-pad*)
+           :tag tag
+           (text (run label :face "link" :tag tag)))))
+
+(defun %math-page-action (problem)
+  "The button saying what to do with PROBLEM next.
+
+A *programming* problem has two, and they are the two keys it already has:
+`SPC m x' runs it and `SPC m e' opens it beside the question. Both go through the
+problem-taking siblings in `math-code.lisp' rather than the commands themselves,
+for the reason at the head of this section — the point-reading versions would run
+whichever problem the cursor was parked in.
+
+A *written* problem has one and it leaves the page, because there is nowhere on a
+page to write."
+  (cond
+    ((string-equal (getf problem :kind) *math-programming-kind*)
+     (block :dir :row :gap (%math-page-px *math-page-gap*)
+            (%math-page-button
+             "▶ run" (lambda () (%math-page-invoke 'math-code-run-problem problem)))
+            (%math-page-button
+             "✎ open" (lambda () (%math-page-invoke 'math-code-edit-problem problem)))))
+    (t (%math-page-button "✎ answer" (lambda () (%math-page-answer problem))))))
+
+(defun %math-page-problem (problem)
+  "The extra `block' arguments PROBLEM's heading grows: its mark, and the way on.
+
+`:dir :row' turns the heading's own block on its side. The list answered here is
+spliced into that block's argument list — keywords may interleave with children,
+which is what `%scene-form' and the wire grammar both promise — so the heading
+text and everything below become children of one row rather than a stack. The
+`fill' spacer between them is what puts the marks out on the right margin, which
+is where a printed page puts anything that is about the page rather than in it.
+
+The pill's tag is `math-problem-tag''s, so a second renderer tagging the same
+problem gets the same integer and one closure answers for both."
+  (when problem
+    (destructuring-bind (glyph face) (%math-page-mark (getf problem :status))
+      (let ((tag (math-problem-tag problem)))
+        (list :dir :row :align :center :gap (%math-page-px *math-page-gap*)
+              (rect :width 'fill)
+              (block :background *math-page-tint*
+                     :pad (%math-page-px *math-page-pad*)
+                     :tag tag
+                     (text (run (format nil "~a ~a" glyph (getf problem :status))
+                                :face face :tag tag)))
+              (%math-page-action problem))))))
+
+(defun %math-page-unit-nodes (unit)
+  "The extra `block' arguments UNIT's heading grows: how much of it is done.
+
+`math-progress' says this about the whole curriculum, in the status line, when
+asked. This says it about *this* unit, on the heading being read, without being
+asked — which is the entire difference between a number you can get and a number
+you have.
+
+A pip per problem and then the fraction, because the two answer different
+questions: \"am I nearly through\" is a shape and \"how many are left\" is a
+number. The pips are the same two glyphs the problems below them carry, so the
+heading is a summary of the page under it rather than a second notation.
+
+A unit with no problems grows nothing. `* Contents' is not a unit at all — it
+carries no `:ID:' — but a unit of pure instruction is a real thing to write, and
+`0/0' on it would be a score for a thing that is not scored.
+
+ponytail: forty problems draw forty pips and push the count off the measure.
+Ceiling: a curriculum shaped unlike the one this was built for — the units in
+`docs/curriculum.org' carry two to five. The upgrade path is a `rect' of
+`(pct (/ done total))' inside a track of a stated width, which is two nodes
+instead of N and is what a progress bar is."
+  (when (and unit (plusp (getf unit :total)))
+    (let* ((done (getf unit :done))
+           (total (getf unit :total))
+           (yes (%math-page-mark *math-done*))
+           (no (%math-page-mark *math-todo*)))
+      (list :dir :row :align :center :gap (%math-page-px *math-page-gap*)
+            (rect :width 'fill)
+            (text (when (plusp done)
+                    (run (%math-page-repeat (first yes) done) :face (second yes)))
+                  (when (< done total)
+                    (run (%math-page-repeat (first no) (- total done))
+                         :face (second no)))
+                  (run (format nil " ~d/~d" done total) :face "comment"))))))
+
+(defun math-page-decorate (context)
+  "Decorate one heading of a frozen page with what a curriculum means by it.
+
+On `*org-frozen-node-functions*'. CONTEXT is that hook's plist and the answer is
+a list of extra arguments spliced into the heading's `block' — the contract is
+the docstring on the variable, and it is the reason `org-frozen.lisp' contains
+not one word about problems while rendering them.
+
+A heading is at most one of the two things this file knows: the `** Problem'
+whose card it is, or the `* Unit' whose score it carries. Matched on `:begin' —
+which the hook documents as the character offset of the heading line, and which
+`math-problems' answers as the offset of its first star. The same number, so the
+join is `eql' on an integer and involves no guess about the heading's text; a
+curriculum that spells its problems `Exercise' works unchanged.
+
+Returns NIL for every heading that is neither, which the hook reads as no
+opinion — so a frozen buffer that is not a curriculum pays one scan per page and
+draws exactly what it drew before."
+  (when (eq (getf context :kind) :heading)
+    (let ((line (getf context :line))
+          (at (getf context :begin)))
+      (when (or (null *math-page-line*) (<= line *math-page-line*))
+        (setf *math-page* (%math-page-read)))
+      (setf *math-page-line* line)
+      (or (%math-page-problem
+           (find at (getf *math-page* :problems) :key (lambda (p) (getf p :begin))))
+          (%math-page-unit-nodes
+           (find at (getf *math-page* :units) :key (lambda (u) (getf u :begin))))))))
+
+;;; DEFVAR before the PUSHNEW, exactly as the two hook lists above: a build whose
+;;; `*runtime-dir*' never found `org-frozen.lisp' must get an empty list here
+;;; rather than an unbound variable, and a config reload must not double it.
+(defvar *org-frozen-node-functions* nil)
+(pushnew 'math-page-decorate *org-frozen-node-functions*)

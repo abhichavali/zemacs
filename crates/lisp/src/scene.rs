@@ -38,7 +38,7 @@
 //! reader agreed to build.
 
 use zemacs_gui::{
-    Align, Block, Dir, FaceId, ImageId, Length, Node, NodeId, Run, Scene, Style, Tag,
+    Align, Block, Dir, FaceId, Family, ImageId, Length, Node, NodeId, Run, Scene, Style, Tag,
 };
 
 /// How deep a form may nest before the reader refuses it.
@@ -435,6 +435,9 @@ fn text_run(form: &Form, rest: &[Form]) -> Result<Run, String> {
                 "size" => style.size = ranged(value, ":size", 1, u16::MAX as i64)? as u16,
                 "bold" => style.bold = boolean(value, ":bold")?,
                 "italic" => style.italic = boolean(value, ":italic")?,
+                // Unstated is prose, from `Style::default` — a scene is a page,
+                // and the run that has to say something is the listing.
+                "family" => style.family = family(value)?,
                 "face" => style.face = face(value, ":face")?,
                 "tag" => carried = tag(value)?,
                 other => {
@@ -638,6 +641,25 @@ fn dir(form: &Form) -> Result<Dir, String> {
     }
 }
 
+/// Which of the two typefaces a run is set in — `mono` or `prose`.
+///
+/// Two words and not a font name, for the reason [`Family`] gives: the renderer
+/// caches an open face per size, weight, slant and family, and a name would make
+/// the last of those a string somebody typed. A closed pair keeps the cache
+/// bounded and keeps "no such font" a question answered once at startup rather
+/// than once per document.
+///
+/// A run that says nothing is prose, because a scene is a page. The word a
+/// document has to write is `mono`, on the runs of a source listing — where the
+/// columns line up only if every character is the same width.
+fn family(form: &Form) -> Result<Family, String> {
+    match &form.kind {
+        Kind::Sym(s) if s == "mono" => Ok(Family::Mono),
+        Kind::Sym(s) if s == "prose" => Ok(Family::Prose),
+        _ => Err(err(form.at, "expected mono or prose for :family")),
+    }
+}
+
 fn align(form: &Form) -> Result<Align, String> {
     match &form.kind {
         Kind::Sym(s) if s == "start" => Ok(Align::Start),
@@ -735,7 +757,7 @@ mod tests {
             heading,
             [Run::Text {
                 text: "The Rank-Nullity Theorem".into(),
-                style: Style { size: 200, bold: true, italic: false, face: None },
+                style: Style { size: 200, bold: true, ..Style::default() },
                 tag: None,
             }]
         );
@@ -1051,6 +1073,51 @@ mod tests {
         }
         assert!(parse(r#"(text (run "x" :bold 0))"#).is_err());
         assert!(parse(r#"(text (run "x" :bold "yes"))"#).is_err());
+    }
+
+    /// `:family` reads both words, in either case, and an unstated one is prose.
+    ///
+    /// The default is the assertion that matters. A scene is a page, so nearly
+    /// every run in a document says nothing about a family and has to come out
+    /// proportional — a default of `mono` would leave every page set in the
+    /// coding font and every one of them looking like it worked.
+    #[test]
+    fn a_family_is_mono_or_prose_and_an_unstated_one_is_prose() {
+        let family_of = |src: &str| {
+            let (scene, id) = root(src);
+            match &runs_of(&scene, id)[0] {
+                Run::Text { style, .. } => style.family,
+                other => panic!("expected a text run, found {other:?}"),
+            }
+        };
+        assert_eq!(family_of(r#"(text (run "x"))"#), Family::Prose);
+        assert_eq!(family_of(r#"(text (run "x" :family prose))"#), Family::Prose);
+        assert_eq!(family_of(r#"(text (run "x" :family mono))"#), Family::Mono);
+        // Upcased, which is how a form the image printed arrives.
+        assert_eq!(family_of(r#"(TEXT (RUN "x" :FAMILY MONO))"#), Family::Mono);
+        // A family is orthogonal to the rest of the style: a bold monospace
+        // heading is a thing a listing's caption wants and must not have to
+        // choose between the two.
+        let (scene, id) = root(r#"(text (run "x" :family mono :size 150 :bold t :italic t))"#);
+        match &runs_of(&scene, id)[0] {
+            Run::Text { style, .. } => {
+                assert_eq!(style.family, Family::Mono);
+                assert_eq!(style.size, 150);
+                assert!(style.bold && style.italic);
+            }
+            other => panic!("expected a text run, found {other:?}"),
+        }
+        // A third word is a message naming the two there are, rather than a
+        // silent fall back to prose — the way to write one is a typo, and a
+        // listing quietly set in a serif is a bug you find by reading it.
+        let e = parse(r#"(text (run "x" :family serif))"#).unwrap_err();
+        assert!(e.contains("mono or prose"), "{e}");
+        assert!(parse(r#"(text (run "x" :family 0))"#).is_err());
+        assert!(parse(r#"(text (run "x" :family "mono"))"#).is_err());
+        // And it is a run's property, not a paragraph's: `text` takes an align
+        // and nothing else, so a family on it is a message rather than a
+        // keyword that silently did nothing.
+        assert!(parse("(text :family mono)").is_err());
     }
 
     /// A conditional face prints as `NIL` when the condition failed, and that

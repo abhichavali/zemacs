@@ -82,7 +82,7 @@ impl Editor {
     /// the bitmap this editor already holds.
     ///
     /// `(image ID)` is the whole form a document wants to write: the id came
-    /// back from `org-latex-image`, and how big the bitmap is is a fact core
+    /// back from `latex-preview`, and how big the bitmap is is a fact core
     /// has had in its image table since it rasterised it. Without this, a node
     /// that gave no size lays out to a 0×0 box and the equation is invisible —
     /// `crates/gui` cannot ask how big a texture is, by design, and the person

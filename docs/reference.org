@@ -529,34 +529,74 @@ either way, from an org buffer or from a frozen one.
 |-------------------------+---+----------------------------------------------------------|
 | =(org-frozen-mode)=       | C | Freeze the live buffer. Derives from =org-mode=.           |
 | =(org-frozen-toggle)=     | C | ...and back again. =SPC m z=                               |
-| =(org-frozen-refresh)=    | C | Redraw the page. =SPC m m=                                 |
-| =(org-frozen-clear)=      | C | Take the rendering off, leaving the mode on.             |
-| =(org-frozen-cycle)=      | C | Org's heading cycle, machinery intact. =TAB=               |
+| =(org-frozen-refresh)=    | C | Rebuild the page. =SPC m m=                                |
 
-It is =org-modern= *plus more, minus the reveal*: entering it runs =org-mode='s own
-body first, so the bullets, the emphasis, the LaTeX previews and the inline
-figures are all that file's and are not redone. What it adds:
+It draws a [[file:gui.org][*scene*]] and not a grid of cells: a tree of boxes and paragraphs laid
+out in pixels, with its text measured and wrapped by the real font. The page is
+described in one form and installed with =scene-set=, so there is nothing to
+clear and no handle to keep in step — =org-frozen-clear= and =org-frozen-cycle=
+were both commands the *overlay* version needed and neither has anything left to
+do.
 
-- **Machinery stops occupying rows.** Property drawers, =#+keyword:= lines,
-  =#+begin_…=/=#+end_…= delimiters and =#= comments are folded — not dimmed, not
-  replaced by a glyph. =j= steps over them too, because [[*Folding][=fold_hiding=]] is the one
-  predicate the renderer and the cursor both ask.
-- **=#+TITLE:= is typeset**, at twice the body size, rather than hidden. It has to
-  be: a fold hides the lines *after* its own, so line 0 is out of reach of every
-  fold there can ever be, and a title is the likeliest thing to be on it.
-- **A source block is a listing** — a =line-background= band, a =line-prefix=
-  gutter, and its body highlighted in *its own language* through [[*Highlighting a string][=highlight=]].
-- **A table is aligned** under a rule, with the rows above the first =|---+---|=
-  set bold and no vertical rules at all — the printed convention.
-- **A quote block** gets a bar and the comment face; a heading's =:tags:= come off;
-  =-----= becomes a rule.
-- **The buffer is read-only for real**, through =set-buffer-read-only=. See
-  [[*Read-only, and writing anyway][Read-only, and writing anyway]]: a program may still write to it, which is what
-  lets a frozen curriculum receive a transcribed answer.
+It is still =org-modern= *plus more, minus the reveal*: entering it runs
+=org-mode='s own body first, so the inline markup policy — which glyph, which
+face, which emphasis — is all that file's and is not decided twice.
 
-The policy is six =defparameter=s and one =case=. =%org-frozen-block= is the
-extension point — it answers the overlay plist a =#+begin_NAME= body wants, so
-giving a kind of block a new look is a line in its arm.
+What it adds:
+
+- **Machinery is never built.** Property drawers, =#+keyword:= lines,
+  =#+begin_…=/=#+end_…= delimiters and =#= comments produce no node at all.
+- **=#+TITLE:= is typeset and centred**, at twice the body size.
+- **A heading is a larger /run/**, not a larger line, with its bullet set smaller
+  than its words and its own emphasis drawn — none of which an =Overlay::scale=
+  can be, since scale is a property of the line it lands on.
+- **Mathematics is typeset.** `$x_1$` in a sentence is an =image-run= — a bitmap
+  that wraps like a word and hangs below the baseline — and =\[ … \]= alone on
+  its lines is a centred figure. Which of the two it is, is the =DISPLAY= flag
+  [[*LaTeX][=latex-fragments=]] has always answered and every caller before this threw away.
+  =latex-preview= keys its id on the source, the size *and the foreground
+  colour*, so an equation matches the text around it, follows =load-theme= and
+  =C-+=, and costs a hash lookup rather than a TeX run the second time. A machine
+  with no =latex= shows the source, once, and stops asking.
+- **A source block is a listing** — a tinted panel with a gutter, one =text= node
+  per line, each line's spans from [[*Highlighting a string][=highlight=]] as =run=\s, and the whole of it in
+  the *coding* face. That last one is not a preference: a scene sets prose in a
+  proportional face, and a column of code lines up only if every character is the
+  same width. No overlay is made, which closes the ceiling the grid version
+  carried.
+- **A table is aligned** under a hairline rule: each cell a box of a stated width,
+  the same widths in every row, and **the emphasis inside a cell is drawn** — on
+  the grid =| *bold* |= came out as six literal characters.
+- **A list item hangs**: the marker is one box and the body another, so a wrapped
+  item's continuations align with its text. Ordered lists work, which they did
+  not at all before.
+- **A link is clickable** — its run carries a =:tag=, and a click reaches the
+  closure that follows it.
+- **The buffer is read-only for real**, claimed twice: by the mode, and by the
+  scene. See [[*Read-only, and writing anyway][Read-only, and writing anyway]] — a program may still write to it, which
+  is what lets a frozen curriculum receive a transcribed answer, and the change
+  hook rebuilds the page and keeps the reader's place.
+
+What a scene costs, and it is real: **no selection, no copy, no =/=, no =n=**.
+There is no text under a page to select. =SPC m z= is the answer meanwhile.
+
+The policy is a dozen =defparameter=\s and one =case=. =%org-frozen-block= is the
+extension point for a kind of block — it answers the flags a =#+begin_NAME= body
+wants — and =*org-frozen-node-functions*= is the extension point for a *mode*:
+
+#+begin_src lisp
+(defun my-decorate (heading)             ; (:kind :level :text :tags :line :begin :end)
+  (when (member "unit" (getf heading :tags) :test #'string=)
+    (list :tag (lambda () (message "clicked a unit"))
+          :border "link"
+          (text (run "done" :face "link")))))
+(pushnew 'my-decorate *org-frozen-node-functions*)
+#+end_src
+
+Each function is called as a heading's node is built and answers a list spliced
+into that heading's =block= form — keywords =block= takes, further nodes, or both.
+That is how a curriculum makes its problems clickable without a line of this
+mode knowing what a problem is.
 
 Reveal-on-cursor is switched off through a list org-modern owns:
 

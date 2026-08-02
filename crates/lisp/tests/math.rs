@@ -19,6 +19,15 @@
 //! SVG off the disk, rasterises it and answers an id, and the proof that all of
 //! that worked is an overlay in the editor carrying an `image`.
 //!
+//! The last third is about the *page*. `:ZEMACS_STATUS:` lives in a property
+//! drawer and `org-frozen-mode` builds no node for a drawer line, so the one
+//! mode built for reading a curriculum could not show which problems were done.
+//! `math-page-decorate` — on `*org-frozen-node-functions*`, which is
+//! `org-frozen.lisp`'s policy hook and knows nothing about problems — is what
+//! puts the state back on the page, and what is asserted is the scene the editor
+//! is actually holding: a mark per problem, a score per unit, and a `:tag` that
+//! routes a click to the right one.
+//!
 //! Deliberately a single `#[test]`, as in every file beside it: `cl_boot`
 //! initialises a process-wide Lisp image, so there is exactly one `spawn` per
 //! test binary and a new file is the only way to add one.
@@ -28,6 +37,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use zemacs_core::{Editor, EditorCommand, Mode, Shared};
+use zemacs_gui::{Node, Run, Scene};
 
 const PATIENCE: Duration = Duration::from_secs(20);
 static NTH: AtomicUsize = AtomicUsize::new(0);
@@ -62,6 +72,105 @@ fn says(shared: &Shared, lisp: &zemacs_lisp::Lisp, form: &str, want: &str) {
     lisp.eval(format!("(message (format nil \"#{tag} ~a\" {form}))"));
     let want = format!("#{tag} {want}");
     wait_message(shared, form, |m| m == want);
+}
+
+/// Evaluate `form` and hand its value, printed with `~a`, back to Rust.
+///
+/// [`says`] is enough wherever the answer is known in advance; this is for the
+/// one place it cannot be — a `:tag` is an integer the image chose and the whole
+/// point of it is that nothing outside the image knows which.
+fn value(shared: &Shared, lisp: &zemacs_lisp::Lisp, form: &str) -> String {
+    let tag = NTH.fetch_add(1, Ordering::Relaxed);
+    let head = format!("#{tag} ");
+    lisp.eval(format!("(message (format nil \"#{tag} ~a\" {form}))"));
+    wait(shared, form, |ed| {
+        ed.messages
+            .iter()
+            .find_map(|m| m.strip_prefix(&head).map(|v| v.to_string()))
+    })
+}
+
+/// How many messages have been produced, for "nothing after this point said X".
+fn mark(shared: &Shared) -> usize {
+    shared.lock().unwrap().messages.len()
+}
+
+fn messages_since(shared: &Shared, from: usize) -> Vec<String> {
+    shared.lock().unwrap().messages[from..].to_vec()
+}
+
+// --- reading a page --------------------------------------------------------
+//
+// The same three walks `org_frozen.rs` uses, and for the same reason: a scene is
+// an arena and a root rather than a tree of boxes, so "every text node" is a
+// filter over `0..len` and nothing has to recurse.
+
+/// What one paragraph puts on the page, its runs joined.
+fn drawn(runs: &[Run]) -> String {
+    runs.iter()
+        .map(|r| match r {
+            Run::Text { text, .. } => text.as_str(),
+            Run::Image { .. } => "",
+        })
+        .collect()
+}
+
+/// The whole page as text, one paragraph per line.
+fn page(scene: &Scene) -> String {
+    (0..scene.len())
+        .filter_map(|id| match scene.node(id) {
+            Some(Node::Text { runs, .. }) => Some(drawn(runs)),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every `:tag` hanging on a `Block`, as the decimal the image wrote.
+///
+/// Strings rather than integers so the comparison is against what `value` read
+/// back out of the image, with no assumption here about the width of a tag.
+fn block_tags(scene: &Scene) -> Vec<String> {
+    (0..scene.len())
+        .filter_map(|id| match scene.node(id) {
+            Some(Node::Block(b)) => b.tag.map(|t| t.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `:tag` on the first run reading exactly `text`.
+///
+/// A button's tag is on its box *and* on its word — `scene-tag` called by hand,
+/// so one closure answers for both — and this reads the word's, which is the
+/// half that would be missing if only the box had been tagged.
+fn run_tag(scene: &Scene, text: &str) -> String {
+    for id in 0..scene.len() {
+        if let Some(Node::Text { runs, .. }) = scene.node(id) {
+            for r in runs {
+                if let Run::Text { text: t, tag, .. } = r {
+                    if t == text {
+                        return tag
+                            .unwrap_or_else(|| panic!("the run reading {text:?} carries no tag"))
+                            .to_string();
+                    }
+                }
+            }
+        }
+    }
+    panic!("no run reading {text:?} on the page:\n{}", page(scene));
+}
+
+/// How many runs read exactly `text`.
+fn runs_reading(scene: &Scene, text: &str) -> usize {
+    (0..scene.len())
+        .filter_map(|id| match scene.node(id) {
+            Some(Node::Text { runs, .. }) => Some(runs),
+            _ => None,
+        })
+        .flat_map(|runs| runs.iter())
+        .filter(|r| matches!(r, Run::Text { text: t, .. } if t == text))
+        .count()
 }
 
 /// Run `form` for its effect and wait until it has landed.
@@ -164,19 +273,21 @@ fn a_curriculum_is_read_navigated_and_written_back() {
     )
     .unwrap();
 
+    // The shipped config, not the three files this file's first half needs.
+    // Reading a curriculum as a *page* is `org-frozen.lisp` built on `gui.lisp`
+    // built on `crates/gui`, and the assertions below are about the whole of
+    // that stack rather than about `math.lisp` in isolation — so the honest
+    // entry point is the one the editor uses, which is also what puts these
+    // files in front of each other in the order `init.lisp` promises.
     let init = dir.join("zemacs_test_math_init.lisp");
     std::fs::write(
         &init,
         format!(
             r#"(in-package :zemacs)
 (load {:?} :verbose nil :print nil)
-(load {:?} :verbose nil :print nil)
-(load {:?} :verbose nil :print nil)
 (message "math test init loaded")
 "#,
-            runtime("modes/modes.lisp"),
-            runtime("modes/org-modern.lisp"),
-            runtime("modes/math.lisp"),
+            runtime("init.lisp"),
         ),
     )
     .unwrap();
@@ -447,4 +558,159 @@ fn a_curriculum_is_read_navigated_and_written_back() {
     wait(&shared, "the figure to clear", |ed| {
         ed.buffer.overlays().iter().all(|o| o.image.is_none()).then_some(())
     });
+
+    // --- the page shows what the drawer hides ---------------------------------
+    //
+    // The state of this document, at this line: problem one `todo`, problem two
+    // `todo`, problem three `done` — set above, through the buffer, by the same
+    // writer a click uses.
+    //
+    // A frozen page builds no node for a drawer line, so every one of those
+    // three facts was invisible in the one mode built for reading a curriculum.
+    // `math-page-decorate` is what puts them back, and it does so through
+    // `*org-frozen-node-functions*` — `org-frozen.lisp` contains not one word
+    // about problems and needs none.
+    lisp.eval("(setf *org-latex-auto* nil)".into());
+    lisp.eval("(progn (org-frozen-mode) (org-frozen-mode-hook))".into());
+    wait(&shared, "a page to go up", |ed| ed.buffer.scene.as_ref().map(|_| ()));
+    {
+        let ed = shared.lock().unwrap();
+        // A page that would not parse is a message and *not* an installed scene,
+        // so every assertion below would silently be about the page before it.
+        // The decorations here are the newest thing on the wire — a `:dir` and a
+        // `:tag` spliced into a block somebody else built — and this is what
+        // names that failure instead of letting it read as a missing pill.
+        assert!(
+            !ed.messages.iter().any(|m| m.starts_with("scene-set:")),
+            "the page did not parse: {:#?}",
+            ed.messages
+        );
+        let scene = ed.buffer.scene.as_ref().unwrap();
+        let text = page(scene);
+        // The machinery is *still* off the page. The point is not that the
+        // drawer got shown; it is that the state stopped being a drawer.
+        for gone in [":PROPERTIES:", ":ZEMACS_STATUS:", ":ZEMACS_PROBLEM:", ":END:"] {
+            assert!(!text.contains(gone), "{gone:?} is on the page:\n{text}");
+        }
+        // A mark per problem, in the checkbox vocabulary org-modern already
+        // draws `- [X]` in, so nothing needs a legend.
+        //
+        // `□` and `✓`, not `☐` and `☑`: `SFNSMono` is the first font the
+        // renderer finds on a current macOS and its `cmap` carries neither of
+        // the latter, so they drew nothing at all. A test asserting on a glyph
+        // the shipped font cannot draw is a test that passes while the page is
+        // blank.
+        assert_eq!(runs_reading(scene, "□ todo"), 2, "two problems are todo:\n{text}");
+        assert_eq!(runs_reading(scene, "✓ done"), 1, "and one is done:\n{text}");
+        // A score per unit, on the heading rather than in a status line that has
+        // to be asked for. `* Contents` carries no `:ID:`, is therefore not a
+        // unit, and gets nothing.
+        assert!(text.contains("□□ 0/2"), "unit one is untouched:\n{text}");
+        assert!(text.contains("✓ 1/1"), "unit two is finished:\n{text}");
+        // The way on, and it differs by kind: a program can be run from the page
+        // and a proof cannot be written on one.
+        assert_eq!(runs_reading(scene, "▶ run"), 1);
+        assert_eq!(runs_reading(scene, "✎ open"), 1);
+        assert_eq!(
+            runs_reading(scene, "✎ answer"),
+            2,
+            "a written problem's button leaves the page, which is the only route there is"
+        );
+    }
+
+    // --- a tag dispatches to the right problem --------------------------------
+    //
+    // `math-problem-tag` is the seam: the drawing side asks it for a problem's
+    // integer and hangs that on the nodes the problem occupies, and the editor
+    // hands the same integer back when a click lands inside one. So the first
+    // assertion is that the two are the same number — a seam that answered a
+    // *fresh* tag every time would pass every "the click worked" test below and
+    // still leave the page cold.
+    let tag = value(&shared, &lisp, "(math-problem-tag (second (math-problems)))");
+    {
+        let ed = shared.lock().unwrap();
+        let scene = ed.buffer.scene.as_ref().unwrap();
+        assert!(
+            block_tags(scene).contains(&tag),
+            "the tag the seam answers is the one on the page: {tag} not in {:?}",
+            block_tags(scene)
+        );
+    }
+    // The middle problem, so both neighbours are witnesses and they disagree
+    // with each other: one `todo`, one `done`.
+    lisp.eval(format!("(%scene-click {tag})"));
+    says(&shared, &lisp, "(getf (second (math-problems)) :status)", "done");
+    says(&shared, &lisp, "(getf (first (math-problems)) :status)", "todo");
+    says(&shared, &lisp, "(getf (third (math-problems)) :status)", "done");
+    // ...and it wrote *through* the read-only claim rather than around it. The
+    // page is still frozen the moment after.
+    says(&shared, &lisp, "(buffer-read-only-p)", "CLAIMED");
+
+    // --- and the page follows --------------------------------------------------
+    //
+    // The rebuild loop belongs to the mode: `org-frozen-after-change` is on
+    // `*after-change-functions*` and the *application* is what drains
+    // `pending_hooks` into it. Nothing drains that here, so the refresh is
+    // spelled out — which is what `org_frozen.rs` does after its own write, and
+    // is deliberately not a second refresh path put in for a click.
+    does(&shared, &lisp, "(org-frozen-refresh)");
+    {
+        let ed = shared.lock().unwrap();
+        let scene = ed.buffer.scene.as_ref().unwrap();
+        let shown = page(scene);
+        assert_eq!(runs_reading(scene, "✓ done"), 2, "the mark moved with the status:\n{shown}");
+        assert_eq!(runs_reading(scene, "□ todo"), 1, "{shown}");
+        // The unit's score moved with it, and the pips are ordered done first —
+        // which is what makes the row read as a bar rather than as a set.
+        assert!(shown.contains("✓□ 1/2"), "unit one is half done:\n{shown}");
+        // The document itself still says it in a drawer. A renderer that got the
+        // mark by rewriting the file would pass every assertion above.
+        assert!(
+            ed.buffer.text.to_string().contains(":ZEMACS_STATUS: done"),
+            "the status is still a property; the page is a reading of it"
+        );
+    }
+
+    // --- an unknown tag is silence, not an error -------------------------------
+    //
+    // Two things arrive at `%scene-click` that nobody got wrong: NIL, whenever
+    // the click lands on the page itself, and a stale integer, whenever a click
+    // races the rebuild that a previous click set off. Neither is a mistake, so
+    // neither is a message — and neither may touch the document.
+    let before = text(&shared);
+    let from = mark(&shared);
+    does(&shared, &lisp, "(%scene-click 987654321)");
+    does(&shared, &lisp, "(%scene-click nil)");
+    let said = messages_since(&shared, from);
+    assert!(
+        !said.iter().any(|m| m.to_lowercase().contains("error")),
+        "a tag naming nothing is not a mistake anybody made: {said:#?}"
+    );
+    assert_eq!(before, text(&shared), "and it wrote nothing");
+
+    // --- the way back is a button, because there is no way in ------------------
+    //
+    // A written answer cannot be typed on a page: a scene is read-only and has no
+    // cursor, and `docs/gui.org` lists that among its ceilings rather than among
+    // its gaps. So `✎ answer` does the only honest thing — moves point to the
+    // problem and takes the page down, which is `SPC m z` with the cursor already
+    // where the answer goes.
+    let answer = {
+        let ed = shared.lock().unwrap();
+        run_tag(ed.buffer.scene.as_ref().unwrap(), "✎ answer")
+    };
+    lisp.eval(format!("(%scene-click {answer})"));
+    says(&shared, &lisp, "(major-mode)", "org-mode");
+    // The exit hook is the application's to call, as the entry hook was.
+    lisp.eval("(org-mode-hook)".into());
+    says(
+        &shared,
+        &lisp,
+        "(if (= (point) (getf (first (math-problems)) :begin)) t nil)",
+        "T",
+    );
+    // ...and the buffer takes a keystroke again, which is the whole of what
+    // "back" means here.
+    says(&shared, &lisp, "(buffer-read-only-p)", "NIL");
+    assert!(shared.lock().unwrap().buffer.scene.is_none(), "the page is down");
 }

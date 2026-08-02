@@ -31,6 +31,7 @@ Same rule as everywhere else in this editor ([[file:boundary.org][boundary.org]]
 | The node tree's storage, and the ids into it     | What nodes exist, and what is in them     |
 | Block layout, text wrapping, hit testing         | Padding, gaps, sizes, colours — the taste |
 | Measuring a string in a real font                | Nothing; it cannot see a font             |
+| Which two typefaces exist, and whether they open | Which of the two a run is set in          |
 | Painting boxes, runs and images through SDL      | Which box, which run, which image         |
 | Routing a click to the node under it             | What a click on that node means           |
 
@@ -48,7 +49,11 @@ Three crates, and the reason there are three:
   scene does not know.
 - =crates/render= — paint. It already owns the fonts, the glyph caches, the image
   uploads and the frame digest, so it implements =Measure= and walks the laid-out
-  tree. **A scene adds no second font stack.**
+  tree. **A scene adds no second font stack.** It does add a second font *file* —
+  see [[* Two families, and why not a font name][the family]] — and the difference is the whole point: one more bit in the
+  face key, one more doubling of a closed bound, the same cache and the same
+  rule that a font which will not open is a =None= that is remembered rather than
+  retried.
 
 * The model
 
@@ -104,7 +109,7 @@ depends on it.
 
 A =Run= is text plus how it is set: point size *as a percentage of the body
 size* (the unit =Overlay::scale= already uses, for the same reason — the bridge to
-Lisp is integers), weight, slant, face, and an optional =Tag=.
+Lisp is integers), weight, slant, [[* Two families, and why not a font name][family]], face, and an optional =Tag=.
 
 *A run may be an image instead of text*, carrying =ImageId=, width, height and
 =depth=. This is not symmetry for its own sake: =$x_1$= in the middle of a
@@ -121,6 +126,51 @@ Rust does nothing with a tag except hand it back when a click lands inside — t
 same contract an =OverlayId= has, and for the same reason: /an arbitrary Lisp
 value never has to survive a round trip through C as printed source/.
 
+** Two families, and why not a font name
+
+An earlier draft of this file described a =Style= as size, weight and slant, and
+never mentioned a typeface at all — so everything a scene drew came out in the
+editor's monospace font, because that is the only one the renderer opens. A
+=org-frozen= page rendered that way is right in every other respect and still
+wrong as a *page*: prose set in a coding font is a grid of cells wearing a
+different hat, which is the thing this whole subsystem exists to stop being.
+
+So a =Style= carries a =Family=, and it has exactly two variants:
+
+#+begin_src rust
+pub enum Family {
+    /// What a *listing* is set in, and not a preference: a column of code lines
+    /// up only if every character is the same width.
+    Mono,
+    /// A proportional face. The **default**, because a scene is a page.
+    Prose,
+}
+#+end_src
+
+*Two roles rather than a font name*, and that is the load-bearing decision. The
+renderer holds one open =Face= per size, weight, slant and family, and every one
+of those dimensions is a short closed list precisely so the cache has a number
+it cannot grow past — see [[* A size is one of four steps, not a free percentage][the size steps]], which exist for the same reason. A
+name makes the family dimension unbounded: a map keyed by whatever anybody
+typed, a config naming a font that exists on the machine it was written on and
+not on the next one, and a document that fails differently on every box. Two
+roles keep the bound arithmetic — =MAX_FACES= doubles from
+=SCALE_STEPS.len() * 4= to =SCALE_STEPS.len() * 8=, thirty-two, and stays a
+*number* — and keep "is that font installed" a question the renderer answers
+once at startup rather than once per document.
+
+*The default is =Prose=.* A run that says nothing is prose, because nearly every
+run in a document is; the run that has to speak up is the one in a listing. A
+default of =Mono= would leave every page set in the coding font and every one of
+them looking like it worked.
+
+*A machine with no proportional font is not a broken machine.* The renderer
+searches a list at startup, and if none of them opens, a prose run is folded
+back onto the monospace face *before a face key is built* — so nothing is opened
+twice and the page is merely set in the wrong font. A document in the wrong font
+beats a document that will not draw, which is the same trade =advance= makes when
+it falls back to the body metric rather than measuring zero.
+
 ** Alignment
 
 =Block= and =Text= carry =align=: =Start= | =Center= | =End=. A centred figure and
@@ -128,6 +178,14 @@ its caption under it are the whole reason; without it every document has to know
 its own measure to fake a centre with padding.
 
 ** Lengths
+
+*A =Px= is a device pixel, not a logical one.* On a Retina display =:pad 48= is
+24 points of actual margin, and a document written against a 1× screen comes out
+half-size on a 2× one. Lisp cannot correct for it: there is no =Em= length and no
+reader that answers the scale factor, so a document either hard-codes a guess or
+states everything in =Pct=. =*org-image-width*= already solved this for figures by
+taking *ems*, and that is the shape the fix wants. Until then it is the biggest
+practical gap in this file.
 
 =Length= is =Px(i32)= | =Pct(u16)= | =Fill= | =Auto=. =Auto= means "as big as the
 content"; =Fill= means "share what is left with the other =Fill= siblings". That is
@@ -161,6 +219,32 @@ pub trait Measure {
 Two methods, because those are the two questions block layout asks. The renderer
 implements them over its existing =Face= cache. The test suite implements them as
 =len() * 8=, which is what makes every wrapping test in =crates/gui= readable.
+
+Both take the whole =Style=, and that now includes the [[* Two families, and why not a font name][family]]: two runs of the
+same string at the same size measure differently and sit on different baselines
+if one is prose and the other is code.
+
+*** =advance= is the sum of its characters, and that is not an implementation detail
+
+The renderer's draw loop steps the pen *one glyph at a time*, by =advance= asked
+one character at a time, and =advance= of a whole string is defined as the sum of
+those same calls. The two are therefore equal by construction rather than by
+luck, and neither may be rewritten in terms of a shaped whole string without the
+other moving in the same edit.
+
+The failure that rule prevents is not a loose line, it is a *broken* one. Ask a
+face for the width of a whole string and you get something *narrower* than its
+own characters summed, because side bearings tuck glyphs together; the run then
+measures short, the next piece is placed at that short width, and it paints over
+the tail of the one before. It has happened once already, on a sheared italic,
+and rendered =sides= followed by =rather= as =sidesrather=. A proportional face
+makes that class of bug the norm rather than the exception — kerning pairs are
+what a text face is *for* — so the rule is written here as well as in the code,
+and =a_prose_face_measures_a_string_as_exactly_the_sum_of_its_characters= is the
+assertion of it against a real font.
+
+The residual cost is the honest one: a pen stepped per glyph sets =AV= a pixel or
+two wider than a shaper would. Slightly loose prose, never an overlap.
 
 ** A size is one of four steps, not a free percentage
 
@@ -236,14 +320,14 @@ every caller hold ids it has to keep in step with the document.
     (text (run "The Rank-Nullity Theorem" :size 200 :bold t))
     (text (run "For a linear map ") (run "T : V → W" :italic t)
           (run ", the dimensions satisfy:"))
-    (image (org-latex-image "\\dim V = \\operatorname{rank} T + \\dim\\ker T"))))
+    (image (latex-preview "\\dim V = \\operatorname{rank} T + \\dim\\ker T"))))
 #+end_src
 
 ** Two languages, and the difference matters
 
 The form above is *not* what reaches Rust, and an earlier draft of this file
-presented it as if it were. =(image (org-latex-image "\\dim V = ..."))= is a
-**call**: =org-latex-image= runs, rasterises, and answers an id. A parser cannot
+presented it as if it were. =(image (latex-preview "\\dim V = ..."))= is a
+**call**: =latex-preview= runs, rasterises, and answers an id. A parser cannot
 evaluate anything, so what crosses the boundary is =(image 7314 :width 210 :height
 28 :depth 6)=.
 
@@ -251,7 +335,7 @@ So there are two languages with the same shape, and both are real:
 
 - What a *config author* writes — =block=, =text=, =run= and the rest are ordinary
   Lisp functions that evaluate their arguments and answer the wire form. This is
-  where =org-latex-image= runs and where a document's taste lives.
+  where =latex-preview= runs and where a document's taste lives.
 - What crosses into Rust — printed, fully evaluated, integers and strings only.
   =crates/lisp/src/scene.rs= reads it.
 
@@ -266,13 +350,15 @@ blockarg  := ":pad" i32 | ":gap" i32 | ":dir" ("row"|"column")
            | ":background" face | ":border" face | ":tag" tag | node
 textarg   := ":align" align | run
 run       := "(" "run" (string | ":size" 1..=65535 | ":bold" bool
-                       | ":italic" bool | ":face" face | ":tag" tag)* ")"
+                       | ":italic" bool | ":family" family | ":face" face
+                       | ":tag" tag)* ")"
            | "(" "image-run" (imageid | ":width" u32 | ":height" u32
                              | ":depth" u32 | ":tag" tag)* ")"
 imgarg    := imageid | ":width" u32 | ":height" u32 | ":depth" u32
 rectarg   := ":width" length | ":height" length | ":fill" face
 length    := i32 | "(" "pct" 0..=65535 ")" | "fill" | "auto"
 align     := "start" | "center" | "end"
+family    := "mono" | "prose"       ; unstated is prose — a scene is a page
 face      := 0..=255 | "nil"        ; nil is the pane's own colour
 tag       := i64 | "nil"
 bool      := "t" | "nil"            ; strict, not generalised truth
@@ -300,14 +386,29 @@ One verb into core, =scene-set=.
 - *No incremental layout.* A scene relays out whole. Ceiling: a document long
   enough that a full relayout is felt on a keystroke that changes it, which
   nothing does today because nothing types into one.
-- *No RTL, no bidi, no shaping beyond what SDL_ttf does.* Same as the grid.
+- *No RTL, no bidi, no shaping beyond what SDL_ttf does.* Same as the grid, and
+  now with a sharper edge on it: the prose face is *stepped per glyph*, so its
+  kerning pairs are ignored and =AV= sets a pixel or two loose. Measuring and
+  drawing agree exactly, which is the property that matters; what is lost is the
+  last bit of fit. Upgrade path is one shaped run per piece, which needs a shaper
+  this editor does not have — and the measure has to move with it in the same
+  edit, or the overlap comes back.
+- *One proportional face, and its bold and italic are synthetic.* FreeType smears
+  the outline for bold and shears it for slant rather than loading the designed
+  cuts, which for a *text* face is more visible than it was on the grid — a real
+  italic is a different alphabet, not a slanted one. Ceiling: emphasis that reads
+  as emphasis but not as typography. Upgrade path is a per-family table of four
+  files, which is four more entries in the search list and a wider =FaceKey=, and
+  nothing else.
 - *One scroll offset per scene*, so a scene with two independently scrolling
   panes inside it is not expressible. Upgrade path: the offset moves onto the
   =Block=.
 - *No table columns.* Column width is a constraint *across siblings* and no
   per-child =Length= can say it, so a table is row-direction =Block=\s whose cells
-  all state the *same* =Px= or =Pct= widths — the writer computes them once from
-  the widest cell in each column and repeats them per row. Not =Auto=: =Auto=
+  all state the *same* widths, repeated per row. It has to be =Pct=: computing
+  =Px= widths means measuring a string, and measuring is in the *Rust* column of
+  the split — the writer of the document is the one party that cannot do it, so
+  a guessed pixel width wraps every cell it guessed low. Not =Auto= either: =Auto=
   sizes a cell to its own content, so column one would be as wide as "Name" in
   one row and "Wolfgang" in the next and the table would not line up at all.
   With stated widths the residual ceiling is that a cell too narrow for its text
@@ -336,7 +437,10 @@ One verb into core, =scene-set=.
   deliberately scaled keeps its numbers, and an id naming no bitmap is left
   alone. *Do not add a =:width= to the example to "fix" it* — that would hide the
   behaviour this paragraph is describing.
-- *A curriculum's state is off the page.* =:ZEMACS_STATUS:= lives in a property
-  drawer and =org-frozen= hides drawers by construction, so the one mode built
-  for reading a curriculum cannot show which problems are done. That is a fact
-  about the *mode*, not about scenes, and the scene port is when to fix it.
+- /A curriculum's state is off the page./ *Closed.* =:ZEMACS_STATUS:= lives in a
+  property drawer and =org-frozen= hides drawers by construction, so the one
+  mode built for reading a curriculum could not show which problems were done —
+  =math-progress= said "3/7" to the status line and the page said nothing.
+  =math.lisp= now decorates each heading through =*org-frozen-node-functions*=
+  with a per-problem pill and a per-unit score. The state stopped being a drawer
+  without starting to be machinery: =:PROPERTIES:= is still off the page.

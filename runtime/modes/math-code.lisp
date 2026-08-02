@@ -500,7 +500,7 @@ this format defines no name), and a path that leaves the curriculum."
                               tangle))
              nil))))
 
-(defun %math-code-here ()
+(defun %math-code-here (&optional problem)
   "What the live buffer says the program is, as a plist, or NIL having said why:
 
     :org       the curriculum's pathname
@@ -513,6 +513,15 @@ gesture is the one `SPC m n' already leaves you in position for. In a *program*
 it is the buffer itself, and there is no problem, because a file knows which
 curriculum it belongs to (see `%math-code-curriculum-of') without knowing which
 heading produced it.
+
+PROBLEM says which one instead of reading point, and NIL — what every keystroke
+passes — means read it. That argument is the whole accommodation this file makes
+for a *click*: `org-frozen-mode' draws a curriculum as a scene, a scene has no
+cursor, and point in one is wherever the keyboard last left it — very likely
+another problem entirely. A callback therefore carries the problem it was built
+for, and this is where that lands. It is ignored in a program's own buffer, which
+is answered from the file's path before any problem is looked for and where a
+click cannot come from anyway.
 
 Every refusal is worded here rather than by the callers, so the sentence a
 learner reads is about the thing that was actually wrong."
@@ -529,7 +538,7 @@ learner reads is about the thing that was actually wrong."
        (message "math: not a curriculum")
        nil)
       (t
-       (let ((problem (math-problem-at-point)))
+       (let ((problem (or problem (math-problem-at-point))))
          (cond
            ((null problem)
             (message "math: no problem at point")
@@ -671,15 +680,27 @@ switcher survive. `C-M-r' still re-runs in place from inside the terminal."
 ;;; ---------------------------------------------------------------------------
 ;;; The commands
 
-(defun math-code-edit ()
-  "Open the program for the problem at point, beside the curriculum.
+;;; Each command is a pair: the one that takes a *problem* and the one that reads
+;;; point, with the second a call to the first. That shape rather than an
+;;; optional argument on one function, because the two are asked by different
+;;; things and the difference is worth being able to see in a backtrace: a key
+;;; press means "the problem I am looking at" and a click means "this problem",
+;;; and only the first has any business consulting the cursor.
+;;;
+;;; The pair is small — the sibling is the body and the command is two lines —
+;;; because `%math-code-here' already had one place where point was read and now
+;;; takes the answer instead.
+
+(defun math-code-edit-problem (problem)
+  "Open PROBLEM's program beside the curriculum. PROBLEM NIL reads point, which
+is what `math-code-edit' passes.
 
 The one gesture this file exists for. It writes the template the *first* time
 and never again, starts the environment building when there is not one, splits
 the window and leaves you in the program — and skips each of those when it has
 already happened, so pressing it twice is the same as pressing it once."
   (math-code-build-poll)
-  (let ((here (%math-code-here)))
+  (let ((here (%math-code-here problem)))
     (when here
       (let* ((org (getf here :org))
              (problem (getf here :problem))
@@ -693,18 +714,23 @@ already happened, so pressing it twice is the same as pressing it once."
            ;; A write that failed has already said why, and saying anything
            ;; after it would put the real reason off the status line.
            (unless (%math-code-write program (getf (getf here :block) :body))
-             (return-from math-code-edit nil)))
+             (return-from math-code-edit-problem nil)))
           (fresh
            (message (format nil "math: ~a is not there — open it from the curriculum"
                             (file-namestring program)))
-           (return-from math-code-edit nil)))
+           (return-from math-code-edit-problem nil)))
         (%math-code-ensure org (math-code-packages problem))
         (%math-code-show program)
         (message (format nil "~a~:[~; · tangled~] · SPC m x runs it"
                          (file-namestring program) fresh))))))
 
-(defun math-code-run ()
-  "Run the program for the problem at point, in a terminal of its own.
+(defun math-code-edit ()
+  "Open the program for the problem at point, beside the curriculum. `SPC m e'."
+  (math-code-edit-problem nil))
+
+(defun math-code-run-problem (problem)
+  "Run PROBLEM's program in a terminal of its own. PROBLEM NIL reads point, which
+is what `math-code-run' passes.
 
 The output goes to a real PTY, so the program may prompt, print as it goes, be
 interrupted with `C-c' and open a window; `C-M-r' runs it again in the same
@@ -714,7 +740,7 @@ unchanged.
 Nothing looks at what comes out. This shows you your program's output; whether
 it is the *right* output is yours to decide."
   (math-code-build-poll)
-  (let ((here (%math-code-here)))
+  (let ((here (%math-code-here problem)))
     (when here
       (let ((org (getf here :org))
             (program (getf here :program)))
@@ -756,6 +782,10 @@ it is the *right* output is yours to decide."
            (when (%math-code-write (%math-code-run-script org program)
                                    (math-code-run-text org program))
              (terminal (math-code-run-verb org program)))))))))
+
+(defun math-code-run ()
+  "Run the program for the problem at point, in a terminal of its own. `SPC m x'."
+  (math-code-run-problem nil))
 
 (defun math-code-env ()
   "Build or top up this curriculum's environment, and say where it stands.

@@ -61,7 +61,9 @@ use zemacs_core::{
 // `zemacs_gui::Rect` is deliberately not imported: `Rect` in this file is
 // SDL's, and three rectangle types in one namespace is how a blit ends up in
 // the wrong coordinate space. The scene's is spelled out where it is used.
-use zemacs_gui::{FaceId, Frame as SceneFrame, Layout, Measure, Node, Run, Scene, Style};
+use zemacs_gui::{
+    FaceId, Family, Frame as SceneFrame, Layout, Measure, Node, Run, Scene, Style,
+};
 use zemacs_term::Screen;
 
 /// Outer margin, in pixels, around the text area and inside the modeline.
@@ -107,6 +109,33 @@ const FONT_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
 ];
 
+/// Proportional faces to try, in order, for the prose of a *scene*. Earlier
+/// entries win. Nothing on the cell grid is ever set in one of these.
+///
+/// The order is reading-driven where the list above is coverage-driven: these
+/// are all text faces rather than display ones, and the first three are the
+/// ones designed for a paragraph at a screen's resolution. Charter is first
+/// because it was drawn for exactly this — a serif that holds up at low
+/// rendering resolutions — and because it ships with every macOS. New York is
+/// Apple's own reading serif and is next for coverage: it is the one here most
+/// likely to have the arrows and set symbols a mathematics document is full of.
+/// The Windows-heritage faces at the end are there because a machine that has
+/// none of the Apple ones has usually got those.
+///
+/// A serif rather than a sans throughout, and that is a taste decision written
+/// down rather than defended: the thing this subsystem is for is a *printed
+/// page*, and the page it is being built against is a mathematics text.
+const PROSE_CANDIDATES: &[&str] = &[
+    "/System/Library/Fonts/Supplemental/Charter.ttc",
+    "/System/Library/Fonts/NewYork.ttf",
+    "/System/Library/Fonts/Palatino.ttc",
+    "/System/Library/Fonts/Supplemental/Georgia.ttf",
+    "/System/Library/Fonts/Supplemental/Times New Roman.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
+];
+
 pub struct Renderer {
     canvas: WindowCanvas,
 
@@ -121,6 +150,15 @@ pub struct Renderer {
     font: Font<'static, 'static>,
 
     font_path: PathBuf,
+    /// The proportional face a scene's prose is set in, or `None` on a box that
+    /// has none of [`PROSE_CANDIDATES`].
+    ///
+    /// Searched once, in [`Renderer::new`], because the answer cannot change
+    /// while the process runs and because a `None` re-derived per face would be
+    /// eight `stat`s a frame. `None` is not a hole in the renderer: it folds a
+    /// prose cut back onto the mono face in [`Renderer::cut_key`], so a page on
+    /// such a box is set in the coding font and draws.
+    prose_path: Option<PathBuf>,
     /// Point size the font is currently open at — already multiplied by the
     /// display scale, so it is *not* `settings.font_size`.
     point_size: u16,
@@ -131,9 +169,9 @@ pub struct Renderer {
     /// the rasterised glyphs differ, so they cannot share a cache either.
     bold: Font<'static, 'static>,
     bold_glyphs: HashMap<char, Option<Texture<'static>>>,
-    /// Every *other* face: any size an overlay's `scale` asked for, and italic
-    /// at any size. See [`Face`] for what one is and [`Renderer::draw_glyph`]
-    /// for the three-way split.
+    /// Every *other* face: any size an overlay's `scale` asked for, italic at
+    /// any size, and every cut of the prose family a scene names. See [`Face`]
+    /// for what one is and [`Renderer::draw_glyph`] for the three-way split.
     ///
     /// The two fields above are not folded in here, deliberately. They are the
     /// faces the editor draws essentially all of its text in — every buffer,
@@ -142,14 +180,19 @@ pub struct Renderer {
     /// only because a config asked for typesetting, and every dimension of it is
     /// therefore something policy can be held to a bound on.
     ///
-    /// **The bound.** The key space is closed by [`SCALE_STEPS`] × four styles =
-    /// 16, of which the body's plain and bold live above, so at most 14 faces
-    /// are ever open here; [`MAX_FACES`] is the assertion of that. Each holds at
-    /// most [`MAX_FACE_GLYPHS`] textures and empties itself rather than growing
-    /// past it. `None` records a face that would not open, so it is not retried
-    /// every frame. All of it is dropped by [`Renderer::sync`], exactly as the
-    /// body caches are, since a font-size or DPI change makes every pixel of it
-    /// stale.
+    /// **The bound.** The key space is closed by [`SCALE_STEPS`] × two weights ×
+    /// two slants × two families = 32, of which the mono body's plain and bold
+    /// live above, so at most 30 faces are ever open here; [`MAX_FACES`] is the
+    /// assertion of that. Each holds at most [`MAX_FACE_GLYPHS`] textures and
+    /// empties itself rather than growing past it. `None` records a face that
+    /// would not open, so it is not retried every frame. All of it is dropped by
+    /// [`Renderer::sync`], exactly as the body caches are, since a font-size or
+    /// DPI change makes every pixel of it stale.
+    ///
+    /// The prose *body* face lives in here rather than in a field of its own,
+    /// unlike the mono body face, and that is the honest place for it: it is
+    /// open only because a scene is on screen, which is the condition every
+    /// other entry in this map shares.
     faces: HashMap<FaceKey, Option<Face>>,
     /// One texture per overlay image, keyed the way core keys the pixels — by
     /// what produced them. So a second `org-latex-preview` over the same buffer
@@ -235,6 +278,7 @@ impl Renderer {
         ));
 
         let font_path = find_font()?;
+        let prose_path = find_prose_font()?;
         // Matches `Settings::default().font_size`; `sync` fixes it up on frame one.
         let point_size = scale_point_size(18.0, dpi_scale(&canvas));
         let mut font = ttf
@@ -257,6 +301,7 @@ impl Renderer {
             images: HashMap::new(),
             scenes: None,
             font_path,
+            prose_path,
             point_size,
             glyphs: HashMap::new(),
             drawn: FNV_SEED,
@@ -1004,7 +1049,17 @@ impl Renderer {
                     // `*bold*` really can be three bold characters in the middle
                     // of a body line while `scale` cannot.
                     let (bold, italic) = overlay_emphasis(&ov_runs, src);
-                    self.draw_glyph(ch, x, ty, color, Cut { pct, bold, italic });
+                    // Mono, and not a choice: this is the cell grid, where the
+                    // cursor's column and the glyph's column are the same
+                    // arithmetic. A proportional face here would put them in two
+                    // different places on every line with a wide letter in it.
+                    self.draw_glyph(
+                        ch,
+                        x,
+                        ty,
+                        color,
+                        Cut { pct, bold, italic, family: Family::Mono },
+                    );
                 }
                 // Images last of the text, over the blanks their substitution
                 // reserved. One that started on an earlier display row is
@@ -1760,20 +1815,45 @@ impl Renderer {
 
     // --- typeset text -----------------------------------------------------
 
-    /// One glyph in whatever face `(pct, bold, italic)` names.
+    /// One glyph in whatever face `cut` names.
     ///
     /// A three-way split rather than one lookup, and it is worth the extra arm:
     /// body-weight and bold body text is nearly every character the editor ever
     /// draws, and those two keep the direct field access and the flat
     /// `HashMap<char, _>` they have always had. Only the rest — anything an
-    /// overlay's `scale` asked for, and italic at any size — pays a second hash
-    /// to find its face first. The fast path is unchanged, which also means the
-    /// glyph cache with the interesting lifetime is unchanged.
+    /// overlay's `scale` asked for, italic at any size, and every cut of the
+    /// prose family — pays a second hash to find its face first. The fast path
+    /// is unchanged, which also means the glyph cache with the interesting
+    /// lifetime is unchanged.
+    ///
+    /// **Which arm is taken is decided by [`Renderer::body_face`], the same
+    /// function [`Renderer::face_font`] asks when it is deciding which handle
+    /// *measures* the character.** That is not tidiness: this split was written
+    /// against `(pct, bold, italic)` and a family added underneath it went
+    /// unnoticed, so prose was measured in the proportional face and painted in
+    /// the monospace one — every glyph a Menlo glyph, stepped by a Charter
+    /// advance, with a hole after every `m` and no gap at all between some
+    /// words. Two copies of "which face is this" is exactly one copy too many.
+    ///
+    /// It costs the fast path an integer multiply and a clamp per glyph, where
+    /// it used to be three comparisons. That is a few thousand cycles across a
+    /// whole frame of text, against a `copy` per glyph on the line below it.
+    ///
+    /// The cut names a face; [`Renderer::glyph_face`] says whether *this
+    /// character* is really set in it, and is the same call the measure makes.
     fn draw_glyph(&mut self, c: char, x: i32, y: i32, color: Color, cut: Cut) {
-        match (cut.pct, cut.bold, cut.italic) {
-            (100, false, false) => self.draw_char(c, x, y, color),
-            (100, true, false) => self.draw_bold_char(c, x, y, color),
-            _ => self.draw_styled_char(c, x, y, color, cut),
+        self.draw_glyph_in(c, x, y, color, self.glyph_face(self.cut_key(cut), c));
+    }
+
+    /// [`Renderer::draw_glyph`] with the face already resolved, for the one
+    /// caller that has to know which face it got: `draw_text_frame` places the
+    /// blit against that face's own ascent, so it resolves first and passes the
+    /// answer down rather than asking twice.
+    fn draw_glyph_in(&mut self, c: char, x: i32, y: i32, color: Color, key: FaceKey) {
+        match self.body_face(key) {
+            Some(false) => self.draw_char(c, x, y, color),
+            Some(true) => self.draw_bold_char(c, x, y, color),
+            None => self.draw_styled_char(c, x, y, color, key),
         }
     }
 
@@ -1798,20 +1878,21 @@ impl Renderer {
 
     /// A glyph from the on-demand face map. See [`Renderer::faces`] for the
     /// bound; this is where both halves of it are enforced.
-    fn draw_styled_char(&mut self, c: char, x: i32, y: i32, color: Color, cut: Cut) {
+    fn draw_styled_char(&mut self, c: char, x: i32, y: i32, color: Color, key: FaceKey) {
         if c == ' ' || c == '\t' {
             return;
         }
-        let key = face_key(self.point_size, cut);
         let Renderer {
             faces,
             ttf,
             font_path,
+            prose_path,
             textures,
             canvas,
             ..
         } = self;
-        let Some(face) = cached_face(faces, ttf, font_path, key) else {
+        let path = face_file(key, font_path, prose_path.as_deref());
+        let Some(face) = cached_face(faces, ttf, path, key) else {
             return;
         };
         // Emptied rather than evicted one by one: there is no access order to
@@ -1843,19 +1924,23 @@ impl Renderer {
     }
 }
 
-/// A *cut* of the typeface: one size, one weight, one slant — the three things
-/// that together decide which font handle rasterises a glyph.
+/// A *cut* of the typeface: one family, one size, one weight, one slant — the
+/// four things that together decide which font handle rasterises a glyph.
 ///
-/// One value rather than three arguments because it is one decision. The draw
+/// One value rather than four arguments because it is one decision. The draw
 /// loop resolves it per cell (the size from the line, the weight and slant from
 /// the overlays covering that cell) and hands it straight down; nothing in
-/// between has any business taking the three apart.
+/// between has any business taking the four apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Cut {
     /// Percent of the body size, already snapped to a [`SCALE_STEPS`] entry.
     pct: u16,
     bold: bool,
     italic: bool,
+    /// Which typeface. **Always [`Family::Mono`] on the cell grid** — a
+    /// proportional face would put the cursor and the glyph under it in two
+    /// different columns — so only a scene ever names the other one.
+    family: Family,
 }
 
 impl Cut {
@@ -1865,6 +1950,7 @@ impl Cut {
             pct,
             bold: false,
             italic: false,
+            family: Family::Mono,
         }
     }
 }
@@ -1880,12 +1966,42 @@ struct Face {
 }
 
 /// What identifies a [`Face`]: an absolute point size — already through the
-/// display's scale factor and the overlay's percentage — and the two style bits.
+/// display's scale factor and the overlay's percentage — and the three style
+/// bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct FaceKey {
     point_size: u16,
-    /// Bit 0 bold, bit 1 italic.
+    /// Bit 0 bold, bit 1 italic, bit 2 the proportional family.
+    ///
+    /// The family is a *bit in this byte* rather than a [`Family`] field beside
+    /// it, and the reason is the frame digest. `draw_styled_char` folds the key
+    /// into the digest as its two numbers, so anything that identifies a face
+    /// and is not in one of them is a change the digest cannot see — and the
+    /// symptom of that is not a wrong pixel but a frame that is never presented,
+    /// because two pictures differing only in their typeface hashed the same.
+    /// One byte carrying every bit of the decision is the shape that cannot go
+    /// out of step with itself.
     style: u8,
+}
+
+impl FaceKey {
+    /// Whether this face is the proportional one — bit 2 of [`FaceKey::style`],
+    /// read here rather than spelled out at each of the three call sites that
+    /// want it.
+    fn prose(self) -> bool {
+        self.style & 4 != 0
+    }
+
+    /// The same cut in the monospace family — same point size, same weight, same
+    /// slant, one family over.
+    ///
+    /// Clearing bit 2 rather than rebuilding a key, so the answer is always a key
+    /// the closed space already contains: every caller of this is *substituting*
+    /// one face for another, and a substitution that minted a key would grow the
+    /// cache past the [`MAX_FACES`] the whole design is bounded by.
+    fn mono(self) -> Self {
+        Self { style: self.style & !4, ..self }
+    }
 }
 
 /// The face a [`Cut`] names, given the point size the body is open at.
@@ -1901,7 +2017,9 @@ struct FaceKey {
 fn face_key(body_point_size: u16, cut: Cut) -> FaceKey {
     FaceKey {
         point_size: scaled(i32::from(body_point_size), cut.pct).clamp(4, 400) as u16,
-        style: u8::from(cut.bold) | (u8::from(cut.italic) << 1),
+        style: u8::from(cut.bold)
+            | (u8::from(cut.italic) << 1)
+            | (u8::from(cut.family == Family::Prose) << 2),
     }
 }
 
@@ -1929,9 +2047,136 @@ fn cached_face<'a>(
         .as_mut()
 }
 
-/// Open faces [`Renderer::faces`] will hold. `SCALE_STEPS.len() * 4`, which is
+/// `key` as this machine can actually honour it: a prose face on a box with no
+/// proportional font becomes the monospace face of the same size and weight.
+///
+/// The degradation happens *to the key*, before anything is opened, and that is
+/// the load-bearing part. Falling back later — at the path, or at the measure —
+/// would leave a distinct prose key in the map, so the same file would be opened
+/// twice under two names, cached twice, and rasterised twice to draw identical
+/// pixels. Folding here means the whole prose half of the key space simply does
+/// not exist on such a box: [`Renderer::face_font`] finds the body font in its
+/// field, the page is set in the coding font, and nothing anywhere is duplicated.
+///
+/// Free rather than a method so it can be tested without a window, which is what
+/// the rest of the measuring path already manages.
+fn on_this_box(key: FaceKey, prose: Option<&std::path::Path>) -> FaceKey {
+    if key.prose() && prose.is_none() {
+        return key.mono();
+    }
+    key
+}
+
+/// The face one *character* is set in, given the face its run named and a way to
+/// find the font behind that face.
+///
+/// Normally the face it named. The exception is the whole reason this exists: a
+/// prose face is a *text* face and its repertoire stops not far past the Latin
+/// alphabet, so a curriculum's status marks `□` and `✓`, org-modern's heading
+/// bullets `● ○ ■ ▸ ‣` and most of the arrow and set notation a mathematics
+/// document is made of have no glyph in Charter at all. What a face draws for a
+/// character it does not map is its `.notdef`, and the two faces disagree about
+/// what that looks like — nothing at all in SFNSMono, a hollow box in Charter —
+/// which is why one bug wore two disguises: stray indentation on the cell grid,
+/// and a page reading `▯▯ 0/2` where the checkboxes should be. The monospace
+/// list is picked for coverage where the prose list is picked for reading (see
+/// [`FONT_CANDIDATES`] against [`PROSE_CANDIDATES`]) and carries every one of
+/// them, so the character is set in [`FaceKey::mono`] of the same cut.
+///
+/// ponytail: **one** face deep, not a chain down [`FONT_CANDIDATES`]. Ceiling: a
+/// character neither the prose face nor the coding face carries is still a
+/// `.notdef` — `☐`, `☑` and `◉` are exactly that on a current macOS, which is
+/// why `org-modern.lisp` and `math.lisp` already pick their glyphs out of what
+/// SFNSMono has rather than out of what Emacs has. Upgrade path is to walk the
+/// list, and the thing it costs is the closed key space: a family is one bit
+/// today because there are two of them, and an *n*th face is `MAX_FACES` times
+/// *n* unless the fallback face is resolved to a single extra key first.
+///
+/// **This is the one place a substitution is decided**, for exactly the reason
+/// [`Renderer::body_face`] is the one place its question is decided, and it is
+/// the same hazard wearing a different hat. [`Renderer::glyph_face`] is its only
+/// caller, and *that* has two: [`Measure::advance`], which decides what
+/// **measures** a character, and [`Renderer::draw_glyph`], which decides what
+/// **draws** it. A second copy of this test in either one would reserve a
+/// Charter advance for a glyph blitted out of the coding face — the `doesnotget`
+/// bug with a smaller blast radius and no easier to see.
+///
+/// # The frame digest
+///
+/// A substitution changes the *key*, and the key is what the painter folds into
+/// the digest: `draw_styled_char` marks `(point_size, style)`, and clearing the
+/// family bit changes `style`. A substituted character that lands on the body
+/// face goes through `draw_char` instead, which marks a differently shaped word
+/// entirely. Either way the digest moves with the picture, which is the property
+/// [`Renderer::drawn`] needs and the one a face swapped silently would break.
+///
+/// # The ASCII gate
+///
+/// `find_glyph` is a C call into FreeType's character map, and this runs for
+/// every visible character of every frame, so nothing that cannot need a
+/// substitution is allowed to pay for one — the gate short-circuits before the
+/// font is even *found*, which is a hash lookup of its own. It is sound because
+/// every face in [`PROSE_CANDIDATES`] is a general-purpose text face covering
+/// the whole of printable ASCII; that is a property of *that list*, not of
+/// ASCII, and `the_prose_face_covers_every_printable_ascii_character` is where
+/// it is checked against the face actually on the box. Adding a display face, an
+/// icon face or a subsetted webfont to the list would make an unmapped `$`
+/// possible and the gate would then be hiding it. The fix in that case is to
+/// delete the gate, not to widen it.
+fn substituted<'a>(
+    key: FaceKey,
+    named: impl FnOnce(FaceKey) -> Option<&'a Font<'static, 'static>>,
+    c: char,
+) -> FaceKey {
+    if c.is_ascii() || !key.prose() {
+        return key;
+    }
+    match named(key) {
+        Some(f) if f.find_glyph(c).is_none() => key.mono(),
+        // A face that would not open answers `None` here, and is left alone: it
+        // is already measured on the grid metric and drawn as whatever
+        // `open_face` eventually decides, and substituting on no evidence would
+        // move a whole page into the coding font the first time an em dash went
+        // past.
+        _ => key,
+    }
+}
+
+/// The file a [`FaceKey`] is opened from.
+///
+/// A family is *which file*, and nothing else: size, weight and slant are all
+/// settings applied to a font already open, which is why only this one of the
+/// four needs a path at all.
+///
+/// A prose key with no prose font falls back to the monospace face rather than
+/// to nothing, on exactly the terms [`advance_in`] falls back to the body
+/// metric: a page in the wrong typeface is a page you can read and complain
+/// about, and a page that would not draw is a bug report with no picture in it.
+/// It is also nearly unreachable — [`Renderer::cut_key`] folds the family back
+/// onto mono before a key is built — so this is the brace to that belt, for the
+/// caller that builds a key by hand.
+fn face_file<'a>(
+    key: FaceKey,
+    mono: &'a std::path::Path,
+    prose: Option<&'a std::path::Path>,
+) -> &'a std::path::Path {
+    match (key.prose(), prose) {
+        (true, Some(p)) => p,
+        _ => mono,
+    }
+}
+
+/// Open faces [`Renderer::faces`] will hold. `SCALE_STEPS.len() * 8`, which is
 /// the whole key space, so reaching it means the steps grew and this did not.
-const MAX_FACES: usize = SCALE_STEPS.len() * 4;
+///
+/// Eight and not four since prose arrived: four steps × two weights × two
+/// slants × **two families**. That is the entire cost of a second typeface and
+/// it is a doubling of a closed number rather than a door opened — the family
+/// is [`Family`], which has two variants and no way to acquire a third from a
+/// config, so nothing a document can say moves this. A family named by *string*
+/// would have made the same product unbounded, which is the whole argument for
+/// the enum.
+const MAX_FACES: usize = SCALE_STEPS.len() * 8;
 
 /// Glyph textures one [`Face`] will cache. At two hundred and fifty-six
 /// characters and a few kilobytes each this is a few megabytes across every
@@ -2146,6 +2391,34 @@ fn find_font() -> anyhow::Result<PathBuf> {
                 FONT_CANDIDATES.join("\n  ")
             )
         })
+}
+
+/// The face a scene's prose is set in, or `None` when the box has none of them.
+///
+/// **`None` rather than an error**, which is the one place this departs from
+/// [`find_font`]. A missing monospace font is fatal because every cell of every
+/// buffer is drawn in one and there is nothing to fall back to; a missing prose
+/// font is a page set in the coding font, which is uglier and entirely legible.
+/// A document in the wrong font beats a document that will not draw, and
+/// refusing to start an editor over a font only scenes use would be the wrong
+/// trade by a distance.
+///
+/// Searched once, at startup, and remembered as a path — so a box with none of
+/// these does not `stat` eight files every time a face opens. That is the same
+/// discipline [`open_face`] applies one level down, where a font that will not
+/// open is a `None` in the cache rather than a retry every frame.
+///
+/// `$ZEMACS_PROSE_FONT` naming something that is not a file *is* an error, and
+/// deliberately not a silent fall-through to the list: somebody who set it
+/// meant it, and a typo that quietly drew the whole page in Menlo is exactly
+/// the sort of thing you spend an evening not finding.
+fn find_prose_font() -> anyhow::Result<Option<PathBuf>> {
+    if let Some(p) = std::env::var_os("ZEMACS_PROSE_FONT") {
+        let p = PathBuf::from(p);
+        anyhow::ensure!(p.is_file(), "$ZEMACS_PROSE_FONT is not a file: {}", p.display());
+        return Ok(Some(p));
+    }
+    Ok(PROSE_CANDIDATES.iter().map(PathBuf::from).find(|p| p.is_file()))
 }
 
 // --- pure layout helpers (unit-tested; no window required) -----------------
@@ -3271,6 +3544,14 @@ fn spans_for_line(
 // multiplying a cell width, which is the whole point of it: the grid's answer is
 // arithmetic and a scene's has to be the truth, because there is no column for a
 // wrong answer to be corrected against.
+//
+// A scene does add a second font *file*. Prose in the coding font is a grid of
+// cells wearing a different hat, and a page is the one thing here that is not a
+// grid — so `Family` picks between the monospace face and one proportional one,
+// and that is the whole of the difference. It is a second file and not a second
+// stack: one more bit in `FaceKey`, one more doubling of a closed `MAX_FACES`,
+// the same `cached_face` door, the same failure-is-cached rule. Nothing a
+// document can write opens a third.
 
 /// Everything that would move a box if it changed, in one number.
 ///
@@ -3303,6 +3584,9 @@ fn scene_cut(style: Style) -> Cut {
         pct: scale_step(style.size),
         bold: style.bold,
         italic: style.italic,
+        // Straight through, and the only field that needs no snapping: there
+        // are two families and a document cannot name a third.
+        family: style.family,
     }
 }
 
@@ -3314,9 +3598,39 @@ fn scene_cut(style: Style) -> Cut {
 /// not zero: a paragraph measured at zero wraps every word onto one line and
 /// stacks the whole document in one place, which is a great deal harder to
 /// recognise as a missing font than text that is merely spaced like the grid.
+///
+/// One face for the whole string, which is why [`Measure::advance`] hands it one
+/// character at a time: the face is a per-character answer once a symbol the
+/// prose font lacks can be substituted into the mono one. That costs nothing —
+/// the sum below is already per character — and it keeps the rule below the one
+/// rule rather than two.
 fn advance_in(font: Option<&Font>, cell_w: i32, text: &str, pct: u16) -> i32 {
-    match font.and_then(|f| f.size_of(text).ok()) {
-        Some((w, _)) => w as i32,
+    match font {
+        // Summed per character, *not* `size_of` of the whole string, and the
+        // difference is not pedantry. `draw_text_frame` blits one glyph at a
+        // time and steps the pen by this same function asked one character at a
+        // time, so the only measure that can agree with what lands on screen is
+        // the one added up the same way. `size_of` of a whole string is narrower
+        // than its own characters summed whenever a face has side bearings the
+        // shaper would tuck together — a sheared italic most of all — and the
+        // symptom is not a loose line but a *broken* one: the run measures short,
+        // the next piece is placed at that short width, and an italic quote
+        // renders its neighbour as `sidesrather`.
+        //
+        // A proportional face makes this class of bug the *norm* rather than the
+        // exception — kerning pairs and side bearings are what a text face is
+        // for — so the rule hardens into an invariant here: **this function is
+        // defined as the sum of its characters' advances, and the draw loop is
+        // defined as stepping by this function per character.** Neither can be
+        // rewritten in terms of a whole string without rewriting the other in
+        // the same edit, and `a_prose_face_measures_a_string_as_exactly_the_sum
+        // _of_its_characters` is the assertion of it against a real font.
+        Some(f) => {
+            let mut buf = [0u8; 4];
+            text.chars()
+                .map(|c| f.size_of(c.encode_utf8(&mut buf)).map_or(0, |(w, _)| w as i32))
+                .sum()
+        }
         // Cells rather than characters, so a wide character still measures two
         // of them — the same rule `draw_weighted` follows on the grid.
         None => str_cells(text) as i32 * scaled(cell_w, pct),
@@ -3359,35 +3673,108 @@ fn line_in(font: Option<&Font>, line_h: i32, ascent: i32, pct: u16) -> (i32, i32
 /// pre-pass gets a document spaced like the grid instead of a document collapsed
 /// into a single point.
 impl Measure for Renderer {
+    /// Summed one character at a time **through the same substitution the
+    /// painter uses**, because the face is a per-character answer: a `□` in a
+    /// paragraph of Charter is set in the coding face, and measuring the run as
+    /// one string in one face would reserve Charter's `.notdef` for it and then
+    /// blit the coding face's box into that space. [`advance_in`] is still the definition of "the
+    /// sum of a string's characters in one face" and is still what does the
+    /// arithmetic; this loop is what decides which face each character's turn
+    /// belongs to, and [`Renderer::glyph_face`] is where that is decided.
     fn advance(&self, text: &str, style: Style) -> i32 {
         let cut = scene_cut(style);
-        let font = self.face_font(face_key(self.point_size, cut));
-        advance_in(font, self.cell_w, text, cut.pct)
+        let key = self.cut_key(cut);
+        // Found once for the run rather than per character: a substitution is a
+        // handful of symbols in a page of prose, and everything else wants this
+        // same font.
+        let named = self.face_font(key);
+        let mut buf = [0u8; 4];
+        let mut w = 0;
+        for c in text.chars() {
+            let face = self.glyph_face(key, c);
+            let font = if face == key { named } else { self.face_font(face) };
+            w += advance_in(font, self.cell_w, c.encode_utf8(&mut buf), cut.pct);
+        }
+        w
     }
 
+    /// The run's own face and no substitution, deliberately: the line box is a
+    /// property of the paragraph, and letting one borrowed glyph vote on it would
+    /// let a single checkbox change the leading of the text around it.
     fn line(&self, style: Style) -> (i32, i32) {
         let cut = scene_cut(style);
-        let font = self.face_font(face_key(self.point_size, cut));
+        let font = self.face_font(self.cut_key(cut));
         line_in(font, self.line_h, self.ascent, cut.pct)
     }
 }
 
 impl Renderer {
-    /// The font handle behind `key`, without opening anything.
+    /// The [`FaceKey`] a [`Cut`] names here, on this box.
     ///
-    /// The same three-way split [`Renderer::draw_glyph`] makes, for the same
-    /// reason: the body's plain and bold faces are not in the `faces` map, they
-    /// are fields, and a lookup that missed them would answer `None` for the two
-    /// faces nearly every character is set in.
-    fn face_font(&self, key: FaceKey) -> Option<&Font<'static, 'static>> {
-        if key.point_size == self.point_size {
-            match key.style {
-                0 => return Some(&self.font),
-                1 => return Some(&self.bold),
-                _ => {}
-            }
+    /// [`face_key`] is the arithmetic and this is the *policy*: a prose cut on a
+    /// machine with no proportional font is folded back onto the monospace
+    /// family before it ever becomes a key. Folding here rather than at the
+    /// point a font is opened is what makes the degradation total — the prose
+    /// body text then resolves to `self.font`, the same handle the grid uses,
+    /// instead of opening a second copy of the same file under a key of its own
+    /// and paying for a duplicate glyph cache to draw identical pixels.
+    ///
+    /// Every caller that turns a `Cut` into a face goes through this, which is
+    /// what keeps measuring and painting looking at the same font: they are the
+    /// same two lines of decision, written once.
+    fn cut_key(&self, cut: Cut) -> FaceKey {
+        on_this_box(face_key(self.point_size, cut), self.prose_path.as_deref())
+    }
+
+    /// Whether `key` names one of the two faces the renderer holds as *fields*
+    /// rather than in [`Renderer::faces`] — and if so, which: `Some(false)` for
+    /// the plain body face, `Some(true)` for its bold.
+    ///
+    /// **The one place that question is answered**, and it has two callers that
+    /// must never disagree: [`Renderer::face_font`], which decides what
+    /// *measures* a character, and [`Renderer::draw_glyph`], which decides what
+    /// *draws* it. They were two copies of this test once, and a family added to
+    /// one and not the other is what set a whole page in the wrong font while
+    /// spacing it in the right one.
+    ///
+    /// Both fields are the *monospace* family at the body size, so a prose key
+    /// never lands here: `style` 0 and 1 are mono plain and mono bold, and bit 2
+    /// being set puts the key past both and into the map, which is where every
+    /// prose face lives.
+    fn body_face(&self, key: FaceKey) -> Option<bool> {
+        match key.style {
+            0 if key.point_size == self.point_size => Some(false),
+            1 if key.point_size == self.point_size => Some(true),
+            _ => None,
         }
-        self.faces.get(&key)?.as_ref().map(|f| &f.font)
+    }
+
+    /// The font handle behind `key`, without opening anything.
+    fn face_font(&self, key: FaceKey) -> Option<&Font<'static, 'static>> {
+        match self.body_face(key) {
+            Some(false) => Some(&self.font),
+            Some(true) => Some(&self.bold),
+            None => self.faces.get(&key)?.as_ref().map(|f| &f.font),
+        }
+    }
+
+    /// The face `c` is really set in, when the run it came from named `key`.
+    ///
+    /// The `&self` half of [`substituted`], which is where the decision lives and
+    /// why there may only be one of it. This is the *only* caller of that, and
+    /// everything that needs to know which face a character belongs to — the
+    /// measure, the paint, and the baseline the paint blits against — calls this.
+    /// The font is passed as a closure so that the ASCII gate short-circuits
+    /// before the lookup happens at all, which is most characters of most pages.
+    fn glyph_face(&self, key: FaceKey, c: char) -> FaceKey {
+        substituted(key, |k| self.face_font(k), c)
+    }
+
+    /// How far below the top of a glyph texture SDL_ttf puts the baseline for
+    /// `key`'s face — which is the number that turns a baseline into the
+    /// top-left corner a blit wants. Degrades on exactly [`line_in`]'s terms.
+    fn face_ascent(&self, key: FaceKey, pct: u16) -> i32 {
+        line_in(self.face_font(key), self.line_h, self.ascent, pct).1
     }
 
     /// Open every face `scene` will be measured in, so that [`Measure`] can
@@ -3410,19 +3797,37 @@ impl Renderer {
             };
             for r in runs {
                 let Run::Text { style, .. } = r else { continue };
-                let key = face_key(self.point_size, scene_cut(*style));
-                if self.face_font(key).is_none() && !want.contains(&key) {
-                    want.push(key);
+                let key = self.cut_key(scene_cut(*style));
+                // The named face *and* the one [`substituted`] can send a
+                // character to, because a face that is not open measures on the
+                // grid metric: a `□` substituted into a mono face nobody had
+                // opened yet would be measured as a cell during layout and as a
+                // real glyph a moment later, once the painter's own
+                // `cached_face` had opened it — two different widths for one
+                // character in one paragraph. Unconditional rather than only for
+                // the runs that need it, since finding out would mean walking
+                // every character of the document to save opening a face inside
+                // the same closed `MAX_FACES` bound. `mono()` of a mono key is
+                // itself, and the body cuts are fields rather than entries, so
+                // for the common page this adds nothing at all.
+                for k in [key, key.mono()] {
+                    if self.face_font(k).is_none() && !want.contains(&k) {
+                        want.push(k);
+                    }
                 }
             }
         }
         let ttf = self.ttf;
         // Cloned once for the whole pre-pass, not per face: `cached_face` wants
         // the path while it holds `&mut self.faces`, and those are two fields of
-        // one struct.
+        // one struct. Both families, because a document is prose with listings
+        // in it and asking which of the two a page needs would be a walk of the
+        // arena to save a `PathBuf`.
         let path = self.font_path.clone();
+        let prose = self.prose_path.clone();
         for key in want {
-            cached_face(&mut self.faces, ttf, &path, key);
+            let file = face_file(key, &path, prose.as_deref());
+            cached_face(&mut self.faces, ttf, file, key);
         }
     }
 
@@ -3725,9 +4130,10 @@ impl Renderer {
                             continue;
                         };
                         let cut = scene_cut(*style);
+                        let key = self.cut_key(cut);
                         // The blit is from the top-left of the glyph's own box,
                         // and the box's baseline is `ascent` down from there.
-                        let top = baseline - self.line(*style).1;
+                        let ascent = self.face_ascent(key, cut.pct);
                         let c = colour(style.face);
                         let mut x = left;
                         for ch in s.chars() {
@@ -3738,14 +4144,40 @@ impl Renderer {
                             // character per frame — cheap against the blit next
                             // to it, and it assumes advances add, which the
                             // wrapper already assumes for the same fonts.
-                            // Ceiling: a kerned proportional face, where the
-                            // drawn text would be a pixel or two loose against
-                            // its own measure. Upgrade path is one shaped run
-                            // per piece, which needs a shaper this editor does
-                            // not have.
+                            //
+                            // The prose family is where that assumption stops
+                            // being free: a text face has kerning pairs, and a
+                            // pen stepped per glyph sets "AV" a pixel or two
+                            // wider than a shaper would. Ceiling: prose that is
+                            // very slightly loose in the pairs a designer
+                            // tightened — never a piece that overruns its
+                            // neighbour, because the *measure* is the same sum.
+                            // Upgrade path is one shaped run per piece, which
+                            // needs a shaper this editor does not have; the
+                            // measure would have to move with it in the same
+                            // edit or the sum and the shape disagree and the
+                            // overlap comes back.
                             let mut buf = [0u8; 4];
                             let w = self.advance(ch.encode_utf8(&mut buf), *style);
-                            self.draw_glyph(ch, x, top, c, cut);
+                            // Resolved here rather than left to `draw_glyph`,
+                            // because a substituted character is rasterised by a
+                            // *different* face and SDL_ttf puts the baseline of a
+                            // glyph texture that face's own ascent below its top.
+                            // Blitting every glyph against the run's ascent would
+                            // hang each `□` the difference between two faces'
+                            // ascents below the line it belongs to — which reads
+                            // as a checkbox that has fallen off the sentence, not
+                            // as a font substitution. The measure above went
+                            // through the same call, so the two cannot disagree
+                            // about which face this is.
+                            let face = self.glyph_face(key, ch);
+                            let top = baseline
+                                - if face == key {
+                                    ascent
+                                } else {
+                                    self.face_ascent(face, cut.pct)
+                                };
+                            self.draw_glyph_in(ch, x, top, c, face);
                             x += w;
                         }
                     }
@@ -4104,8 +4536,9 @@ mod tests {
         assert_eq!(scale_step(1), 100);
         assert_eq!(scale_step(4000), 200);
         // ...and the declared bound covers the whole key space, which is the
-        // claim `Renderer::faces` makes in prose.
-        assert_eq!(MAX_FACES, SCALE_STEPS.len() * 4);
+        // claim `Renderer::faces` makes in prose: a step, a weight, a slant and
+        // a family, so eight faces per step and not four.
+        assert_eq!(MAX_FACES, SCALE_STEPS.len() * 2 * 2 * 2);
         assert!(SCALE_STEPS.contains(&100), "body size must be a step");
     }
 
@@ -5465,6 +5898,29 @@ mod tests {
         }
     }
 
+    /// A proportional face is findable, or its absence is the survivable kind.
+    ///
+    /// Not an assertion that one *is* there: a build box may have none of them,
+    /// which is the case [`find_prose_font`] answers `None` for on purpose. What
+    /// is asserted is that whatever it answered is real — a path that came back
+    /// and is not a file would open as `None` on every face and set a whole
+    /// document in the coding font with nothing anywhere saying why.
+    #[test]
+    fn a_prose_font_is_findable_or_honestly_absent() {
+        match find_prose_font() {
+            Ok(Some(p)) => assert!(p.is_file(), "{} does not exist", p.display()),
+            Ok(None) => {
+                // Every candidate really is missing, which is what `None` means.
+                for c in PROSE_CANDIDATES {
+                    assert!(!PathBuf::from(c).is_file(), "{c} exists but was not found");
+                }
+            }
+            // Only reachable from a bad `$ZEMACS_PROSE_FONT`, and then the
+            // message has to name the variable somebody has to go and fix.
+            Err(e) => assert!(e.to_string().contains("ZEMACS_PROSE_FONT"), "{e}"),
+        }
+    }
+
     /// A scaled face really opens, and really is bigger.
     ///
     /// Everything else about typesetting in this file is arithmetic and is
@@ -5565,12 +6021,23 @@ mod scenes {
     use super::*;
     use zemacs_gui::{Align, Block, Length, Rect as GuiRect};
 
+    /// A style at `size`, in whatever family [`Style::default`] picks — which is
+    /// prose, and every test below that says nothing about a family is
+    /// deliberately exercising that default rather than working around it.
     fn style(size: u16, bold: bool, italic: bool) -> Style {
         Style {
             size,
             bold,
             italic,
-            face: None,
+            ..Style::default()
+        }
+    }
+
+    fn in_family(size: u16, family: Family) -> Style {
+        Style {
+            size,
+            family,
+            ..Style::default()
         }
     }
 
@@ -5599,31 +6066,77 @@ mod scenes {
     }
 
     #[test]
-    fn weight_and_slant_are_the_two_bits_of_the_face_key() {
-        let bits = |b, i| face_key(18, scene_cut(style(100, b, i))).style;
-        assert_eq!(bits(false, false), 0);
-        assert_eq!(bits(true, false), 1);
-        assert_eq!(bits(false, true), 2);
-        assert_eq!(bits(true, true), 3);
+    fn weight_slant_and_family_are_the_three_bits_of_the_face_key() {
+        let bits = |b, i, f| {
+            face_key(
+                18,
+                scene_cut(Style {
+                    bold: b,
+                    italic: i,
+                    family: f,
+                    ..style(100, false, false)
+                }),
+            )
+            .style
+        };
+        assert_eq!(bits(false, false, Family::Mono), 0);
+        assert_eq!(bits(true, false, Family::Mono), 1);
+        assert_eq!(bits(false, true, Family::Mono), 2);
+        assert_eq!(bits(true, true, Family::Mono), 3);
+        // Bit 2, above both style bits — which is what keeps the two mono faces
+        // the renderer holds as *fields* at keys 0 and 1, where `face_font`
+        // looks for them.
+        assert_eq!(bits(false, false, Family::Prose), 4);
+        assert_eq!(bits(true, true, Family::Prose), 7);
+        assert!(face_key(18, scene_cut(in_family(100, Family::Prose))).prose());
+        assert!(!face_key(18, scene_cut(in_family(100, Family::Mono))).prose());
+    }
+
+    /// A family names a *different face*, not a different setting on one.
+    ///
+    /// The failure this catches is the cheap one: threading `Family` through the
+    /// model and the parser and then dropping it before the key, which would
+    /// leave every test above passing and every page still set in Menlo.
+    #[test]
+    fn the_two_families_are_two_faces_at_the_same_size_and_weight() {
+        let key = |f| face_key(18, scene_cut(in_family(100, f)));
+        let (mono, prose) = (key(Family::Mono), key(Family::Prose));
+        assert_ne!(mono, prose, "both families landed on one face key");
+        assert_eq!(mono.point_size, prose.point_size, "a family is not a size");
     }
 
     /// The bound on [`Renderer::faces`] is the one thing a scene could quietly
     /// break, since a scene's sizes are written by hand in Lisp rather than
     /// picked from a list. It cannot: every one of them goes through
-    /// [`scene_cut`] first.
+    /// [`scene_cut`] first, and the family that multiplies the key space is an
+    /// enum of two rather than a name.
     #[test]
     fn no_scene_style_can_name_a_face_outside_the_cache_bound() {
         let mut keys = std::collections::HashSet::new();
         for size in [0u16, 1, 99, 100, 101, 112, 137, 175, 200, 1000, u16::MAX] {
             for bold in [false, true] {
                 for italic in [false, true] {
-                    let cut = scene_cut(style(size, bold, italic));
-                    assert!(SCALE_STEPS.contains(&cut.pct), "{size}% escaped as {}", cut.pct);
-                    keys.insert(face_key(18, cut));
+                    for family in [Family::Mono, Family::Prose] {
+                        let cut = scene_cut(Style {
+                            bold,
+                            italic,
+                            family,
+                            ..style(size, false, false)
+                        });
+                        assert!(SCALE_STEPS.contains(&cut.pct), "{size}% escaped as {}", cut.pct);
+                        keys.insert(face_key(18, cut));
+                    }
                 }
             }
         }
         assert!(keys.len() <= MAX_FACES, "{} faces, bound is {MAX_FACES}", keys.len());
+        // And the bound is what it says it is: four steps, two weights, two
+        // slants, two families. Asserting the *number* and not only the
+        // inequality is what turns "a family was added and `MAX_FACES` was not"
+        // into a failing test rather than a cache that silently clears itself
+        // every few frames.
+        assert_eq!(MAX_FACES, 32);
+        assert_eq!(keys.len(), MAX_FACES, "the whole key space should be reachable");
     }
 
     /// A face the cache would not open degrades to the body metric.
@@ -5681,6 +6194,386 @@ mod scenes {
         // An empty string is nothing wide in a real face too, which is what
         // lets a paragraph hold an empty run without reserving a pixel for it.
         assert_eq!(advance_in(Some(&body.font), 8, "", 100), 0);
+    }
+
+    /// A box with no proportional font sets its prose in the coding face, and
+    /// the fold happens to the *key* so that nothing is opened twice.
+    ///
+    /// The failure this guards is the one the whole scheme is exposed to:
+    /// `Family::Prose` on a machine that has none of [`PROSE_CANDIDATES`]. The
+    /// wrong answers are a face that opens as `None` and measures at the grid's
+    /// arithmetic while everything around it measures in a real font, and a
+    /// second key holding a second copy of the monospace file. Both are avoided
+    /// by the prose bit simply not surviving [`on_this_box`].
+    #[test]
+    fn a_prose_face_with_no_font_behind_it_becomes_the_mono_face_and_not_nothing() {
+        let mono = face_key(18, scene_cut(in_family(100, Family::Mono)));
+        let prose = face_key(18, scene_cut(in_family(100, Family::Prose)));
+        let elsewhere = PathBuf::from("/System/Library/Fonts/NoSuchProseFont.ttf");
+
+        // With a proportional font, the two stay two.
+        assert_eq!(on_this_box(prose, Some(&elsewhere)), prose);
+        assert_eq!(on_this_box(mono, Some(&elsewhere)), mono);
+        // Without one, prose *is* mono — the same key, so the same single entry
+        // in the cache and the same `self.font` behind it.
+        assert_eq!(on_this_box(prose, None), mono);
+        assert_eq!(on_this_box(mono, None), mono);
+        // And the size and weight survive the fold: it degrades the family and
+        // nothing else, so a 200% bold heading is still a 200% bold heading.
+        let big = face_key(18, scene_cut(Style { bold: true, ..in_family(200, Family::Prose) }));
+        let folded = on_this_box(big, None);
+        assert_eq!(folded.point_size, big.point_size);
+        assert_eq!(folded.style, 1, "bold, mono, and nothing else");
+
+        // The path follows the same rule one level down, for a key built by
+        // hand rather than through `Renderer::cut_key`.
+        let m = PathBuf::from("/mono.ttf");
+        assert_eq!(face_file(prose, &m, None), m.as_path());
+        assert_eq!(face_file(prose, &m, Some(&elsewhere)), elsewhere.as_path());
+        assert_eq!(face_file(mono, &m, Some(&elsewhere)), m.as_path());
+    }
+
+    /// The two families really are two different files, and the prose one really
+    /// is proportional.
+    ///
+    /// Everything else about a family here is arithmetic on a bit. This is the
+    /// step that talks to FreeType, and its failure is the silent one: a prose
+    /// candidate that will not open answers `None`, and a page then draws in the
+    /// coding font with the whole plumbing above it working perfectly.
+    #[test]
+    fn the_prose_face_opens_and_sets_the_same_words_unlike_the_mono_one() {
+        let (Ok(mono_path), Ok(Some(prose_path))) = (find_font(), find_prose_font()) else {
+            return; // the two tests above have already said which is missing
+        };
+        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
+        let open = |path: &PathBuf, family| {
+            open_face(ttf, path, face_key(18, scene_cut(in_family(100, family))))
+                .unwrap_or_else(|| panic!("{} would not open at the body size", path.display()))
+        };
+        let mono = open(&mono_path, Family::Mono);
+        let prose = open(&prose_path, Family::Prose);
+
+        // Proportional means an `i` is narrower than an `m`. On the grid they
+        // are the same width by definition, which is what makes this the one
+        // assertion that cannot pass by accident on the mono face.
+        let w = |f: &Face, s: &str| advance_in(Some(&f.font), 0, s, 100);
+        assert_eq!(w(&mono, "i"), w(&mono, "m"), "the coding font is not monospace");
+        assert!(
+            w(&prose, "i") < w(&prose, "m"),
+            "{} sets i and m the same width — it is not a proportional face",
+            prose_path.display()
+        );
+        // And a paragraph of it is narrower than the same words on the grid,
+        // which is the visible half of why a page is set in it at all.
+        let s = "The dimensions of a linear map satisfy a rank-nullity relation.";
+        assert!(
+            w(&prose, s) < w(&mono, s),
+            "prose set {} wide against the grid's {}",
+            w(&prose, s),
+            w(&mono, s)
+        );
+    }
+
+    /// **What a run measures is exactly where the pen lands, and exactly how
+    /// wide the ink is** — checked in the face where it is hardest to be true.
+    ///
+    /// Three facts, and together they are the whole agreement:
+    ///
+    /// 1. [`advance_in`] is the sum of its characters' widths, taken from the
+    ///    font one character at a time. Asserted against the raw `size_of` calls
+    ///    rather than against itself, so rewriting it in terms of a whole string
+    ///    fails here rather than on somebody's screen.
+    /// 2. `draw_text_frame` steps the pen by that same per-character number.
+    ///    That one is not testable without a canvas; it is one line, and it is
+    ///    the line this test exists to protect.
+    /// 3. The *texture* blitted for a character is precisely that many pixels
+    ///    wide, since `glyph_texture` renders it as a one-character string and
+    ///    that is what `size_of` measures. So a character's ink cannot leave the
+    ///    cell the pen reserved for it, and a piece's ink cannot leave the piece.
+    ///
+    /// Which is why the interesting comparison is *not* against the face's own
+    /// measurement of the whole string. That number differs in both directions —
+    /// narrower where a kern pair pulls `AV` together, wider where the final
+    /// glyph's ink overhangs its advance — and the renderer never asks for it.
+    /// The last time measuring and drawing disagreed, the cause was exactly
+    /// that: a whole-string `size_of` against a per-character draw, which
+    /// rendered an italic run's neighbour as `sidesrather`.
+    #[test]
+    fn a_prose_run_measures_the_pixels_its_glyphs_will_actually_cover() {
+        let Ok(Some(path)) = find_prose_font() else {
+            return; // no proportional font on this box
+        };
+        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
+        // Every cut a document actually uses, since a sheared italic is where
+        // the bearings are worst.
+        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let cut = scene_cut(Style { bold, italic, ..in_family(100, Family::Prose) });
+            let face = open_face(ttf, &path, face_key(18, cut)).expect("the prose face opens");
+            let font = &face.font;
+            // Pairs a designer would have kerned, an ascender-descender clash,
+            // and text with punctuation and accents in it.
+            let mut ever_differed = false;
+            for s in ["AV", "To", "Way", "Yo.", "rank-nullity", "naïve — café", "f) (g"] {
+                let mut per_char = 0;
+                for c in s.chars() {
+                    let mut buf = [0u8; 4];
+                    let t = c.encode_utf8(&mut buf);
+                    let step = font.size_of(t).map_or(0, |(w, _)| w as i32);
+                    // The ink of this character is this wide, so stepping the pen
+                    // by it leaves the next character clear of it. A space has no
+                    // ink and is skipped by the painter, which is why it is the
+                    // one character not asserted about.
+                    if c != ' ' {
+                        let ink = font
+                            .render(t)
+                            .blended(Color::RGB(255, 255, 255))
+                            .expect("the prose face rasterises its own characters");
+                        assert_eq!(
+                            ink.width() as i32,
+                            step,
+                            "{c:?} is {} pixels of ink in a {step}-pixel step",
+                            ink.width()
+                        );
+                    }
+                    per_char += step;
+                }
+                assert_eq!(
+                    advance_in(Some(font), 0, s, 100),
+                    per_char,
+                    "{s:?} is not measured as the sum of its characters"
+                );
+                // And the distinction is a real one in this face rather than a
+                // rule about nothing: somewhere in this list the whole string
+                // measures differently from its own characters summed.
+                ever_differed |= font.size_of(s).map_or(0, |(w, _)| w as i32) != per_char;
+            }
+            assert!(
+                ever_differed,
+                "no string measured differently whole — is this face really proportional?"
+            );
+        }
+    }
+
+    /// The glyphs the modes actually draw a page's furniture out of. Every one
+    /// of them was chosen by `org-modern.lisp` and `math.lisp` for being in both
+    /// `SFNSMono` and `Menlo`, because the *grid* had this same bug first and
+    /// those tables are the workaround — which is precisely what makes them the
+    /// right characters to test the substitution with: the coding face is
+    /// guaranteed to carry them, so a substitution into it buys a real glyph
+    /// rather than one `.notdef` for another.
+    ///
+    /// Not `☐`, `☑` or `◉`, which is the trap. They are what Emacs draws and what
+    /// the bug report says, and no font this renderer opens on a current macOS
+    /// has any of them — a test written against those asserts a thing the fix
+    /// cannot deliver, and the fix is not the one at fault.
+    const PAGE_FURNITURE: &[char] = &['□', '✓', '✗', '●', '○', '■', '▸', '‣', '→'];
+
+    /// A character the prose face has no glyph for is set in the coding face of
+    /// the same cut, and one it *has* is left alone.
+    ///
+    /// The defect: a curriculum's checkboxes came out as `▯▯ 0/2` and a heading's
+    /// bullet as another hollow box, because Charter maps none of them and a face
+    /// with no glyph draws `.notdef`. The two wrong fixes this pins down are a
+    /// substitution that never fires — the page still full of tofu — and one that
+    /// fires for everything, which sets the whole of a serif page in the coding
+    /// font and would satisfy every assertion about the symbols on its own.
+    #[test]
+    fn a_symbol_the_prose_face_has_no_glyph_for_is_set_in_the_mono_face_of_the_same_cut() {
+        let (Ok(mono_path), Ok(Some(prose_path))) = (find_font(), find_prose_font()) else {
+            return; // the two font tests have already said which is missing
+        };
+        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
+        // Every cut, because a substitution changes the family and must change
+        // nothing else: a 200% bold heading's star is still 200% and still bold.
+        for (pct, bold, italic) in [(100, false, false), (200, true, false), (100, false, true)] {
+            let cut = scene_cut(Style { bold, italic, ..in_family(pct, Family::Prose) });
+            let key = face_key(18, cut);
+            let prose = open_face(ttf, &prose_path, key).expect("the prose face opens");
+            let at = |c| substituted(key, |_| Some(&prose.font), c);
+
+            // Nothing anywhere maps the private use area, so this is the leg that
+            // holds whichever proportional face the box happened to have.
+            let sub = at('\u{e123}');
+            assert_eq!(sub, key.mono(), "an unmapped character stayed in the prose face");
+            assert_eq!(sub.point_size, key.point_size, "a substitution resized the glyph");
+            assert_eq!(sub.style, key.style & 3, "a substitution changed more than the family");
+            assert!(!sub.prose());
+
+            // And the characters that actually produced the screenshot. A prose
+            // face carrying one of these is not the face that produced the bug,
+            // and there is nothing for this to say about it.
+            let mono = open_face(ttf, &mono_path, key.mono()).expect("the coding face opens");
+            let mut ever_substituted = false;
+            for &c in PAGE_FURNITURE {
+                if prose.font.find_glyph(c).is_none() {
+                    ever_substituted = true;
+                    assert_eq!(at(c), key.mono(), "{c:?} was left in a face that cannot set it");
+                    assert!(
+                        mono.font.find_glyph(c).is_some(),
+                        "{} cannot set {c:?} either — substituting into it buys nothing",
+                        mono_path.display()
+                    );
+                }
+            }
+            assert!(
+                ever_substituted,
+                "{} carries every one of a page's symbols — this box cannot see the bug",
+                prose_path.display()
+            );
+
+            // A letter every text face has stays in the face the run named.
+            assert!(prose.font.find_glyph('é').is_some(), "a text face with no é");
+            assert_eq!(at('é'), key, "a character the prose face has was substituted away");
+        }
+    }
+
+    /// **The face that measures a character is the face that draws it**, because
+    /// there is one answer and both take theirs from it.
+    ///
+    /// Asserted against [`substituted`] rather than against a second copy of the
+    /// rule, which is the only version of this that could ever fail: a test that
+    /// re-derived "which face is this" would agree with itself while the renderer
+    /// disagreed with the screen. That is the failure [`Renderer::body_face`]
+    /// documents — a family added to the painter and not the measure, which set a
+    /// page in the wrong font and spaced it in the right one — and a per-character
+    /// substitution is the same hazard at a finer grain.
+    ///
+    /// So everything below is derived from one call: the file the painter opens,
+    /// the font the measure asks, and the ink SDL_ttf actually blits.
+    #[test]
+    fn the_face_that_measures_a_character_is_the_face_that_draws_it() {
+        let (Ok(mono_path), Ok(Some(prose_path))) = (find_font(), find_prose_font()) else {
+            return;
+        };
+        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
+        let key = face_key(18, scene_cut(in_family(100, Family::Prose)));
+        let prose = open_face(ttf, &prose_path, key).expect("the prose face opens");
+        let mono = open_face(ttf, &mono_path, key.mono()).expect("the coding face opens");
+
+        let every: Vec<char> = ['a', 'é', '—', '\u{e123}']
+            .into_iter()
+            .chain(PAGE_FURNITURE.iter().copied())
+            .collect();
+        for c in every {
+            let face = substituted(key, |_| Some(&prose.font), c);
+            let (font, file) = if face == key {
+                (&prose.font, &prose_path)
+            } else {
+                (&mono.font, &mono_path)
+            };
+
+            // The painter opens `face` from this file...
+            assert_eq!(
+                face_file(face, &mono_path, Some(&prose_path)),
+                file.as_path(),
+                "{c:?} is drawn out of a different file than it is measured in"
+            );
+            // ...the pen steps by that same font's advance for the character...
+            let mut buf = [0u8; 4];
+            let t = c.encode_utf8(&mut buf);
+            let step = advance_in(Some(font), 0, t, 100);
+            // ...and that is exactly the ink the blit puts down, so a substituted
+            // glyph cannot overhang the space the measure reserved for it.
+            let ink = font
+                .render(t)
+                .blended(Color::RGB(255, 255, 255))
+                .expect("the resolved face rasterises the character it was chosen for");
+            assert_eq!(ink.width() as i32, step, "{c:?} is {} of ink in a {step} step", ink.width());
+        }
+    }
+
+    /// The gate on the hot path: ASCII never reaches the glyph lookup.
+    ///
+    /// Two claims, and the second is the one worth a test. The answer is the face
+    /// the run named — but it is reached *without the font being found at all*,
+    /// which is the hash lookup and the C call this is here to save on every
+    /// visible character of every frame. The closure below records being asked,
+    /// so a rewrite that resolves first and gates afterwards fails here rather
+    /// than in a profile nobody takes.
+    #[test]
+    fn no_ascii_character_ever_leaves_the_face_its_run_named() {
+        let key = face_key(18, scene_cut(in_family(100, Family::Prose)));
+        let asked = std::cell::Cell::new(false);
+        let never = |_| {
+            asked.set(true);
+            None::<&Font<'static, 'static>>
+        };
+        for c in (0u8..=127).map(char::from) {
+            assert_eq!(substituted(key, never, c), key, "{c:?} was substituted");
+        }
+        assert!(!asked.get(), "an ASCII character reached the glyph lookup");
+
+        // A mono run is the other free case, and for every character rather than
+        // only the ASCII ones: there is no other family to substitute *to*.
+        let mono = key.mono();
+        for &c in PAGE_FURNITURE.iter().chain(&['\u{e123}', 'é']) {
+            assert_eq!(substituted(mono, never, c), mono, "{c:?} left the coding face");
+        }
+        assert!(!asked.get(), "a run already in the coding face reached the glyph lookup");
+    }
+
+    /// What makes the gate above sound: the face this box actually found covers
+    /// every printable ASCII character, so skipping the lookup for them cannot
+    /// hide a missing glyph.
+    ///
+    /// It is a property of [`PROSE_CANDIDATES`] and not of ASCII. A display face,
+    /// an icon face or a subsetted webfont added to that list fails here, which is
+    /// the signal to delete the gate rather than widen it.
+    #[test]
+    fn the_prose_face_covers_every_printable_ascii_character() {
+        let Ok(Some(path)) = find_prose_font() else {
+            return;
+        };
+        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
+        let key = face_key(18, scene_cut(in_family(100, Family::Prose)));
+        let face = open_face(ttf, &path, key).expect("the prose face opens");
+        for c in (0x20u8..=0x7e).map(char::from) {
+            assert!(
+                face.font.find_glyph(c).is_some(),
+                "{} has no glyph for {c:?}, so the ASCII gate in `substituted` hides a tofu",
+                path.display()
+            );
+        }
+    }
+
+    /// A substitution **reuses** a face key rather than minting one, so the
+    /// bound on [`Renderer::faces`] survives it.
+    ///
+    /// The failure it prevents is the quiet one that [`MAX_FACES`] exists for: a
+    /// fallback that built a key of its own — a third family bit, a nudged point
+    /// size — would push the live set past a cap sized for the closed space, and
+    /// [`cached_face`] would answer by emptying the whole cache and
+    /// re-rasterising the screen, every few frames, forever.
+    #[test]
+    fn a_substitution_reuses_a_face_key_the_cache_bound_already_counted() {
+        let mut keys = std::collections::HashSet::new();
+        for &pct in &SCALE_STEPS {
+            for bold in [false, true] {
+                for italic in [false, true] {
+                    for family in [Family::Mono, Family::Prose] {
+                        let cut = scene_cut(Style {
+                            bold,
+                            italic,
+                            family,
+                            ..style(pct, false, false)
+                        });
+                        keys.insert(face_key(18, cut));
+                    }
+                }
+            }
+        }
+        assert_eq!(keys.len(), MAX_FACES, "the closed key space is not what it was");
+        for k in &keys {
+            assert!(
+                keys.contains(&k.mono()),
+                "substituting out of {k:?} names a face outside the bound"
+            );
+            // And it is the same cut but for the family, which is what makes it a
+            // key that was already counted rather than one that happens to fit.
+            assert_eq!(k.mono().point_size, k.point_size);
+            assert_eq!(k.mono().style, k.style & 3);
+            assert!(!k.mono().prose());
+        }
     }
 
     /// Eight pixels a character, sixteen a line — the fake metric every wrapping
@@ -5760,3 +6653,4 @@ mod scenes {
         }
     }
 }
+

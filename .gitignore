@@ -1,3 +1,11 @@
 /target
 Cargo.lock
 .DS_Store
+
+# What a math-code block builds for itself next to the document: a virtualenv,
+# the log of the run that made it, and the script it was run with. All of it is
+# reproducible from the .org file, and the venv alone is 46M.
+.venv/
+.zemacs-setup.log
+.zemacs-run-*.sh
+.zemacs-setup.sh

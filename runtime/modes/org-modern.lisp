@@ -30,11 +30,15 @@
 ;;;; here and can drift from the highlighter's; the two agree today, and the
 ;;;; places they must agree are marked.
 ;;;;
-;;;; The other ceiling, and the one you will feel: there is no cursor-movement
-;;;; hook. `after-change-hook' is the only thing the editor reports about a
-;;;; buffer, so `org-modern-appear' runs when you *type* and not when you merely
-;;;; move — see the note above the PUSHNEW near the foot of this file for what
-;;;; that costs and what closes it.
+;;;; What used to be the ceiling you felt — no cursor-movement hook, so markup
+;;;; revealed itself as you typed and not as you navigated — is closed:
+;;;; `point-moved-hook' is the editor's second report about a buffer, and
+;;;; `org-modern-appear' hangs off it beside the change hook at the foot of this
+;;;; file.
+;;;;
+;;;; The ceiling that remains is `org-modern-refresh': markup *typed since the
+;;;; last refresh* has no overlay to reveal, because a full rescan per keystroke
+;;;; is not affordable and the editor reports no change delta. `SPC m m'.
 
 (in-package :zemacs)
 
@@ -50,6 +54,20 @@
 A level-N heading substitutes N-1 spaces and then its bullet for its N stars,
 so the glyph steps right as the level deepens and the heading *text* does not
 move at all — the substitution is the same width as what it replaces.")
+
+(defparameter *org-modern-heading-scale* '(1.5 1.25)
+  "Type size per heading level, as a multiple of the body's.
+
+One entry per level from the top; a level past the end of the list is body size,
+which is what stops a deep outline from being a wall of large type. Setting this
+to NIL turns the whole thing off and leaves headings the colour they were.
+
+A *multiple*, not a point size: the body follows `font-size' and a heading
+follows the body, so C-+ enlarges the document rather than closing the gap
+between its parts. The renderer snaps a size to the nearest of the few it will
+open a font face at — that snapping is what bounds its glyph cache — so 1.4 and
+1.5 are the same face here on purpose. This list is a statement of intent, not a
+measurement.")
 
 (defparameter *org-modern-list-bullets* '((#\- . "•") (#\+ . "◦"))
   "One glyph per list marker. `1.' and `1)' are deliberately absent, for the
@@ -136,6 +154,77 @@ the first, `http://x/a/b/' is italics; without the second, `2 * 3' is bold."
         ;; `[[]]' links to nothing and is left as the four characters it is.
         (when (and close (> close (+ i 2))) (+ close 2))))))
 
+(defun %org-link-parts (text)
+  "The (TARGET . LABEL) of the whole link TEXT `[[target]]' or
+`[[target][label]]', or NIL when TEXT is not one.
+
+LABEL is TARGET when the link has no description, which is org's own rule and is
+what lets every caller below treat the two spellings alike. The one place the
+distinction survives is the *drawn* one: a bare link shows its target because
+that is all there is to show.
+
+Split out of `%org-modern-render' rather than beside it. Three things now want
+the two halves of a link — what to draw, where to jump, and whether it names a
+figure — and a link parsed three ways is a link parsed differently three ways
+the first time somebody handles `[[a][b][c]]'."
+  (let ((n (length text)))
+    (when (and (> n 4)
+               (string= "[[" text :end2 2)
+               (string= "]]" text :start2 (- n 2)))
+      (let* ((body (subseq text 2 (- n 2)))
+             (split (search "][" body)))
+        (if split
+            (cons (subseq body 0 split) (subseq body (+ split 2)))
+            (cons body body))))))
+
+(defun %org-link-scheme (target)
+  "(SCHEME . REST) when TARGET is `scheme:rest', else NIL. SCHEME is downcased.
+
+A scheme is a letter followed by letters, digits and `+ - .', which is the URI
+rule and is here to keep a *title* from being read as one: the Contents section
+of a curriculum is full of `[[id:unit-1][1. Vectors and Spaces]]', and the
+description half of that link has a colon in it about as often as not."
+  (let ((colon (position #\: target)))
+    (when (and colon (plusp colon) (alpha-char-p (char target 0))
+               (every (lambda (c)
+                        (or (alphanumericp c) (member c '(#\+ #\- #\.))))
+                      (subseq target 0 colon)))
+      (cons (string-downcase (subseq target 0 colon)) (subseq target (1+ colon))))))
+
+(defun %org-link-rest (target)
+  "TARGET with its scheme stripped — `file:a/b.png' is `a/b.png', and a target
+that names no scheme is itself."
+  (let ((s (%org-link-scheme target)))
+    (if s (cdr s) target)))
+
+(defparameter *org-image-file-types* '("png" "svg" "svgz")
+  "Extensions `org-inline-images' will draw, lower-cased.
+
+Exactly what `zemacs-figure' decodes and no more, because a link this list
+claims and the decoder then refuses is a message in the status line rather than
+a link. SVG for a diagram, PNG for a plot; a photograph is not a figure. See the
+ceiling at the head of `crates/figure/src/lib.rs'.")
+
+(defun %org-image-target (target)
+  "TARGET's path when it names a file that could be drawn as a figure, else NIL.
+
+A classification and not a probe: it says nothing about whether the file is
+there, only that a link of this shape is the image path's business rather than
+the link-drawing path's. Both callers want that question answered before either
+of them touches the disk.
+
+`file:' or no scheme at all. `https://example.com/a.png' is deliberately not a
+figure: nothing here fetches, and drawing a broken image for it would be worse
+than showing the URL you can read."
+  (let* ((s (%org-link-scheme target))
+         (path (if s (cdr s) target)))
+    (when (or (null s) (string= (car s) "file"))
+      (let ((dot (position #\. path :from-end t)))
+        (when (and dot
+                   (member (string-downcase (subseq path (1+ dot)))
+                           *org-image-file-types* :test #'string=))
+          path)))))
+
 (defun %org-checkbox-at (line from)
   "(BEG . END) of a `[ ]', `[X]' or `[-]' cookie at or just after FROM, or NIL."
   (let* ((n (length line))
@@ -181,7 +270,12 @@ the same cells."
                        (and (< k n) (char= (char line k) #\Space) k)))))
     (cond
       ((null head) nil)
-      (stars (list (list 0 stars :heading)))
+      ;; Two ranges, not one: the stars become a bullet and carry the line's
+      ;; type size, and the text after them carries the weight. See the
+      ;; `:heading-line' arm of `%org-modern-render' for why they cannot be the
+      ;; same overlay.
+      (stars (list (list 0 stars :heading)
+                   (list stars n :heading-line)))
       ((member head '(#\# #\|)) nil)
       ;; `- item' / `+ item', then its checkbox, then the prose after both.
       ((and (member head '(#\- #\+))
@@ -234,13 +328,22 @@ quadratic, and over a line it is a few dozen characters."
 ;;; afterwards, because nothing was cached.
 
 (defun %org-modern-render (kind text)
-  "(DISPLAY . FACE) for the literal TEXT of a KIND substitution, or NIL when
-TEXT is no longer that kind of markup at all.
+  "The overlay properties the literal TEXT of a KIND substitution wants, as a
+plist, or NIL when TEXT is no longer that kind of markup at all.
 
 NIL is the useful answer: an overlay whose text was edited under it retires
 itself instead of drawing a glyph over something that is not there any more.
 
-FACE is NIL wherever the syntax highlighter already has the colour right — a
+A **plist** and not the (DISPLAY . FACE) pair this used to answer, and the
+reason is the shape of the thing on the other end rather than taste. An overlay
+is a bag of display properties — `display', `face', and whatever the renderer
+grows next — and deciding which of them a piece of markup wants is this
+function's entire job. Both callers below apply whatever they are handed without
+knowing a single property name, so *adding* one is a line in the arm that wants
+it and nothing anywhere else. Making a heading's type larger, for instance, is a
+property on the heading arm and no change to the machinery at all.
+
+No `face' wherever the syntax highlighter already has the colour right — a
 display string is attributed to the first character it covers, so it inherits
 that character's highlight for free. Only emphasis and links need to say
 otherwise, because the character they start on is a markup marker."
@@ -248,31 +351,78 @@ otherwise, because the character they start on is a markup marker."
     (case kind
       (:heading
        (when (and (plusp n) (every (lambda (c) (char= c #\*)) text))
-         (cons (concatenate 'string
-                            (make-string (1- n) :initial-element #\Space)
-                            (nth (mod (1- n) (length *org-modern-stars*))
-                                 *org-modern-stars*))
-               nil)))
+         ;; `scale' is a *line* property wherever it lands, so this overlay —
+         ;; which covers only the stars — sets the type size of the whole
+         ;; heading line. Nothing in the renderer knows the word "heading";
+         ;; this list is the entire policy.
+         (let ((scale (nth (1- n) *org-modern-heading-scale*)))
+           (append (list 'display
+                         (concatenate 'string
+                                      (make-string (1- n) :initial-element #\Space)
+                                      (nth (mod (1- n) (length *org-modern-stars*))
+                                           *org-modern-stars*)))
+                   ;; `scale' is line-wide, so setting it on the stars sizes the
+                   ;; whole heading. Weight is *not* — see `:heading-line'.
+                   (when scale (list 'scale scale))))))
+      ;; The heading's text, claiming weight and nothing else.
+      ;;
+      ;; A separate range because the two properties have different reach:
+      ;; `scale' belongs to the line (a taller cell is a fact about the row),
+      ;; while `weight' belongs to the run, since it changes no metric. Setting
+      ;; `weight' on the stars above would therefore have emboldened exactly one
+      ;; character — the bullet glyph substituted for them — and left the words
+      ;; light, which is the opposite of the intent.
+      ;;
+      ;; Every level gets it, including the ones past
+      ;; `*org-modern-heading-scale*' that are body-sized: what says "heading" in
+      ;; a typeset document is the weight, and a deep heading at body size with
+      ;; body weight is just a sentence.
+      (:heading-line
+       (when (plusp n) (list 'weight 'bold)))
       (:list
        (let ((glyph (and (= n 1) (cdr (assoc (char text 0) *org-modern-list-bullets*)))))
-         (when glyph (cons glyph nil))))
+         (when glyph (list 'display glyph))))
       (:checkbox
        (let ((glyph (and (= n 3)
                          (char= (char text 0) #\[)
                          (char= (char text 2) #\])
                          (cdr (assoc (char text 1) *org-modern-checkboxes*)))))
-         (when glyph (cons glyph nil))))
+         (when glyph (list 'display glyph))))
       (:emphasis
        (let ((face (and (> n 2) (cdr (assoc (char text 0) *org-modern-emphasis*)))))
          (when (and face (char= (char text 0) (char text (1- n))))
-           (cons (subseq text 1 (1- n)) face))))
+           (append
+            (list 'display (subseq text 1 (1- n)) 'face face)
+            ;; ...and now really bold and really italic, rather than the colour
+            ;; the face table had to stand in for while the renderer opened one
+            ;; font. Read off the face name rather than from a second table: the
+            ;; two would be one mapping written twice and would drift.
+            ;;
+            ;; The face stays either way — it is what carries `code' and
+            ;; `comment', and a theme may well want bold text tinted as well as
+            ;; heavy.
+            (cond ((string= face "bold") (list 'weight 'bold))
+                  ((string= face "italic") (list 'slant 'italic)))))))
       (:link
-       (when (and (> n 4)
-                  (string= "[[" text :end2 2)
-                  (string= "]]" text :start2 (- n 2)))
-         (let* ((body (subseq text 2 (- n 2)))
-                (split (search "][" body)))
-           (cons (if split (subseq body (+ split 2)) body) "link")))))))
+       (let ((parts (%org-link-parts text)))
+         ;; ...and NIL for a link that names a figure, which is the one kind of
+         ;; markup this file deliberately does not draw. `org-inline-images'
+         ;; puts a *bitmap* over exactly those cells, and two overlays claiming
+         ;; the same range is the one case the renderer resolves arbitrarily —
+         ;; the older one wins its substitution and the newer one is dropped, so
+         ;; whichever of the two passes ran first would decide whether you saw
+         ;; the figure or the words `[[file:fig-1.svg]]'. Declining here is what
+         ;; makes that question not exist.
+         (when (and parts (not (%org-image-target (car parts))))
+           (list 'display (cdr parts) 'face "link")))))))
+
+(defun %org-modern-apply (ov look)
+  "Put every property in the plist LOOK on overlay OV.
+
+The one place a property name is *not* written out, which is what keeps
+`%org-modern-render' the only file that has to know them."
+  (loop for (prop value) on look by #'cddr
+        do (overlay-put ov prop value)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The overlays
@@ -292,6 +442,25 @@ otherwise, because the character they start on is a markup marker."
 DEFVAR rather than DEFPARAMETER: reloading the config must not forget that
 something on screen is revealed, or the next `org-modern-appear' would leave it
 revealed forever.")
+
+(defvar *org-modern-appear-inhibit-modes* nil
+  "Major modes in which markup is never revealed under the cursor.
+
+*The policy hook for reveal-on-cursor*, and the one thing about this file a
+**renderer** has to switch off. `org-appear' exists because the buffer is being
+edited: the asterisks around a word have to come back when you move onto them,
+or you cannot see what you are about to type into. A mode where nothing is typed
+has no use for that and is actively harmed by it — markup reappearing because
+the cursor drifted is exactly the machinery such a mode promised was not on the
+page.
+
+A list of mode names rather than a test for one, and pushed onto from the mode
+that wants it: `org-frozen.lisp' adds itself and this file does not know it
+exists. The same shape `*org-mode-functions*', `*after-change-functions*' and
+`*fold-subtree-functions*' have, and for the same reason — a second mode wanting
+it is one PUSHNEW and no edit here.
+
+Asked with `derived-mode-p', so naming a parent inhibits every mode under it.")
 
 (defun %org-modern-remove ()
   "Drop every overlay this file made, and answer how many there were.
@@ -323,8 +492,7 @@ note beside that hook at the foot of this file."
             (let ((ov (make-overlay beg end)))
               (when ov
                 (overlay-put ov :org-modern kind)
-                (when (cdr look) (overlay-put ov 'face (cdr look)))
-                (overlay-put ov 'display (car look))
+                (%org-modern-apply ov look)
                 (incf made)))))))
     ;; Whatever the cursor is already sitting in should not have been hidden.
     (org-modern-appear)
@@ -345,8 +513,7 @@ note beside that hook at the foot of this file."
         ;; shows the markup it covers, which is what the mode being off looks
         ;; like anyway; deleting somebody else's buffer's overlay is not.
         ((null at))
-        (look (when (cdr look) (overlay-put ov 'face (cdr look)))
-              (overlay-put ov 'display (car look)))
+        (look (%org-modern-apply ov look))
         ;; The text under it is not the markup it was made for any more — an
         ;; overlay that cannot draw itself has nothing to say.
         (t (delete-overlay ov))))))
@@ -358,7 +525,8 @@ org-appear, in a dozen lines and no state worth the name: at most one overlay
 is revealed at a time, so the work is `is the cursor still in the one I
 revealed' and, when it is not, two `overlay-put's. That is what makes this
 affordable on every keystroke where a full rescan is not."
-  (when (minor-mode-p 'org-modern)
+  (when (and (minor-mode-p 'org-modern)
+             (notany #'derived-mode-p *org-modern-appear-inhibit-modes*))
     (let ((now (first (%org-modern-overlays (point) (1+ (point))))))
       (unless (eql now *org-modern-revealed*)
         (%org-modern-rehide *org-modern-revealed*)
@@ -368,6 +536,377 @@ affordable on every keystroke where a full rescan is not."
         (setf *org-modern-revealed* now))))
   ;; Answers NIL rather than an overlay handle: this is a command as well as a
   ;; hook, and `M-x' echoing an integer at you says nothing.
+  nil)
+
+;;; ---------------------------------------------------------------------------
+;;; Reading the buffer a line at a time
+;;;
+;;; One query and a walk, rather than `line-string' per line. Everything below
+;;; this point — following a link, finding an `:ID:', deciding which links are
+;;; figures — is a question about the whole document, and asking the editor once
+;;; is what keeps that from being a thousand round trips through `%query' on a
+;;; file the size of a textbook.
+;;;
+;;; `%org-modern-scan' has this loop inlined and predates it; the two agree
+;;; because they are the same six lines, and the day the scanner is rewritten
+;;; against `crates/syntax' (see the ponytail note at the top of this file) it
+;;; goes away and this one stays.
+
+(defun %org-lines (&optional (text (buffer-string)))
+  "Every line of TEXT as (STRING BEGIN END).
+
+BEGIN and END are *character* offsets, which is what every editor primitive
+takes; TEXT arrives as UTF-8 bytes, which is what `%char-index' is for. END is
+the newline's own offset — so `(subseq buffer BEGIN END)' is the line without
+it, and END is also where a line-final insertion goes.
+
+Converted per *line* and not per hit, for `%org-modern-scan''s reason: the
+conversion counts continuation bytes from the start of whatever it is handed,
+which over a whole buffer would be quadratic and over one line is a few dozen
+characters."
+  (let ((n (length text)) (out nil) (bol 0) (cbol 0))
+    (loop while (<= bol n)
+          do (let* ((eol (or (position #\Newline text :start bol) n))
+                    (line (subseq text bol eol))
+                    (chars (%char-index line (length line))))
+               (push (list line cbol (+ cbol chars)) out)
+               (setf bol (1+ eol) cbol (+ cbol chars 1))))
+    (nreverse out)))
+
+(defun %org-line-level (line)
+  "LINE's headline level — its run of leading `*' — or NIL when it is not one.
+
+The string-taking twin of `%org-level' in `org-fold.lisp', which asks the editor
+for a line by number. Both apply org's own rule, which is what makes `**bold**'
+at the start of a line not a headline: stars at column 0 *followed by a space*."
+  (let ((n (or (position-if-not (lambda (c) (char= c #\*)) line) (length line))))
+    (when (and (plusp n) (< n (length line)) (char= (char line n) #\Space))
+      n)))
+
+(defun %org-property (line name)
+  "The value of the property drawer line LINE when it names NAME, else NIL.
+
+`:ID: unit-1' with NAME `\"ID\"' is `\"unit-1\"'. Case-insensitive in the name,
+as org is, and the value is trimmed — which is the whole reason this is a
+function and not a `search': a drawer line is indented, org writes `:ID:  x'
+about as often as `:ID: x', and every reader of a property would otherwise strip
+its own whitespace slightly differently.
+
+An empty value answers the empty string rather than NIL, so `:ZEMACS_STATUS:'
+with nothing after it is distinguishable from no such property at all."
+  (let* ((s (string-trim '(#\Space #\Tab #\Return) line))
+         (n (length name)))
+    (when (and (> (length s) (1+ n))
+               (char= (char s 0) #\:)
+               (string-equal name s :start2 1 :end2 (1+ n))
+               (char= (char s (1+ n)) #\:))
+      (string-trim '(#\Space #\Tab) (subseq s (+ n 2))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Following a link
+;;;
+;;; `RET' on a link, which is the binding the user's Emacs config has had in org
+;;; normal state for years and which this editor simply did not have. It is
+;;; cheap because the parser was already here: `%org-link-at' finds the extent,
+;;; `%org-link-parts' splits it, and the rest of this section is *policy* — one
+;;; table saying what a scheme means.
+;;;
+;;; The table is the point. `id:' and `file:' are what a curriculum needs, `http'
+;;; is what a citation needs, and a config that wants `doi:' or `roam:' adds a
+;;; line and a function with nothing to rebuild. That is the same shape
+;;; `*fold-subtree-functions*' has in `org-fold.lisp', for the same reason.
+
+(defparameter *org-link-open-functions*
+  '(("id"     . org-link-open-id)
+    ("file"   . org-link-open-file)
+    ("http"   . org-link-open-url)
+    ("https"  . org-link-open-url)
+    ("mailto" . org-link-open-url))
+  "Link scheme -> the function that follows it. *This is the policy hook.*
+
+Called with the **whole** target, scheme and all, and not with the part after
+the colon: `http' needs its scheme back to be a URL again, and one argument that
+never has to be reassembled beats two that have to agree. `%org-link-rest' is
+there for the handlers that want the other half.
+
+A scheme with no entry, and a target with no scheme at all, fall through to
+`%org-link-open-plain' below.")
+
+(defparameter *org-link-opener*
+  #+darwin "open" #+(or linux freebsd) "xdg-open" #-(or darwin linux freebsd) nil
+  "The program handed a URL this editor cannot open itself, or NIL to refuse.
+
+Not a browser name: the point of `open' and `xdg-open' is that the *desktop*
+decides, so a `mailto:' reaches your mail client and an `https:' reaches the
+browser you actually use.")
+
+(defun %org-link-at-point ()
+  "The (TARGET . LABEL) of the link point is inside, or NIL.
+
+Point's column has to be converted into the same index space `%org-link-at'
+reports in, which is bytes — `line-string' hands out UTF-8 like `buffer-string'
+does, and a heading with an accent in it would otherwise put the cursor one
+character to the left of where it is."
+  (let* ((line (line-string))
+         (col (%byte-index line (- (point) (line-start)))))
+    (loop for (beg end kind) in (%org-modern-inline line 0)
+          when (and (eq kind :link) (<= beg col) (< col end))
+            return (%org-link-parts (subseq line beg end)))))
+
+(defun %org-expand-file (name)
+  "NAME as a path, resolved the way a link in a document means it.
+
+Relative to the *file's own directory* and not to the process's, which is what
+makes `[[file:fig-1.svg]]' mean the figure next to the .org file rather than one
+next to wherever the editor was launched from. `~/' is expanded here because CL
+does not do it, and a buffer with no file behind it leaves NAME alone — there is
+nothing to be relative to."
+  (let ((base (buffer-file-name)))
+    (cond ((and (> (length name) 1) (string= "~/" name :end2 2))
+           (namestring (merge-pathnames (subseq name 2) (user-homedir-pathname))))
+          ((null base) name)
+          (t (namestring
+              (merge-pathnames name
+                               (make-pathname :name nil :type nil
+                                              :defaults (parse-namestring base))))))))
+
+(defun %org-id-heading (id &optional (lines (%org-lines)))
+  "Character offset of the heading whose `:ID:' is ID, or NIL.
+
+The *heading*, not the property line: a drawer belongs to the headline above it,
+and landing on `:ID: unit-1' would put point inside a drawer — which `org-fold'
+may have closed, and which is not where you meant to go anyway.
+
+`:CUSTOM_ID:' counts too. Org keeps them apart because one is a UUID it
+generates and the other is a name you chose; nothing here generates anything, so
+a link that finds either has found what it was looking for."
+  (let ((heading nil))
+    (dolist (l lines)
+      (destructuring-bind (text begin end) l
+        (declare (ignore end))
+        (cond ((%org-line-level text) (setf heading begin))
+              ((let ((v (or (%org-property text "ID")
+                            (%org-property text "CUSTOM_ID"))))
+                 (and v (string= v id)))
+               (return (or heading begin))))))))
+
+(defun %org-heading-position (title &optional (lines (%org-lines)))
+  "Character offset of the first heading whose text is TITLE, or NIL.
+Org's `[[*Heading]]', and the fallback for a bare target that matches one."
+  (dolist (l lines)
+    (destructuring-bind (text begin end) l
+      (declare (ignore end))
+      (let ((level (%org-line-level text)))
+        (when (and level
+                   (string-equal (string-trim '(#\Space #\Tab #\Return)
+                                              (subseq text level))
+                                 (string-trim '(#\Space #\Tab) title)))
+          (return begin))))))
+
+(defun org-link-open-id (target)
+  "Follow `id:...' — jump to the heading carrying that `:ID:'."
+  (let* ((id (%org-link-rest target))
+         (at (%org-id-heading id)))
+    (cond (at (goto-char at) (message (format nil "id: ~a" id)))
+          (t (message (format nil "no heading with :ID: ~a" id))))))
+
+(defun org-link-open-file (target)
+  "Follow `file:...' — open the file, relative to this one's directory.
+
+`find-file' reaches the *application* rather than the editor core, so the new
+buffer arrives a frame later and nothing here can act on it. That is also why
+the file is probed first: an open that will fail should say so now, in a message
+naming the path, rather than a frame later in whatever the app decides to say."
+  (let ((path (%org-expand-file (%org-link-rest target))))
+    (cond ((probe-file path) (find-file path))
+          (t (message (format nil "no such file: ~a" path))))))
+
+(defun org-link-open-url (target)
+  "Hand TARGET to the desktop — a browser for `http', a mail client for
+`mailto'.
+
+`:wait nil' because nothing here wants the browser's exit status and waiting for
+one would park the Lisp thread on a program the user is still reading. Wrapped
+in IGNORE-ERRORS because a machine with no opener is a message, not a backtrace,
+and the message is worth having: the URL is printed either way, so a refusal
+still leaves you something to copy."
+  (let ((opener *org-link-opener*))
+    (cond ((null opener) (message (format nil "no opener for ~a" target)))
+          (t (ignore-errors
+              (ext:run-program opener (list target)
+                               :wait nil :input nil :output nil :error nil))
+             (message (format nil "opened ~a" target))))))
+
+(defun %org-link-open-plain (target)
+  "Follow a target with no scheme — org's own fallbacks, in org's own order.
+
+`*Heading' is a headline. `#name' is a `:CUSTOM_ID:'. Anything else is a file if
+one is there, and otherwise a search: org's plain link is a *fuzzy* one, and
+`[[Vectors and Spaces]]' meaning the heading of that name is the reason a
+Contents section can be written without ids at all."
+  (let ((n (length target)))
+    (cond
+      ((zerop n) (message "empty link"))
+      ((char= (char target 0) #\*)
+       (let ((at (%org-heading-position (subseq target 1))))
+         (if at (goto-char at) (message (format nil "no heading: ~a" (subseq target 1))))))
+      ((char= (char target 0) #\#) (org-link-open-id (subseq target 1)))
+      ((probe-file (%org-expand-file target)) (find-file (%org-expand-file target)))
+      (t (let ((at (or (%org-heading-position target) (search-forward target 0))))
+           (if at (goto-char at) (message (format nil "not found: ~a" target))))))))
+
+(defun org-open-at-point ()
+  "Follow the link under point.
+
+`RET' in an org buffer, which is what the table above makes worth having: a
+Contents section of `[[id:unit-1][1. Vectors and Spaces]]' becomes a document you
+navigate with one key rather than a list you read and then go hunting through."
+  (let ((link (%org-link-at-point)))
+    (if (null link)
+        (message "no link at point")
+        (let* ((target (car link))
+               (scheme (car (%org-link-scheme target)))
+               (open (and scheme (cdr (assoc scheme *org-link-open-functions*
+                                             :test #'string=)))))
+          (if (and open (fboundp open))
+              (funcall open target)
+              (%org-link-open-plain target))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Figures
+;;;
+;;; `[[file:fig-1.svg]]' alone on a line, drawn as the figure. The mechanism is
+;;; `org-latex-preview''s, whole: an overlay carrying `image', an id from a
+;;; primitive that produced pixels, and the renderer growing the line to fit the
+;;; bitmap. Nothing here is new machinery — the *only* thing that had to be built
+;;; in Rust was a second producer of an id, because the first one could only
+;;; render LaTeX. See `image-file' and `crates/figure'.
+;;;
+;;; Alone on its line is the whole of the rule, and it is org's: a link with
+;;; prose around it is a reference and stays words, a link on its own line is a
+;;; figure. That is also what makes the substitution safe — an image reserves
+;;; cells but nothing to its right reflows (see `draw_image'), so the only place
+;;; a wide one can paint over is a line with nothing else on it.
+;;;
+;;; ponytail: no `#+CAPTION:' and no `#+ATTR' width. A caption is a line of prose
+;;; above the figure and already reads as one; a per-figure width is a keyword to
+;;; parse and a second argument to thread, for a document whose figures all want
+;;; the same measure. `*org-image-width*' is that measure, and the day one figure
+;;; genuinely differs it becomes the default rather than the only answer.
+;;;
+;;; ponytail: the cursor does not reveal a figure the way it reveals emphasis, so
+;;; editing the path under one means `SPC m F' first. org-appear's state is one
+;;; overlay keyed by `:org-modern' and a figure is not one of those; joining in
+;;; would mean the reveal machinery growing a second notion of what it owns.
+
+(defparameter *org-image-width* 34
+  "Widest a figure is drawn, in ems — NIL for the size it was authored at.
+
+Ems and not pixels, and that is not a stylistic choice: the *device* pixel is
+something only the renderer knows, so a width computed in the image from
+`(font-size)' would come out half-size on a Retina display and full-size beside
+it. `image-file' resolves this against the em the renderer parked on the editor,
+which is the same correction `org-latex-preview' makes with its dpi.
+
+A **maximum**. Nothing is scaled up, so a small diagram stays small and a plot
+exported at 1600 px is brought down to something a pane can hold. 34 ems is
+roughly a 55-column measure, which is a figure you can read with text beside
+it.")
+
+(defun %org-images (&optional (beg (point-min)) (end (point-max)))
+  "Handles of the figure overlays this file made, overlapping BEG..END.
+
+`:org-image' is the mark, exactly as `:org-modern' and `:latex' are theirs, so
+clearing figures leaves equations and bullets alone. It holds the *path*, which
+makes it the answer to `which file is this' as well as the mark — one property,
+two jobs, which is the shape `:org-modern' already had."
+  (remove-if-not (lambda (o) (overlay-get o :org-image))
+                 (mapcar #'first (overlays-in beg end))))
+
+(defun %org-image-links (&optional (lines (%org-lines)))
+  "Every figure link alone on its line, as (BEGIN END PATH) in character offsets.
+
+BEGIN and END cover the link *text* and not the whole line, so the overlay
+replaces `[[file:fig-1.svg]]' and leaves the line's indentation where it was —
+which is what indents a figure inside a list item along with the item."
+  (let ((out nil))
+    (dolist (l lines (nreverse out))
+      (destructuring-bind (text begin end) l
+        (declare (ignore end))
+        (let ((i (position-if-not #'%org-blank-p text)))
+          (when i
+            (let ((j (%org-link-at text i)))
+              (when (and j (every #'%org-blank-p (subseq text j)))
+                (let* ((parts (%org-link-parts (subseq text i j)))
+                       (path (and parts (%org-image-target (car parts)))))
+                  (when path
+                    (push (list (+ begin (%char-index text i))
+                                (+ begin (%char-index text j))
+                                path)
+                          out)))))))))))
+
+(defun %org-image-draw (beg end path)
+  "Draw PATH over BEG..END. T when there were pixels, NIL when there were not —
+which is the answer callers branch on, the same way `%org-latex-draw' works.
+
+Two calls and not one, and they cannot be merged: `image-file' has to read and
+rasterise before there is an id to hang, and it is the slow half. It runs on the
+Lisp thread, so the editor keeps drawing and keeps taking keystrokes while a
+buffer full of plots is decoded."
+  (let ((id (image-file (%org-expand-file path) *org-image-width*)))
+    (when id
+      (let ((ov (make-overlay beg end)))
+        (when ov
+          (overlay-put ov :org-image path)
+          (overlay-put ov 'image id)))
+      t)))
+
+(defun org-inline-images-clear ()
+  "Take the figures off, showing their links again."
+  (let ((ovs (%org-images)))
+    (mapc #'delete-overlay ovs)
+    (message (format nil "~d figure~:p cleared" (length ovs)))))
+
+(defun org-inline-images ()
+  "Draw every figure in the buffer.
+
+Its own overlays first, so this doubles as `refresh' and is safe to press as
+often as you like — which is how you see a figure you have just regenerated: the
+id `image-file' answers with is derived from the file's length and mtime, so a
+rewritten .svg is genuinely re-read rather than served from the id it had
+before."
+  (mapc #'delete-overlay (%org-images))
+  (let ((drawn 0) (failed 0))
+    (dolist (f (%org-image-links))
+      (destructuring-bind (beg end path) f
+        (if (%org-image-draw beg end path) (incf drawn) (incf failed))))
+    (message (if (plusp failed)
+                 (format nil "~d figure~:p, ~d could not be read" drawn failed)
+                 (format nil "~d figure~:p" drawn)))))
+
+(defun org-inline-images-new ()
+  "Draw the figures that have none yet, quietly.
+
+The hook version, and the same two-query shape `org-latex-preview-new' has: ask
+once for the links and once for the overlays, and read a file only for what is
+genuinely new. A buffer whose figures are all drawn costs those two queries and
+no disk at all.
+
+Quiet on success and quiet on failure both: a missing figure has already put
+`image: cannot read ...' on the status line from inside the primitive, and
+saying it twice per redraw would be the editor talking over you."
+  (when (derived-mode-p 'org-mode)
+    (let ((have (let ((out nil))
+                  (dolist (o (overlays-in (point-min) (point-max)) out)
+                    (when (overlay-get (first o) :org-image)
+                      (push (cons (second o) (third o)) out))))))
+      (dolist (f (%org-image-links))
+        (destructuring-bind (beg end path) f
+          ;; Overlap and not containment, for `org-latex-preview-new''s reason:
+          ;; an overlay shifts with the text around it, so a link whose path has
+          ;; grown by a character is still the same figure.
+          (unless (some (lambda (r) (and (< (car r) end) (> (cdr r) beg))) have)
+            (%org-image-draw beg end path))))))
   nil)
 
 ;;; ---------------------------------------------------------------------------
@@ -399,23 +938,28 @@ Turning it off removes exactly the overlays it made."
   (defun after-change-hook ()
     (dolist (f *after-change-functions*) (ignore-errors (funcall f)))))
 
-;;; Hanging org-appear off the one event the editor reports about a buffer.
+;;; Hanging org-appear off both events the editor reports about a buffer.
 ;;;
-;;; ponytail — and this is the ceiling you will actually feel.
-;;; `after-change-hook' fires when the *document* moves, not when the *cursor*
-;;; does, so markup is revealed as you type and not as you navigate: in Normal
-;;; mode `j' and `w' change nothing, so nothing fires, and the asterisks around
-;;; the word you just moved onto only appear once you press `i' and type the
-;;; first character. `SPC m a' asks for it by hand in the meantime.
+;;; The *cursor* one is what makes this feel live, and it used to be the ceiling
+;;; this file complained about at length: `after-change-hook' fires when the
+;;; document moves, not when the cursor does, so in Normal mode `j' and `w'
+;;; changed nothing, nothing fired, and the asterisks around the word you had
+;;; just moved onto only appeared once you pressed `i' and typed a character.
+;;; `point-moved-hook' — queued by the application from the same place, taking
+;;; the same route through `pending_hooks' and the same `fboundp' guard, and
+;;; declared in `modes.lisp' — closes it, and closing it cost exactly the second
+;;; PUSHNEW below.
 ;;;
-;;; The upgrade is one line in the application, in exactly the place
-;;; `after-change-hook' is pushed from — a `point-moved-hook' queued when the
-;;; cursor offset changes, taking the same route through `pending_hooks' and the
-;;; same `fboundp' guard. Nothing here would change but the name in the PUSHNEW.
+;;; Rebinding the motion keys to Lisp wrappers was the other way, and it was the
+;;; wrong one: it would have reimplemented counts, operators and the desired
+;;; column in the image to buy a hook, which is the trade the boundary exists to
+;;; refuse.
 ;;;
-;;; Rebinding the motion keys to Lisp wrappers is the other way, and it is the
-;;; wrong one: it would reimplement counts, operators and the desired column in
-;;; the image to buy a hook, which is the trade the boundary exists to refuse.
+;;; Both, and not just the motion one: a change that leaves point where it was —
+;;; `x' on the last character of a line, an edit arriving from Lisp — still
+;;; changes what point is *inside*. `org-modern-appear' is one comparison when
+;;; nothing has moved, so the overlap costs a function call rather than a scan,
+;;; and `after-change-hook' is one Lisp evaluation whether this is on it or not.
 ;;;
 ;;; Note what is *not* hung here: `org-modern-refresh'. A rescan is one query
 ;;; plus an overlay per hit, and doing that per keystroke would put a `%do' per
@@ -425,6 +969,12 @@ Turning it off removes exactly the overlays it made."
 ;;; `boundary.org' lists as missing, which would let this rescan the two lines
 ;;; that moved instead of all of them.
 (pushnew 'org-modern-appear *after-change-functions*)
+
+;;; DEFVAR before the PUSHNEW for the same reason as above: `modes.lisp' is
+;;; where this list is declared, and a build whose `*runtime-dir*' never found
+;;; that file must get an empty list here rather than an unbound variable.
+(defvar *point-moved-functions* nil)
+(pushnew 'org-modern-appear *point-moved-functions*)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys, and turning it on
@@ -439,9 +989,67 @@ Turning it off removes exactly the overlays it made."
 ;;; Guarded by `minor-mode-p' because the body runs on every entry into the
 ;;; mode, and `org-modern' is a toggle.
 
+;;; `org-latex-preview-new' comes from `init.lisp', which is read before this
+;;; file — so the FBOUNDP is about a *config* that never loaded it rather than
+;;; about load order. It is here and not there because this is the last
+;;; `define-derived-mode org-mode' in the runtime and therefore the only body
+;;; that runs: declaring one in `init.lisp' would be silently replaced by this.
+;;;
+;;; Entering the mode is the right moment for it. The buffer has just been read,
+;;; nothing is being typed into it, and previewing here is what makes an org
+;;; file *arrive* typeset instead of arriving as `$\int_0^1 x^2 dx$' and waiting
+;;; for you to ask.
+
+;;; ...and figures for the same reason and at the same moment: a document
+;;; arrives with its plots in it rather than with the paths to its plots in it.
+;;; Cheaper than the LaTeX pass — a file read and a rasterise, no subprocess —
+;;; and it is `-new', so re-entering the mode redraws nothing that is already
+;;; drawn.
+
+;;; ...and one hook list, because this body is the *only* one that runs.
+;;;
+;;; `define-derived-mode' writes into `*mode-bodies*', so the last declaration of
+;;; `org-mode' in the runtime replaces every earlier one — which is what the
+;;; comment above is about, and which means a file loaded after this one cannot
+;;; add to org's entry without silently dropping everything in it. A hook list is
+;;; the way in: PUSHNEW onto it, and a config reload does not stack a second copy
+;;; the way wrapping the body would. `*after-change-functions*' and
+;;; `*point-moved-functions*' are the same shape for the same reason, and
+;;; `math.lisp' is the first customer.
+;;;
+;;; IGNORE-ERRORS per function, as those two do: one config's broken hook must
+;;; not stop the next one from running, and must not turn opening a `.org' file
+;;; into a backtrace.
+
+(defvar *org-mode-functions* nil
+  "Functions called with no arguments on entry into `org-mode'.")
+
 (define-derived-mode org-mode text-mode
-  (unless (minor-mode-p 'org-modern) (org-modern)))
+  (unless (minor-mode-p 'org-modern) (org-modern))
+  (when (fboundp 'org-latex-preview-new) (org-latex-preview-new))
+  (org-inline-images-new)
+  (dolist (f *org-mode-functions*) (ignore-errors (funcall f))))
 
 (define-key "org-mode" "SPC m m" "org-modern-refresh")
 (define-key "org-mode" "SPC m M" "org-modern")
 (define-key "org-mode" "SPC m a" "org-modern-appear")
+(define-key "org-mode" "SPC m f" "org-inline-images")
+(define-key "org-mode" "SPC m F" "org-inline-images-clear")
+
+;;; `RET' follows a link, which is the binding an Emacs config has bound in org
+;;; normal state for as long as there has been one.
+;;;
+;;; Safe in exactly the way it has to be: a *mode* keymap is consulted from
+;;; `normal_key' and nowhere else, so this claims `RET' in org buffers in Normal
+;;; and Visual state and leaves Insert alone — pressing return while typing
+;;; still types a return. Binding it globally would not have that property, and
+;;; is the reason it is spelled `"org-mode"' rather than `"normal"'.
+;;;
+;;; And it displaces nothing: `<ret>' has no arm in the built-in Normal grammar,
+;;; so before this it did nothing at all. vim's `+' — first non-blank of the next
+;;; line — was never here to lose.
+;;;
+;;; `SPC m o' beside it, because RET is the key you *use* and a leader binding
+;;; is the one which-key can tell you about.
+(define-key "org-mode" "<ret>" "org-open-at-point")
+(define-key "org-mode" "SPC m o" "org-open-at-point")

@@ -507,15 +507,22 @@ impl Editor {
         }
     }
 
-    /// Drop a request to enter Insert in a generated buffer.
+    /// Drop a request to enter Insert in a buffer that refuses edits.
     ///
     /// The grammar now runs in dired, magit and the dashboard, which is what
     /// makes their motions and operators work — but `i` there would park you in
     /// a mode where every keystroke is refused by `apply`, with the modeline
     /// claiming INSERT. The text is re-rendered from state and an edit could
     /// never survive anyway, so the honest answer is to say so and stay put.
+    ///
+    /// A buffer a mode has *frozen* is the same refusal for a different reason,
+    /// and says so differently: `*magit*` is not a file, while a frozen `.org`
+    /// very much is — it is being rendered instead of edited, which is
+    /// something you can turn off, so the message names that rather than
+    /// denying the file exists.
     fn without_insert(&mut self, cmds: Vec<EditorCommand>) -> Vec<EditorCommand> {
-        if !self.buffer.kind.is_generated()
+        let why = self.buffer.read_only();
+        if why == crate::ReadOnly::No
             || !cmds
                 .iter()
                 .any(|c| matches!(c, EditorCommand::SetMode(Mode::Insert)))
@@ -523,7 +530,10 @@ impl Editor {
             return cmds;
         }
         let name = self.buffer.name();
-        vec![EditorCommand::Message(format!("{name} is not a file"))]
+        vec![EditorCommand::Message(match why {
+            crate::ReadOnly::Claimed => format!("{name} is read-only"),
+            _ => format!("{name} is not a file"),
+        })]
     }
 
     /// The built-in grammar. `None` means "incomplete, wait for more keys".
@@ -1399,6 +1409,24 @@ impl Editor {
                 }
                 p.refilter();
             }
+            // `M-<bs>`, the one thing a path prompt needs that a plain backspace
+            // cannot do: separators first, then the word itself, so `~/src/doc`
+            // goes to `~/src/` and then to `~/` rather than a character a press.
+            // Empty cancels, exactly as `<bs>` does — a delete key at an empty
+            // prompt means "I did not want this prompt".
+            Key::MetaBackspace => {
+                if p.text.is_empty() {
+                    return self.cancel_prompt();
+                }
+                let word = |c: char| c.is_alphanumeric() || c == '_';
+                while p.text.chars().next_back().is_some_and(|c| !word(c)) {
+                    p.text.pop();
+                }
+                while p.text.chars().next_back().is_some_and(word) {
+                    p.text.pop();
+                }
+                p.refilter();
+            }
             Key::Char(c) => {
                 p.text.push(c);
                 p.refilter();
@@ -1453,8 +1481,12 @@ impl Editor {
                     vec![EditorCommand::OpenFile(PathBuf::from(expand_tilde(&path)))]
                 }
             }
-            PromptKind::Buffer => match p.matches.get(p.selected) {
-                Some(&i) => vec![EditorCommand::SwitchBuffer(i)],
+            // By id, like the preview: the index this candidate had when the
+            // prompt opened stopped being true the first time the preview
+            // switched, and accepting has to land on the buffer you were
+            // looking at rather than on whatever now sits at that position.
+            PromptKind::Buffer => match p.matches.get(p.selected).and_then(|&i| p.ids.get(i)) {
+                Some(&id) => vec![EditorCommand::SwitchBufferId(id)],
                 None => vec![],
             },
             // Items are one per line, in order, so the item index *is* the
@@ -1506,8 +1538,14 @@ impl Editor {
         let Some(p) = self.prompt.take() else {
             return vec![];
         };
-        let mut out: Vec<EditorCommand> =
-            p.origin.into_iter().map(EditorCommand::MoveTo).collect();
+        // Back to the buffer you were in *before* the cursor, because the
+        // cursor offset means nothing until the right document is live again.
+        let mut out: Vec<EditorCommand> = p
+            .origin_buffer
+            .into_iter()
+            .map(EditorCommand::SwitchBufferId)
+            .chain(p.origin.map(EditorCommand::MoveTo))
+            .collect();
         if let PromptKind::Lisp { id, .. } = p.kind {
             out.push(EditorCommand::CallLisp(format!("(%prompt-reply {id} nil)")));
         }
@@ -1536,6 +1574,16 @@ impl Editor {
                 .then(|| self.search_pos(&pat, origin + 1, true))
                 .flatten();
             return vec![EditorCommand::MoveTo(at.unwrap_or(origin))];
+        }
+        // The switcher shows you the buffer you are pointing at. Nothing else
+        // in the prompt changes: the candidate list was built when it opened and
+        // is not rebuilt, so the names stay where they are even though switching
+        // has quietly reordered the editor's own list underneath.
+        if p.kind == PromptKind::Buffer {
+            return match p.matches.get(p.selected).and_then(|&i| p.ids.get(i)) {
+                Some(&id) => vec![EditorCommand::SwitchBufferId(id)],
+                None => vec![],
+            };
         }
         match p.matches.get(p.selected) {
             Some(&line) => vec![EditorCommand::MoveTo(self.buffer.first_non_blank(line))],
@@ -1570,7 +1618,7 @@ impl Editor {
                 items.extend(extra);
                 ("M-x ", items)
             }
-            PromptKind::Buffer => ("Buffer: ", self.buffer_names()),
+            PromptKind::Buffer => ("Buffer: ", self.buffer_candidates()),
             // The app fills these in as the path is typed; core does no IO.
             PromptKind::File => ("Find file: ", Vec::new()),
             // Likewise, but from ripgrep rather than from a directory read.
@@ -1602,6 +1650,21 @@ impl Editor {
         };
         let mut prompt = Prompt::new(kind, label, items);
         prompt.origin = kind.previews().then_some(self.buffer.cursor);
+        // The switcher previews by *showing* the highlighted buffer, so it needs
+        // stable handles for the candidates and one for the way back. Captured
+        // here, with the list, because this is the only moment the two are known
+        // to correspond — switching reorders them.
+        if kind == PromptKind::Buffer {
+            prompt.ids = self.buffer_ids();
+            prompt.origin_buffer = Some(self.buffer.id);
+        }
+        // The width of the number and the two spaces after it, matching the
+        // `format!` above. Told to the prompt rather than re-derived from a
+        // row, so the one place that decides the layout is the one that wrote
+        // it — see `Prompt::prefix`.
+        if kind == PromptKind::Line {
+            prompt.prefix = self.buffer.len_lines().to_string().len() + 2;
+        }
         self.prompt = Some(prompt);
     }
 
@@ -1754,6 +1817,22 @@ impl Editor {
         };
         match cmd {
             "" => vec![],
+            // vim's `:q` closes the *window*, and reaches the application only
+            // when there is nothing smaller left to close. That is the ordering
+            // worth having: closing a split is something you do constantly and
+            // quitting is something you do once, so the common gesture must not
+            // be the destructive one.
+            //
+            // Decided here rather than by chaining commands, because every
+            // command in a returned batch is computed against the *pre-edit*
+            // state — a `CloseWindow` followed by a conditional quit would ask
+            // its question of the world before the close happened.
+            //
+            // `:q!` and `:quit` stay unconditional: `!` is vim's "I mean it",
+            // and typing the whole word is not something a hand does by
+            // accident.
+            "q" if self.frame().windows.len() > 1 => vec![EditorCommand::CloseWindow],
+            "q" if self.frames.len() > 1 => vec![EditorCommand::CloseFrame],
             "q" | "q!" | "quit" => vec![EditorCommand::Quit],
             "w" => vec![EditorCommand::SaveFile(
                 (!arg.is_empty()).then(|| PathBuf::from(arg)),
@@ -3148,6 +3227,109 @@ mod tests {
         // out of range is ignored rather than panicking
         ed.apply(EditorCommand::FocusFrame(99));
         assert_eq!(ed.focus_frame, 1);
+    }
+
+    /// `M-<bs>` in a prompt eats a word, and eats the separator before it on
+    /// the next press — the two-step that makes it usable for walking back up
+    /// a path. The last press, on an empty line, cancels like `<bs>` does.
+    #[test]
+    fn meta_backspace_kills_a_word_in_the_prompt() {
+        let mut ed = fresh("");
+        ed.run_action("find-file");
+        feed(&mut ed, &keys("~/src/doc"));
+
+        for want in ["~/src/", "~/", ""] {
+            for cmd in ed.handle_key(Key::MetaBackspace) {
+                ed.apply(cmd);
+            }
+            assert_eq!(ed.prompt.as_ref().map(|p| p.text.clone()).as_deref(), Some(want));
+        }
+        for cmd in ed.handle_key(Key::MetaBackspace) {
+            ed.apply(cmd);
+        }
+        assert!(ed.prompt.is_none(), "empty prompt cancels, as `<bs>` does");
+    }
+
+    /// The switcher shows you the buffer you are pointing at, and cancelling
+    /// puts back the one you came from.
+    ///
+    /// The trap this guards is that switching *reorders* the buffer list — the
+    /// outgoing buffer goes to the front, which is what makes the switcher
+    /// most-recently-used. So a preview built on the indices the candidates had
+    /// when the prompt opened would scramble them on the first arrow key, and
+    /// each subsequent press would show a buffer other than the highlighted one.
+    /// Hence ids, and hence this test moving the selection *twice*.
+    /// A name alone does not say what a buffer *is* — two `mod.rs` and a
+    /// `*scratch*` read alike. The mode is the missing word, and it is the one
+    /// the modeline already uses, so the switcher and the strip agree.
+    #[test]
+    fn the_buffer_switcher_names_the_mode() {
+        let mut ed = fresh("first");
+        ed.apply(EditorCommand::CreateBuffer("*second*".into()));
+        ed.run_action("switch-buffer");
+        let items = ed.prompt.as_ref().unwrap().items.clone();
+        assert!(
+            items.iter().all(|i| i.ends_with("Fundamental")),
+            "every row should name its mode; got {items:#?}"
+        );
+        // Padded to one column, so the modes line up rather than tracking the
+        // ragged right edge of the names.
+        let widths: Vec<usize> = items
+            .iter()
+            .map(|i| i.rfind("Fundamental").unwrap())
+            .collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "{items:#?}");
+    }
+
+    #[test]
+    fn the_buffer_switcher_shows_what_it_is_pointing_at() {
+        let mut ed = fresh("first");
+        ed.apply(EditorCommand::CreateBuffer("*second*".into()));
+        ed.apply(EditorCommand::CreateBuffer("*third*".into()));
+        let home = ed.buffer.id;
+
+        ed.run_action("switch-buffer");
+        assert_eq!(ed.prompt.as_ref().map(|p| p.kind), Some(PromptKind::Buffer));
+        let names = ed.prompt.as_ref().unwrap().items.clone();
+        let ids = ed.prompt.as_ref().unwrap().ids.clone();
+        assert_eq!(names.len(), ids.len(), "one id per candidate");
+
+        // Down twice. The second press is the one that would fail on indices:
+        // by then the first preview has already moved the editor's own list.
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            for cmd in ed.handle_key(Key::Ctrl('n')) {
+                ed.apply(cmd);
+            }
+            let p = ed.prompt.as_ref().unwrap();
+            let want = p.ids[p.matches[p.selected]];
+            assert_eq!(ed.buffer.id, want, "the live buffer is the highlighted one");
+            seen.push(want);
+        }
+        assert_ne!(seen[0], seen[1], "two presses, two different buffers");
+
+        // Escape comes home — to the *buffer*, which is the thing a cursor
+        // offset is meaningless without.
+        for cmd in ed.handle_key(Key::Esc) {
+            ed.apply(cmd);
+        }
+        assert!(ed.prompt.is_none());
+        assert_eq!(ed.buffer.id, home, "cancelling restores the buffer");
+
+        // ...and accepting lands on the highlighted one for good.
+        ed.run_action("switch-buffer");
+        for cmd in ed.handle_key(Key::Ctrl('n')) {
+            ed.apply(cmd);
+        }
+        let want = {
+            let p = ed.prompt.as_ref().unwrap();
+            p.ids[p.matches[p.selected]]
+        };
+        for cmd in ed.handle_key(Key::Enter) {
+            ed.apply(cmd);
+        }
+        assert!(ed.prompt.is_none());
+        assert_eq!(ed.buffer.id, want);
     }
 
     #[test]

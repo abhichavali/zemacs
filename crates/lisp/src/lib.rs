@@ -39,20 +39,32 @@
 //! here: ECL's API is largely macros (`ECL_NIL`, `cl_object` tagging), which
 //! don't survive translation to Rust declarations.
 //!
-//! The channel sender lives in a thread-local because ECL's C-function ABI
-//! carries no user-data pointer.
+//! The editor handle and the channel sender live in a process-wide static
+//! because ECL's C-function ABI carries no user-data pointer. **Process-wide,
+//! and not a thread-local**, so that a primitive means the same thing on every
+//! thread in the image: ECL has threads of its own
+//! (`mp:process-run-function`), a config that starts one is entitled to call
+//! `message` from it, and with the host installed on one thread only that call
+//! would reach nothing at all — no error, no message, and no way to find out.
+//! Silence is the worst failure a primitive can have.
+//!
+//! What it costs is nothing new: the lock is per primitive, exactly as it is
+//! for the Lisp thread, so a form running on a worker thread is interleaved
+//! with the editor in precisely the way [`Lisp`]'s own forms already are. The
+//! rule stays what `docs/threading.org` says — when a sequence must be
+//! all-or-nothing, make it one primitive.
 //!
 //! The Lisp-facing reference — every primitive, reader and helper, the recipes,
 //! and the list of what is deliberately out of reach — lives in `docs/` at the
 //! repository root.
 
-use std::cell::RefCell;
 use std::ffi::{c_char, c_double, c_int, c_long, CStr, CString};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::Sender;
-use zemacs_core::{Editor, EditorCommand, HlKind, Image, OverlayEdit, Shared};
+use zemacs_core::{Editor, EditorCommand, HlKind, Image, ImageId, OverlayEdit, Shared};
 
 extern "C" {
     fn zemacs_boot();
@@ -60,16 +72,17 @@ extern "C" {
     fn zemacs_eval(src: *const c_char);
 }
 
-/// What a primitive on the Lisp thread has to work with.
+/// What a primitive has to work with. Both halves are `Sync`, which is what
+/// lets one static serve every thread in the image.
 struct Host {
     editor: Shared,
     /// For the few commands only the app layer can carry out.
     tx: Sender<EditorCommand>,
 }
 
-thread_local! {
-    static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
-}
+/// Installed once, by [`spawn`], and read from whichever thread a primitive
+/// happens to be called on — the boot thread, or one ECL made itself.
+static HOST: OnceLock<Host> = OnceLock::new();
 
 /// Run `f` with the editor locked.
 ///
@@ -77,23 +90,18 @@ thread_local! {
 /// having panicked mid-edit is bad, but it is not a reason for every subsequent
 /// keystroke to panic too. `None` before [`spawn`] has installed the host.
 fn with_editor<T>(f: impl FnOnce(&mut Editor) -> T) -> Option<T> {
-    HOST.with(|h| {
-        let borrow = h.borrow();
-        let host = borrow.as_ref()?;
-        let mut guard = host.editor.lock().unwrap_or_else(|e| e.into_inner());
-        Some(f(&mut guard))
-    })
+    let host = HOST.get()?;
+    let mut guard = host.editor.lock().unwrap_or_else(|e| e.into_inner());
+    Some(f(&mut guard))
 }
 
 /// Pure commands are applied on the spot, so a read that follows one sees it.
 /// The rest need the app layer and land on the next turn of the main loop.
 fn emit(cmd: EditorCommand) {
     if cmd.needs_app() {
-        HOST.with(|h| {
-            if let Some(host) = h.borrow().as_ref() {
-                let _ = host.tx.send(cmd);
-            }
-        });
+        if let Some(host) = HOST.get() {
+            let _ = host.tx.send(cmd);
+        }
         return;
     }
     with_editor(|ed| ed.apply(cmd));
@@ -182,6 +190,13 @@ pub extern "C" fn rs_set_tab_width(n: c_long) {
     emit(EditorCommand::SetTabWidth(n.max(0) as usize));
 }
 
+/// Columns to hold the text column to, centred in the pane. 0 is off, and a
+/// negative is the same thing said clumsily rather than an error.
+#[no_mangle]
+pub extern "C" fn rs_set_text_width(n: c_long) {
+    emit(EditorCommand::SetTextWidth(n.max(0) as usize));
+}
+
 /// Signed on purpose: the sign *is* the feature, exactly as in Emacs' `:box
 /// :line-width` — positive raises the modeline, negative sinks it. Core clamps
 /// the magnitude, so nothing is rejected here.
@@ -210,6 +225,17 @@ pub extern "C" fn rs_dashboard_banner(text: *const c_char) {
     emit(EditorCommand::SetDashboardBanner(unsafe {
         str_or_empty(text)
     }));
+}
+
+/// The picture above the banner, by the id `image-file` answered. `0` — which
+/// is what that primitive returns when it could not read the file — takes the
+/// logo away rather than leaving a dangling id, so `(dashboard-logo
+/// (image-file "gone.png"))` degrades to the text banner instead of a blank.
+#[no_mangle]
+pub extern "C" fn rs_dashboard_logo(id: c_long) {
+    emit(EditorCommand::SetDashboardLogo(
+        (id > 0).then_some(id as ImageId),
+    ));
 }
 
 #[no_mangle]
@@ -294,6 +320,16 @@ pub extern "C" fn rs_set_major_mode(name: *const c_char) {
     emit(EditorCommand::SetMajorMode(unsafe { str_or_empty(name) }));
 }
 
+/// The modes whose buffers show no gutter, space-separated in one string. The
+/// whole list every time, so setting it twice replaces rather than accumulates
+/// — a config reload has to be idempotent.
+#[no_mangle]
+pub extern "C" fn rs_set_no_gutter_modes(modes: *const c_char) {
+    emit(EditorCommand::SetNoGutterModes(unsafe {
+        str_or_empty(modes)
+    }));
+}
+
 #[no_mangle]
 pub extern "C" fn rs_set_minor_mode(name: *const c_char, on: c_int) {
     emit(EditorCommand::SetMinorMode(
@@ -327,6 +363,43 @@ pub extern "C" fn rs_free_string(p: *mut c_char) {
     if !p.is_null() {
         drop(unsafe { CString::from_raw(p) });
     }
+}
+
+/// Highlight a *string* as a language, as `((START END "face") ...)` in char
+/// offsets. Rust-owned memory, freed by [`rs_free_string`] like [`rs_query`].
+///
+/// The reader `%query` could not carry, and the reason is the envelope rather
+/// than the question: `%query` takes a name and two integers, and this takes two
+/// strings. It is the same *shape* as `latex-fragments` — a fact `zemacs-syntax`
+/// knows and `zemacs-core` cannot, answered in Lisp source — and it earns a C
+/// entry point for the same reason `image-file` does, that it has an argument
+/// the envelope has no room for.
+///
+/// **It is a pure function and takes no lock at all.** Nothing here reads the
+/// editor: the caller hands over text it has already got out of the buffer, so a
+/// keystroke never waits behind a parse. That is what makes it affordable to
+/// highlight every source block in a document on entry to a mode.
+///
+/// The interesting use is the one org has: a `#+begin_src python` block inside a
+/// buffer whose *own* language is org, which the buffer-wide highlighter cannot
+/// colour because there is one language per buffer and no grammar for org at
+/// all. Lisp finds the block, hands the body over as `python`, and turns the
+/// answer into one `face` overlay per run — and a nested block is highlighted by
+/// exactly the grammar that would colour the same text in a file of its own.
+///
+/// An unknown language answers `nil`, which is also what a parse failure and an
+/// unhighlighted run answer, so the caller has one thing to check.
+#[no_mangle]
+pub extern "C" fn rs_highlight(lang: *const c_char, text: *const c_char) -> *mut c_char {
+    let lang = unsafe { str_or_empty(lang) };
+    let text = unsafe { str_or_empty(text) };
+    let rows: Vec<String> = zemacs_syntax::highlight(&lang, &text)
+        .iter()
+        .map(|s| format!("({} {} \"{}\")", s.start, s.end, s.kind.name()))
+        .collect();
+    CString::new(format!("({})", rows.join(" ")))
+        .unwrap_or_else(|_| CString::new("nil").expect("literal has no NUL"))
+        .into_raw()
 }
 
 #[no_mangle]
@@ -462,6 +535,105 @@ pub extern "C" fn rs_latex_preview(source: *const c_char) -> c_long {
     }
 }
 
+/// Read an image *file* and remember its pixels; the answer is the id an
+/// `image` overlay property takes, the same one [`rs_latex_preview`] answers
+/// with. 0 means it did not load, and the reason has already gone to the status
+/// line.
+///
+/// The second half of the display path org needed. LaTeX was its only producer,
+/// so `[[file:fig-1.svg]]` had nowhere to get an id from; this is that, and
+/// nothing more. Note what it deliberately does *not* add: no second image map,
+/// no second overlay property, no second lifetime. A figure lands in
+/// `Editor::add_image` beside every equation and is pruned by the same pass, so
+/// the renderer's texture cache has one story about eviction rather than two.
+///
+/// `ems` is the widest the figure may be drawn, as **a hundredth of an em** —
+/// the percentage the whole overlay bridge carries integers in, and the same
+/// trick `overlay-scale` plays for the same reason. 0 means "as authored". It
+/// is resolved here rather than in Lisp because the em in *device* pixels is
+/// something only the renderer knows, and it parks it on the editor for exactly
+/// this: a figure sized from `(font-size)` in the image would come out half
+/// width on a Retina display.
+///
+/// The same shape of id as a LaTeX preview: a hash of exactly the inputs that
+/// decide the pixels — the path, the file's length and mtime, and the width it
+/// was rendered to. Editing `fig-1.svg` and previewing again therefore renders
+/// it afresh, and re-previewing an unchanged buffer is a lookup with no file
+/// read at all. ponytail: mtime and length rather than the bytes, so a figure
+/// rewritten within the filesystem's timestamp granularity and to exactly the
+/// same length keeps its old pixels. Hashing the content would mean reading the
+/// file to decide whether to read the file.
+///
+/// One short lock to read the metrics, the decode *between* the locks, and a
+/// short one to store — never the editor held across a rasterise, exactly as
+/// the LaTeX primitive does it.
+#[no_mangle]
+pub extern "C" fn rs_image_file(path: *const c_char, ems: c_long) -> c_long {
+    use std::hash::{Hash, Hasher};
+
+    let path = PathBuf::from(unsafe { str_or_empty(path) });
+    if path.as_os_str().is_empty() {
+        return 0;
+    }
+    // The em in device pixels, and the ratio between it and the point size Lisp
+    // asked for — which *is* the display's scale factor, and is the only place
+    // it can be recovered. A vector figure has to be rasterised at it or it
+    // comes out at half size next to text that was not.
+    let Some((px, scale)) = with_editor(|ed| {
+        let nominal = ed.settings.font_size.max(1.0);
+        (ed.font_px, (ed.font_px / nominal).clamp(0.25, 8.0))
+    }) else {
+        return 0;
+    };
+    let max_width = ((px * ems.max(0) as f32) / 100.0).round().max(0.0) as u32;
+
+    // Metadata failures are left to `zemacs_figure::load`, which reports the
+    // path; hashing zeroes here just means an unreadable file gets a stable id
+    // and fails again the same way.
+    let stamp = std::fs::metadata(&path)
+        .map(|m| {
+            let secs = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            (m.len(), secs)
+        })
+        .unwrap_or((0, 0));
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (&path, stamp, max_width, scale.to_bits()).hash(&mut hasher);
+    let id = (hasher.finish() & 0xFFFF_FFFF_FFFF).max(1);
+    if with_editor(|ed| ed.has_image(id)) == Some(true) {
+        return id as c_long;
+    }
+
+    match zemacs_figure::load(&path, max_width, scale) {
+        Ok(fig) => {
+            with_editor(|ed| {
+                ed.add_image(
+                    id,
+                    Image {
+                        width: fig.width,
+                        height: fig.height,
+                        // A figure sits *on* the baseline. Only a LaTeX fragment
+                        // has a depth, because only a fragment is set inline with
+                        // the words around it.
+                        depth: 0,
+                        rgba: fig.rgba,
+                    },
+                )
+            });
+            id as c_long
+        }
+        Err(e) => {
+            emit(EditorCommand::Message(format!("image: {e:#}")));
+            0
+        }
+    }
+}
+
 // --- the write half of `%query` -------------------------------------------
 
 /// Turn a verb into a command, the way [`zemacs_core::query`] turns one into an
@@ -548,6 +720,43 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
             a.max(0) as u64,
             (b > 0).then_some(b as u64),
         )),
+
+        // --- typesetting -----------------------------------------------------
+        //
+        // Size, weight and slant, which between them are what let a heading be
+        // drawn as a heading rather than as a coloured line of text. Nothing
+        // here has an opinion about *what* is a heading: `1.5` and `bold` arrive
+        // from Lisp, the renderer snaps the size to one of the handful of steps
+        // it will open a face at, and that is the whole of the mechanism.
+        //
+        // A percentage in `b` rather than a float, because the envelope carries
+        // integers — and the renderer was going to quantise it anyway. 0 clears,
+        // which is how `(overlay-put ov 'scale nil)` arrives.
+        "overlay-scale" => EditorCommand::Overlay(OverlayEdit::Scale(
+            a.max(0) as u64,
+            (b > 0).then(|| b.min(u16::MAX as i64) as u16),
+        )),
+        // Emacs' `:weight` and `:slant`, spelled the same way and with the same
+        // three answers. The middle one matters: `'normal` is a claim that
+        // outranks an earlier overlay's bold, and NIL is the absence of one.
+        "overlay-weight" => {
+            EditorCommand::Overlay(OverlayEdit::Bold(a.max(0) as u64, emphasis(&arg, "bold")))
+        }
+        "overlay-slant" => EditorCommand::Overlay(OverlayEdit::Italic(
+            a.max(0) as u64,
+            emphasis(&arg, "italic"),
+        )),
+        // The two line-level attributes. A band the width of the pane and a
+        // string in front of the text — between them, a source block drawn as a
+        // block. Same face-name vocabulary as `overlay-background`.
+        "overlay-line-background" => EditorCommand::Overlay(OverlayEdit::LineBackground(
+            a.max(0) as u64,
+            HlKind::from_name(&arg),
+        )),
+        "overlay-line-prefix" => EditorCommand::Overlay(OverlayEdit::LinePrefix(
+            a.max(0) as u64,
+            (!arg.is_empty()).then_some(arg),
+        )),
         // Code folding, and the only overlay property that is about *lines*:
         // the lines after the overlay's first stop occupying rows entirely.
         // `b` rather than `arg` because the value is a flag, so one overlay can
@@ -574,6 +783,10 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
         "kill-buffer" => EditorCommand::KillBuffer(n),
         // An empty name means plain text — `(set-language nil)`.
         "set-language" => EditorCommand::SetLanguage((!arg.is_empty()).then_some(arg)),
+        // A flag in `a` rather than a word in `arg`, the shape `overlay-fold`
+        // already has and for the same reason: it is a claim that is turned on
+        // and off, and a mode's exit hook has to be able to say the other one.
+        "set-read-only" => EditorCommand::SetReadOnly(a != 0),
 
         // `read-string` and `completing-read`. `a` is the continuation id the
         // image parked its closure under, `b` says whether to draw a candidate
@@ -602,6 +815,24 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
         // --- end of the lisp-api block ---------------------------------------
         _ => return None,
     })
+}
+
+/// A `weight` or `slant` value, as the three answers Emacs' face attributes
+/// have: `on` for the emphatic spelling, `false` for a plain one, `None` for
+/// anything else.
+///
+/// `None` for the empty string is what makes `(overlay-put ov 'weight nil)`
+/// clear the attribute, matching `face`; `None` for an unrecognised word is the
+/// same forgiveness `HlKind::from_name` shows, and for the same reason — the
+/// value came out of a config and must not be able to raise an error here.
+fn emphasis(arg: &str, on: &str) -> Option<bool> {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        s if s == on => Some(true),
+        // Every spelling of "deliberately not". `regular` and `roman` are what
+        // a font family calls the plain cut; `upright` is what CSS calls it.
+        "normal" | "regular" | "roman" | "upright" => Some(false),
+        _ => None,
+    }
 }
 
 #[no_mangle]
@@ -831,7 +1062,10 @@ pub fn spawn(tx: Sender<EditorCommand>, editor: Shared, init_path: PathBuf) -> L
     let thread = thread::Builder::new()
         .name("zemacs-lisp".into())
         .spawn(move || unsafe {
-            HOST.with(|h| *h.borrow_mut() = Some(Host { editor, tx }));
+            // A second `spawn` in one process would find the cell already
+            // taken and is ignored: `cl_boot` initialises a *process-wide*
+            // image, so there is one of these per process by construction.
+            let _ = HOST.set(Host { editor, tx });
             zemacs_boot();
 
             if let Ok(path) = CString::new(init_path.into_os_string().into_encoded_bytes()) {

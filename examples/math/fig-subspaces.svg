@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 200" width="420" height="200">
+  <!-- Two subspaces of a common space, and the intersection the dimension
+       formula refunds. Drawn in plain shapes with no external font reference:
+       an SVG that names a font renders differently wherever that font is
+       missing, and this one is rasterised by resvg inside the editor. -->
+  <defs>
+    <style>
+      .lab { font-family: serif; font-size: 17px; fill: #dfe6ff; }
+      .sub { font-family: serif; font-size: 13px; fill: #9aa6c8; }
+    </style>
+  </defs>
+
+  <rect x="8" y="8" width="404" height="184" rx="10"
+        fill="none" stroke="#4a5578" stroke-width="1.5"/>
+  <text class="sub" x="20" y="28">V</text>
+
+  <circle cx="165" cy="105" r="72" fill="#5aa6ff" fill-opacity="0.22"
+          stroke="#5aa6ff" stroke-width="2"/>
+  <circle cx="255" cy="105" r="72" fill="#5ce0c0" fill-opacity="0.22"
+          stroke="#5ce0c0" stroke-width="2"/>
+
+  <text class="lab" x="104" y="112">U</text>
+  <text class="lab" x="303" y="112">W</text>
+  <text class="sub" x="186" y="100">U ∩ W</text>
+  <text class="sub" x="176" y="118">counted twice</text>
+
+  <text class="sub" x="112" y="180">dim U + dim W − dim(U ∩ W)</text>
+</svg>

@@ -149,6 +149,60 @@ fn an_org_subtree_folds_from_lisp_and_stops_occupying_rows() {
     lisp.eval("(zemacs::fold-open-all)".into());
     wait(&shared, "every fold to open", |ed| (folds(ed) == 0).then_some(()));
 
+    // --- org's own three-state cycle ----------------------------------------
+    //
+    // `fold-dwim` above is the generic two-state toggle every mode gets. This is
+    // the org-only one, and the whole reason it needs a test is that its three
+    // states are told apart by *reading the buffer back* — so a state that is
+    // misread does not fail loudly, it just refuses to advance. Both bugs this
+    // caught were of exactly that kind.
+    {
+        let mut ed = shared.lock().unwrap();
+        ed.buffer.major_mode = "org-mode".into();
+        ed.buffer.cursor = 0; // on `* one`
+        ed.status.clear();
+    }
+
+    // SUBTREE -> FOLDED: everything under the headline goes.
+    lisp.eval("(zemacs::org-cycle)".into());
+    wait(&shared, "org-cycle to fold", |ed| {
+        (hidden(ed) == vec![1, 2, 3]).then_some(())
+    });
+
+    // FOLDED -> CHILDREN: `** deep` comes back as a headline, its body does not,
+    // and neither does the parent's own body. This is the state that does not
+    // exist without the cycle, and asserting on `hidden` rather than on the fold
+    // count is the point — several folds spell it, and how many is not the
+    // contract.
+    lisp.eval("(zemacs::org-cycle)".into());
+    wait(&shared, "org-cycle to show children", |ed| {
+        (hidden(ed) == vec![1, 3]).then_some(())
+    });
+
+    // CHILDREN -> SUBTREE. The regression: every child headline is the *start*
+    // of its own fold here, so a state test built on `folded-p` reads CHILDREN
+    // as FOLDED and this press loops back instead of opening.
+    lisp.eval("(zemacs::org-cycle)".into());
+    wait(&shared, "org-cycle to open", |ed| {
+        (folds(ed) == 0 && hidden(ed).is_empty()).then_some(())
+    });
+
+    // A leaf headline has no middle state and cycles in two. `* two` owns only
+    // `tail`; the second press used to be a type error on `(first NIL)`.
+    {
+        let mut ed = shared.lock().unwrap();
+        ed.buffer.cursor = ed.buffer.line_start(4);
+        ed.status.clear();
+    }
+    lisp.eval("(zemacs::org-cycle)".into());
+    wait(&shared, "the leaf subtree to fold", |ed| {
+        (hidden(ed) == vec![5]).then_some(())
+    });
+    lisp.eval("(zemacs::org-cycle)".into());
+    wait(&shared, "the leaf subtree to open again", |ed| {
+        (folds(ed) == 0).then_some(())
+    });
+
     // --- a buffer whose mode has no policy says so rather than guessing -------
     //
     // Which is the boundary working: Rust has no opinion about what is foldable,

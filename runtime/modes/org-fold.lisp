@@ -70,6 +70,100 @@ The shape `*fold-subtree-functions*' expects."
         when (eql (%org-level l) 1)
           collect (cons (line-start l) (%org-subtree-end l))))
 
+(defun %org-children (line)
+  "Lines of LINE's *direct* children — headlines exactly one level deeper.
+
+Direct and not descendant: a grandchild lives inside a child's own subtree and
+is that child's business to reveal, which is the whole difference between org's
+CHILDREN state and simply unfolding everything."
+  (let ((level (%org-level line))
+        (out '()))
+    (loop for l from (1+ line) to (line-count)
+          do (let ((lv (%org-level l)))
+               (when (and lv (<= lv level)) (return))
+               (when (eql lv (1+ level)) (push l out))))
+    (nreverse out)))
+
+;;; ---------------------------------------------------------------------------
+;;; org's own three-state cycle
+;;;
+;;; The ceiling at the top of this file, now closed. `fold-dwim' is still the
+;;; generic two-state toggle every mode gets — a selection, a defun, a magit
+;;; hunk — and this is the one mode whose folding is a *structure* rather than a
+;;; range, so it is the one mode that earns a third state.
+;;;
+;;; What makes CHILDREN expressible without a new primitive: a fold hides the
+;;; lines *after* the first line of its range. So "headline visible, body
+;;; hidden" is one fold from the headline to the line before its first child,
+;;; and each child is the same shape one level down. CHILDREN is therefore a
+;;; *set* of ordinary folds, not a new kind of one, and everything that already
+;;; knows how to unfold keeps working on it.
+;;;
+;;; ponytail: the state is read back off the buffer every press rather than
+;;; remembered per headline. That is one `folded-p' per direct child, which is
+;;; nothing next to a redisplay, and it has the property a table would not: a
+;;; fold you removed by hand, or one that died with the text under it, cannot
+;;; leave the cycle believing something the buffer disagrees with.
+
+(defun %org-cycle-state (beg end)
+  "Which of :SUBTREE, :FOLDED or :CHILDREN the subtree BEG..END is showing.
+
+Told apart by the folds' *extents*, which is the only thing that distinguishes
+the last two: both states have a fold starting at the headline. FOLDED is the
+single fold that reaches the end of the subtree; CHILDREN is a body fold that
+stops before the first child, plus one per child, none of which reaches the end.
+
+Not `folded-p': that answers \"the innermost fold covering this position\", and
+in CHILDREN state every child's headline is the *start* of its own fold — so
+asking there returns that fold and reports CHILDREN as FOLDED. The cycle then
+sticks between the two and never opens. `>=' rather than `=' on the far edge
+because an overlay adjusts itself across an edit and may have grown."
+  (let ((folds (folds-in beg end)))
+    (cond ((null folds) :subtree)
+          ((some (lambda (ov)
+                   (and (= (overlay-start ov) beg) (>= (overlay-end ov) end)))
+                 folds)
+           :folded)
+          (t :children))))
+
+(defun %org-show-children (line beg end)
+  "Reveal LINE's direct children and hide everything else under it."
+  (unfold-region beg end)
+  ;; A leaf headline has no middle state, so opening it *is* the whole of this
+  ;; and the cycle is two-state there. Guarded rather than special-cased by the
+  ;; caller because `(first NIL)' is NIL and every arithmetic test below would
+  ;; then be a type error on the one shape that reaches it.
+  (let ((kids (%org-children line)))
+    (when kids
+      ;; The body between the headline and its first child. Skipped when the
+      ;; child follows immediately: a fold spanning a single line hides nothing
+      ;; and would only be one more overlay to read back.
+      (let ((first-kid (first kids)))
+        (when (> first-kid (1+ line))
+          (fold-region beg (line-end (1- first-kid)))))
+      (dolist (k kids)
+        (fold-region (line-start k) (%org-subtree-end k))))))
+
+(defun org-cycle ()
+  "TAB on a headline: SUBTREE -> FOLDED -> CHILDREN -> SUBTREE.
+
+org's own cycle and org's own order — pressing TAB on something open closes it,
+which is the gesture that makes an outline an outline. A headline with no
+children has no middle state and cycles in two.
+
+Off a headline this defers to `fold-dwim', so TAB in the preamble or over a
+selection still does the generic thing rather than reporting that there is no
+subtree here."
+  (let ((line (%org-headline-above)))
+    (if (null line)
+        (fold-dwim)
+        (let* ((beg (line-start line))
+               (end (%org-subtree-end line)))
+          (ecase (%org-cycle-state beg end)
+            (:subtree  (fold-region beg end)          (message "folded"))
+            (:folded   (%org-show-children line beg end) (message "children"))
+            (:children (unfold-region beg end)        (message "subtree")))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; the generic commands
 
@@ -121,6 +215,11 @@ overlay over the first and leave `fold-dwim' needing two presses to undo."
 (defun fold-open-all ()
   "Open every fold in the buffer."
   (message (format nil "~a fold~:p opened" (unfold-all))))
+
+;;; TAB on a headline, which is *the* org gesture and the reason the cycle above
+;;; exists at all. Mode-local, so it is org's and nothing else's: `lisp-mode'
+;;; keeps `<tab>' for indentation and magit keeps it for its sections.
+(define-mode-key 'org-mode "<tab>" "org-cycle")
 
 ;;; vim's own fold keys, which is the muscle memory this is for. `z' is not a
 ;;; prefix in the built-in grammar and is bound only inside magit, so these

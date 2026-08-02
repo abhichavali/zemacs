@@ -19,6 +19,7 @@ cannot, and why the line is where it is.
 | [[file:reference.org][reference.org]]          | Every primitive, reader and helper: arguments, return value, example.  |
 | [[file:recipes.org][recipes.org]]            | The things people actually write, end to end.                         |
 | [[file:boundary.org][boundary.org]]           | What belongs in Lisp, what belongs in Rust, and every known ceiling.   |
+| [[file:curriculum.org][curriculum.org]]         | The curriculum format: a whole interactive course as one .org file.    |
 
 If you only read one thing, read [[file:threading.org][threading.org]]. It is the one place zemacs
 deliberately differs from Emacs, and the difference changes how you write

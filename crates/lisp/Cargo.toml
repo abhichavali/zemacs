@@ -16,6 +16,11 @@ crossbeam-channel.workspace = true
 # new build.
 zemacs-latex.workspace = true
 zemacs-syntax.workspace = true
+# ...and its sibling: `[[file:fig-1.svg]]` drawn as the figure rather than as
+# the link text. Same shape as the LaTeX one — a path in, RGBA out — landing in
+# the same `add_image` under the same kind of content-derived id, so there is
+# one image cache and one eviction story rather than two.
+zemacs-figure.workspace = true
 
 [build-dependencies]
 cc = "1"

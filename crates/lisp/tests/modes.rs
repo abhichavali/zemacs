@@ -123,6 +123,13 @@ fn modes_are_built_in_lisp() {
   (:on  (message "test-minor on"))
   (:off (message "test-minor off")))
 
+;; `point-moved-hook' is the editor's second report about a buffer, and
+;; `modes.lisp' is where the list and the function that walks it live. The
+;; application queues the hook by name when the cursor offset changes; the test
+;; below queues it by hand, which is the same route.
+(defun test-motion () (message "point moved"))
+(pushnew 'test-motion *point-moved-functions*)
+
 (message "modes test init loaded")
 "#,
             entry.display().to_string()
@@ -157,25 +164,81 @@ fn modes_are_built_in_lisp() {
 
     // --- a mode-local setting applies... -------------------------------------
     //
-    // Wrapping comes from `text-mode`, which `org-mode` derives from; the
-    // absolute line numbers are org's own claim, over a global `t`.
+    // Wrapping comes from `text-mode`, which `org-mode` derives from. Nothing
+    // claims relative numbering any more, so the global `t` above reaches org
+    // too — which is the point of the claim having been dropped: a mode may
+    // decide what only it can know, and "do I want relative numbers" is not
+    // that.
+    // Org's own two claims come along with it: no gutter, and a measure to
+    // centre the text in. Both are what make an org buffer look like a page
+    // rather than like every other buffer, and both are settings the *editor*
+    // holds one of — so a claim is the only way a mode can have its own.
     lisp.eval("(org-mode)".into());
     wait(&shared, "org-mode's settings", |ed| {
         (ed.buffer.major_mode == "org-mode"
             && ed.settings.line_overflow == LineOverflow::Wrap
-            && !ed.settings.relative_line_numbers)
+            && ed.settings.text_width == 80
+            && ed.settings.relative_line_numbers)
             .then_some(())
+    });
+
+    // The gutter is *not* among them, and deliberately: it is decided per
+    // buffer rather than claimed per mode, because it is drawn per pane and two
+    // panes must be able to disagree. So it does not move the editor-wide flag
+    // at all — it moves this buffer's.
+    {
+        let ed = shared.lock().unwrap();
+        assert!(ed.settings.line_numbers, "org must not touch the global flag");
+        assert_eq!(ed.buffer.line_numbers, Some(true), "no policy set yet");
+    }
+    lisp.eval(r#"(set-no-gutter-modes '("org-mode"))"#.into());
+    wait(&shared, "the gutter policy to reach this buffer", |ed| {
+        (ed.buffer.line_numbers == Some(false)).then_some(())
+    });
+    // Setting the list *replaces* it, so a config reload is idempotent and
+    // taking a mode out gives the gutter back to buffers already open. Checked
+    // without changing mode, because the exit-hook count below is an assertion
+    // about how many departures happened and an extra one here would break it.
+    lisp.eval(r#"(set-no-gutter-modes '("text-mode"))"#.into());
+    wait(&shared, "the policy to be replaced, not added to", |ed| {
+        (ed.buffer.line_numbers == Some(true)).then_some(())
+    });
+    lisp.eval(r#"(set-no-gutter-modes '("org-mode"))"#.into());
+    wait(&shared, "org back on the list", |ed| {
+        (ed.buffer.line_numbers == Some(false)).then_some(())
+    });
+
+    // A list of more than one, because the shipped `init.lisp` passes four and
+    // the C side flattens it with `format` before the envelope — one string,
+    // space-separated. The mode under test is deliberately *last*, so a format
+    // call that dropped or truncated the tail would read as "org is not on the
+    // list" rather than as nothing at all.
+    lisp.eval(r#"(set-no-gutter-modes '("text-mode" "prog-mode" "org-mode"))"#.into());
+    wait(&shared, "the last entry of a longer list", |ed| {
+        (ed.buffer.line_numbers == Some(false)).then_some(())
+    });
+    // ...and the same length of list without it gives the gutter back, so the
+    // answer above came from the list's contents and not from its size.
+    lisp.eval(r#"(set-no-gutter-modes '("text-mode" "prog-mode" "conf-mode"))"#.into());
+    wait(&shared, "a longer list org is not on", |ed| {
+        (ed.buffer.line_numbers == Some(true)).then_some(())
+    });
+    lisp.eval(r#"(set-no-gutter-modes '("org-mode"))"#.into());
+    wait(&shared, "org back on the list once more", |ed| {
+        (ed.buffer.line_numbers == Some(false)).then_some(())
     });
 
     // --- ...and reverts on the way out --------------------------------------
     //
-    // The whole point. `fundamental-mode` says nothing about either setting:
-    // wrapping goes back to the editor default and relative numbering goes back
-    // to the `t` the config asked for, not to the factory `nil`.
+    // The whole point. `fundamental-mode` says nothing about any of these:
+    // wrapping goes back to the editor default, the full-width measure comes
+    // back, and relative numbering is still the `t` the config asked for, never
+    // the factory `nil`. (The gutter is checked above; it is not a claim.)
     lisp.eval("(fundamental-mode)".into());
     wait(&shared, "org-mode's settings to revert", |ed| {
         (ed.buffer.major_mode == "fundamental-mode"
             && ed.settings.line_overflow == LineOverflow::Truncate
+            && ed.settings.text_width == 0
             && ed.settings.relative_line_numbers)
             .then_some(())
     });
@@ -201,6 +264,7 @@ fn modes_are_built_in_lisp() {
         "one exit per departure — no more, and no less; got {:#?}",
         last_messages(&shared, 12)
     );
+
 
     // --- inheritance --------------------------------------------------------
     //
@@ -320,7 +384,7 @@ fn modes_are_built_in_lisp() {
         );
         assert_eq!(
             bound("lisp-mode", "SPC m e").as_deref(),
-            Some("eval-dwim"),
+            Some("lisp-eval-dwim"),
             "lisp-mode's own binding"
         );
         assert_eq!(
@@ -339,6 +403,22 @@ fn modes_are_built_in_lisp() {
             );
         }
     }
+
+    // --- the cursor-movement hook -------------------------------------------
+    //
+    // The half of it that lives in the image: a name queued on `pending_hooks`
+    // reaches `point-moved-hook`, which walks `*point-moved-functions*`. The
+    // application's half — noticing that `buffer.cursor` moved and queueing the
+    // name — is one comparison in the main loop and has no test binary to live
+    // in, which is the same place `after-change-hook` has always been.
+    shared
+        .lock()
+        .unwrap()
+        .pending_hooks
+        .push("point-moved-hook".into());
+    wait_message(&shared, "point-moved-hook to reach its functions", |m| {
+        m == "point moved"
+    });
 
     // --- a setting nothing knows about is reported, not silently dropped ----
     let at = mark(&shared);
@@ -374,13 +454,40 @@ fn modes_are_built_in_lisp() {
         entry.display().to_string()
     ));
     lisp.eval("(set-relative-line-numbers t)".into());
+    // What is being proved is that a *global* setting survives the reload — that
+    // the wrapper in `modes.lisp` still records a baseline after the config has
+    // been read on top of it. Any wrapped setting demonstrates that, so this
+    // uses the one the test itself asked for.
+    //
+    // It deliberately does *not* assert the shipped point size. That is a
+    // preference: somebody changing `*font-size*` in their own config is not a
+    // regression, and a test that fails when they do is a test that punishes
+    // editing the config it is meant to be checking. It failed exactly that way
+    // once already.
     wait(&shared, "the shipped config to have loaded", |ed| {
-        (ed.settings.relative_line_numbers && ed.settings.font_size == 22.0).then_some(())
+        ed.settings.relative_line_numbers.then_some(())
+    });
+
+    // The shipped config read all the way to the end, and its org block is
+    // wired to the two hooks. Named individually rather than checked by
+    // "no error in the messages": a form near the foot of a 900-line file can
+    // fail to be reached without anything anywhere saying so, and the settings
+    // asserted above are all set in its first hundred lines.
+    lisp.eval(
+        r#"(message (format nil "~a"
+                            (and (fboundp 'org-latex-preview-new)
+                                 (member 'org-latex-note-change *after-change-functions*)
+                                 (member 'org-latex-maybe-preview *point-moved-functions*)
+                                 t)))"#
+            .into(),
+    );
+    wait_message(&shared, "org's automatic previews to be wired up", |m| {
+        m == "T"
     });
 
     lisp.eval("(org-mode)".into());
     wait(&shared, "org-mode after a reload", |ed| {
-        (ed.settings.line_overflow == LineOverflow::Wrap && !ed.settings.relative_line_numbers)
+        (ed.settings.line_overflow == LineOverflow::Wrap && ed.settings.relative_line_numbers)
             .then_some(())
     });
     lisp.eval("(rust-mode)".into());
@@ -396,4 +503,25 @@ fn modes_are_built_in_lisp() {
         "the exit hook must survive the reload too; got {:#?}",
         last_messages(&shared, 12)
     );
+
+    // --- the gutter follows the buffer's mode -------------------------------
+    //
+    // Last in the file on purpose. This changes major mode, and two assertions
+    // above are statements about *how many* mode changes happened and about
+    // which mode the buffer was left in — so anywhere earlier and it would be
+    // measuring itself into someone else's test.
+    //
+    // The shipped config has just been reloaded, so the real
+    // `set-no-gutter-modes` list is in effect rather than the one this test set.
+    lisp.eval("(org-mode)".into());
+    wait(&shared, "org to lose its gutter on entry", |ed| {
+        (ed.buffer.line_numbers == Some(false)).then_some(())
+    });
+    lisp.eval("(rust-mode)".into());
+    wait(&shared, "a mode off the list to get one", |ed| {
+        (ed.buffer.line_numbers == Some(true)).then_some(())
+    });
+    // The editor-wide flag never moved: this is a per-buffer decision, which is
+    // the entire reason it exists.
+    assert!(shared.lock().unwrap().settings.line_numbers);
 }

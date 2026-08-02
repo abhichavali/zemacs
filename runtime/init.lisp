@@ -1,4 +1,4 @@
-;;;; zemacs default configuration — Common Lisp.
+;;; zemacs default configuration — Common Lisp.
 ;;;;
 ;;;; This file is LOADed on startup by the embedded ECL image, which runs on its
 ;;;; own thread with its own GC. It is the config file the way ~/.emacs is for
@@ -18,8 +18,11 @@
 ;;;;                                           operator punctuation default
 ;;;;                                           modeline modeline-inactive
 ;;;;                                           modeline-text
-;;;;   (set-line-numbers t)                    or NIL
+;;;;   (set-line-numbers t)                    or NIL — the editor-wide default
+;;;;   (set-no-gutter-modes '("org-mode"))     the modes that overrule it, per
+;;;;                                           buffer; replaces the whole list
 ;;;;   (set-tab-width n)
+;;;;   (set-text-width n)                      columns, centred; 0 is off
 ;;;;   (set-modeline-relief n)                 bevel px; negative sinks it
 ;;;;   (set-modeline-pad n)                    padding px inside the modeline
 ;;;;   (set-completion-style "center")         "minibuffer" "bottom" "center"
@@ -108,18 +111,42 @@ during a load, so it has to be captured here rather than read later.")
 ;;; ---------------------------------------------------------------------------
 ;;; Appearance
 
-(defparameter *font-size* 22
+(defparameter *font-size* 16
   "Current point size. Kept here rather than read back from the editor, the
 same way Emacs tracks `text-scale-mode-amount' in a variable.")
 
 (set-font-size *font-size*)
 (set-line-numbers t)
+
+;;; ...and then the exceptions, buffer by buffer.
+;;;
+;;; `set-line-numbers' above is the editor-wide default and every buffer follows
+;;; it; this names the major modes that do not. The distinction matters because
+;;; the gutter is drawn per *pane*: with an org file open beside a source file,
+;;; one editor-wide flag can only give them the same answer. It used to be said
+;;; with `set-mode-local', and that is exactly what went wrong — a mode-local
+;;; setting is global by construction, so entering org turned the numbers off in
+;;; the code buffer next to it, and which pane won depended on which mode had
+;;; been entered last.
+;;;
+;;; Prose is the case worth stating: a line number is a coordinate for talking
+;;; to a compiler or another person about code, and nobody has ever cited a line
+;;; of prose by number. Terminals and the dashboard are *not* here — they have no
+;;; buffer lines to number and the renderer knows it, so they are not a decision
+;;; anyone should have to remember to write down.
+(set-no-gutter-modes '("org-mode" "org-frozen-mode" "text-mode" "tutor-mode"))
 ;; t counts from the cursor, vim-style — and counts *visual* lines, so with
 ;; wrapping on a long paragraph is numbered once per row. That is Emacs'
 ;; `display-line-numbers-type 'visual', and it is the reading that agrees with
 ;; `j' and `k': `3j' lands on the row labelled 3.
-(set-relative-line-numbers nil)
+(set-relative-line-numbers t)
 (set-tab-width 4)
+
+;;; Full-width text everywhere by default: code wants every column it can get,
+;;; and indentation read down the middle of a pane is indentation you have to
+;;; hunt for. `org-mode' claims this for itself in `modes/library.lisp' — a
+;;; measure is a fact about *prose*, not about the editor.
+(set-text-width 0)
 
 ;;; What a window does with a line wider than it is.
 ;;; "truncate" — cut it at the pane edge and mark the tail with a `→'
@@ -138,17 +165,29 @@ same way Emacs tracks `text-scale-mode-amount' in a variable.")
 (set-syntax-color "number"   0.98 0.72 0.47)
 (set-syntax-color "comment"  0.42 0.46 0.58)
 
-;;; Markup faces, used by org-mode. Emphasis is carried by colour rather than
-;;; by weight or slant — the renderer opens one font face, so real bold and
-;;; italic would mean loading two more.
-(set-syntax-color "heading-1" 0.60 0.80 1.00)
-(set-syntax-color "heading-2" 0.55 0.88 0.80)
-(set-syntax-color "heading-3" 0.80 0.75 0.98)
-(set-syntax-color "bold"      1.00 0.92 0.72)
-(set-syntax-color "italic"    0.78 0.88 0.72)
-(set-syntax-color "code"      0.72 0.82 0.95)
-(set-syntax-color "link"      0.52 0.76 0.98)
-(set-syntax-color "markup"    0.36 0.40 0.52) ; the delimiters themselves
+;;; Markup faces, used by org-mode.
+;;;
+;;; Emphasis used to be carried by colour *instead of* weight and slant, because
+;;; the renderer opened one font face. It opens several now, so `*bold*' is bold
+;;; and `/italic/' is italic — and these colours changed with that, because they
+;;; were doing two jobs and now do one. A tint that had to be distinguishable
+;;; from body text all by itself could not also be subtle; freed of that, it can
+;;; be bright enough to read as deliberate.
+;;;
+;;; Brighter here means *further from the background*, not further from white:
+;;; the ground is a near-black blue-grey, so these are pushed up in value and
+;;; kept saturated, which is what makes them sing against it rather than wash
+;;; out. Three levels and no more: the highlighter paints level 3 and everything
+;;; below it in the same face, so a `heading-4' here would be a line that names
+;;; nothing. Depth past three is carried by the bullet and the indent.
+(set-syntax-color "heading-1" 0.62 0.84 1.00) ; bright azure
+(set-syntax-color "heading-2" 0.52 0.95 0.84) ; bright aqua
+(set-syntax-color "heading-3" 0.86 0.78 1.00) ; bright lilac
+(set-syntax-color "bold"      1.00 0.95 0.78) ; near-white gold: heaviest thing here
+(set-syntax-color "italic"    0.80 0.94 0.74)
+(set-syntax-color "code"      0.70 0.90 1.00)
+(set-syntax-color "link"      0.55 0.82 1.00)
+(set-syntax-color "markup"    0.36 0.40 0.52) ; the delimiters themselves, dim on purpose
 
 ;;; The modeline. Relief is Emacs' `:box :line-width': the magnitude is the
 ;;; bevel in pixels and the *sign* picks which way it goes — 2 raises the bar
@@ -298,6 +337,22 @@ key binding or a dashboard item."
     (goto-char (point-max))
     (message (format nil "~a message~:p" (length log)))))
 
+(defun yank-buffer-file-name ()
+  "Put this buffer's path in the register, and say what it copied.
+
+The register is this editor's kill ring: `p' pastes it, and it is what every
+other copy in here writes to. `set-register' takes the text and a `linewise'
+flag, and a path is emphatically not a line — pasting it must land inside the
+line you are on, not open a new one below it.
+
+ponytail: the register and the system clipboard are the same thing here, so
+this reaches other applications only as far as that already does. Nothing to
+add until the two are separated."
+  (let ((path (buffer-file-name)))
+    (if path
+        (progn (set-register path nil) (message path))
+        (message "no file behind this buffer"))))
+
 (defun %newest-file (&rest paths)
   "The most recently written of PATHS that exists, or NIL."
   (let ((live (remove-if-not #'probe-file (remove nil paths))))
@@ -400,19 +455,26 @@ Clears first, so reloading the config does not duplicate the list."
 so the width stays right whichever line comes up.")
 
 (defun %banner ()
+  "The text under the logo.
+
+Block-capital ASCII used to spell the name here, and it is gone for two
+reasons. The logo above says what the application is, in artwork that does not
+depend on a font having the block-drawing characters — and the art *did* depend
+on that: rendered in a font missing some of them it degraded into letters that
+were not the ones intended, which is a worse first impression than no artwork at
+all. Letter-spaced type says the same thing in characters every font has.
+
+No leading whitespace on any line: the dashboard centres each line itself, so
+padding here would shift the block off-centre rather than move it."
   (let ((koan (nth (random (length *koans*)) *koans*)))
     (format nil "
-      ╭────────────────────────────────────────────────╮
-      │  ▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄  ▄▄▄   ▄▄▄  ▄▄▄▄▄   ▄▄▄▄▄▄  │
-      │     ███    ██▄▄▄    ████ ████  ██▄▄██  ██▄▄▄   │
-      │    ███     ██▀▀▀    ██ ███ ██  ██▀▀██  ██▀▀▀   │
-      │  ▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀  ▀▀  ▀  ▀▀  ▀▀  ▀▀  ▀▀▀▀▀▀  │
-      ╰────────────────────────────────────────────────╯
+z e m a c s
 
-              (a common lisp machine that edits text)
+a common lisp machine that edits text
 
-         ;; ~a
-         (~a ~a) on ~a
+;; ~a
+
+(~a ~a) on ~a
 "
             koan
             (string-downcase (lisp-implementation-type))
@@ -420,6 +482,19 @@ so the width stays right whichever line comes up.")
             (string-downcase (software-type)))))
 
 (dashboard-banner (%banner))
+
+;;; ...and a picture over it. `image-file' answers NIL when it cannot read the
+;;; file, and `dashboard-logo' takes NIL to mean "no logo" — so a checkout
+;;; without the assets directory falls back to the ASCII banner alone instead of
+;;; leaving a hole where a lambda should be. That is the same contract
+;;; `latex-preview' has, for the same reason: an asset is a thing that can be
+;;; missing, and a config must survive it.
+;;;
+;;; Sized in ems, like every other figure, so it grows with the font rather than
+;;; staying a fixed slab of pixels when the display or the point size changes.
+(when *runtime-dir*
+  (dashboard-logo
+   (image-file (merge-pathnames "../assets/Lisp_logo.svg.png" *runtime-dir*) 10)))
 
 (clear-dashboard-items)
 ;; Built-in verbs...
@@ -527,6 +602,70 @@ the bindings.")
 ;;; ...and back in, the way `i' enters Insert mode from Normal.
 (define-key "normal" "C-M-t" "terminal")
 
+;;; Clickable links in the terminal. A click the child did not ask for used to
+;;; do nothing at all — a shell never turns mouse reporting on — so the row it
+;;; landed on comes here instead. What counts as a link is decided in Lisp
+;;; rather than in Rust, because it is policy and policy is what this file is.
+(defparameter *browse-url-program*
+  #+darwin "open" #+(or linux freebsd) "xdg-open" #-(or darwin linux freebsd) nil
+  "The program handed a URL, or NIL to refuse.
+
+Not a browser name: the point of `open' and `xdg-open' is that the *desktop*
+decides, so an `https:' reaches the browser you actually use, a `file:' reaches
+whatever opens that kind of file, and a `mailto:' reaches your mail client.")
+
+(defun browse-url (url)
+  "Hand URL to the desktop.
+
+`:wait nil' because nothing here wants the browser's exit status and waiting for
+one would park the Lisp thread on a program you are still reading. The URL is
+echoed either way, so a machine with no opener still leaves you something to
+copy."
+  (if *browse-url-program*
+      (progn (ignore-errors
+              (ext:run-program *browse-url-program* (list url)
+                               :wait nil :input nil :output nil :error nil))
+             (message (format nil "opened ~a" url)))
+      (message (format nil "no opener for ~a" url))))
+
+(defparameter *url-schemes* '("http://" "https://" "file://" "mailto:")
+  "Prefixes that make a run of text worth clicking. The policy hook: add one and
+that scheme becomes clickable too.")
+
+(defparameter *url-breaks* '(#\Space #\Tab #\" #\' #\< #\> #\( #\) #\[ #\])
+  "Characters a URL cannot contain, so one printed inside quotes or brackets
+still ends where the eye says it does.")
+
+(defun %url-at (line col)
+  "The URL in LINE that column COL falls inside, or NIL.
+
+A click on the space *after* a link is a click on nothing: without that check
+the run scanned backwards from a delimiter is the link, and half the blank right
+half of a terminal row would open the last URL on the line."
+  (let ((n (length line)))
+    (when (and (< -1 col n) (not (member (char line col) *url-breaks*)))
+      (flet ((break-p (c) (member c *url-breaks*)))
+        (let* ((beg (1+ (or (position-if #'break-p line :end col :from-end t) -1)))
+               (end (or (position-if #'break-p line :start col) n))
+               ;; Trailing punctuation belongs to the sentence, not to the URL.
+               ;; A link at the end of a log line is followed by a period often
+               ;; enough that keeping it would break every one of them.
+               (url (string-right-trim ".,;:!?" (subseq line beg end))))
+          (when (some (lambda (s) (and (<= (length s) (length url))
+                                       (string-equal s url :end2 (length s))))
+                      *url-schemes*)
+            url))))))
+
+(defun %terminal-click (line col &optional uri)
+  "A click the child did not want, on the screen row LINE at column COL.
+
+URI is the OSC 8 link the child hung on that cell, and it wins: `cargo' marks
+its error codes and `ls --hyperlink' marks its filenames that way, so the text
+you clicked is a word and the link behind it is nowhere on the screen. Only when
+there is no such link does the row itself get read for one."
+  (let ((url (or uri (%url-at line col))))
+    (when url (browse-url url))))
+
 ;;; Dired. `SPC f d' opens the directory of the current file; in a listing,
 ;;; the keys are Emacs' own.
 (define-leader "SPC f d" "dired")
@@ -558,7 +697,12 @@ the bindings.")
 (define-key "dired" "C" "dired-copy")
 (define-key "dired" "+" "dired-mkdir")
 (define-key "dired" "H" "dired-toggle-hidden")
-(define-key "dired" "g" "dired-refresh")
+;;; `g r', not a bare `g': a single-key binding here would claim the `g' that
+;;; starts `gg', and the second one would only refresh again — so the motion
+;;; every other buffer has would be the one thing a listing could not do. `g r'
+;;; is what evil-collection binds refresh to for the same reason, and `g' stays
+;;; a prefix, so `gg' falls through to the grammar underneath.
+(define-key "dired" "g r" "dired-refresh")
 (define-key "dired" "q" "show-dashboard")
 
 ;;; ---------------------------------------------------------------------------
@@ -654,30 +798,186 @@ the bindings.")
     (mapc #'delete-overlay ovs)
     (message (format nil "~d preview~:p cleared" (length ovs)))))
 
-(defun org-latex-preview ()
-  "Show every LaTeX fragment as an image — the selection's, or the buffer's.
+(defvar *org-latex-auto* t
+  "Whether org buffers typeset their fragments by themselves.
 
-Fragments already previewed are re-done, so this doubles as `refresh'."
-  (let* ((r (region))
-         (beg (if r (car r) (point-min)))
-         (end (if r (cdr r) (point-max)))
-         (done 0))
-    (mapc #'delete-overlay (org-latex-previews beg end))
-    ;; Back to front: an overlay adjusts itself across an edit, but nothing here
-    ;; edits, and walking backwards keeps the *offsets* from `latex-fragments'
-    ;; valid however long the rendering takes.
-    (dolist (f (reverse (latex-fragments)))
+Turned off by a pass that could not render anything — a machine with no `latex'
+should say so once, not once per equation — and back on by `org-latex-preview'
+succeeding, since asking by hand is how you say you have fixed it.")
+
+(defun %org-latex-draw (fbeg fend)
+  "Typeset the fragment between FBEG and FEND and hang an overlay on it. T when
+LaTeX produced an image, NIL when it could not — which is the answer every
+caller branches on, because it is the difference between `this equation is
+wrong' and `this machine has no latex'."
+  (let ((image (latex-preview (buffer-substring fbeg fend))))
+    (when image
+      (let ((ov (make-overlay fbeg fend)))
+        (when ov
+          (overlay-put ov :latex t)
+          (overlay-put ov 'image image)))
+      t)))
+
+(defun %org-latex-render (beg end)
+  "Preview every fragment between BEG and END, answering how many were drawn, or
+NIL when one of them could not be rendered at all. Stops at the first failure:
+a hundred identical `latex: not found' messages tell you nothing the first did.
+
+Back to front: an overlay adjusts itself across an edit, but nothing here edits,
+and walking backwards keeps the *offsets* from `latex-fragments' valid however
+long the rendering takes."
+  (let ((done 0))
+    (dolist (f (reverse (latex-fragments)) done)
       (destructuring-bind (fbeg fend display) f
         (declare (ignore display))
         (when (and (< fbeg end) (> fend beg))
-          (let ((image (latex-preview (buffer-substring fbeg fend))))
-            (when image
-              (let ((ov (make-overlay fbeg fend)))
-                (when ov
-                  (overlay-put ov :latex t)
-                  (overlay-put ov 'image image)
-                  (incf done))))))))
-    (message (format nil "~d fragment~:p previewed" done))))
+          (if (%org-latex-draw fbeg fend)
+              (incf done)
+              ;; NIL out of the DOLIST, which is this function's value.
+              (return nil)))))))
+
+(defun %org-latex-fragment-at-point ()
+  "(BEG . END) of the fragment point is inside, or NIL.
+
+`latex-fragments' scans the whole buffer and there is no reader for \"the one
+here\", but the list it answers is short and already in order — so finding point
+in it is a walk over a handful of pairs rather than a second pass over the text,
+and no new primitive.
+
+Both delimiters count as inside. Point on the closing `$' of `$x^2$' is in that
+equation to anyone who just typed it, and a rule that said otherwise would make
+`C-c r' silently do the whole buffer from the one position you are most likely
+to press it from."
+  (let ((p (point)))
+    (dolist (f (latex-fragments))
+      (destructuring-bind (fbeg fend display) f
+        (declare (ignore display))
+        (when (and (<= fbeg p) (<= p fend))
+          (return (cons fbeg fend)))))))
+
+(defun org-latex-preview ()
+  "Show LaTeX fragments as images: the selection's, the one point is inside, or
+— failing both — the whole buffer's.
+
+The middle case is the one that makes this a command you press rather than one
+you schedule. Inside `$...$' or a `\\begin{...}' block, `C-c r' renders *that*
+equation: a few hundred milliseconds, against a few hundred per fragment for a
+file full of them. It is also what you mean by pressing it there — you are
+looking at one equation, and the buffer is not what you were asking about.
+
+Fragments already previewed are re-done, so this doubles as `refresh' at
+whichever of the three scopes it picked."
+  (let* ((r (or (region) (%org-latex-fragment-at-point)))
+         (beg (if r (car r) (point-min)))
+         (end (if r (cdr r) (point-max))))
+    (mapc #'delete-overlay (org-latex-previews beg end))
+    (let ((done (%org-latex-render beg end)))
+      ;; Asking by hand also *re-arms* the automatic pass: the usual reason a
+      ;; machine had no `latex' is that it has one now.
+      (setf *org-latex-auto* (and done t))
+      (message (if done
+                   (format nil "~d fragment~:p previewed" done)
+                   "latex: nothing previewed — automatic previews off")))))
+
+;;; ---------------------------------------------------------------------------
+;;; ...and previewing without being asked
+;;;
+;;; The command above is the whole mechanism; this is the policy that decides
+;;; when to run it, and the policy is entirely about *cost*. A cold render is a
+;;; few hundred milliseconds per fragment and `latex-fragments' is a pass over
+;;; the buffer, so the one thing this must never do is either of them per
+;;; keystroke.
+;;;
+;;; Two triggers, and between them they are what "first-class inline LaTeX"
+;;; means in practice:
+;;;
+;;;   entering org-mode   — the buffer arrives already typeset. Cold this costs
+;;;                         one render per fragment on the Lisp thread while the
+;;;                         editor keeps taking your keystrokes; warm, from the
+;;;                         on-disk cache, it is instant.
+;;;   leaving the line    — you finish editing `$\alpha$', move off the line,
+;;;   you were editing      and it becomes an image. Which is exactly when you
+;;;                         want it: rendering *while* you type would spend a
+;;;                         latex run on `$\alph', `$\alpha', `$\alpha$' in turn
+;;;                         and flicker an image in and out under the cursor.
+;;;
+;;; The line test is what makes the second one affordable. `after-change-hook'
+;;; only records that something changed and which line it was — two variables,
+;;; no scan — and `point-moved-hook' does the work only once the two disagree.
+;;; Typing therefore costs a comparison per keystroke, and the buffer pass
+;;; happens once per line you edit rather than once per character.
+
+(defvar *org-latex-edited-line* nil
+  "The line an edit last touched, or NIL when nothing is waiting to be typeset.
+NIL is also the whole of the dirty flag: there is no second variable.")
+
+(defun %org-latex-previewed-ranges ()
+  "(BEG . END) of every preview overlay in the buffer, in one query.
+
+`overlays-in' already answers (ID BEG END), so asking once for the whole buffer
+and matching in the image costs one round trip; asking per fragment — which is
+what `org-latex-previews' does — would cost one per equation on a hook."
+  (let ((out nil))
+    (dolist (o (overlays-in (point-min) (point-max)) (nreverse out))
+      (when (overlay-get (first o) :latex)
+        (push (cons (second o) (third o)) out)))))
+
+(defun org-latex-preview-new ()
+  "Typeset the fragments that have no preview yet, quietly.
+
+Two queries for the whole pass — the fragments and the overlays — and then a
+render only for what is genuinely new. That is what makes this cheap enough to
+hang off a hook: a buffer whose equations are all drawn already costs those two
+and no LaTeX at all.
+
+Quietly matters too: a `3 fragments previewed' in the status line every time you
+leave a line would be the editor talking over you. Only a *failure* is worth a
+message, and only the once."
+  (when (and *org-latex-auto* (derived-mode-p 'org-mode))
+    (let ((have (%org-latex-previewed-ranges))
+          (at (point)))
+      (dolist (f (reverse (latex-fragments)))
+        (destructuring-bind (fbeg fend display) f
+          (declare (ignore display))
+          (when (and
+                 ;; Already drawn. Overlap and not containment: an overlay
+                 ;; shifts with the text around it, so a fragment whose source
+                 ;; has grown by a character is still the same equation.
+                 (notany (lambda (r) (and (< (car r) fend) (> (cdr r) fbeg))) have)
+                 ;; ...and not the one point is inside: you are still typing in
+                 ;; it, and `$\alph' is a LaTeX error, not an equation.
+                 (not (and (<= fbeg at) (<= at fend))))
+            (unless (%org-latex-draw fbeg fend)
+              (setf *org-latex-auto* nil)
+              (message "latex: automatic previews off — `SPC m l' to retry")
+              (return)))))))
+  nil)
+
+(defun org-latex-note-change ()
+  "Remember that this line now wants typesetting. On `after-change-hook', so it
+must stay this cheap: one reader and one SETF, no scan."
+  (when (derived-mode-p 'org-mode)
+    (setf *org-latex-edited-line* (line-number))))
+
+(defun org-latex-maybe-preview ()
+  "Typeset the edited line's fragments once point has left it.
+
+On `point-moved-hook'. The guard is two integers, so navigating a buffer nobody
+has edited costs one comparison per keystroke and nothing else."
+  (when (and *org-latex-edited-line*
+             (/= *org-latex-edited-line* (line-number)))
+    (setf *org-latex-edited-line* nil)
+    (org-latex-preview-new))
+  nil)
+
+;;; DEFVAR before each PUSHNEW, exactly as `org-modern.lisp' does it: this file
+;;; is read before `lsp.lisp' installs `after-change-hook' and before
+;;; `modes.lisp' would have been reached in a build with no `*runtime-dir*', so
+;;; both lists have to be safe to be the first to mention.
+(defvar *after-change-functions* nil)
+(defvar *point-moved-functions* nil)
+(pushnew 'org-latex-note-change *after-change-functions*)
+(pushnew 'org-latex-maybe-preview *point-moved-functions*)
 
 ;;; `C-c r', which is what the TODO asked for and what Emacs muscle memory
 ;;; wants. It could not work when this was written: `C-c' is bound whole, to
@@ -720,7 +1020,7 @@ Fragments already previewed are re-done, so this doubles as `refresh'."
 (define-key "magit" "c" "magit-commit")
 (define-key "magit" "P" "magit-push")
 (define-key "magit" "F" "magit-pull")
-(define-key "magit" "g" "magit-refresh")
+(define-key "magit" "g r" "magit-refresh")   ; `g' stays a prefix, so `gg' works
 (define-key "magit" "q" "show-dashboard")
 
 ;;; C-c stays one binding — `eval-dwim' — and finishes the commit when the
@@ -733,11 +1033,48 @@ Fragments already previewed are re-done, so this doubles as `refresh'."
 ;;; the selection if there is one, else the top-level form under point, else the
 ;;; whole buffer — so nothing needs saving first.
 ;;;
-;;; In Insert mode this *replaces* the built-in "C-c is a synonym for Esc":
-;;; `insert_key' looks the key up in the user keymap before it reaches that
-;;; rule, so this binding wins and C-c no
-;;; longer leaves Insert mode. <esc> and C-g still do.
-(define-key-everywhere "C-c" "eval-dwim")
+;;; `C-c C-c' and not a bare `C-c', so that `C-c' is a *prefix* — which is what
+;;; it is in Emacs, and what the whole `C-c &lt;letter&gt;' family below depends on.
+;;;
+;;; This is a rule about core, not a preference. `normal_key' looks for an exact
+;;; global binding *before* it asks whether the sequence is a prefix, so while
+;;; `C-c' was bound whole no global `C-c d' could ever be typed: the first key
+;;; fired and the second landed in a fresh sequence. Only a *mode-local* prefix
+;;; outranked an exact global one, which is why `C-c C-e' worked in a Lisp
+;;; buffer and nowhere else.
+;;;
+;;; Nothing is lost by the move. `C-c C-c' is Emacs' own spelling for "do the
+;;; thing this buffer is for", it is already what `lisp-mode' binds to
+;;; `lisp-eval-defun', and it is what finishes a commit message — `eval-dwim'
+;;; dispatches on the buffer kind, so one binding still covers both.
+(define-key-everywhere "C-c C-c" "eval-dwim")
+
+;;; ...except while typing, where it stays a single key. `insert_key' consults
+;;; only *single-key* bindings and only in the `insert' keymap — it never waits
+;;; for a second — so `C-c C-c' is unreachable there and a prefix would silently
+;;; do nothing. Keeping the one-key binding in Insert also keeps the property
+;;; the paragraph this replaced was describing: `C-c' evaluates rather than
+;;; leaving Insert mode, and `&lt;esc&gt;' and `C-g' are still how you leave.
+(define-key "insert" "C-c" "eval-dwim")
+
+;;; The `C-c' family. These are the bindings a hand reaches for without
+;;; deciding to, so they get the shortest thing that is not already spoken for.
+;;;
+;;; Every one of these already had a leader spelling — `SPC p p', `SPC a a' —
+;;; and keeps it. A leader sequence is discoverable: hold `SPC' and which-key
+;;; shows you the family. A chord is *fast*, and the two are worth having for
+;;; different reasons, so this adds rather than replaces.
+(define-key-everywhere "C-c d" "dired")          ; this file's directory
+(define-key-everywhere "C-c t" "terminal")
+(define-key-everywhere "C-c m" "magit-status")
+(define-key-everywhere "C-c p" "project-switch")
+(define-key-everywhere "C-c c" "project-find-file")
+(define-key-everywhere "C-c a" "ai")
+(define-key-everywhere "C-c i" "edit-config")
+(define-key-everywhere "C-c s" "switch-buffer")
+(define-key-everywhere "C-c b" "messages-buffer")
+(define-key-everywhere "C-c y" "yank-buffer-file-name")
+(define-key-everywhere "C-q" "delete-window")
 
 ;;; `execute-command' and `switch-buffer' are built-in verbs — core opens the
 ;;; prompt itself, so these names are not Lisp functions and are not in the M-x
@@ -836,12 +1173,62 @@ Fragments already previewed are re-done, so this doubles as `refresh'."
 ;;;                   its first stop occupying rows. `*fold-subtree-functions*'
 ;;;                   is where another mode joins in.
 ;;;
+;;;   org-frozen.lisp org as a *printed page*: `org-frozen-mode', which derives
+;;;                   from `org-mode' and is read-only for real. Drawers,
+;;;                   `#+keyword:' lines and block delimiters stop occupying
+;;;                   rows; `#+TITLE:' is typeset as a title; a `#+begin_src'
+;;;                   body gets a band, a gutter and *its own language's*
+;;;                   highlighting; a table is drawn with aligned columns under a
+;;;                   rule. `SPC m z' toggles it either way. Loaded after
+;;;                   `org-fold.lisp' because it rebinds TAB over that file's
+;;;                   `org-cycle', and before `math.lisp' because a curriculum is
+;;;                   what it was built to display.
+;;;
+;;;   tutor.lisp      `SPC h t' — the tutorial, as a buffer that marks your
+;;;                   homework rather than a page of prose that trusts you.
+;;;                   Stage 1 teaches Common Lisp and checks each answer in a
+;;;                   *child* `ecl' with a timeout, so a student's `(loop)'
+;;;                   costs them the exercise and not the image; Stage 2
+;;;                   teaches the API in this file and checks by watching the
+;;;                   live editor. Last in the list because it uses
+;;;                   `%eval-source' from `repl.lisp' and `executable-find'
+;;;                   from `ai.lisp'.
+;;;
+;;;   math.lisp       a whole maths curriculum as one org file — units,
+;;;                   problems, and a place for your answer, all of it ordinary
+;;;                   org with `#+ZEMACS_*' properties on the headings. The
+;;;                   format is specified in `docs/curriculum.org', precisely
+;;;                   enough to hand to a model as "generate one of these".
+;;;                   Loaded after `org-modern.lisp' because it reads that
+;;;                   file's org helpers and hangs itself off the
+;;;                   `*org-mode-functions*' hook declared there.
+;;;
+;;;   math-code.lisp  the other half of a `programming' problem: its
+;;;                   `#+begin_src python' block tangled to a file beside the
+;;;                   curriculum, a venv built for it in the background, a
+;;;                   window beside the question and one key that runs it in a
+;;;                   terminal. Last of all, because it reads the schema from
+;;;                   `math.lisp' and `executable-find' from `ai.lisp'.
+;;;
+;;;   math-written.lisp
+;;;                   the other half of a `written' problem: a photograph of your
+;;;                   handwriting, dropped in `~/Public/MathSync' by a phone,
+;;;                   transcribed into org with LaTeX by a vision model and
+;;;                   written into the Response of the problem *point is in*.
+;;;                   The watcher is an ECL thread of its own, so it fires with
+;;;                   nobody at the keyboard; everything slow happens on it, and
+;;;                   nothing at all is deleted. `SPC m r' does one by hand.
+;;;                   Beside `math-code.lisp' and for the same reasons.
+;;;
 ;;; Loaded here rather than next to `modes.lisp' because they use `define-leader'
 ;;; and `define-mode-key', which are defined above this point and not below it.
 (when *runtime-dir*
   (dolist (file '("modes/which-key.lisp" "modes/lisp-mode.lisp" "modes/repl.lisp"
                   "modes/parinfer.lisp" "modes/org-modern.lisp" "modes/org-fold.lisp"
-                  "modes/ai.lisp"))
+                  "modes/org-frozen.lisp"
+                  "modes/math.lisp"
+                  "modes/ai.lisp" "modes/tutor.lisp"
+                  "modes/math-code.lisp" "modes/math-written.lisp"))
     (load (merge-pathnames file *runtime-dir*) :verbose nil :print nil)))
 
 ;;; ---------------------------------------------------------------------------

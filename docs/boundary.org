@@ -18,6 +18,7 @@ Concretely:
 |---------------------------------------------+--------------------------------------------|
 | The rope, and every edit to it               | Which edit to make, and when               |
 | tree-sitter parsing and highlight spans      | What colour each highlight class is        |
+| Highlighting *a string* as a named language  | Which strings, and what to do with the runs |
 | Glyph rasterisation and the frame            | Font size, theme, modeline geometry        |
 | The vim grammar: counts, operators, motions  | Every key binding on top of it             |
 | Window layout arithmetic and hit-testing     | When to split, close, focus                |
@@ -214,6 +215,13 @@ Upgrade path: core recording =(start, old-end, new-end)= per edit and handing it
 to the hook. It is the same record overlays want, so it should be built once for
 both rather than approximated by diffing two copies of a buffer here.
 
+=point-moved-hook=, added beside it, has the smaller version of the same ceiling:
+it says point moved and not where it moved *from*. A config that wants to act on
+the range you just left — re-typesetting the equation you stepped out of — keeps
+the old position in a variable. Both close together, and for the same reason: a
+hook here carries a name and no arguments, so giving either one a payload means
+teaching =pending_hooks= to carry data.
+
 ** LSP columns are characters, not UTF-16 code units
 
 =runtime/lsp.lisp=. LSP counts a column in UTF-16 code units and this editor
@@ -246,16 +254,25 @@ a =read-string= rather than from its callback. =(clrhash *prompt-continuations*)
 is the sweep; the upgrade path is core replying =NIL= to the prompt it is about
 to discard, which is three lines in =open_prompt=.
 
-** A buffer Lisp made is not read-only
+** A buffer Lisp made is not read-only — *closed*
 
-=crates/core/src/lib.rs=, =Editor::create_buffer=. =BufferKind::is_generated= is
-what makes =*magit*= and =*dired*= refuse an edit, and a created buffer is
-deliberately not one of those — Lisp owns it, so it has to be writable. The cost
-is that =*Messages*= can be typed into, and the typing is thrown away the next
-time the command regenerates it.
+Was: =BufferKind::is_generated= was the only thing that made a buffer refuse an
+edit, so a buffer Lisp created (=*Messages*=, a =*xref*= listing) could be typed
+into and the typing thrown away the next time the command regenerated it. The
+upgrade path written here was "a per-buffer read-only flag rather than a kind,
+which is what Emacs has".
 
-Upgrade path: a per-buffer read-only flag rather than a kind, which is what
-Emacs has and what a =*xref*= listing will want too.
+That is what landed. =Buffer::read_only= is the flag, =(set-buffer-read-only)= is
+the writer, and =Editor::apply= asks =Buffer::read_only()= — which answers
+=ReadOnly::{No,Generated,Claimed}= — instead of asking the kind. The two reasons
+stay apart because they behave differently: nothing can make a *generated*
+buffer writable, and a *claimed* one is lifted for the duration of a
+=with-inhibited-read-only=. =org-frozen-mode= is the first customer;
+=(buffer-read-only-p)= reports which of the two it is.
+
+What is still open is one line down from this: a buffer Lisp made is writable
+*by default*, and a command that regenerates one has to claim the flag itself.
+That is now a line of Lisp rather than a hole in the boundary.
 
 ** Markers
 
@@ -350,11 +367,29 @@ unseparated mix like ="g<tab>"= is not supported — write ="g <tab>"=.
 Also =Key=: three named keys carry modifiers (=C-<ret>=, =C-M-<ret>=, =M-<bs>=) and
 the enum will become a modifier bitset at four.
 
-** Emphasis is colour-only
+** A type size scales the line, not the run
 
-=crates/core/src/lib.rs=, =HlKind=. The renderer opens exactly one font face, so
-=bold= and =italic= are carried by colour rather than by weight or slant. Themes can
-choose the colour; they cannot ask for real bold.
+=crates/render/src/lib.rs=, =line_box=. This is what closed "emphasis is
+colour-only": an overlay carries =weight=, =slant= and =scale=, the renderer opens a
+face per size and style, and =org-modern= sets all three. Weight and slant are per
+*cell*; the size is not.
+
+A scaled cell is wider as well as taller, and where a line wraps, which column
+the cursor is in and which character a click lands on are all counted in whole
+cells of one width. So the widest scale claimed by any overlay touching a line
+sets that whole line's type. =*this* word bigger= is not expressible; a heading is,
+which is the case that asked. The upgrade path is the per-line table of cell
+advances =draw_image= already names for its own horizontal reflow — one table,
+both problems.
+
+The size is also *snapped* to one of four steps. A face plus a texture per
+character it draws is what a size costs, so the ladder is the glyph cache's bound
+made visible in the vocabulary instead of hidden in an eviction policy.
+
+A themed *span* — what the highlighter produces — is still colour-only, and that
+part is not a ceiling but a boundary: a span is recomputed from scratch on every
+keystroke, and weight is something a mode *puts* rather than something a parser
+derives.
 
 ** Two render colours are not settable
 
@@ -420,14 +455,14 @@ that show up as behaviour rather than as API.
 | ● | =lisp/shim.c= (=with-current-buffer=) | Buffers matched by name; duplicates collide.                   |
 | ● | =lisp/lib.rs= (=command_for=)    | One primitive for every command fitting "verb + string + two integers". |
 | ● | =core/lib.rs= (=normalize_keys=) | ="gg"= is =g g=; an unseparated mix like ="g<tab>"= is unsupported.       |
-| ● | =core/lib.rs= (=HlKind=)         | Emphasis is colour-only; no real bold or italic.                     |
+| ● | =render/lib.rs= (=line_box=)     | =scale= sizes the whole line, not a run, and is snapped to one of four steps. |
 | ● | =core/lib.rs= (=step_history=)   | Undo clamps markers rather than restoring them exactly.              |
 | ● | =core/lib.rs= (=Key=)            | Three named keys carry modifiers; a bitset at four.                  |
 | ● | =core/marker.rs=               | Markers are a linearly scanned =Vec=.                                  |
 | ● | =core/overlay.rs=              | Colours are face names, not RGB; insertion types fixed at Emacs' defaults; an overlay whose text goes, goes. Linearly scanned =Vec=. A fold is two-state and hides whole lines only. |
 | ● | =lisp/shim.c= (overlays)       | The property list is Lisp-side, so an overlay the *editor* deleted leaves its plist behind. |
 | ● | =lisp/shim.c= (=PROMPT_FORM=)    | A Lisp prompt replaced by another prompt never answers its continuation. |
-| ● | =core/lib.rs= (=create_buffer=)  | A buffer Lisp made is writable; there is no per-buffer read-only flag. |
+| ● | =core/lib.rs= (=create_buffer=)  | A buffer Lisp made is writable *by default*; the flag now exists, and a command that regenerates one has to claim it. |
 | ● | =runtime/rpc.lisp=             | =false=, =null=, =[]= and ={}= all decode to =NIL=; object-versus-array is inferred on encode. |
 | ● | =runtime/lsp.lisp=             | Full-text =didChange=; columns are characters, not UTF-16; the diagnostics listing is a plain file that does not re-read. |
 | ● | =runtime/init.lisp=            | Themes are found relative to the config file; no search path.        |

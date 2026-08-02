@@ -1,0 +1,23 @@
+[package]
+name = "zemacs-figure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+# The same PNG decoder `zemacs-latex` already builds, so a raster figure costs
+# no new crate at all.
+png = "0.18"
+
+# Pure Rust, and the whole reason `[[file:fig.svg]]` can work without a system
+# dependency: librsvg would mean cairo, pango and glib in the build, and
+# rasterising with a browser would mean a browser. `resvg` re-exports both
+# `usvg` (the parser) and `tiny-skia` (the rasteriser), so this is one line in
+# the manifest rather than three.
+#
+# Default features on purpose. `text` is what draws the axis labels of a plot —
+# a figure whose text vanished would be worse than no figure — and it is what
+# pulls in `fontdb` and `rustybuzz`.
+resvg = "0.47"

@@ -224,16 +224,53 @@ fn init_lisp_drives_editor_commands() {
         !tail.iter().any(|m| m.contains("lisp error")),
         "runtime/init.lisp should load without errors; got {tail:#?}"
     );
-    // The banner is unicode, so this also proves extended strings survive the
-    // trip through the shim byte-exact. Asserted as "some of this is not ASCII"
-    // rather than as particular art: which glyphs the banner is drawn with
-    // belongs to whoever is editing the config, and pinning them here makes
-    // redrawing it a test failure.
-    let banner = shared.lock().unwrap().dashboard.banner.clone();
-    assert!(
-        banner.chars().any(|c| !c.is_ascii()),
-        "expected the unicode banner from runtime/init.lisp; got {banner:?}"
-    );
+    // The config sets a banner at all.
+    assert!(!shared.lock().unwrap().dashboard.banner.is_empty());
+
+    // NOT asserted here, because it is not true: a non-ASCII string in a form
+    // handed to `zemacs_eval` does *not* survive to the editor. It arrives as a
+    // base string of UTF-8 bytes, ECL's reader parses those bytes as Latin-1
+    // characters, and `dup_utf8` then encodes each of those back into UTF-8 — so
+    // `(message "λ")` from a keybinding reaches the status line as `Î»`.
+    //
+    // The previous assertion here was "the banner contains a non-ASCII
+    // character", which double-encoded text satisfies, so this went unnoticed.
+    // The path that *is* correct is loading a file: `load` decodes through the
+    // stream's external format, which is why org's `◉` bullets are right.
+    //
+    // Not fixed here because the fix is not local. Lisp deliberately holds text
+    // as UTF-8 *bytes* — `buffer-string` returns them, `%byte-index` and
+    // `%char-index` convert between the two counts, and `search-forward`
+    // compares a pattern against them — so decoding eval'd source into real
+    // characters makes it incomparable with buffer text and breaks every search.
+    // Making it coherent means moving the whole model to character strings and
+    // deleting the two index conversions, which is the ceiling `f_query` in
+    // `shim.c` already writes up. Reaches: an accented answer to `read-string`,
+    // a path with a non-ASCII component, any form built by Rust.
+
+    // --- the link a terminal click lands on ---
+    //
+    // The whole of "is that a link" lives in `%url-at`; the app only hands it a
+    // screen row and a column. Every case here is one the terminal produces:
+    // a URL in prose, the blank right half of a row, and a bare word.
+    for (line, col, want) in [
+        ("see https://zemacs.dev/a. next", 12, "https://zemacs.dev/a"),
+        ("see https://zemacs.dev/a. next", 25, "NIL"), // the space after it
+        ("open file:///tmp/report.html", 20, "file:///tmp/report.html"),
+        ("cargo test --lib", 3, "NIL"), // a bare word is not a link
+    ] {
+        // Reported through `message' rather than read off the echoed value,
+        // because NIL is deliberately silent — see above — and NIL is half the
+        // answers here.
+        let at = mark(&shared);
+        lisp.eval(format!(
+            "(zemacs:message (format nil \"~a\" (zemacs::%url-at {line:?} {col})))"
+        ));
+        let got = wait(&shared, "%url-at value", |ed| {
+            ed.messages.get(at..)?.first().cloned()
+        });
+        assert_eq!(got, want, "%url-at {line:?} {col}");
+    }
 
     // --- what M-x offers ---
     let names = shared.lock().unwrap().commands.clone();
@@ -279,7 +316,7 @@ fn init_lisp_drives_editor_commands() {
         "command names must be lowercase; got {names:?}"
     );
     // The evaluation commands have to be reachable from M-x, not just from a key.
-    for wanted in ["eval-file-dwim", "lisp-scratch"] {
+    for wanted in ["eval-file-dwim", "lisp-scratch", "yank-buffer-file-name"] {
         assert!(
             heads.contains(&wanted),
             "M-x must offer {wanted}; got {names:?}"
@@ -287,17 +324,50 @@ fn init_lisp_drives_editor_commands() {
     }
 
     // --- C-c evaluates Lisp in every mode you can be typing in ---
-    // Insert included: core hardcodes C-c as a synonym for Esc, but `insert_key`
-    // consults the user keymap *before* that rule, so this binding wins.
+    //
+    // `C-c C-c` outside Insert, so that `C-c` is left a *prefix* and the
+    // `C-c <letter>` family is reachable at all: `normal_key` finds an exact
+    // global binding before it asks whether the sequence is a prefix, so a bare
+    // `C-c` made every global `C-c d` untypable.
+    //
+    // Insert is the exception and has to be: `insert_key` consults only
+    // single-key bindings and never waits for a second, so `C-c C-c` cannot be
+    // spelled there. The one-key binding stays, which also keeps it winning
+    // over core's hardcoded "C-c is a synonym for Esc" — that rule is consulted
+    // after the user keymap.
     {
         let ed = shared.lock().unwrap();
-        for mode in [Mode::Normal, Mode::Insert, Mode::Visual, Mode::Dashboard] {
+        let bound = |m, k: &str| ed.keymap.get(&(m, k.into())).map(String::as_str);
+        for mode in [Mode::Normal, Mode::Visual, Mode::Dashboard] {
             assert_eq!(
-                ed.keymap.get(&(mode, "C-c".into())).map(String::as_str),
+                bound(mode, "C-c C-c"),
                 Some("eval-dwim"),
-                "expected C-c bound to eval-dwim in {mode:?} mode"
+                "expected C-c C-c bound to eval-dwim in {mode:?} mode"
             );
+            assert_eq!(
+                bound(mode, "C-c"),
+                None,
+                "C-c must stay a prefix in {mode:?} mode, not an exact binding"
+            );
+            // ...and that prefix is what the whole family hangs off. Listed out
+            // rather than counted: the failure this guards against is one of
+            // them quietly not being bound, and a count would still pass.
+            for (keys, command) in [
+                ("C-c d", "dired"),
+                ("C-c t", "terminal"),
+                ("C-c m", "magit-status"),
+                ("C-c p", "project-switch"),
+                ("C-c c", "project-find-file"),
+                ("C-c a", "ai"),
+                ("C-c i", "edit-config"),
+                ("C-c s", "switch-buffer"),
+                ("C-c b", "messages-buffer"),
+                ("C-c y", "yank-buffer-file-name"),
+            ] {
+                assert_eq!(bound(mode, keys), Some(command), "{keys} in {mode:?}");
+            }
         }
+        assert_eq!(bound(Mode::Insert, "C-c"), Some("eval-dwim"));
         // The shipped theme drives the modeline through the same primitives.
         assert_ne!(
             ed.theme.color(zemacs_core::HlKind::Modeline, [0.0; 3]),

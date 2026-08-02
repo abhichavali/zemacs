@@ -74,9 +74,13 @@ pub fn segments(editor: &Editor, buf: &Buffer, active: bool) -> (Vec<Segment>, V
     // Modified beats read-only: a generated buffer cannot be modified, so the
     // two never compete, and showing "unsaved" matters more than showing why a
     // buffer cannot be saved.
+    //
+    // A buffer a mode has frozen *can* have been modified before it was frozen,
+    // which is the one case where they do compete — and the dot still wins, for
+    // the same reason: unsaved work is the more urgent fact.
     if buf.modified {
         left.push(Segment::faced(" ●", HlKind::Bold, false));
-    } else if buf.kind.is_generated() {
+    } else if buf.read_only() != crate::ReadOnly::No {
         left.push(Segment::faced(" ◈", HlKind::Comment, false));
     }
 
@@ -115,7 +119,7 @@ pub fn segments(editor: &Editor, buf: &Buffer, active: bool) -> (Vec<Segment>, V
 
 /// `rust-mode` reads better as `Rust` on a strip this narrow, and the `-mode`
 /// suffix is the same on every one of them.
-fn major_mode_label(buf: &Buffer) -> String {
+pub(crate) fn major_mode_label(buf: &Buffer) -> String {
     let name = buf.major_mode.strip_suffix("-mode").unwrap_or(&buf.major_mode);
     let mut chars = name.chars();
     match chars.next() {

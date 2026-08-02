@@ -22,11 +22,13 @@ extern void rs_set_foreground(double r, double g, double b);
 extern void rs_set_syntax_color(const char *face, double r, double g, double b);
 extern void rs_set_line_numbers(int on);
 extern void rs_set_tab_width(long n);
+extern void rs_set_text_width(long n);
 extern void rs_set_modeline_relief(long n);
 extern void rs_set_modeline_pad(long n);
 extern void rs_message(const char *text);
 extern void rs_quit(void);
 extern void rs_dashboard_banner(const char *text);
+extern void rs_dashboard_logo(long id);
 extern void rs_clear_dashboard_items(void);
 extern void rs_dashboard_item(const char *key, const char *label, const char *action);
 extern void rs_define_key(const char *mode, const char *keys, const char *command);
@@ -40,6 +42,7 @@ extern void rs_register_command(const char *name);
 extern void rs_set_line_overflow(const char *mode);
 extern void rs_set_relative_line_numbers(int on);
 extern void rs_set_major_mode(const char *name);
+extern void rs_set_no_gutter_modes(const char *modes);
 extern void rs_set_minor_mode(const char *name, int on);
 /* Returns Rust-owned memory: hand it to rs_free_string, never to free(3). */
 extern char *rs_query(const char *name, long a, long b);
@@ -57,6 +60,9 @@ extern void rs_open_prompt(const char *kind);
 /* --- overlays and inline images (see the block near the bottom of this file) */
 extern long rs_make_overlay(long start, long end);
 extern long rs_latex_preview(const char *source);
+extern long rs_image_file(const char *path, long ems);
+/* Returns Rust-owned memory, like rs_query: rs_free_string, never free(3). */
+extern char *rs_highlight(const char *lang, const char *text);
 /* --- JSON-RPC subprocesses (see the block near the bottom of this file) --- */
 extern long rs_rpc_start(const char *program, const char *args, const char *cwd);
 extern long rs_rpc_send(long conn, const char *method, const char *params,
@@ -126,6 +132,14 @@ static char *dup_utf8_or_empty(cl_object x) {
   return s ? s : strdup("");
 }
 
+/* Note on the string model, because it is unusual and everything above depends
+ * on it: **Lisp holds text as UTF-8 bytes in base strings**, not as characters.
+ * `buffer-string' comes back that way, `%byte-index' and `%char-index' exist to
+ * convert between the two counts, and `search-forward' compares a pattern
+ * against those bytes. So a string arriving from Rust must stay bytes — decoding
+ * it into a character string here would make it incomparable with buffer text
+ * and break every search. The ceiling is written up on `f_query'. */
+
 /* --- Primitives --------------------------------------------------------- */
 /* Numbers are converted before strings everywhere: a type error in ecl_to_*
  * unwinds non-locally, and doing it first means there is no malloc'd block
@@ -165,6 +179,13 @@ static cl_object f_set_tab_width(cl_object n) {
   return ECL_NIL;
 }
 
+/* NIL is 0 is "off", so `(set-text-width nil)' reads as turning it off rather
+ * than signalling — the same courtesy the boolean settings extend. */
+static cl_object f_set_text_width(cl_object n) {
+  rs_set_text_width(n == ECL_NIL ? 0 : (long)ecl_to_fixnum(n));
+  return ECL_NIL;
+}
+
 /* No abs/max here: a negative relief is a *sunken* modeline, not an error. */
 static cl_object f_set_modeline_relief(cl_object n) {
   rs_set_modeline_relief((long)ecl_to_fixnum(n));
@@ -192,6 +213,13 @@ static cl_object f_dashboard_banner(cl_object text) {
   char *s = dup_utf8_or_empty(text);
   rs_dashboard_banner(s);
   free(s);
+  return ECL_NIL;
+}
+
+/* Takes the id `image-file' answered, so the dashboard reuses the one image
+ * pipeline rather than learning to read files. NIL means "no logo". */
+static cl_object f_dashboard_logo(cl_object id) {
+  rs_dashboard_logo(id == ECL_NIL ? 0 : ecl_to_fixnum(id));
   return ECL_NIL;
 }
 
@@ -255,6 +283,32 @@ static cl_object f_set_major_mode(cl_object name) {
   char *n = dup_utf8_or_empty(name);
   rs_set_major_mode(n);
   free(n);
+  return ECL_NIL;
+}
+
+/* A list of mode names, or one space-separated string. The list spelling is
+ * what a config wants to write; the string is what the envelope carries.
+ *
+ * The 3 is load-bearing. ECL's NARG counts *every* argument, the destination
+ * and the control string included — `ecl_va_start(a, p, n, 2)' subtracts the
+ * two named ones — so this is (format nil "~{~a~^ ~}" modes) and nothing more.
+ * A 4 here says there is a second format argument, and ECL's CL_GRAB_REST_ARGS
+ * duly reads one out of the outgoing-argument area and conses whatever word is
+ * sitting there into a list as a cl_object. It is usually harmless and it is
+ * not reliably so: with that slot poisoned it is an immediate
+ * SEGMENTATION-VIOLATION inside FORMAT, and even when FORMAT never looks at it
+ * the garbage is a live root the collector will try to trace. */
+static cl_object f_set_no_gutter_modes(cl_object modes) {
+  cl_object s = modes;
+  if (ECL_LISTP(modes) && modes != ECL_NIL) {
+    s = cl_format(3, ECL_NIL, ecl_make_simple_base_string("~{~a~^ ~}", -1),
+                  modes);
+  } else if (modes == ECL_NIL) {
+    s = ecl_make_simple_base_string("", 0);
+  }
+  char *m = dup_utf8_or_empty(s);
+  rs_set_no_gutter_modes(m);
+  free(m);
   return ECL_NIL;
 }
 
@@ -405,6 +459,47 @@ static cl_object f_latex_preview(cl_object source) {
   return id ? ecl_make_fixnum(id) : ECL_NIL;
 }
 
+/* Read an image file; the answer is the id an `image' overlay property takes,
+ * or NIL with the reason already in the status line.
+ *
+ * The sibling of LATEX-PREVIEW above and it earns its C entry point for the same
+ * reason: it has to hand a value back. WIDTH is the widest the figure may be
+ * drawn, as a hundredth of an em — an integer, because the whole overlay bridge
+ * is integers and strings, and resolved against the *device* em on the Rust
+ * side because that is the one thing this image cannot know. NIL or 0 means "as
+ * authored". */
+static cl_object f_image_file(cl_object path, cl_object width) {
+  char *p = dup_utf8_or_empty(path);
+  long ems = (width == ECL_NIL) ? 0 : (long)ecl_to_fixnum(width);
+  long id = rs_image_file(p, ems);
+  free(p);
+  return id ? ecl_make_fixnum(id) : ECL_NIL;
+}
+
+/* Highlight a string as a language: `((START END "face") ...)` in char offsets.
+ *
+ * The third primitive that has to answer with a value, and the first that is a
+ * *pure function* — it never touches the editor, so no lock is taken and the
+ * text it parses is whatever the caller hands over rather than whatever happens
+ * to be in the live buffer. That is what lets org colour a `#+begin_src python`
+ * block: one language per buffer is a fact about the highlighting thread, and
+ * this is the way around it.
+ *
+ * Comes back through READ exactly as f_query does, for the same reason — one C
+ * signature, and the answer is Lisp source. */
+static cl_object f_highlight(cl_object lang, cl_object text) {
+  char *l = dup_utf8_or_empty(lang);
+  char *t = dup_utf8_or_empty(text);
+  char *src = rs_highlight(l, t);
+  free(l);
+  free(t);
+  if (!src)
+    return ECL_NIL;
+  cl_object form = ecl_read_from_cstring(src);
+  rs_free_string(src);
+  return form;
+}
+
 /* The editor's own pickers: "file" "buffer" "command" "line" "grep"
  * "project-file" "ex" "search". What the answer does is fixed by the kind, so
  * this puts the picker up and does not hand Lisp the reply. */
@@ -504,6 +599,7 @@ static const char *PACKAGE_FORM =
     "(defpackage \"ZEMACS\" (:use \"CL\")"
     " (:export \"SET-FONT-SIZE\" \"SET-BACKGROUND\" \"SET-FOREGROUND\""
     "          \"SET-SYNTAX-COLOR\" \"SET-LINE-NUMBERS\" \"SET-TAB-WIDTH\""
+    "          \"SET-TEXT-WIDTH\""
     "          \"SET-MODELINE-RELIEF\" \"SET-MODELINE-PAD\""
     "          \"MESSAGE\" \"QUIT\" \"DASHBOARD-BANNER\""
     "          \"CLEAR-DASHBOARD-ITEMS\" \"DASHBOARD-ITEM\" \"DEFINE-KEY\""
@@ -511,6 +607,7 @@ static const char *PACKAGE_FORM =
     "          \"SET-COMPLETION-STYLE\" \"CLEAR-COMMANDS\""
     "          \"REGISTER-COMMAND\" \"SET-LINE-OVERFLOW\""
     "          \"SET-RELATIVE-LINE-NUMBERS\" \"SET-MAJOR-MODE\""
+    "          \"SET-NO-GUTTER-MODES\""
     "          \"SET-MINOR-MODE\" \"GOTO-CHAR\" \"DELETE-REGION\""
     "          \"REPLACE-REGION\" \"SET-EVIL-STATE\" \"BUFFER-SUBSTRING\""
     "          \"REGION-TEXT\" \"REGION-BEGINNING\" \"REGION-END\""
@@ -540,7 +637,7 @@ static const char *QUERIES_FORM =
     "              \"window-scroll\" \"window-height\" \"frame-count\""
     "              \"window-list\" \"window-id\" \"frame-index\""
     "              \"key-bindings\" \"command-list\" \"status\" \"face-list\""
-    "              \"font-size\" \"tab-width\" \"line-numbers-p\""
+    "              \"font-size\" \"tab-width\" \"text-width\" \"line-numbers-p\""
     "              \"relative-line-numbers-p\" \"line-overflow\""
     "              \"completion-style\" \"modeline-relief\" \"modeline-pad\""
     "     \"background\" \"foreground\"))"
@@ -681,6 +778,51 @@ static const char *LIBRARY_FORM =
      * buffer can want one without the other. */
     " (defun zemacs::set-language (&optional language)"
     "   (zemacs::%do \"set-language\" (and language (string language)) 0 0))"
+    /* The writer beside `buffer-read-only-p', which until now could only ever
+     * report on a *generated* buffer — one whose text is a rendering of state.
+     * This is the other reason a buffer refuses an edit: a mode has decided the
+     * document is being read rather than written, which is a claim about a real
+     * file and one the mode's exit hook takes back with `(set-buffer-read-only
+     * nil)'. `org-frozen-mode' is the first customer.
+     *
+     * Per *buffer*, so a split showing a frozen document beside a source file
+     * lets you type in the source file. */
+    " (defun zemacs::set-buffer-read-only (&optional (on t))"
+    "   (zemacs::%do \"set-read-only\" nil (if on 1 0) 0)"
+    "   on)"
+    /* Emacs' `inhibit-read-only', and the reason a *renderer* mode is usable at
+     * all: read-only has to mean "the user cannot type here", not "nothing can
+     * ever write here". A maths curriculum is displayed frozen and is still the
+     * buffer a transcribed handwritten answer is written into, and a problem's
+     * status is toggled in place — both are `replace-region', both from Lisp,
+     * and both would die on the guard in `Editor::apply'.
+     *
+     * It lifts a *claim* and never a kind: `(buffer-read-only-p)' answers
+     * `:claimed' for a buffer a mode froze and `:generated' for dired, magit,
+     * the dashboard and a terminal, and only the first is put back. A generated
+     * buffer has no document behind it — the next refresh would throw the edit
+     * away — so making one writable is not a favour, and this refuses to.
+     *
+     * UNWIND-PROTECT and not a SETF pair: a body that throws must not leave the
+     * document editable, which is the whole failure mode this exists to have.
+     *
+     * ponytail: there is a window. The flag lives on the editor behind a mutex
+     * that is released between primitives, so a keystroke arriving from the
+     * application thread while BODY runs sees the buffer unfrozen. Emacs has the
+     * same shape and gets away with it by being single-threaded. Closing it
+     * means the *command* carrying its own permission rather than the editor
+     * holding a mode — one more field on the write envelope — and nothing has
+     * been bitten yet: BODY is a `replace-region' or two, and the window is the
+     * microseconds between them. */
+    " (defun zemacs::call-with-inhibited-read-only (fn)"
+    "   (let ((claimed (eq (zemacs::buffer-read-only-p) :claimed)))"
+    "     (unwind-protect"
+    "          (progn (when claimed (zemacs::set-buffer-read-only nil))"
+    "                 (funcall fn))"
+    "       (when claimed (zemacs::set-buffer-read-only t)))))"
+    " (defmacro zemacs::with-inhibited-read-only (&body body)"
+    "   \"Run BODY able to write to a buffer a mode has frozen.\""
+    "   `(zemacs::call-with-inhibited-read-only (lambda () ,@body)))"
     " (defun zemacs::create-buffer (name &optional language)"
     "   (zemacs::%do \"create-buffer\" (string name) 0 0)"
     "   (when language (zemacs::set-language language))"
@@ -836,6 +978,8 @@ static const char *LIBRARY_FORM =
     "              \"LINE-STRING\" \"MESSAGES\" \"SYNTAX-COLOR\""
     /* lisp-api */
     "              \"CREATE-BUFFER\" \"KILL-BUFFER\" \"SET-LANGUAGE\""
+    "              \"SET-BUFFER-READ-ONLY\" \"CALL-WITH-INHIBITED-READ-ONLY\""
+    "              \"WITH-INHIBITED-READ-ONLY\""
     "              \"CALL-COMMAND\" \"TERM-SEND-KEY\"))"
     "   (export (intern n \"ZEMACS\") \"ZEMACS\")))";
 
@@ -845,10 +989,17 @@ static const char *LIBRARY_FORM =
  * the whole argument for building overlays this way round.
  *
  * The property list lives *here*, in the image, and Rust is told only about the
- * four properties it has to draw. That is not a shortcut — it is what makes an
- * overlay able to carry an arbitrary Lisp value at all: an avy hint's target
- * window, a flymake diagnostic, a closure. None of those could survive the trip
- * through C as printed source, and none of them has to.
+ * handful of properties it has to draw. That is not a shortcut — it is what
+ * makes an overlay able to carry an arbitrary Lisp value at all: an avy hint's
+ * target window, a flymake diagnostic, a closure. None of those could survive
+ * the trip through C as printed source, and none of them has to.
+ *
+ * The drawn ones, in the order the CASE below takes them: `face', `background'
+ * and `display' replace or recolour the cells a range covers; `image' puts a
+ * bitmap over them; `scale', `weight' and `slant' say what *type* they are set
+ * in; `line-background', `line-prefix' and `fold' are about the lines the range
+ * touches rather than about its cells. Everything else a config puts on an
+ * overlay stops here.
  *
  * ponytail: an overlay the editor deletes on its own — because an edit swallowed
  * the text it was about — leaves its plist behind, a few conses per stale entry.
@@ -888,10 +1039,46 @@ static const char *OVERLAY_FORM =
     "       (:display"
     "        (zemacs::%do \"overlay-display\" (and value (string value)) ov 0))"
     "       (:image (zemacs::%do \"overlay-image\" nil ov (or value 0)))"
-    /* The one property that is about *lines* rather than about cells: the
-     * lines after the overlay's first one stop occupying rows at all. The
-     * renderer does not draw them and `j' steps over them, which is code
-     * folding — and everything about *what* to fold is up here, in Lisp. */
+    /* --- typesetting -----------------------------------------------------
+     *
+     * `scale', `weight' and `slant' are what make a heading *look* like one
+     * rather than like a coloured line of text, and they are the reason the
+     * renderer now opens more than one font face. A multiplier, not a point
+     * size: text follows `font-size' and a heading follows the text.
+     *
+     * Sent as a percentage because the write envelope carries integers, and it
+     * costs nothing — the renderer snaps a size to one of a handful of steps
+     * anyway, which is what bounds its glyph cache. `(overlay-put ov 'scale
+     * 1.6)' and `... 1.5)' are the same face and deliberately so. */
+    "       (:scale"
+    "        (zemacs::%do \"overlay-scale\" nil ov"
+    "                     (if value (round (* 100 value)) 0)))"
+    /* Emacs' `:weight' and `:slant', spelled the same and with the same three
+     * answers: `bold'/`italic', `normal', and NIL for "no opinion" — which is
+     * not the same as `normal', since `normal' overrides an overlay underneath
+     * and NIL leaves it alone. */
+    "       (:weight (zemacs::%do \"overlay-weight\" (zemacs::%overlay-face value) ov 0))"
+    "       (:slant (zemacs::%do \"overlay-slant\" (zemacs::%overlay-face value) ov 0))"
+    /* --- the properties about *lines* ------------------------------------
+     *
+     * Everything above is about the cells a range covers. These three are
+     * about the lines it touches, whole.
+     *
+     * `line-background' is a band the width of the pane, which is what
+     * `background' cannot be: a background paints the cells, so a source block
+     * drawn with one is a stripe as ragged as its own text. `line-prefix' is
+     * Emacs' property of that name with its `wrap-prefix' folded in — the
+     * continuation rows of a quoted paragraph get the bar too — and it is
+     * drawn in the same overlay's `face', so one overlay says the whole
+     * thing. */
+    "       (:line-background"
+    "        (zemacs::%do \"overlay-line-background\" (zemacs::%overlay-face value) ov 0))"
+    "       (:line-prefix"
+    "        (zemacs::%do \"overlay-line-prefix\" (and value (string value)) ov 0))"
+    /* The line property that changes how many rows there are: the lines after
+     * the overlay's first one stop occupying rows at all. The renderer does
+     * not draw them and `j' steps over them, which is code folding — and
+     * everything about *what* to fold is up here, in Lisp. */
     "       (:fold (zemacs::%do \"overlay-fold\" nil ov (if value 1 0)))))"
     "   value)"
     " (defun zemacs::overlay-get (ov prop)"
@@ -922,6 +1109,18 @@ static const char *OVERLAY_FORM =
     /* A reader is a noun, not a command: keep it out of the M-x list the same
      * way every other reader is kept out. */
     " (pushnew \"latex-fragments\" zemacs::*readers* :test #'string=)"
+    /* The other producer of an `image' id: a *file*, rather than a LaTeX run.
+     * WIDTH is in ems and may be fractional, which is why the primitive
+     * underneath takes hundredths — the same percentage `overlay-scale' sends
+     * for the same reason. NIL means "as authored".
+     *
+     * Answers NIL when the file cannot be read or parsed, with the reason
+     * already in the status line, so `(when (image-file p) ...)' is the idiom —
+     * exactly `latex-preview''s contract. */
+    " (defun zemacs::image-file (path &optional width)"
+    "   (zemacs::%image-file (namestring path)"
+    "                        (if width (round (* 100 width)) 0)))"
+    " (export (intern \"IMAGE-FILE\" \"ZEMACS\") \"ZEMACS\")"
     /* --- folding ---------------------------------------------------------
      *
      * Five functions and no new mechanism: a fold *is* an overlay carrying
@@ -959,7 +1158,8 @@ static const char *OVERLAY_FORM =
     "              \"OVERLAY-START\" \"OVERLAY-END\" \"REMOVE-OVERLAYS\""
     "              \"FOLD-REGION\" \"FOLDS-IN\" \"FOLDED-P\" \"UNFOLD-REGION\""
     "              \"UNFOLD-ALL\""
-    "              \"LATEX-PREVIEW\" \"LATEX-FRAGMENTS\" \"*OVERLAY-PROPERTIES*\"))"
+    "              \"LATEX-PREVIEW\" \"LATEX-FRAGMENTS\" \"HIGHLIGHT\""
+    "              \"*OVERLAY-PROPERTIES*\"))"
     "   (export (intern n \"ZEMACS\") \"ZEMACS\")))";
 
 /* --- lisp-api: prompts whose answer comes back here ----------------------- */
@@ -1085,16 +1285,19 @@ void zemacs_boot(void) {
   defprim("SET-SYNTAX-COLOR", (cl_objectfn_fixed)f_set_syntax_color, 4);
   defprim("SET-LINE-NUMBERS", (cl_objectfn_fixed)f_set_line_numbers, 1);
   defprim("SET-TAB-WIDTH", (cl_objectfn_fixed)f_set_tab_width, 1);
+  defprim("SET-TEXT-WIDTH", (cl_objectfn_fixed)f_set_text_width, 1);
   defprim("SET-MODELINE-RELIEF", (cl_objectfn_fixed)f_set_modeline_relief, 1);
   defprim("SET-MODELINE-PAD", (cl_objectfn_fixed)f_set_modeline_pad, 1);
   defprim("SET-LINE-OVERFLOW", (cl_objectfn_fixed)f_set_line_overflow, 1);
   defprim("SET-RELATIVE-LINE-NUMBERS",
           (cl_objectfn_fixed)f_set_relative_line_numbers, 1);
   defprim("SET-MAJOR-MODE", (cl_objectfn_fixed)f_set_major_mode, 1);
+  defprim("SET-NO-GUTTER-MODES", (cl_objectfn_fixed)f_set_no_gutter_modes, 1);
   defprim("SET-MINOR-MODE", (cl_objectfn_fixed)f_set_minor_mode, 2);
   defprim("MESSAGE", (cl_objectfn_fixed)f_message, 1);
   defprim("QUIT", (cl_objectfn_fixed)f_quit, 0);
   defprim("DASHBOARD-BANNER", (cl_objectfn_fixed)f_dashboard_banner, 1);
+  defprim("DASHBOARD-LOGO", (cl_objectfn_fixed)f_dashboard_logo, 1);
   defprim("CLEAR-DASHBOARD-ITEMS", (cl_objectfn_fixed)f_clear_dashboard_items,
           0);
   defprim("DASHBOARD-ITEM", (cl_objectfn_fixed)f_dashboard_item, 3);
@@ -1124,9 +1327,14 @@ void zemacs_boot(void) {
   defprim("%RPC-STOP", (cl_objectfn_fixed)f_rpc_stop, 1);
   defprim("%JSON-QUOTE", (cl_objectfn_fixed)f_json_quote, 1);
   /* --- end of the JSON-RPC defprims --- */
-  /* --- overlays: the only two that have to answer with a value --- */
+  /* --- overlays: the only ones that have to answer with a value --- */
   defprim("MAKE-OVERLAY", (cl_objectfn_fixed)f_make_overlay, 2);
   defprim("LATEX-PREVIEW", (cl_objectfn_fixed)f_latex_preview, 1);
+  defprim("%IMAGE-FILE", (cl_objectfn_fixed)f_image_file, 2);
+  /* Not an overlay itself — it is what a mode turns *into* overlays, which is
+   * why it sits with them rather than with the readers: `%QUERY' takes two
+   * integers and this takes two strings. */
+  defprim("HIGHLIGHT", (cl_objectfn_fixed)f_highlight, 2);
   /* --- end of the overlay defprims --- */
 
   cl_safe_eval(ecl_read_from_cstring(HELPERS_FORM), ECL_NIL, ECL_NIL);

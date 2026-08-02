@@ -101,9 +101,18 @@ impl Term {
             // it, which is the half core cannot do.
             "normal" => self.freeze(editor),
             "insert" => self.thaw(editor),
-            other => match other.strip_prefix("run:") {
-                Some(rest) => self.run_harness(editor, rest),
-                None => editor.apply(EditorCommand::Message(format!(
+            // `run:` starts a session; `rerun:` replaces the one of that name.
+            //
+            // Two verbs because there are two intentions and they are opposites.
+            // A harness is a *thing you start* — two agents side by side is the
+            // point, so `run:claude` twice is two sessions. A program is a thing
+            // you run *again*: edit, run, read, edit, and a session per press
+            // would pile up dead children in the switcher within a minute, all
+            // but the last finished and none named distinguishably.
+            other => match (other.strip_prefix("run:"), other.strip_prefix("rerun:")) {
+                (Some(rest), _) => self.run_harness(editor, rest, false),
+                (_, Some(rest)) => self.run_harness(editor, rest, true),
+                _ => editor.apply(EditorCommand::Message(format!(
                     "unknown terminal verb: {other}"
                 ))),
             },
@@ -118,7 +127,7 @@ impl Term {
     /// carry a *list* rather than a string, which means an `EditorCommand`
     /// shaped like `Term { verb, args }` — worth doing the first time a harness
     /// wants `--prompt "do the thing"`, and not before.
-    fn run_harness(&mut self, editor: &mut Editor, rest: &str) {
+    fn run_harness(&mut self, editor: &mut Editor, rest: &str, reuse: bool) {
         let Some((name, line)) = rest.split_once(':') else {
             editor.apply(EditorCommand::Message(format!(
                 "terminal: run needs NAME:COMMAND, got {rest:?}"
@@ -133,7 +142,21 @@ impl Term {
             return;
         };
         let command = Command::new(program, words.collect());
-        self.spawn(editor, &format!("*{name}*"), Some(command), true);
+        let buffer = format!("*{name}*");
+
+        // The command is rewritten before restarting rather than reusing the
+        // stored one, because this is a *run*, not the resume `restart` was
+        // written for: the script it points at may have been regenerated, and
+        // re-running the previous command would silently execute the old one.
+        if reuse {
+            if let Some(i) = self.sessions.iter().position(|s| s.name == buffer) {
+                self.show(editor, i);
+                self.sessions[i].inner.set_command(command);
+                self.restart(editor);
+                return;
+            }
+        }
+        self.spawn(editor, &buffer, Some(command), true);
     }
 
     fn open(&mut self, editor: &mut Editor) {
@@ -493,6 +516,35 @@ impl Term {
         let session = &self.sessions[i];
         (!session.frozen).then(|| session.inner.screen(fg(editor), bg(editor)))
     }
+
+    /// What is under the pointer at `(col, row)`: the OSC 8 link the child put
+    /// on that cell if there is one, otherwise the row as plain text.
+    ///
+    /// Two answers because there are two kinds of link. `cargo` and `ls
+    /// --hyperlink` attach a URL to text that does not look like one — an error
+    /// code, a filename — and that link is the whole point of the escape. Every
+    /// other program just prints the URL, and then the text *is* the link.
+    ///
+    /// The row comes from the grid rather than from the buffer, whose copy has
+    /// had its trailing blanks trimmed and whose rows are lines — so a column
+    /// index means something here and nothing there.
+    /// `(row text, the OSC 8 link on that cell)`. Both, because Lisp decides
+    /// between them and there is no third call to make.
+    pub fn click_context(
+        &self,
+        editor: &Editor,
+        col: usize,
+        row: usize,
+    ) -> Option<(String, Option<String>)> {
+        let screen = self.screen(editor)?;
+        let i = self.current(editor)?;
+        (row < screen.rows).then(|| {
+            let text = (0..screen.cols)
+                .filter_map(|col| screen.cell(row, col).map(|cell| cell.c))
+                .collect();
+            (text, self.sessions[i].inner.link_at(col, row))
+        })
+    }
 }
 
 /// The editor's colours, as the terminal wants them. Settings are `0.0..1.0`
@@ -568,6 +620,41 @@ mod tests {
         term.run(&mut ed, "run:claude:cat");
         let names: Vec<&str> = term.sessions.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["*claude*", "*claude*<2>"]);
+    }
+
+    /// ...and `rerun:` is the opposite intention, which is why it is a second
+    /// verb rather than a flag on the first.
+    ///
+    /// A harness is a thing you *start* — two agents side by side is the point.
+    /// A program is a thing you run *again*: edit, run, read, edit. Spawning per
+    /// press piled dead children into the switcher, all but the last finished
+    /// and none of them named distinguishably, which is what made running a
+    /// curriculum's code feel like it was leaking.
+    #[test]
+    fn rerunning_replaces_the_session_of_that_name_rather_than_stacking_one() {
+        let mut ed = Editor::new();
+        let mut term = Term::default();
+        term.run(&mut ed, "rerun:gaussian:cat");
+        let first = term.sessions[0].buffer;
+        term.run(&mut ed, "rerun:gaussian:cat");
+
+        let names: Vec<&str> = term.sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["*gaussian*"], "one session, not two");
+        // The *buffer* survives, which is the point of restarting in place: the
+        // window showing it, its position in the switcher and anything pointing
+        // at it all still mean what they did.
+        assert_eq!(term.sessions[0].buffer, first);
+
+        // A different program is still its own session — reuse is by name, not
+        // a global "one runner".
+        term.run(&mut ed, "rerun:independence:cat");
+        let names: Vec<&str> = term.sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["*gaussian*", "*independence*"]);
+
+        // And `run:` is untouched by any of it.
+        term.run(&mut ed, "run:gaussian:cat");
+        let names: Vec<&str> = term.sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["*gaussian*", "*independence*", "*gaussian*<2>"]);
     }
 
     /// Keys, freezing and closing all address the session whose buffer is live

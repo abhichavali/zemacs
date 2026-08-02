@@ -202,9 +202,14 @@ Two caveats, both from the module's own docs:
 * Overlays
 
 A marker names a position across an edit. An overlay names a *range* across one,
-and carries something with it — a colour, a substituted string, an image, or any
-Lisp object at all. It is a marker pair plus a property list, which is exactly
-how it is built.
+and carries something with it — a colour, a substituted string, an image, a type
+size, or any Lisp object at all. It is a marker pair plus a property list, which
+is exactly how it is built.
+
+It is also the whole of the drawing API. There is no second vocabulary for
+"make this look different": a mode that wants larger headings, a bold run, a
+quoted block or a folded subtree says all four with =overlay-put=, and the
+renderer knows none of those words.
 
 | Form                            |   | Answers                                                  |
 |---------------------------------+---+----------------------------------------------------------|
@@ -225,15 +230,23 @@ characters is what makes every offset here a character index, and threading a
 plist through it would give that up to buy an inheritance rule most configs turn
 off. One mechanism, and this is it.
 
-** The five properties the renderer draws
+** The properties the renderer draws
 
-| Property     | Value                        | Effect                                    |
-|--------------+------------------------------+-------------------------------------------|
-| =face=         | a name from =(face-list)=      | Foreground of the covered text.           |
-| =background=   | a name from =(face-list)=      | Background of the covered cells.          |
-| =display=      | a string                     | Drawn *instead of* the covered text.      |
-| =image=        | a handle from =latex-preview=  | Drawn instead of the covered text, as a bitmap. |
-| =fold=         | =T= or =NIL=                     | The lines *after* the first stop occupying rows at all. |
+Two groups, and the split is worth knowing: most of them are about the *cells* a
+range covers, and three are about the *lines* it touches, whole.
+
+| Property         | Value                        | Effect                                    |
+|------------------+------------------------------+-------------------------------------------|
+| =face=             | a name from =(face-list)=      | Foreground of the covered text.           |
+| =background=       | a name from =(face-list)=      | Background of the covered cells.          |
+| =display=          | a string                     | Drawn *instead of* the covered text.      |
+| =image=            | =latex-preview= or =image-file= | Drawn instead of the covered text, as a bitmap. |
+| =weight=           | ='bold=, ='normal=              | Real weight, not a colour.                |
+| =slant=            | ='italic=, ='normal=            | Real slant.                               |
+| =scale=            | a number, =1.0= being body     | Type size — *for the whole line*. See below. |
+| =line-background=  | a name from =(face-list)=      | A band across the whole pane, behind every line the range touches. |
+| =line-prefix=      | a string                     | Drawn in the left margin of every row of those lines, text pushed right by its width. |
+| =fold=             | =T= or =NIL=                     | The lines *after* the first stop occupying rows at all. |
 
 =NIL= clears any of them. A colour is a *face name*, not an =(R G B)= — the theme
 already owns that vocabulary, so an overlay recolours itself when a theme is
@@ -251,10 +264,51 @@ Priority, where two things claim the same cell:
 Overlapping =display= substitutions are not composed: the one that starts first
 wins and the rest are ignored.
 
+=weight= and =slant= are three-valued, and the middle value earns its place:
+='normal= is a claim, and overrides an overlay underneath; =NIL= is the absence of
+one, and leaves that overlay's alone.
+
+** Type size
+
+=scale= is a multiple of the body size, so text follows =font-size= and a heading
+follows the text: =C-+= enlarges the document rather than closing the gap between
+its parts.
+
+Two things about it are not obvious and both are deliberate.
+
+*It scales the line, not the run.* A scaled cell is wider as well as taller, and
+every piece of layout downstream — where a line wraps, which column the cursor is
+in, which character a click lands on — counts in whole cells of one width. So the
+*widest* scale claimed by any overlay touching a line sets that whole line's
+type, rather than a run carrying its own advance. That is what a heading wants
+anyway, and it is what lets =org-modern= scale a heading with the overlay it
+already puts on the stars. ponytail: =*this* word bigger= is therefore not
+expressible. =weight= and =slant= *are* per-run, because they change no metric.
+
+*The size is snapped to one of four steps* — =1.0=, =1.25=, =1.5=, =2.0= — and a
+request lands on the nearest. That is not a rounding accident: a font face plus a
+texture per character it has drawn is what a size costs, so the steps are the
+renderer's glyph cache bound made visible in the vocabulary rather than hidden in
+an eviction policy. Ask for =1.4= and you get the =1.5= face.
+
+A scaled line claims whole extra rows — =ceil(scale)= of them per wrapped row —
+which is the same mechanism an inline image already used, and is what keeps
+=scroll=, the gutter and the click map counting whole rows. The type sits at the
+*bottom* of that block, so the slack lands above the line, which is where a
+heading wants its air.
+
+#+begin_src lisp
+;; A quoted block drawn as a block rather than as coloured characters.
+(let ((ov (make-overlay beg end)))
+  (overlay-put ov 'line-background "code")
+  (overlay-put ov 'line-prefix "▎ ")
+  (overlay-put ov 'face "comment"))            ; ...which is also the bar's colour
+#+end_src
+
 ** Folding
 
-=fold= is the odd one out and worth its own paragraph: the other four swap cells
-for other cells, and this makes *rows stop existing*. Every line after the
+=fold= is the odd one out and worth its own paragraph: the others swap cells for
+other cells or change how big they are, and this makes *rows stop existing*. Every line after the
 overlay's first, up to its end, is skipped by the renderer and stepped over by
 =j= and =k= — one predicate answers for both, because a line the frame does not
 draw and a line the cursor may land on have to be the same set or point
@@ -358,6 +412,43 @@ is a dollar sign. =DISPLAY-P= is =T= for the ones that want a line of their own.
 - the handle is derived from the fragment, the size and the colour, so previewing
   the same fragment twice costs nothing at all.
 
+* Highlighting a string
+
+| Form                    |   | Answers                                              |
+|-------------------------+---+------------------------------------------------------|
+| =(highlight lang text)=   | P | =(START END FACE)= per run, in char offsets, sorted. |
+
+A **pure function**: it reads no buffer, takes no lock, and parses whatever you
+hand it. =FACE= is a name from =(face-list)=, so a run goes straight onto an overlay:
+
+#+begin_src lisp
+(dolist (run (highlight "python" body))
+  (destructuring-bind (a b face) run
+    (overlay-put (make-overlay (+ beg a) (+ beg b)) 'face face)))
+#+end_src
+
+It exists because a buffer has *one* language and sometimes a piece of it is
+written in another. Org is the case that wanted it: a =#+begin_src python= block
+lives in a buffer the highlighting thread is colouring as org — which has no
+tree-sitter grammar at all — so the block can only be coloured by asking for it.
+=runtime/modes/org-frozen.lisp= is the customer and =org-frozen-mode= is what it
+buys. Nothing about the primitive is about org: "colour this string as that
+language" is what a markdown fence, a docstring or a diff view would each want.
+
+Two things to get right when calling it:
+
+- =LANG= is a *tree-sitter* language id, not a babel name. =(languages)= is the
+  list; =emacs-lisp= is =lisp= and =py= is =python=, and a name no grammar answers to
+  simply gets an empty list back — the same answer a parse failure gives, so
+  there is one case to handle and not three.
+- =TEXT= must be real characters. =buffer-substring= answers one character per
+  UTF-8 *byte* — the convention =docs/threading.org= writes up and the reason
+  =%char-index= exists — and handing that over unchanged makes the parser count a
+  longer string than the buffer holds, so every run after the first accented
+  character lands a byte or two to the right. =%org-frozen-text= in
+  =runtime/modes/org-frozen.lisp= is the decoder, and the note above it is where
+  the whole story is written down.
+
 The image is rasterised to match the text it sits in and placed against the
 *baseline*, so =$x_1$= hangs below the line the way a descender does. A fragment
 taller than one line gets one: the line it starts on grows to as many display
@@ -365,6 +456,142 @@ rows as the image needs, so a display equation claims space upward from its own
 baseline instead of painting over the text below. A fragment spanning several
 source lines already owns a blank row for each of them and is charged only the
 shortfall, so =\begin{equation}= looks exactly as it did.
+
+** Previewing without being asked
+
+An org buffer typesets itself. Two triggers, both policy in =runtime/init.lisp=
+and both chosen to keep a =latex= run off the keystroke path:
+
+- *entering =org-mode== — the buffer arrives typeset. Cold, that is one render per
+  fragment while the editor keeps taking your keystrokes; warm, it is the cache.
+- *leaving the line you edited* — =after-change-hook= records only which line
+  changed, and =point-moved-hook= does the work once point is on a different one.
+  So typing costs one integer comparison per keystroke, a pass happens once per
+  line you edit rather than once per character, and =$\alph= is never handed to
+  TeX half-typed.
+
+Only fragments with no preview overlay are rendered, and never the one point is
+inside. A pass that cannot render anything sets =*org-latex-auto*= to =NIL= and says
+so once — a machine with no TeX should not print the same error per equation —
+and =M-x org-latex-preview= turns it back on, since asking by hand is how you say
+you have installed it.
+
+* Figures
+
+| Form                        |   | Answers                                                |
+|-----------------------------+---+--------------------------------------------------------|
+| =(image-file path &optional width)= | P | An image handle for an =image= overlay property, or =NIL=. |
+
+The other producer of an =image= handle, and deliberately the same contract as
+=latex-preview=: pixels in the editor under an id, =NIL= with the reason already in
+the status line, and an id derived from exactly what decided the pixels — here
+the path, the file's length and mtime, and the width — so drawing an unchanged
+figure again is a lookup and a rewritten one is genuinely re-read.
+
+- *SVG and PNG.* =.svg=, =.svgz= and =.png=. SVG goes through =resvg=, which is pure
+  Rust, so a figure costs no system dependency; PNG goes through the decoder the
+  LaTeX pipeline already builds.
+- =WIDTH= is *in ems* and is a **maximum** — nothing is ever scaled up. Ems and
+  not pixels because the device pixel is something only the renderer knows: a
+  width computed in the image from =(font-size)= comes out half-size on a Retina
+  display. =NIL= means "as authored".
+- A vector file is rasterised at the display's scale factor before the maximum
+  applies, which is the same correction =latex-preview= makes with its dpi.
+
+Together with overlays this is the whole of =org-inline-images= in
+=runtime/modes/org-modern.lisp=: a =[[file:fig-1.svg]]= link alone on its line gets
+an overlay carrying the handle, and the renderer grows the line to fit the
+bitmap exactly as it does for a display equation. =SPC m f= redraws, =SPC m F=
+clears, and entering =org-mode= draws what has none yet.
+
+* Following a link
+
+| Form                   |   | Does                                                     |
+|------------------------+---+----------------------------------------------------------|
+| =(org-open-at-point)=    | C | Follows the link under point. =RET= in an org buffer.      |
+
+=*org-link-open-functions*= is the policy table: a scheme, and the function that
+follows it. =id:= jumps to the heading carrying that =:ID:= (or =:CUSTOM_ID:=),
+=file:= opens the file relative to *this* file's directory, and =http:=, =https:=
+and =mailto:= go to the desktop's own opener. A target with no scheme is org's
+fuzzy link: =*Heading= is a headline, =#name= is a custom id, and anything else is
+a file if one is there and a search if it is not.
+
+Adding =doi:= or =roam:= is a line in that table and a function. Nothing in Rust
+knows what a link is.
+
+* org as a printed page
+
+=org-frozen-mode= renders an org file instead of editing it. =SPC m z= toggles it
+either way, from an org buffer or from a frozen one.
+
+| Form                    |   | Does                                                     |
+|-------------------------+---+----------------------------------------------------------|
+| =(org-frozen-mode)=       | C | Freeze the live buffer. Derives from =org-mode=.           |
+| =(org-frozen-toggle)=     | C | ...and back again. =SPC m z=                               |
+| =(org-frozen-refresh)=    | C | Redraw the page. =SPC m m=                                 |
+| =(org-frozen-clear)=      | C | Take the rendering off, leaving the mode on.             |
+| =(org-frozen-cycle)=      | C | Org's heading cycle, machinery intact. =TAB=               |
+
+It is =org-modern= *plus more, minus the reveal*: entering it runs =org-mode='s own
+body first, so the bullets, the emphasis, the LaTeX previews and the inline
+figures are all that file's and are not redone. What it adds:
+
+- **Machinery stops occupying rows.** Property drawers, =#+keyword:= lines,
+  =#+begin_…=/=#+end_…= delimiters and =#= comments are folded — not dimmed, not
+  replaced by a glyph. =j= steps over them too, because [[*Folding][=fold_hiding=]] is the one
+  predicate the renderer and the cursor both ask.
+- **=#+TITLE:= is typeset**, at twice the body size, rather than hidden. It has to
+  be: a fold hides the lines *after* its own, so line 0 is out of reach of every
+  fold there can ever be, and a title is the likeliest thing to be on it.
+- **A source block is a listing** — a =line-background= band, a =line-prefix=
+  gutter, and its body highlighted in *its own language* through [[*Highlighting a string][=highlight=]].
+- **A table is aligned** under a rule, with the rows above the first =|---+---|=
+  set bold and no vertical rules at all — the printed convention.
+- **A quote block** gets a bar and the comment face; a heading's =:tags:= come off;
+  =-----= becomes a rule.
+- **The buffer is read-only for real**, through =set-buffer-read-only=. See
+  [[*Read-only, and writing anyway][Read-only, and writing anyway]]: a program may still write to it, which is what
+  lets a frozen curriculum receive a transcribed answer.
+
+The policy is six =defparameter=s and one =case=. =%org-frozen-block= is the
+extension point — it answers the overlay plist a =#+begin_NAME= body wants, so
+giving a kind of block a new look is a line in its arm.
+
+Reveal-on-cursor is switched off through a list org-modern owns:
+
+#+begin_src lisp
+(pushnew "my-reader-mode" *org-modern-appear-inhibit-modes* :test #'string=)
+#+end_src
+
+* A curriculum
+
+| Form                                 |   | Answers                                       |
+|--------------------------------------+---+-----------------------------------------------|
+| =(math-curriculum-p)=                  | R | =T= when this buffer declares itself one.       |
+| =(math-units)=                         | R | =(:id :title :begin :end)= per unit, in order.  |
+| =(math-unit-at-point)=                 | R | One of those, or =NIL=.                         |
+| =(math-problems &optional unit)=       | R | Problem plists, in order.                     |
+| =(math-problem-at-point)=              | R | One problem plist, or =NIL=.                    |
+| =(math-set-status problem status)=     | C | Rewrites =:ZEMACS_STATUS:=, in one edit.        |
+| =(math-response-insert problem text)=  | C | Replaces the Response body, in one edit.      |
+| =(math-src-block problem)=             | R | =(:lang :tangle :body :begin :end)=, or =NIL=.    |
+
+A whole maths course as one org file — units, problems, and somewhere for your
+answers to land — all of it ordinary org with =#+ZEMACS_*= properties on the
+headings. The format is specified in [[file:curriculum.org][curriculum.org]], precisely enough to hand to
+a model as "generate one of these"; the reader is =runtime/modes/math.lisp=.
+
+Two things to know before writing against it. A plist is a *reading*, not a
+handle: it describes the buffer as it was, so both writers re-read before they
+write and use the plist only to say which problem was meant. And both writers are
+a single =replace-region=, for the reason [[file:threading.org][threading.org]] gives — a =delete-region=
+followed by an =insert= can take a keystroke between them, and a half-written
+property drawer is a corrupted document. =math-response-insert= is idempotent as
+well as atomic.
+
+*Nothing here decides a status.* =:ZEMACS_STATUS:= is =todo= or =done= and the
+learner sets it; there is no checker and no answer key anywhere in the format.
 
 * The region
 
@@ -395,7 +622,7 @@ stay valid:
 | =(buffer-name)=                         | R | Display name of the live buffer.                  |
 | =(buffer-file-name)=                    | R | Its path, or =NIL=.                                 |
 | =(buffer-modified-p)=                   | R | =T= / =NIL=.                                          |
-| =(buffer-read-only-p)=                  | R | =T= for a generated buffer (dashboard, magit, dired, terminal). |
+| =(buffer-read-only-p)=                  | R | =:generated=, =:claimed=, or =NIL=. Truthy means every edit is refused. |
 | =(buffer-list)=                         | R | Display names, live buffer first, modified ones carrying =" [+]"=. |
 | =(buffer-info)=                         | R | =(NAME FILE MODIFIED-P MAJOR-MODE)= per buffer, same order, names unmarked. |
 | =(buffer-names)=                        | H | Just the names.                                   |
@@ -405,10 +632,45 @@ stay valid:
 | =(create-buffer name &optional language)= | H | A buffer with no file behind it. Shows it if it is already open. Answers =name=. |
 | =(kill-buffer &optional name)=          | H | Kill it, or the live one. =T=, or =NIL= and a message.  |
 | =(set-language &optional language)=     | H | What tree-sitter colours the live buffer as. =NIL= is plain text. |
+| =(set-buffer-read-only &optional on)=   | H | Refuse, or stop refusing, every edit to the live buffer. |
+| =(with-inhibited-read-only &body body)= | H | Run =body= able to write to a buffer a *mode* froze. |
 
 =buffer-list= is the switcher's list and is right for a menu; =buffer-info= is the
 same buffers with their fields apart and is right for anything that has to
 *match* a name.
+
+** Read-only, and writing anyway
+
+There are two reasons a buffer refuses an edit and =buffer-read-only-p= tells them
+apart, because they are not the same fact:
+
+- =:generated= — the dashboard, magit, dired, a terminal. There is no document
+  behind it; the text is a rendering of state and the next refresh would throw
+  an edit away. Nothing can make one of these writable, and nothing should.
+- =:claimed= — an ordinary file buffer whose *mode* has decided you are reading
+  rather than writing. =org-frozen-mode= is the first; =set-buffer-read-only= is
+  how a mode says it, on entry, and takes it back in its exit hook.
+
+The refusal is one line in =Editor::apply=, tested against "does this command
+mutate the document" — so it covers a keystroke, an =:s= substitution, a paste and
+an =insert= from Lisp alike, and a new command cannot accidentally get past it.
+The cursor still moves, search still works, folds still fold: read-only is not
+the same as disabled.
+
+Which means Lisp needs a way through, and =with-inhibited-read-only= is it —
+Emacs' =inhibit-read-only=, with the one difference that it lifts a =:claimed= flag
+and never a =:generated= kind:
+
+#+begin_src lisp
+;; A frozen curriculum is still the buffer a transcribed answer lands in.
+(with-inhibited-read-only
+  (replace-region beg end transcription))
+#+end_src
+
+=UNWIND-PROTECT=, so a body that throws still leaves the document frozen. Note the
+window: the flag lives on the editor behind a mutex that is released between
+primitives, so a keystroke arriving while =body= runs sees the buffer unfrozen.
+Keep =body= short — a =replace-region= or two, which is what it is for.
 
 #+begin_src lisp
 (buffer-names)                     ; => ("main.rs" "*dashboard*" "*scratch*")
@@ -763,6 +1025,7 @@ Every setting now has both halves. Writers are primitives, readers are readers.
 | =(set-line-numbers on)=                 | =(line-numbers-p)=            | Whether the gutter is drawn.      |
 | =(set-relative-line-numbers on)=        | =(relative-line-numbers-p)=   | Count from the cursor, in *visual* rows — Emacs' =display-line-numbers-type 'visual=. Orthogonal to whether the gutter is drawn at all. |
 | =(set-tab-width n)=                     | =(tab-width)=                 | Clamped 1–16.                     |
+| =(set-text-width n)=                    | =(text-width)=                | Columns to hold the text column to, centred in the pane — =olivetti-mode=. =0= is off and means the pane's full width. Claimed by =org-mode= at 80. |
 | =(set-line-overflow mode)=              | =(line-overflow)=             | ="truncate"= or ="wrap"=.            |
 | =(set-completion-style style)=          | =(completion-style)=          | ="minibuffer"=, ="bottom"=, ="center"=. |
 | =(set-modeline-relief n)=               | =(modeline-relief)=           | Emacs' =:box :line-width=. Signed: positive raises, negative *sinks*. Clamped ±16. |
@@ -815,7 +1078,7 @@ app layer, which does the work and feeds the result back as buffer text.
 |------------------------+----+--------------------------------------------------------------|
 | =(magit verb)=           | HA | ="status"= ="stage"= ="unstage"= ="stage-all"= ="unstage-all"= ="commit"= ="commit-finish"= ="push"= ="pull"= ="refresh"= |
 | =(dired verb)=           | HA | ="open"= ="up"= ="enter"= ="mark"= ="unmark"= ="toggle-marks"= ="flag-delete"= ="execute"= ="rename"= ="copy"= ="mkdir"= ="toggle-hidden"= ="refresh"= |
-| =(terminal verb)=        | HA | ="open"= ="new"= ="close"= ="restart"= ="next"= ="prev"= ="normal"= ="insert"= ="run:NAME:COMMAND"= |
+| =(terminal verb)=        | HA | ="open"= ="new"= ="close"= ="restart"= ="next"= ="prev"= ="normal"= ="insert"= ="run:NAME:COMMAND"= ="rerun:NAME:COMMAND"= |
 | =(term-send-key key)=    | HA | One keystroke, spelled as =(key-bindings)= spells one.        |
 
 #+begin_src lisp
@@ -838,6 +1101,7 @@ live, and the rest keep running. See the buffer-kind table in [[file:model.org][
 | ="open"=                  | Show the shell session, starting it if there is none.          |
 | ="new"=                   | A *second* shell, however many are already up.                 |
 | ="run:NAME:COMMAND"=      | Run =COMMAND= in a buffer called =*NAME*=. What AI mode is built on. |
+| ="rerun:NAME:COMMAND"=    | The same, but *replacing* a session already called =*NAME*= instead of opening a second. For a program you run over and over; =run:= is for a harness you start. |
 | ="close"=                 | Hang up on the live session and kill its buffer.               |
 | ="restart"=               | Run the same command again in the *same* buffer.               |
 | ="next"= / ="prev"=         | Walk the sessions, wrapping.                                   |
@@ -1128,6 +1392,32 @@ config can both hang something off it.
 It carries no *delta*, which is why =textDocument/didChange= sends the whole
 buffer. See the ceiling in [[file:boundary.org][boundary.org]].
 
+** =point-moved-hook=
+
+The other event, and its twin: the *cursor* moved. Called with no arguments
+whenever the live buffer's point offset changes — a motion, a click, a jump, an
+edit that shifted it, or a switch to a buffer whose point is elsewhere.
+=*point-moved-functions*= is the list it runs, and =runtime/modes/modes.lisp= is
+where both are declared.
+
+This is what a mode hangs *live editing* off. =org-modern-appear= is the shipped
+example: it reveals the markup the cursor is inside, and before this hook existed
+it could only do so when you typed, because the change hook is the only other
+thing the editor says. So the asterisks around a word appeared as you edited it
+and stayed hidden as you walked onto it.
+
+#+begin_src lisp
+(push (lambda () (message (format nil "col ~d" (column))))
+      *point-moved-functions*)
+#+end_src
+
+It fires at most once per keystroke, in every buffer, so a function on it gets
+the same budget the change hook has: a constant amount of work, or a cheap test
+that decides whether to do any. A buffer rescan here is felt. It carries no
+*previous* position either — a config that wants to act on the range you left
+has to remember it, which is what =org-latex-maybe-preview= in =init.lisp= does
+with one integer.
+
 * The escape hatch
 
 Both halves of the bridge are one C entry point each, and both are exported. If
@@ -1166,6 +1456,7 @@ integers. =NIL= for =arg= means absent. An unknown verb reports =no such command
 | ="create-buffer"=                            | name  | —          | —   |
 | ="kill-buffer"=                              | —     | index      | —   |
 | ="set-language"=                             | language, =NIL= for none | — | — |
+| ="set-read-only"=                            | —     | on?        | —   |
 | ="read-from-minibuffer"=                     | label | continuation id | completing? |
 | ="prompt-item"=                              | one candidate | —  | —   |
 | ="term-key"=                                 | key token | —      | —   |

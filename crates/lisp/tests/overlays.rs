@@ -123,6 +123,50 @@ fn overlays_reach_the_editor_and_move_with_the_text() {
         ed.buffer.overlays().first()?.face.is_none().then_some(())
     });
 
+    // --- the display attributes -------------------------------------------
+    //
+    // Type size, weight and slant, plus the two that are about the *line* an
+    // overlay touches rather than about the cells it covers. All of it through
+    // the same `overlay-put`, which is the point of putting it there: the
+    // vocabulary grew and the verb did not.
+    lisp.eval("(overlay-put *ov* 'scale 1.5)".into());
+    lisp.eval("(overlay-put *ov* 'weight 'bold)".into());
+    lisp.eval("(overlay-put *ov* 'slant 'italic)".into());
+    lisp.eval("(overlay-put *ov* 'line-background \"code\")".into());
+    lisp.eval("(overlay-put *ov* 'line-prefix \"| \")".into());
+    wait(&shared, "the display attributes to land", |ed| {
+        let o = ed.buffer.overlays().first()?;
+        (o.scale == Some(150)
+            && o.bold == Some(true)
+            && o.italic == Some(true)
+            && o.line_background == Some(zemacs_core::HlKind::Code)
+            && o.line_prefix.as_deref() == Some("| "))
+        .then_some(())
+    });
+    // A multiplier crosses the boundary as a percentage, because the write
+    // envelope carries integers — and `overlay-get` still answers the float that
+    // was put, because the plist is the image's and never went anywhere.
+    says(&shared, &lisp, "(overlay-get *ov* 'scale)", "1.5");
+    // `normal` is a claim and NIL is the absence of one, which is the whole
+    // reason weight is three-valued: the first draws upright over an overlay
+    // underneath, the second leaves whatever that overlay said alone.
+    lisp.eval("(overlay-put *ov* 'weight 'normal)".into());
+    wait(&shared, "an explicit upright weight", |ed| {
+        (ed.buffer.overlays().first()?.bold == Some(false)).then_some(())
+    });
+    lisp.eval("(overlay-put *ov* 'weight nil)".into());
+    lisp.eval("(overlay-put *ov* 'line-prefix nil)".into());
+    wait(&shared, "the weight and prefix to clear", |ed| {
+        let o = ed.buffer.overlays().first()?;
+        (o.bold.is_none() && o.line_prefix.is_none()).then_some(())
+    });
+    // Body size is not a size, however it is spelled — so a mode may set the
+    // scale of every heading level unconditionally and level 1 costs nothing.
+    lisp.eval("(overlay-put *ov* 'scale 1)".into());
+    wait(&shared, "a body-size scale to fold away", |ed| {
+        ed.buffer.overlays().first()?.scale.is_none().then_some(())
+    });
+
     // --- the properties only Lisp knows about ----------------------------
     //
     // The whole reason the plist lives in the image: none of this could survive

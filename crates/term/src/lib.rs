@@ -591,6 +591,18 @@ impl Terminal {
         self.command.as_ref()
     }
 
+    /// Point an existing session at a different command, to take effect on the
+    /// next restart.
+    ///
+    /// For re-*running* rather than resuming: a run reuses the session so the
+    /// buffer and window survive, but the thing being run may have been
+    /// regenerated since, and restarting the remembered command would quietly
+    /// execute the previous one. Does not disturb the child that is live now —
+    /// `restart` is what ends that.
+    pub fn set_command(&mut self, command: Command) {
+        self.command = Some(command);
+    }
+
     pub fn size(&self) -> (usize, usize) {
         (self.cols, self.rows)
     }
@@ -690,9 +702,28 @@ impl Terminal {
         Screen {
             rows,
             cols,
-            cells,
             cursor,
+            cells,
         }
+    }
+
+    /// The OSC 8 hyperlink the child attached to the cell at `(col, row)`, if
+    /// any — the target of `cargo`'s error codes and of `ls --hyperlink`, where
+    /// the text you see is a word and the link behind it is a URL.
+    ///
+    /// Asked for on demand rather than carried on every [`Cell`]: the grid is
+    /// copied out sixty times a second and a cell is `Copy`, so a `String` per
+    /// cell would be tens of thousands of allocations a frame to answer a
+    /// question only a click ever asks.
+    pub fn link_at(&self, col: usize, row: usize) -> Option<String> {
+        let term = self.term.lock();
+        let grid = term.grid();
+        if row >= grid.screen_lines() || col >= grid.columns() {
+            return None;
+        }
+        let line = Line(row as i32 - grid.display_offset() as i32);
+        let uri = grid[line][Column(col)].hyperlink()?.uri().to_string();
+        Some(uri)
     }
 }
 
@@ -789,6 +820,8 @@ fn indexed(i: u8) -> [u8; 3] {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     #[test]
@@ -843,6 +876,39 @@ mod tests {
     #[test]
     fn meta_backspace_kills_a_word_in_the_shell() {
         assert_eq!(encode(Input::Alt('\u{7f}'), false), vec![0x1b, 0x7f]);
+    }
+
+    /// `cargo` marks its error codes this way, and `ls --hyperlink` its
+    /// filenames: OSC 8 puts a URL *beside* the text rather than in it, so what
+    /// is on screen is a word and reading the row would find nothing to open.
+    /// The click path asks the cell instead — this is the proof the parser
+    /// keeps the link at all.
+    #[test]
+    fn an_osc_8_hyperlink_is_readable_off_the_cell() {
+        let link = "https://doc.rust-lang.org/error_codes/E0308.html";
+        let mut term = Terminal::spawn_command(
+            40,
+            4,
+            None,
+            Some(Command::new(
+                "printf",
+                vec![format!("\\033]8;;{link}\\033\\\\E0308\\033]8;;\\033\\\\")],
+            )),
+        )
+        .expect("printf must be on $PATH");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            term.poll();
+            if let Some(uri) = term.link_at(0, 0) {
+                assert_eq!(uri, link);
+                let screen = term.screen([0; 3], [0; 3]);
+                assert_eq!(screen.cell(0, 0).map(|c| c.c), Some('E'), "the text is the code");
+                return;
+            }
+            assert!(Instant::now() < deadline, "no hyperlink arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

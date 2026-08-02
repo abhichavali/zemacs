@@ -1,0 +1,13 @@
+[package]
+name = "zemacs-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Nothing. That is the feature, not an accident of being early: this crate is
+# where every wrapping and stacking bug will live, and a layout engine that
+# needs a window open to run its tests is a layout engine nobody tests. Text is
+# measured through the `Measure` trait, so `crates/render` supplies the font and
+# the test suite supplies `len() * 8`. Depending on `zemacs-core` would also be
+# a cycle: core is what will hold scenes by id.
+[dependencies]

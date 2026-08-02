@@ -1097,6 +1097,29 @@ has edited costs one comparison per keystroke and nothing else."
 (define-key-everywhere "M-0" "text-scale-reset")
 
 ;;; ---------------------------------------------------------------------------
+;;; Scenes — a page in pixels rather than a grid of cells
+;;;
+;;; `gui.lisp' is the Lisp face of `crates/gui': `block', `text', `run', `image'
+;;; and `rect' build a page, `scene-set' installs it on the live buffer, and a
+;;; `:tag' makes a node clickable. Rust lays it out, wraps its text in a real
+;;; font and routes a click back; *what* is on the page is entirely here.
+;;;
+;;; Loaded before the modes below because a mode that renders a document — the
+;;; first will be `org-frozen-mode' — is a builder written on top of it, and
+;;; before nothing else: it needs only `%do' and the face table, so it can sit
+;;; anywhere above its first caller.
+;;;
+;;; It takes the name `block' back from Common Lisp, which is the one thing in
+;;; this config that shadows a standard symbol. The file says why; the short
+;;; version is that a page is written as `(block :pad 48 ...)' and `cl:block' is
+;;; still there for anyone who wanted the special operator.
+
+(when *runtime-dir*
+  (handler-case
+      (load (merge-pathnames "gui.lisp" *runtime-dir*) :verbose nil :print nil)
+    (error (e) (message (format nil "gui: not loaded — ~a" e)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Language servers — the eglot equivalent
 ;;;
 ;;; `rpc.lisp' is JSON-RPC over a child's stdin and stdout, and knows nothing

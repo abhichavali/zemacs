@@ -19,6 +19,7 @@ pub mod minibuffer;
 pub mod modeline;
 pub mod overlay;
 pub mod query;
+pub mod scene;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -606,6 +607,25 @@ pub enum EditorCommand {
     /// off would then be the one edit a read-only buffer could never accept, and
     /// the mode could never be left.
     SetReadOnly(bool),
+    /// Show a pixel-space page on the live buffer instead of its text, or —
+    /// with `None` — go back to drawing the text.
+    ///
+    /// The whole of the scene integration, and there is only one verb because a
+    /// scene is described in one form and swapped in whole: the alternative —
+    /// mutate this node, now this one — is the API that makes every caller hold
+    /// ids it has to keep in step with the document.
+    ///
+    /// Installing one claims the buffer read-only and clearing one gives the
+    /// claim back; see [`Buffer::set_scene`], which is where that is spelled and
+    /// why. No buffer is named because the live one is meant: `scene-set` is
+    /// `(current-buffer)`-shaped in Lisp, and a command that could aim at a
+    /// parked buffer would be the only one here that can.
+    ///
+    /// Deliberately *not* [`EditorCommand::mutates_document`]. Nothing about the
+    /// text changes, and if it were, a buffer already showing a scene — and
+    /// therefore already read-only — could never be handed a new one or have
+    /// this one taken away.
+    SetScene(Option<zemacs_gui::Scene>),
 
     /// Put a prompt up whose answer goes **back to Lisp**, as
     /// `(%prompt-reply ID ANSWER)` through [`EditorCommand::CallLisp`]. `id`
@@ -894,6 +914,31 @@ pub struct Buffer {
     /// as the undo history is — an overlay is about a document, not about the
     /// editor that happens to be showing it.
     overlays: overlay::Overlays,
+    /// A pixel-space page drawn *instead of* this buffer's text, or `None` for
+    /// every buffer that is a grid of cells — which is nearly all of them.
+    ///
+    /// On the buffer rather than on the [`Window`], and that is the whole
+    /// integration: a scene follows its document from pane to pane, which is
+    /// what a split showing the same document twice needs; the modeline, the
+    /// buffer list, `switch-to-buffer` and killing all keep working unchanged,
+    /// because it is still a buffer; and there is no id space and no editor-side
+    /// table, because Lisp never names a scene, it names a buffer. See
+    /// [`scene`] for the argument written out.
+    ///
+    /// Set only through [`EditorCommand::SetScene`], which is also what claims
+    /// the buffer read-only: a scene is not an editing surface, and a document
+    /// you could type into while looking at a rendering of it would be two
+    /// documents.
+    pub scene: Option<zemacs_gui::Scene>,
+    /// What [`Buffer::read_only`] said before a scene claimed this buffer.
+    ///
+    /// A scene freezes the buffer it is installed on, so taking one away has to
+    /// hand back whatever was there before rather than simply thawing: a mode
+    /// that shows a page over a file `org-frozen` had already frozen must not
+    /// unfreeze it on the way out. Meaningless while [`Buffer::scene`] is
+    /// `None`, which is why it is private — nothing outside this file should be
+    /// reading a flag that is only half of a pair.
+    read_only_before_scene: bool,
 }
 
 impl Buffer {
@@ -921,6 +966,56 @@ impl Buffer {
             redo: Vec::new(),
             markers: marker::Markers::default(),
             overlays: overlay::Overlays::default(),
+            scene: None,
+            read_only_before_scene: false,
+        }
+    }
+
+    /// Show a scene instead of this buffer's text, or — with `None` — stop.
+    ///
+    /// The read-only flag moves with it, because `docs/gui.org` says a scene is
+    /// not an editing surface and this is where that is enforced: installing
+    /// one claims the buffer exactly as `org-frozen` does, and clearing one
+    /// hands back the claim the buffer had before, so a page shown over a file
+    /// does not leave the file frozen once the page is gone.
+    ///
+    /// Idempotent in both directions. Replacing one scene with the next does
+    /// *not* re-record the flag — a mode that rebuilds its page whenever
+    /// anything changes would otherwise record the read-only it imposed itself
+    /// and could never let go — and clearing a scene that was never there
+    /// leaves the flag alone, because a mode's exit hook runs whether or not
+    /// its entry did.
+    ///
+    /// **A swap carries the reader's place across.** A scene is built whole and
+    /// swapped in, which is the right API and would otherwise mean that a
+    /// curriculum re-rendering because one problem's state changed throws
+    /// somebody on page nine back to page one. So replacing a scene keeps the
+    /// outgoing offset and ignores whatever the incoming one carried; clearing
+    /// and installing later starts at the top, which is right, because that is
+    /// a different document arriving rather than the same one re-rendered.
+    fn set_scene(&mut self, scene: Option<zemacs_gui::Scene>) {
+        match (self.scene.is_some(), scene) {
+            (false, Some(s)) => {
+                self.read_only_before_scene = self.read_only;
+                self.read_only = true;
+                self.scene = Some(s);
+            }
+            (true, Some(mut s)) => {
+                // Carried raw and deliberately *not* clamped: the new page may
+                // be shorter than the offset, and the height that would say so
+                // belongs to a laid-out scene, which needs a font this crate
+                // cannot see. So this number is a request rather than a
+                // position until the app has clamped it — see `scroll_scene` in
+                // `crates/app`, which is where every write of a scroll offset on
+                // that side goes through.
+                s.scroll = self.scene.as_ref().map_or(0, |old| old.scroll);
+                self.scene = Some(s);
+            }
+            (true, None) => {
+                self.scene = None;
+                self.read_only = self.read_only_before_scene;
+            }
+            (false, None) => {}
         }
     }
 
@@ -1728,6 +1823,11 @@ impl Editor {
         self.buffer.redo.clear();
         self.buffer.markers.clear();
         self.buffer.overlays.clear();
+        // A scene is about a document too, and this path *reuses* the live
+        // buffer when it was pristine — so a page left over from the buffer
+        // that was here would be drawn over a scratchpad that has nothing to do
+        // with it, and would keep the read-only claim that came with it.
+        self.buffer.set_scene(None);
         self.buffer.highlights.clear();
         // No hook: `fundamental-mode-hook` firing on every scratchpad would be a
         // surprise, and Lisp that wants one calls `set-major-mode` itself — it
@@ -2061,6 +2161,20 @@ impl Editor {
             // syntax thread has already computed for a buffer that is about to
             // be typeset rather than edited.
             EditorCommand::SetReadOnly(on) => self.buffer.read_only = on,
+            // The revision is left alone for the same reason `SetReadOnly`
+            // leaves it alone, and it matters more here: a buffer showing a
+            // scene is being typeset rather than edited, and bumping the
+            // counter would throw away the highlight spans the syntax thread
+            // computed for text that has not changed — the very spans a mode
+            // built the scene's runs out of. What has to notice a new scene is
+            // the *renderer*, and it notices through its frame digest.
+            EditorCommand::SetScene(scene) => {
+                // The sizes are filled in *before* the scene is installed, so
+                // nothing downstream — layout, hit testing, paint — ever sees a
+                // figure of no size and has to decide what to do about it.
+                let scene = scene.map(|s| self.with_image_sizes(s));
+                self.buffer.set_scene(scene);
+            }
             EditorCommand::ReadFromMinibuffer {
                 id,
                 label,
@@ -2148,6 +2262,10 @@ impl Editor {
         // that clears the undo history.
         self.buffer.markers.clear();
         self.buffer.overlays.clear();
+        // ...and the scene, for the reason `create_buffer` clears it: a
+        // pristine buffer is reused rather than stacked, and the page that was
+        // on it is about the document that just left.
+        self.buffer.set_scene(None);
         self.buffer.kind = BufferKind::Text;
         // The major mode follows the file, and its hook fires so `init.lisp`
         // can react — `(defun org-mode-hook () ...)` is the whole extension
@@ -2349,20 +2467,35 @@ impl Editor {
         !self.no_gutter_modes.iter().any(|m| m == name)
     }
 
-    /// Drop bitmaps no overlay in any buffer still names.
+    /// Drop bitmaps nothing in the editor still names.
     ///
-    /// The dashboard's logo is named by no overlay and has to be spared
-    /// explicitly: it belongs to the *editor* rather than to a range of text,
-    /// so the reachability question this asks has one root outside the buffers.
-    /// Without it the logo survives until the first prune and then vanishes,
-    /// which is the kind of bug that only shows up after a while.
+    /// Three roots, and every one of them is a way a bitmap gets pointed at
+    /// rather than a place bitmaps are kept:
+    ///
+    /// - the overlays of every buffer, which is where a LaTeX preview over text
+    ///   lives;
+    /// - the **scene** of every buffer, because a figure or an inline fragment
+    ///   on a page is named by no overlay at all. Without this root a preview
+    ///   that only a scene points at is dropped by the next prune — which is
+    ///   triggered by deleting some *unrelated* overlay, in some other buffer —
+    ///   and the page then paints an id that resolves to nothing;
+    /// - the dashboard's logo, which belongs to the editor rather than to any
+    ///   document, and would otherwise survive until the first prune and then
+    ///   vanish.
+    ///
+    /// A miss in any of the three is the same shape of bug and it is not a
+    /// crash: the image simply stops being drawn, some time later, for a reason
+    /// nowhere near where it went.
     fn prune_images(&mut self) {
         if self.images.is_empty() {
             return;
         }
         let live: std::collections::HashSet<ImageId> = std::iter::once(&self.buffer)
             .chain(self.others.iter())
-            .flat_map(|b| b.overlays.images())
+            .flat_map(|b| {
+                let scene = b.scene.iter().flat_map(|s| scene::images(s).map(|(id, ..)| id));
+                b.overlays.images().chain(scene)
+            })
             .chain(self.dashboard.logo)
             .collect();
         self.images.retain(|id, _| live.contains(id));
@@ -3035,6 +3168,299 @@ mod tests {
         ed.apply(EditorCommand::KillBuffer(0));
         assert_eq!(ed.buffer.id, last);
         assert_eq!(ed.status, "cannot kill the last buffer");
+    }
+
+    /// A scene of one paragraph, named by its own text so one buffer's page can
+    /// be told from another's.
+    fn page(text: &str) -> zemacs_gui::Scene {
+        let mut scene = zemacs_gui::Scene::default();
+        let node = scene.push(zemacs_gui::Node::Text {
+            runs: vec![zemacs_gui::Run::Text {
+                text: text.into(),
+                style: zemacs_gui::Style::default(),
+                tag: None,
+            }],
+            align: zemacs_gui::Align::Start,
+        });
+        scene.set_root(node);
+        scene
+    }
+
+    /// The text of the page a buffer is showing, or `None` for a buffer drawn
+    /// as a grid of cells like every other one.
+    fn page_text(buffer: &Buffer) -> Option<String> {
+        let scene = buffer.scene.as_ref()?;
+        let zemacs_gui::Node::Text { runs, .. } = scene.node(scene.root()?)? else {
+            return None;
+        };
+        match runs.first()? {
+            zemacs_gui::Run::Text { text, .. } => Some(text.clone()),
+            zemacs_gui::Run::Image { .. } => None,
+        }
+    }
+
+    /// A scene is not an editing surface, and this is where that stops being a
+    /// sentence in `docs/gui.org` and becomes the keyboard refusing you.
+    #[test]
+    fn installing_a_scene_makes_the_buffer_read_only_and_clearing_it_puts_it_back() {
+        let mut ed = fresh("hello");
+        assert_eq!(ed.buffer.read_only(), ReadOnly::No);
+        ed.apply(EditorCommand::SetScene(Some(page("a"))));
+        assert_eq!(ed.buffer.read_only(), ReadOnly::Claimed);
+        // The same claim `org-frozen` makes, refused by the same one guard: no
+        // way into Insert, and nothing gets typed.
+        ed.apply(EditorCommand::SetMode(Mode::Insert));
+        assert_eq!(ed.mode, Mode::Normal);
+        ed.apply(EditorCommand::InsertText("x".into()));
+        assert_eq!(ed.buffer.text.to_string(), "hello");
+
+        // A page rebuilt over the top of the last one is a swap, not a second
+        // claim — that is what would leave the buffer frozen forever.
+        ed.apply(EditorCommand::SetScene(Some(page("b"))));
+        assert_eq!(page_text(&ed.buffer).as_deref(), Some("b"));
+        ed.apply(EditorCommand::SetScene(None));
+        assert!(ed.buffer.scene.is_none());
+        assert_eq!(ed.buffer.read_only(), ReadOnly::No);
+
+        // ...and "what was there before" is a claim as readily as the absence
+        // of one: a page shown over a document a mode had already frozen
+        // leaves it frozen on the way out.
+        ed.apply(EditorCommand::SetReadOnly(true));
+        ed.apply(EditorCommand::SetScene(Some(page("c"))));
+        ed.apply(EditorCommand::SetScene(None));
+        assert_eq!(ed.buffer.read_only(), ReadOnly::Claimed);
+    }
+
+    /// A scene is swapped in whole, which is the right API and would otherwise
+    /// mean the reader loses their place on every re-render: a curriculum
+    /// rebuilds its page when one problem's state changes, and somebody
+    /// answering question nine would be thrown back to question one.
+    #[test]
+    fn re_installing_a_scene_keeps_the_reader_where_they_were() {
+        let mut ed = fresh("");
+        ed.apply(EditorCommand::SetScene(Some(page("a"))));
+        // The wheel, in the pixels a scene scrolls in.
+        ed.buffer.scene.as_mut().expect("a page is up").scroll = 300;
+
+        // The incoming page carries an offset of its own and it loses: the
+        // builder in Lisp described a document, not a position in one.
+        let mut next = page("b");
+        next.scroll = 5;
+        ed.apply(EditorCommand::SetScene(Some(next)));
+        assert_eq!(page_text(&ed.buffer).as_deref(), Some("b"));
+        assert_eq!(ed.buffer.scene.as_ref().unwrap().scroll, 300);
+    }
+
+    /// The other half of the same rule: a scene taken away and a new one put up
+    /// is a *different document arriving*, not the same one re-rendered, and it
+    /// starts where a document starts.
+    #[test]
+    fn clearing_the_scene_and_installing_a_new_one_starts_at_the_top() {
+        let mut ed = fresh("");
+        ed.apply(EditorCommand::SetScene(Some(page("a"))));
+        ed.buffer.scene.as_mut().expect("a page is up").scroll = 300;
+        ed.apply(EditorCommand::SetScene(None));
+        ed.apply(EditorCommand::SetScene(Some(page("b"))));
+        assert_eq!(ed.buffer.scene.as_ref().unwrap().scroll, 0);
+    }
+
+    /// `(image ID)` with no size is the form a document wants to write, and a
+    /// node of no size lays out to a box of no size — an equation nobody can
+    /// see. Core is where the bitmap's real size lives, so core is where the
+    /// number comes from.
+    #[test]
+    fn an_image_with_no_size_takes_the_size_of_its_bitmap() {
+        let mut ed = fresh("");
+        ed.add_image(
+            7,
+            Image { width: 120, height: 40, depth: 9, rgba: vec![0; 120 * 40 * 4] },
+        );
+        let mut scene = zemacs_gui::Scene::default();
+        let figure = scene.push(zemacs_gui::Node::Image {
+            image: 7,
+            width: 0,
+            height: 0,
+            depth: 0,
+        });
+        // ...and the same for an image *in a sentence*, which is the case the
+        // whole thing is being built for.
+        let inline = scene.push(zemacs_gui::Node::Text {
+            runs: vec![zemacs_gui::Run::Image {
+                image: 7,
+                width: 0,
+                height: 0,
+                depth: 0,
+                tag: None,
+            }],
+            align: zemacs_gui::Align::Start,
+        });
+        // A figure somebody scaled on purpose keeps the number they chose.
+        let scaled = scene.push(zemacs_gui::Node::Image {
+            image: 7,
+            width: 60,
+            height: 20,
+            depth: 0,
+        });
+        let root = scene.push(zemacs_gui::Node::Block(zemacs_gui::Block {
+            children: vec![figure, inline, scaled],
+            ..Default::default()
+        }));
+        scene.set_root(root);
+        ed.apply(EditorCommand::SetScene(Some(scene)));
+
+        let scene = ed.buffer.scene.as_ref().expect("a page is up");
+        assert_eq!(
+            scene.node(figure),
+            Some(&zemacs_gui::Node::Image { image: 7, width: 120, height: 40, depth: 9 })
+        );
+        let Some(zemacs_gui::Node::Text { runs, .. }) = scene.node(inline) else {
+            panic!("the paragraph survived the pass");
+        };
+        assert_eq!(
+            runs.first(),
+            Some(&zemacs_gui::Run::Image {
+                image: 7,
+                width: 120,
+                height: 40,
+                depth: 9,
+                tag: None
+            })
+        );
+        assert_eq!(
+            scene.node(scaled),
+            Some(&zemacs_gui::Node::Image { image: 7, width: 60, height: 20, depth: 0 })
+        );
+        // An id naming no bitmap is left exactly as it came rather than given
+        // an invented size: it arrived from arithmetic in Lisp.
+        let mut orphan = zemacs_gui::Scene::default();
+        let node = orphan.push(zemacs_gui::Node::Image { image: 99, width: 0, height: 0, depth: 0 });
+        orphan.set_root(node);
+        ed.apply(EditorCommand::SetScene(None));
+        ed.apply(EditorCommand::SetScene(Some(orphan)));
+        assert_eq!(
+            ed.buffer.scene.as_ref().unwrap().node(node),
+            Some(&zemacs_gui::Node::Image { image: 99, width: 0, height: 0, depth: 0 })
+        );
+    }
+
+    /// A bitmap a scene names and no overlay does survives the prune that some
+    /// unrelated overlay's deletion triggers.
+    ///
+    /// The bug this is here for is quiet: the page keeps its `ImageId`, the
+    /// image table stops resolving it, and the equation simply stops being
+    /// drawn — some time after the edit that dropped it, in a buffer that had
+    /// nothing to do with the page.
+    #[test]
+    fn deleting_an_overlay_does_not_drop_an_image_only_a_scene_still_names() {
+        let mut ed = fresh("hello");
+        let bitmap = |n| Image { width: n, height: n, depth: 0, rgba: vec![0; (n * n * 4) as usize] };
+        ed.add_image(7, bitmap(10)); // the scene's figure
+        ed.add_image(8, bitmap(12)); // an inline fragment on the same page
+        ed.add_image(9, bitmap(14)); // nobody's, once the overlay below goes
+
+        // An overlay naming an image, in the buffer that will hold the page —
+        // and a *second* buffer with the scene on it, so the prune has to walk
+        // more than the live one.
+        let home = ed.buffer.id;
+        let doomed = ed.make_overlay(0, 3);
+        ed.apply(EditorCommand::Overlay(OverlayEdit::Image(doomed, Some(9))));
+
+        let mut scene = zemacs_gui::Scene::default();
+        let figure = scene.push(zemacs_gui::Node::Image {
+            image: 7,
+            width: 10,
+            height: 10,
+            depth: 0,
+        });
+        let sentence = scene.push(zemacs_gui::Node::Text {
+            runs: vec![zemacs_gui::Run::Image {
+                image: 8,
+                width: 12,
+                height: 12,
+                depth: 2,
+                tag: None,
+            }],
+            align: zemacs_gui::Align::Start,
+        });
+        let root = scene.push(zemacs_gui::Node::Block(zemacs_gui::Block {
+            children: vec![figure, sentence],
+            ..Default::default()
+        }));
+        scene.set_root(root);
+        ed.apply(EditorCommand::CreateBuffer("*page*".into()));
+        ed.apply(EditorCommand::SetScene(Some(scene)));
+        ed.switch_buffer_id(home);
+
+        ed.apply(EditorCommand::Overlay(OverlayEdit::Delete(doomed)));
+        assert!(ed.has_image(7), "the figure is named by the page");
+        assert!(ed.has_image(8), "so is the fragment in the sentence");
+        assert!(!ed.has_image(9), "and nothing at all names the overlay's");
+    }
+
+    /// The whole argument for the field living on the buffer: there is no scene
+    /// table, so there is nothing to sweep and nothing to leak.
+    #[test]
+    fn a_killed_buffer_takes_its_scene_with_it() {
+        let mut ed = Editor::new();
+        ed.apply(EditorCommand::CreateBuffer("*page*".into()));
+        ed.apply(EditorCommand::SetScene(Some(page("gone"))));
+        let doomed = ed.buffer.id;
+
+        // Parked rather than lost: the page follows its document out of the
+        // pane, which is what a split showing it somewhere else needs.
+        ed.apply(EditorCommand::CreateBuffer("*plain*".into()));
+        assert!(ed.buffer.scene.is_none(), "a fresh buffer is a grid of cells");
+        assert_eq!(
+            ed.buffer_by_id(doomed).and_then(page_text).as_deref(),
+            Some("gone")
+        );
+
+        let at = ed
+            .buffer_names()
+            .iter()
+            .position(|n| n.starts_with("*page*"))
+            .expect("*page* is open");
+        ed.apply(EditorCommand::KillBuffer(at));
+        assert!(ed.buffer_by_id(doomed).is_none());
+        assert!(
+            std::iter::once(&ed.buffer)
+                .chain(ed.others.iter())
+                .all(|b| page_text(b).as_deref() != Some("gone")),
+            "the scene went with the buffer, because it was never anywhere else"
+        );
+    }
+
+    /// A scene belongs to a document, so parking one and bringing it back has
+    /// to leave both pages — and both read-only claims — exactly as they were.
+    #[test]
+    fn switching_buffers_leaves_each_scene_on_its_own_buffer() {
+        let mut ed = Editor::new();
+        ed.apply(EditorCommand::CreateBuffer("*one*".into()));
+        ed.apply(EditorCommand::SetScene(Some(page("one"))));
+        ed.apply(EditorCommand::CreateBuffer("*two*".into()));
+        ed.apply(EditorCommand::SetScene(Some(page("two"))));
+
+        let index = |ed: &Editor, name: &str| {
+            ed.buffer_names()
+                .iter()
+                .position(|n| n.starts_with(name))
+                .expect("buffer is open")
+        };
+        let back = index(&ed, "*one*");
+        ed.switch_buffer(back);
+        assert_eq!(page_text(&ed.buffer).as_deref(), Some("one"));
+        assert_eq!(ed.buffer.read_only(), ReadOnly::Claimed);
+        let forward = index(&ed, "*two*");
+        ed.switch_buffer(forward);
+        assert_eq!(page_text(&ed.buffer).as_deref(), Some("two"));
+        assert_eq!(ed.buffer.read_only(), ReadOnly::Claimed);
+
+        // ...and a buffer that never had one still has none, which is the half
+        // of "undisturbed" that a swap of two identical things would hide.
+        ed.apply(EditorCommand::CreateBuffer("*three*".into()));
+        assert!(ed.buffer.scene.is_none());
+        ed.switch_buffer(index(&ed, "*one*"));
+        assert_eq!(page_text(&ed.buffer).as_deref(), Some("one"));
     }
 
     /// The prompt whose answer goes back to Lisp. Core's half of it: open one,

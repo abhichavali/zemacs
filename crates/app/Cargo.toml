@@ -17,6 +17,11 @@ zemacs-git.workspace = true
 zemacs-dired.workspace = true
 zemacs-term.workspace = true
 zemacs-project.workspace = true
+# Layout and hit testing for a pane showing a scene. The event loop needs both
+# — a wheel notch has to be clamped against the document's height, and a click
+# has to come back as the tag under it — and neither is arithmetic core can do,
+# because a scene is measured in pixels rather than counted in cells.
+zemacs-gui.workspace = true
 zemacs-rpc.workspace = true
 crossbeam-channel.workspace = true
 anyhow.workspace = true

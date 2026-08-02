@@ -8,6 +8,13 @@ license.workspace = true
 ropey.workspace = true
 unicode-width.workspace = true
 
+# The node tree a `Buffer` may show instead of a grid of cells. It depends on
+# nothing at all — no SDL, no fonts, no core — so this is storage arriving, not
+# a layer: core holds a `Scene`, and `crates/render` is what lays one out and
+# paints it. The dependency runs this way and never the other, which is what
+# lets the layout engine be tested with no window open.
+zemacs-gui.workspace = true
+
 # Search and `:s` are regex, and a hand-rolled engine is a bug farm rather than
 # laziness. Already in the lock as a tree-sitter dependency, so this costs no
 # new build. What it does *not* give us is vim's dialect — see `vim_regex`.

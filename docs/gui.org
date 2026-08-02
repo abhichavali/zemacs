@@ -1,0 +1,342 @@
+#+TITLE: Scenes
+#+SUBTITLE: a pixel-space GUI a window can hold instead of a grid of cells
+
+* Why this exists
+
+Everything the editor draws today is cells. [[file:../crates/core/src/overlay.rs][overlay.rs]] says so out loud, in the
+note on =Overlay::scale=: /the widest scale claimed by any overlay touching a line
+sets that line's cell, and the grid stays a grid/. That is the right trade for a
+buffer you are typing into — the cursor and the renderer have to agree about
+where column 12 is — and it is a ceiling nothing on the overlay side can lift.
+
+=org-frozen= is the mode that ran into it. It is already org "as a printed page":
+drawers stop occupying rows, a =#+begin_src= is gone and its body is highlighted
+as Python, a table is aligned columns under a rule. But every one of those still
+happens *on the grid*, so a heading is 1.5× only by making its whole line 1.5×,
+a figure claims whole rows, two columns are two columns of monospace, and prose
+is set in a font chosen for code.
+
+A scene is the other thing a window can show. It is laid out in **pixels**, not
+cells; its text is measured, wrapped and kerned by the font rather than counted;
+and it is a tree rather than a sequence of lines. It is not an editing surface
+and does not pretend to be one — a buffer showing a scene is read-only, which is
+what =org-frozen= already enforces in core.
+
+* The split
+
+Same rule as everywhere else in this editor ([[file:boundary.org][boundary.org]]).
+
+| In Rust                                          | In Lisp                                   |
+|--------------------------------------------------+-------------------------------------------|
+| The node tree's storage, and the ids into it     | What nodes exist, and what is in them     |
+| Block layout, text wrapping, hit testing         | Padding, gaps, sizes, colours — the taste |
+| Measuring a string in a real font                | Nothing; it cannot see a font             |
+| Painting boxes, runs and images through SDL      | Which box, which run, which image         |
+| Routing a click to the node under it             | What a click on that node means           |
+
+Three crates, and the reason there are three:
+
+- =crates/gui= — the model, the layout engine and hit testing. **No SDL, no core,
+  no fonts.** Text is measured through a [[* Measuring][=Measure=]] trait, so the whole engine is
+  testable against a fake monospace metric with no window open. This is where
+  every wrapping and stacking bug will be, so this is where the tests are.
+- =crates/core= — storage, and the two facts only core has. A =Buffer= holds its
+  own [[* Ids][=Scene=]]; nothing here lays anything out. It is not /storage only/, which an
+  earlier draft claimed: installing a scene fills in the size of any image the
+  tree names, from the image table core already keeps, and carries the outgoing
+  scene's scroll onto the incoming one. Both need something the writer of the
+  scene does not know.
+- =crates/render= — paint. It already owns the fonts, the glyph caches, the image
+  uploads and the frame digest, so it implements =Measure= and walks the laid-out
+  tree. **A scene adds no second font stack.**
+
+* The model
+
+A node is one of four things. Four, not fourteen: everything a document needs is
+these composed, and a widget that turns out to be worth a fifth is a fifth we
+will have a document asking for.
+
+#+begin_src rust
+pub enum Node {
+    /// Children stacked down or across, with padding, a gap, and optionally a
+    /// background and a border. The only container.
+    Block(Block),
+    /// A paragraph. One or more `Run`s, wrapped as a single flow — so a bold
+    /// word mid-sentence does not start a new box, and the line breaks fall
+    /// where the font says they do.
+    Text { runs: Vec<Run>, align: Align },
+    /// A bitmap by `ImageId`, the same id core already keys LaTeX previews and
+    /// figures by. `crates/render` has the texture; this has the size.
+    ///
+    /// Block level — a figure. An image *in a sentence* is not this, it is a
+    /// `Run`; see below.
+    Image { image: ImageId, width: u32, height: u32, depth: u32 },
+    /// A fixed gap or a rule: a box with a size and maybe a colour, no children.
+    Rect { w: Length, h: Length, fill: Option<FaceId> },
+}
+#+end_src
+
+Colour is a =FaceId=, a plain integer core maps to its own =HlKind=. The crate
+holds no dependency on core and this is what that costs: one integer.
+
+=None= means two different things and both are deliberate. On a =Run='s style it
+is /the pane's own foreground/, which is why the renderer's colour resolver takes
+an =Option<FaceId>= rather than a =FaceId= — there is no face that spells
+"default". On a =Block='s background and a =Rect='s fill it is /paint nothing/,
+which is the only reading under which a =Rect= is usable as a spacer.
+
+A =Block='s border is one pixel, drawn *inside* the rect, in frame order — so a
+child with a background of its own paints over it. That is the ceiling
+=Block::border= already accepts rather than a bug, and it is written here because
+the word "border" on its own settles none of those three questions.
+
+** Where a paragraph gets its width
+
+A =Text= frame cannot be both /as wide as its longest line/, which is what makes
+=Auto= shrink to prose, and /as wide as the measure/, which is what =align= needs
+something to align *in*. So it is both, in the two places the question is asked:
+measuring reports the longest line, placing hands the paragraph its parent's full
+content width — *down a column only*. Across a row a paragraph takes its own
+width, because two cells side by side would otherwise each be as wide as the row.
+
+That asymmetry is real and worth knowing before you write a document that
+depends on it.
+
+A =Run= is text plus how it is set: point size *as a percentage of the body
+size* (the unit =Overlay::scale= already uses, for the same reason — the bridge to
+Lisp is integers), weight, slant, face, and an optional =Tag=.
+
+*A run may be an image instead of text*, carrying =ImageId=, width, height and
+=depth=. This is not symmetry for its own sake: =$x_1$= in the middle of a
+sentence works on the grid today, positioned against the baseline by the =depth=
+core's =Image= already carries, and a scene that could only put an equation in a
+box of its own would be a regression on the one document this is being built
+for. An image run sits on the line's baseline, hangs =depth= pixels below it, and
+takes part in wrapping like any other piece.
+
+A =Tag= is an integer Lisp chose, and it hangs on a *=Block= or a =Run=*, not only
+a run — a figure with its caption, a problem card, a pill are all boxes, and a
+tag only on runs leaves every one of them cold everywhere but on its words.
+Rust does nothing with a tag except hand it back when a click lands inside — the
+same contract an =OverlayId= has, and for the same reason: /an arbitrary Lisp
+value never has to survive a round trip through C as printed source/.
+
+** Alignment
+
+=Block= and =Text= carry =align=: =Start= | =Center= | =End=. A centred figure and
+its caption under it are the whole reason; without it every document has to know
+its own measure to fake a centre with padding.
+
+** Lengths
+
+=Length= is =Px(i32)= | =Pct(u16)= | =Fill= | =Auto=. =Auto= means "as big as the
+content"; =Fill= means "share what is left with the other =Fill= siblings". That is
+enough for a centred measure with margins, a two-column figure-plus-caption, and
+a table row, and it is small enough to lay out in one pass down and one back up.
+
+** Ids
+
+*There is no =SceneId=.* An earlier draft of this file had one, and an
+=Editor=-side table to resolve it, and both were answers to a question nobody
+asks: Lisp never names a scene, it names a *buffer* — =(scene-set (current-buffer)
+...)= — and a buffer already has somewhere to put one. So the =Scene= lives on the
+=Buffer= itself, an id space stops existing, and killing a buffer takes its scene
+with it for free.
+
+=NodeId= is an index into its own scene's arena, for the same reason: a scene is
+swapped in whole, and Lisp names a node only in a click reply or a
+scroll-into-view, where the scene is already known.
+
+* Measuring
+
+#+begin_src rust
+pub trait Measure {
+    /// Advance width of `text` set in `style`, in pixels.
+    fn advance(&self, text: &str, style: Style) -> i32;
+    /// Line height and ascent for `style`, in pixels.
+    fn line(&self, style: Style) -> (i32, i32);
+}
+#+end_src
+
+Two methods, because those are the two questions block layout asks. The renderer
+implements them over its existing =Face= cache. The test suite implements them as
+=len() * 8=, which is what makes every wrapping test in =crates/gui= readable.
+
+** A size is one of four steps, not a free percentage
+
+An earlier draft of this file asked for both /point size as a percentage of the
+body size/ and /a scene adds no second font stack/, and did not notice that the
+second forbids the first. Honouring =1.37×= literally means an open =Font= plus a
+glyph cache per distinct number, which is exactly the growth =SCALE_STEPS= exists
+to bound.
+
+So a scene's sizes snap through the same four steps an =Overlay::scale= does:
+=:size 175= is drawn at 200%, =:size 110= at 100%. The percentage is still how a
+size is *written*, because the bridge to Lisp is integers — it is just not
+continuous. A document with six distinct type sizes in it cannot have them, and
+=*org-frozen-title-scale*= means whichever step it lands on.
+
+** The awkward part of implementing it
+
+=advance(&self, ...)= against a =&mut= font cache is the whole difficulty, and it
+is not visible in the two-line trait. The renderer's answer is a pre-pass:
+=layout_scene= walks the arena and opens every face the scene's runs name, and
+measuring is then a pure map read. A face that will not open degrades to the body
+metric rather than measuring zero, so a missing font is a document set in the
+wrong size rather than a document collapsed to a point.
+
+* Layout
+
+One pass, top down, returning a =Frame= per node: an absolute rect plus, for a
+=Text= node, the lines it broke into and where each run sits on each line. The
+=Frame= list is flat and in paint order, which is also hit-test order reversed.
+
+A =Layout= also answers =rect_of(NodeId)=. Four commands in the curriculum modes
+are =goto-char= today — next problem, previous problem, jump to unit — and in a
+scene "go there" means "scroll that node into view", which needs its rect.
+
+Nothing about layout is incremental yet. A document relays out when its scene
+changes, not per frame, and the result is cached beside the scene — measured
+against =docs/curriculum.org=, which is the longest thing we have.
+
+* What a window shows
+
+A =Buffer= grows one field: =scene: Option<Scene>=. When it is set, the pane draws
+the scene instead of =draw_document=, and the modeline, the buffer list,
+=switch-to-buffer= and killing all keep working unchanged, because it is still a
+buffer. That is the whole integration, and it is why the field is on the buffer
+rather than on the window: a scene follows its document between panes, which is
+exactly what =math-code-edit='s split needs.
+
+Scrolling is the scene's own: a =y= offset in pixels, moved by the wheel and by
+the motions bound in the mode. The cursor does not exist here.
+
+*A swap carries the scroll across.* Installing a scene on a buffer that already
+has one keeps the offset the reader was at and ignores whatever the incoming
+scene arrived with; clearing and installing later starts at the top, because
+that is a different document rather than the same one re-rendered. Without this
+a curriculum — which re-renders whenever a problem's state changes — throws you
+back to page one every time you answer a question, and it took writing the
+parser to notice.
+
+Core stores the offset *raw*: the height that would clamp it belongs to a
+laid-out scene and core cannot measure a font. Clamping is one function on the
+app side, and it stays one — the wheel, the swap, and the scroll-into-view the
+curriculum's "next problem" needs are three callers of one rule.
+
+* What Lisp gets
+
+Builders, not a DOM. A scene is described in one form and swapped in whole,
+because the alternative — mutate this node, now this one — is the API that makes
+every caller hold ids it has to keep in step with the document.
+
+#+begin_src lisp
+(scene-set (current-buffer)
+  (block :pad 48 :gap 12 :width (pct 100)
+    (text (run "The Rank-Nullity Theorem" :size 200 :bold t))
+    (text (run "For a linear map ") (run "T : V → W" :italic t)
+          (run ", the dimensions satisfy:"))
+    (image (org-latex-image "\\dim V = \\operatorname{rank} T + \\dim\\ker T"))))
+#+end_src
+
+** Two languages, and the difference matters
+
+The form above is *not* what reaches Rust, and an earlier draft of this file
+presented it as if it were. =(image (org-latex-image "\\dim V = ..."))= is a
+**call**: =org-latex-image= runs, rasterises, and answers an id. A parser cannot
+evaluate anything, so what crosses the boundary is =(image 7314 :width 210 :height
+28 :depth 6)=.
+
+So there are two languages with the same shape, and both are real:
+
+- What a *config author* writes — =block=, =text=, =run= and the rest are ordinary
+  Lisp functions that evaluate their arguments and answer the wire form. This is
+  where =org-latex-image= runs and where a document's taste lives.
+- What crosses into Rust — printed, fully evaluated, integers and strings only.
+  =crates/lisp/src/scene.rs= reads it.
+
+The wire grammar, which is the actual contract:
+
+#+begin_example
+scene     := node                          ; and nothing after it
+node      := "(" "block" blockarg* ")" | "(" "text" textarg* ")"
+           | "(" "image" imgarg*  ")" | "(" "rect" rectarg* ")"
+blockarg  := ":pad" i32 | ":gap" i32 | ":dir" ("row"|"column")
+           | ":width" length | ":height" length | ":align" align
+           | ":background" face | ":border" face | ":tag" tag | node
+textarg   := ":align" align | run
+run       := "(" "run" (string | ":size" 1..=65535 | ":bold" bool
+                       | ":italic" bool | ":face" face | ":tag" tag)* ")"
+           | "(" "image-run" (imageid | ":width" u32 | ":height" u32
+                             | ":depth" u32 | ":tag" tag)* ")"
+imgarg    := imageid | ":width" u32 | ":height" u32 | ":depth" u32
+rectarg   := ":width" length | ":height" length | ":fill" face
+length    := i32 | "(" "pct" 0..=65535 ")" | "fill" | "auto"
+align     := "start" | "center" | "end"
+face      := 0..=255 | "nil"        ; nil is the pane's own colour
+tag       := i64 | "nil"
+bool      := "t" | "nil"            ; strict, not generalised truth
+#+end_example
+
+Keywords are optional, in any order, and may interleave with children — an
+argument list built with =append= comes out that way. Every out-of-range integer
+is an error naming the range rather than a truncating cast.
+
+*Symbols are matched however the printer cased them.* =prin1= upcases everything,
+so the image itself emits =(BLOCK :PAD 48 (TEXT (RUN "x" :BOLD T)))= while every
+example written by a human is lower case. A case-sensitive reader would have
+accepted only hand-typed forms and rejected every one the editor produced. A
+package prefix is stripped for the same reason.
+
+Strings undo exactly what =zemacs_rpc::lisp::string= does, so the two halves of
+the bridge agree by construction rather than by coincidence.
+
+One verb into core, =scene-set=.
+
+* Ceilings, written down now
+
+- *No editing.* A scene is read-only. Typing in one is not "not implemented
+  yet", it is the reason the grid exists.
+- *No incremental layout.* A scene relays out whole. Ceiling: a document long
+  enough that a full relayout is felt on a keystroke that changes it, which
+  nothing does today because nothing types into one.
+- *No RTL, no bidi, no shaping beyond what SDL_ttf does.* Same as the grid.
+- *One scroll offset per scene*, so a scene with two independently scrolling
+  panes inside it is not expressible. Upgrade path: the offset moves onto the
+  =Block=.
+- *No table columns.* Column width is a constraint *across siblings* and no
+  per-child =Length= can say it, so a table is row-direction =Block=\s whose cells
+  all state the *same* =Px= or =Pct= widths — the writer computes them once from
+  the widest cell in each column and repeats them per row. Not =Auto=: =Auto=
+  sizes a cell to its own content, so column one would be as wide as "Name" in
+  one row and "Wolfgang" in the next and the table would not line up at all.
+  With stated widths the residual ceiling is that a cell too narrow for its text
+  wraps and makes its row taller, and nothing clips, so a long unbroken word
+  overflows its cell. The document that cannot live with that is the document
+  that earns a fifth node kind, =Grid=. Nothing in =examples/math/= is one yet.
+- *A code block is one =Text= node per line*, not one node with newlines in it.
+  There are no hard breaks: every whitespace is a break opportunity and nothing
+  forces one, because a paragraph is a flow. Per line is what a listing wants
+  anyway — each line carries its own syntax runs, which is exactly what
+  =%org-frozen-highlight= already produces.
+- *No selection, no copy, no search.* =org-frozen= argues out loud that these are
+  "the difference between a read-only buffer and a disabled one", and a scene
+  takes all three back. They are the first thing to build after it renders, not
+  a thing to leave written down and forgotten.
+- *A paragraph cannot carry a tag.* A =Tag= hangs on a =Block= or a =Run=, and
+  =Node::Text= has no field for one — so a whole clickable sentence means tagging
+  every run in it with the same integer, or wrapping it in a block that exists
+  only to be clicked. Both work; neither is what you would write. This is a gap
+  in the model rather than in any one crate, and the fix is one field.
+- /An image with no size lays out to nothing./ *Closed.* =crates/gui= holds a size
+  and =crates/render= holds the texture, so =(image 7314)= was a 0×0 box and an
+  equation that rendered as nothing — including the example above. Core now
+  fills width, height and depth in at install time from its own image table, for
+  any image node whose width and height are both zero. A figure that was
+  deliberately scaled keeps its numbers, and an id naming no bitmap is left
+  alone. *Do not add a =:width= to the example to "fix" it* — that would hide the
+  behaviour this paragraph is describing.
+- *A curriculum's state is off the page.* =:ZEMACS_STATUS:= lives in a property
+  drawer and =org-frozen= hides drawers by construction, so the one mode built
+  for reading a curriculum cannot show which problems are done. That is a fact
+  about the *mode*, not about scenes, and the scene port is when to fix it.

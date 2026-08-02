@@ -576,6 +576,54 @@ fn a_programming_problem_becomes_a_program_a_venv_and_a_run_key() {
     );
     std::fs::write(venv.join(".zemacs-packages"), "numpy\nsympy\n").unwrap();
 
+    // --- the same run, with point nowhere near it -----------------------------
+    //
+    // `math-code-run` starts from `(point)`, and a *scene* has none: a curriculum
+    // rendered as a page has no cursor, and the buffer's point is wherever the
+    // keyboard last left it — very likely another problem. So a click carries the
+    // problem it was built for and calls the sibling, and this is that sibling
+    // asked to run problem two while point sits in the preamble, inside no
+    // problem at all.
+    does(&shared, &lisp, "(goto-char 0)");
+    assert_eq!(
+        probe(&shared, &lisp, "(if (math-problem-at-point) \"yes\" \"no\")"),
+        "no",
+        "point has to be somewhere that would give the wrong answer for this to prove anything"
+    );
+    while rx.try_recv().is_ok() {}
+    does(&shared, &lisp, "(math-code-run-problem (second (math-problems)))");
+    let verb = loop {
+        match rx.recv_timeout(PATIENCE) {
+            Ok(EditorCommand::Term(verb)) => break verb,
+            Ok(_) => continue,
+            Err(e) => panic!("no terminal verb arrived: {e}"),
+        }
+    };
+    assert_eq!(
+        verb,
+        format!("rerun:gauss_test:/bin/sh {}", script_path.display()),
+        "the problem it was handed is the block that ran, not the one point is in"
+    );
+    // ...and the third problem is `:tangle no`, so the sibling refuses for the
+    // block's own reason. The sentence itself is pinned above, where
+    // `math-code-edit` is asked the same thing; what matters here is that being
+    // handed a problem does not talk anything past a refusal.
+    while rx.try_recv().is_ok() {}
+    does(&shared, &lisp, "(math-code-run-problem (third (math-problems)))");
+    assert!(rx.try_recv().is_err(), "a block that says do not write me out is not run");
+
+    // The point-reading command is now a call to its sibling, so `SPC m x` from
+    // the preamble still says the one sentence it always said. Read out of the
+    // messages *since* the call, because the log is cumulative and a refusal
+    // matched anywhere in it would prove nothing.
+    let from = shared.lock().unwrap().messages.len();
+    does(&shared, &lisp, "(math-code-run)");
+    let said = shared.lock().unwrap().messages[from..].to_vec();
+    assert!(
+        said.iter().any(|m| m == "math: no problem at point"),
+        "reading point is still what the key does: {said:#?}"
+    );
+
     // --- the program's own buffer ---------------------------------------------
     //
     // Opening a curriculum's program turns on `math-code`, which is where its

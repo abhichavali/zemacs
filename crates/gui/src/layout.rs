@@ -599,6 +599,18 @@ fn wrap(runs: &[Run], max_w: i32, m: &dyn Measure) -> Vec<Line> {
             }
         }
     }
+    // A paragraph that is *only* whitespace has parked every segment in
+    // `pending` and never met a word to flush them in front of, so it would
+    // finish with no lines and therefore no height at all. That is right for a
+    // trailing space after a word — it is the space a break ate — and wrong for
+    // the one case where the whitespace is the whole content: a blank line in a
+    // listing, which `docs/gui.org` says is a `text` node of its own, would
+    // silently close up and the code block would lose its paragraphing.
+    if cur.pieces.is_empty() && lines.is_empty() && !pending.is_empty() {
+        for &p in &pending {
+            x += emit(&mut cur, &mut desc, &segs[p], runs, x, m);
+        }
+    }
     if !cur.pieces.is_empty() {
         flush(&mut lines, &mut cur, &mut desc, &mut y);
     }
@@ -701,17 +713,37 @@ fn flush(lines: &mut Vec<Line>, cur: &mut Line, desc: &mut i32, y: &mut i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Block, Length::*, Node, Run, Scene, Style};
+    use crate::{Block, Family, Length::*, Node, Run, Scene, Style};
 
     /// A font that does not exist, and the reason this crate has no
     /// dependencies: eight pixels a character, sixteen tall, twelve of them
     /// above the baseline, all three scaled by the run's size percentage. Every
     /// expected number below is arithmetic on those four facts.
-    struct Mono;
+    ///
+    /// The *proportional* family is the eight, not the monospace one, and that
+    /// is deliberate rather than backwards: [`Style::default`] is prose, so
+    /// every test here that says nothing about a family is measured in it, and
+    /// pinning the default to the number the tests were written against is what
+    /// keeps this fake honest about wrapping instead of about a family. A run
+    /// that asks for [`Family::Mono`] measures twelve, which is the only reason
+    /// a test can tell the two apart at all — a real proportional face differs
+    /// from a real monospace one by exactly this, a different width for the same
+    /// string.
+    struct Fake;
 
-    impl Measure for Mono {
+    /// Pixels a character in `family`. Wider for mono, so a run that asked for
+    /// the coding font wraps sooner and the difference shows up as a line break
+    /// rather than as a number nobody looks at.
+    fn per_char(family: Family) -> i32 {
+        match family {
+            Family::Prose => 8,
+            Family::Mono => 12,
+        }
+    }
+
+    impl Measure for Fake {
         fn advance(&self, text: &str, style: Style) -> i32 {
-            text.chars().count() as i32 * 8 * style.size as i32 / 100
+            text.chars().count() as i32 * per_char(style.family) * style.size as i32 / 100
         }
         fn line(&self, style: Style) -> (i32, i32) {
             (16 * style.size as i32 / 100, 12 * style.size as i32 / 100)
@@ -724,6 +756,10 @@ mod tests {
 
     fn sized(text: &str, size: u16) -> Run {
         Run::Text { text: text.into(), style: Style { size, ..Style::default() }, tag: None }
+    }
+
+    fn in_family(text: &str, family: Family) -> Run {
+        Run::Text { text: text.into(), style: Style { family, ..Style::default() }, tag: None }
     }
 
     fn tagged(text: &str, tag: Tag) -> Run {
@@ -747,7 +783,7 @@ mod tests {
         let mut s = Scene::default();
         let id = s.push(text(runs));
         s.set_root(id);
-        layout(&s, Rect { x: 0, y: 0, w, h: 1000 }, &Mono)
+        layout(&s, Rect { x: 0, y: 0, w, h: 1000 }, &Fake)
     }
 
     /// One block, `kids` inside it, laid out in `viewport`.
@@ -756,7 +792,7 @@ mod tests {
         let ids: Vec<NodeId> = kids.into_iter().map(|n| s.push(n)).collect();
         let root = s.push(Node::Block(Block { children: ids, ..block }));
         s.set_root(root);
-        layout(&s, viewport, &Mono)
+        layout(&s, viewport, &Fake)
     }
 
     /// What each line reads as, which is the only readable way to assert that a
@@ -827,6 +863,66 @@ mod tests {
         let at: Vec<(usize, i32, i32)> =
             lines[0].pieces.iter().map(|p| (p.run, p.x, p.width)).collect();
         assert_eq!(at, vec![(0, 0, 16), (1, 16, 32), (2, 48, 40)]);
+    }
+
+    /// A run's family reaches the metric, and reaches it per *run* rather than
+    /// per paragraph.
+    ///
+    /// This is the whole of what this crate does with a family — it never
+    /// interprets one — so the failure it guards is the plumbing quietly
+    /// dropping it somewhere between the run and the `Measure` call: a
+    /// paragraph of prose with an inline identifier in it would then be laid
+    /// out as if the identifier were prose, and the piece after it would start
+    /// where the narrower face ended and be painted over.
+    #[test]
+    fn a_run_is_measured_in_its_own_family_and_its_neighbour_in_theirs() {
+        let runs = vec![
+            in_family("aaaa", Family::Prose),
+            in_family("bbbb", Family::Mono),
+            in_family("cccc", Family::Prose),
+        ];
+        let out = paragraph(runs.clone(), 400);
+        let lines = &out.frames[0].lines;
+        assert_eq!(lines.len(), 1, "three runs, one flow, one line");
+        // Four characters at eight, twelve and eight pixels, laid end to end —
+        // and each piece starting exactly where the one before it ended is the
+        // property `sidesrather` was the symptom of losing.
+        let at: Vec<(i32, i32)> = lines[0].pieces.iter().map(|p| (p.x, p.width)).collect();
+        assert_eq!(at, vec![(0, 32), (32, 48), (80, 32)]);
+    }
+
+    /// The default family is prose, so a run that says nothing about one is set
+    /// the way a reader expects a paragraph to be — which is the reason this
+    /// field exists rather than a detail of it.
+    #[test]
+    fn a_run_that_names_no_family_is_measured_as_prose() {
+        let plain = paragraph(vec![run("aaaaaaaa")], 400);
+        let prose = paragraph(vec![in_family("aaaaaaaa", Family::Prose)], 400);
+        let mono = paragraph(vec![in_family("aaaaaaaa", Family::Mono)], 400);
+        let width = |l: &Layout| l.frames[0].lines[0].pieces[0].width;
+        assert_eq!(width(&plain), width(&prose));
+        assert!(width(&mono) > width(&plain), "the two families measured the same");
+    }
+
+    /// Wrapping asks the metric, so a family changes where the lines break and
+    /// not only how wide a piece is. A listing set in the coding font runs out
+    /// of measure sooner than the same words as prose, and that has to be what
+    /// the wrapper sees.
+    #[test]
+    fn a_family_moves_where_a_paragraph_breaks() {
+        let words = "aaa bbb ccc";
+        // Eighty pixels take all three words at eight pixels a character (11
+        // characters, 88 — so the last word goes over) and only two at twelve.
+        let prose = paragraph(vec![in_family(words, Family::Prose)], 88);
+        let mono = paragraph(vec![in_family(words, Family::Mono)], 88);
+        assert_eq!(
+            text_of(&[in_family(words, Family::Prose)], &prose.frames[0].lines),
+            vec!["aaa bbb ccc"]
+        );
+        assert_eq!(
+            text_of(&[in_family(words, Family::Mono)], &mono.frames[0].lines),
+            vec!["aaa bbb", "ccc"]
+        );
     }
 
     #[test]
@@ -962,7 +1058,7 @@ mod tests {
             let root =
                 s.push(Node::Block(Block { width: Px(100), children: vec![t], ..Block::default() }));
             s.set_root(root);
-            layout(&s, Rect { x: 0, y: 0, w: 500, h: 500 }, &Mono)
+            layout(&s, Rect { x: 0, y: 0, w: 500, h: 500 }, &Fake)
         };
         // The paragraph takes the whole measure the column gave it — that is
         // what there is to be centred *in*, and a ragged frame would leave
@@ -996,7 +1092,7 @@ mod tests {
     #[test]
     fn padding_and_gap_both_move_children_and_nesting_composes() {
         let (s, [root, ..]) = nested();
-        let out = layout(&s, Rect { x: 0, y: 0, w: 500, h: 500 }, &Mono);
+        let out = layout(&s, Rect { x: 0, y: 0, w: 500, h: 500 }, &Fake);
         let rects: Vec<Rect> = out.frames.iter().map(|f| f.rect).collect();
         assert_eq!(
             rects,
@@ -1018,7 +1114,7 @@ mod tests {
     #[test]
     fn rect_of_answers_for_a_node_nested_deep_in_the_tree() {
         let (s, [root, _, inner, dot]) = nested();
-        let out = layout(&s, Rect { x: 0, y: 0, w: 500, h: 500 }, &Mono);
+        let out = layout(&s, Rect { x: 0, y: 0, w: 500, h: 500 }, &Fake);
         assert_eq!(out.rect_of(root), Some(Rect { x: 0, y: 0, w: 27, h: 37 }));
         assert_eq!(out.rect_of(inner), Some(Rect { x: 10, y: 20, w: 7, h: 7 }));
         assert_eq!(out.rect_of(dot), Some(Rect { x: 12, y: 22, w: 3, h: 3 }));
@@ -1052,7 +1148,7 @@ mod tests {
     #[test]
     fn hit_testing_finds_the_innermost_node() {
         let (s, [root, inner, t]) = tagged_scene();
-        let out = layout(&s, Rect { x: 0, y: 0, w: 200, h: 200 }, &Mono);
+        let out = layout(&s, Rect { x: 0, y: 0, w: 200, h: 200 }, &Fake);
         // The paragraph is at (15, 15) and ten characters wide.
         assert_eq!(hit(&out, 20, 20).map(|h| h.0), Some(t));
         // Inside the inner block but below its one line of prose.
@@ -1065,7 +1161,7 @@ mod tests {
     #[test]
     fn hit_testing_reports_the_nearest_enclosing_tag() {
         let (s, [root, inner, t]) = tagged_scene();
-        let out = layout(&s, Rect { x: 0, y: 0, w: 200, h: 200 }, &Mono);
+        let out = layout(&s, Rect { x: 0, y: 0, w: 200, h: 200 }, &Fake);
         // The untagged root has no tag to give.
         assert_eq!(hit(&out, 2, 2), Some((root, None)));
         // A click on the tagged block's own padding is a click on the block —
@@ -1087,7 +1183,7 @@ mod tests {
         let id = s.push(rect(Px(10), Px(10)));
         s.set_root(id);
         s.scroll = 40;
-        let out = layout(&s, Rect { x: 0, y: 100, w: 200, h: 200 }, &Mono);
+        let out = layout(&s, Rect { x: 0, y: 100, w: 200, h: 200 }, &Fake);
         assert_eq!(out.frames[0].rect, Rect { x: 0, y: 60, w: 10, h: 10 });
         // Hit testing is in the same coordinates, so a scrolled scene needs no
         // second correction anywhere else.
@@ -1108,15 +1204,35 @@ mod tests {
         }));
         s.set_root(root);
         let view = Rect { x: 0, y: 0, w: 200, h: 40 };
-        let unscrolled = layout(&s, view, &Mono).content_height();
+        let unscrolled = layout(&s, view, &Fake).content_height();
         assert_eq!(unscrolled, 80);
         s.scroll = 25;
-        assert_eq!(layout(&s, view, &Mono).content_height(), unscrolled);
+        assert_eq!(layout(&s, view, &Fake).content_height(), unscrolled);
+    }
+
+    /// The blank line between two paragraphs of a listing. `docs/gui.org` says
+    /// a code block is one `text` node per line precisely because there are no
+    /// hard breaks — so if a whitespace-only line has no height, every blank
+    /// line in every listing closes up.
+    #[test]
+    fn a_paragraph_of_nothing_but_spaces_still_occupies_a_line() {
+        let out = paragraph(vec![run("   ")], 400);
+        assert_eq!(out.frames[0].lines.len(), 1);
+        assert!(out.frames[0].lines[0].height > 0);
+        assert!(out.frames[0].rect.h > 0, "and the frame has that height");
+    }
+
+    /// ...but a space that merely *trails* a word is still the space a break
+    /// ate, and must not buy a second line.
+    #[test]
+    fn a_space_after_the_last_word_does_not_add_a_line() {
+        let out = paragraph(vec![run("hi ")], 400);
+        assert_eq!(out.frames[0].lines.len(), 1);
     }
 
     #[test]
     fn an_empty_scene_lays_out_to_nothing() {
-        let out = layout(&Scene::default(), Rect { x: 0, y: 0, w: 100, h: 100 }, &Mono);
+        let out = layout(&Scene::default(), Rect { x: 0, y: 0, w: 100, h: 100 }, &Fake);
         assert!(out.frames.is_empty());
         assert_eq!(hit(&out, 0, 0), None);
         assert_eq!(out.rect_of(0), None);
@@ -1139,15 +1255,21 @@ mod tests {
         assert_eq!(out.frames[1].rect, Rect { x: 0, y: 0, w: 0, h: 0 });
     }
 
+    /// A paragraph with *nothing in it* has no lines — which is why a deliberate
+    /// gap is a `Rect` and not an empty paragraph.
+    ///
+    /// Whitespace is deliberately not in this list, though it was once: three
+    /// spaces are content, and a `text` node of three spaces is a line of three
+    /// spaces. See `a_paragraph_of_nothing_but_spaces_still_occupies_a_line` —
+    /// the blank line in a listing is written as exactly that node, and having
+    /// it measure zero closed up every code block that had one.
     #[test]
     fn a_paragraph_of_no_text_is_a_paragraph_of_no_lines() {
-        for runs in [vec![], vec![run("")], vec![run("   ")]] {
+        for runs in [vec![], vec![run("")]] {
             let out = paragraph(runs, 100);
             assert!(out.frames[0].lines.is_empty());
             assert_eq!(out.frames[0].rect.h, 0);
         }
-        // Which is why a deliberate gap is a `Rect` and not an empty
-        // paragraph — the one takes room and the other cannot.
     }
 
     #[test]
@@ -1157,7 +1279,7 @@ mod tests {
         let b = s.push(Node::Block(Block { children: vec![a], ..Block::default() }));
         assert_eq!(b, 1, "the two blocks name each other");
         s.set_root(a);
-        let out = layout(&s, Rect { x: 0, y: 0, w: 100, h: 100 }, &Mono);
+        let out = layout(&s, Rect { x: 0, y: 0, w: 100, h: 100 }, &Fake);
         assert!(out.frames.len() <= MAX_DEPTH as usize + 1);
     }
 
@@ -1173,7 +1295,7 @@ mod tests {
         let root =
             s.push(Node::Block(Block { gap: 4, children: vec![real, 99], ..Block::default() }));
         s.set_root(root);
-        let dangling = layout(&s, Rect { x: 0, y: 0, w: 100, h: 100 }, &Mono);
+        let dangling = layout(&s, Rect { x: 0, y: 0, w: 100, h: 100 }, &Fake);
         // The missing child draws nothing but still takes its gap, so the two
         // walks agree about which child is which — and the height differs from
         // the one-child case by exactly that gap.

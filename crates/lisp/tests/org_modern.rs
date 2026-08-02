@@ -4,7 +4,7 @@
 //! The feature is entirely Lisp over `make-overlay` and the `display` property,
 //! so the only honest way to check it is to boot the real image against a real
 //! [`Editor`] and read back the overlays the editor actually holds. That is
-//! also the only way to prove the *glyphs* survive: `◉` is a non-ASCII literal
+//! also the only way to prove the *glyphs* survive: `●` is a non-ASCII literal
 //! in a `load`ed file, which arrives in the image as an extended string and has
 //! to be UTF-8 encoded on its way through the shim.
 //!
@@ -186,13 +186,13 @@ fn org_markup_is_drawn_as_glyphs_and_revealed_under_the_cursor() {
     });
 
     let want: Vec<&str> = vec![
-        "◉",    // `*` — level 1: no padding
+        "●",    // `*` — level 1: no padding
         "bold", // `*bold*` — markers gone, one overlay over the whole run
         "link", // `[[https://x/a/b][link]]` — the description alone
         " ○",   // `**` — level 2: one space, so the heading text does not move
         "•",    // `- item one`
         "•",    // `- [X] done`
-        "☑",    // `[X]`
+        "✓",    // `[X]`
     ];
     let got: Vec<String> = ovs.iter().map(|o| o.2.clone().unwrap_or_default()).collect();
     assert_eq!(got, want, "one glyph per substitution: {ovs:#?}");
@@ -227,7 +227,7 @@ fn org_markup_is_drawn_as_glyphs_and_revealed_under_the_cursor() {
         display_at(ed, emph).is_none().then_some(())
     });
     // ...and only that one. Everything else is still a glyph.
-    assert_eq!(display_at(&shared.lock().unwrap(), ovs[0].0).as_deref(), Some("◉"));
+    assert_eq!(display_at(&shared.lock().unwrap(), ovs[0].0).as_deref(), Some("●"));
 
     // Moving out puts it back, and the string is *recomputed* from the text
     // rather than restored from a copy — which is what makes editing inside a

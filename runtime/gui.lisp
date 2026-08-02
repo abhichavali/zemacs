@@ -259,7 +259,8 @@ the *lines* within the paragraph's own width.
 
 There are no hard breaks — every space is a break opportunity and nothing forces
 one — so a code listing is one `text' per line, which is what a listing wants
-anyway: each line carries its own syntax runs."
+anyway: each line carries its own syntax runs. Set those runs `:family :mono',
+or the columns of the listing will not line up — see `run'."
   (%scene-form "text" '(:align %scene-word) nil args))
 
 (defun run (string &rest args)
@@ -273,11 +274,31 @@ of a handful of steps anyway; that snapping is what bounds its glyph cache, so
 175 and 200 may well be the same face. `:face' is a face name, `:tag' makes this
 run and not the paragraph around it clickable.
 
+`:family' is `:prose' or `:mono', and **`:prose' is what you get by saying
+nothing** — a scene is a page, and prose set in a coding font is a grid of cells
+wearing a different hat, which is the thing this whole subsystem exists to stop
+being. Write `:mono' on the runs of a *source listing*, where it is not a
+preference: a column of code lines up only if every character is the same width,
+and a `#+begin_src' body set in a serif is a listing nobody can read a diff in.
+An identifier or a file name inside a sentence wants it too, for the same reason
+`code' does in any printed book.
+
+  (run \"(defun square (x) (* x x))\" :family :mono :face \"keyword\")
+
+Two words and not a font name, deliberately. The renderer holds one open face
+per size, weight, slant and family, and every one of those is a short closed
+list so the cache has a number it cannot grow past; a name would make the family
+dimension a string somebody typed, a font that exists on the machine the config
+was written on and not on the next one, and a page that fails differently
+everywhere. On a machine with no proportional font at all the page comes out in
+the coding font — worse looking, entirely legible, and never a page that will
+not draw.
+
 STRING must be *characters*. If it came out of the buffer it is bytes — see
 `utf8-text'."
   (%scene-form "run"
                '(:size %scene-int :bold %scene-bool :italic %scene-bool
-                 :face %scene-face :tag %scene-tag-id)
+                 :family %scene-word :face %scene-face :tag %scene-tag-id)
                (%scene-string string) args))
 
 (defun image-run (id &rest args)

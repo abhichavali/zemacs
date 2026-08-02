@@ -184,7 +184,7 @@ fn a_page_built_in_lisp_reaches_the_buffer_and_its_clicks_come_back() {
         heading,
         [Run::Text {
             text: "The Rank-Nullity Theorem".into(),
-            style: Style { size: 200, bold: true, italic: false, face: None },
+            style: Style { size: 200, bold: true, ..Style::default() },
             tag: None,
         }]
     );

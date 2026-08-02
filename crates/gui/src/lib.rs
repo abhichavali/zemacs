@@ -142,6 +142,40 @@ pub enum Align {
     End,
 }
 
+/// Which of the editor's two typefaces a run is set in.
+///
+/// A scene exists because a page is not a grid of cells, and prose set in a
+/// coding font is a grid of cells wearing a different hat. This is the field
+/// that stops it being one.
+///
+/// # Two roles, not a font name
+///
+/// The obvious alternative — a `String` naming a family — is the wrong shape
+/// for what is underneath. `crates/render` caches an *open face* per size,
+/// weight and slant, and every dimension of that key is a short closed list
+/// precisely so the cache has a number it cannot grow past. A name makes the
+/// family dimension unbounded: a map keyed by whatever anybody typed, a config
+/// naming a font that exists on the machine it was written on and not on the
+/// next one, and a document that fails differently on every box. Two named
+/// roles keep the bound arithmetic — it doubles, and it stays a number — and
+/// keep "is that font installed" a question the renderer answers once at
+/// startup rather than once per document.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Family {
+    /// The face every cell of every buffer is drawn in. What a *listing* is set
+    /// in, and not a preference: a column of code lines up only if every
+    /// character is the same width, so a source block in a scene asks for this
+    /// by name.
+    Mono,
+    /// A proportional face — the one a reader would expect a paragraph in.
+    ///
+    /// The default, because a scene is a page. A run that wants the coding font
+    /// says so; a run that says nothing is prose, which is what nearly every
+    /// run in a document is.
+    #[default]
+    Prose,
+}
+
 /// How a run of text is set.
 ///
 /// Everything a [`Measure`] implementation needs to pick a face and nothing
@@ -158,16 +192,20 @@ pub struct Style {
     pub size: u16,
     pub bold: bool,
     pub italic: bool,
+    /// Which typeface, of the two there are. See [`Family`].
+    pub family: Family,
     /// `None` is the pane's own foreground.
     pub face: Option<FaceId>,
 }
 
 impl Default for Style {
-    /// Body text: upright, unemphasised, the pane's colour, at the body size.
-    /// `size: 0` would be a legal `u16` and an illegal type size, so this is not
-    /// something `#[derive(Default)]` could have got right.
+    /// Body text: upright, unemphasised, the pane's colour, at the body size,
+    /// in the proportional face. `size: 0` would be a legal `u16` and an
+    /// illegal type size, so this is not something `#[derive(Default)]` could
+    /// have got right — and the family is the same kind of decision, since the
+    /// default a *page* wants is the opposite of the one the grid wants.
     fn default() -> Self {
-        Self { size: 100, bold: false, italic: false, face: None }
+        Self { size: 100, bold: false, italic: false, family: Family::Prose, face: None }
     }
 }
 
@@ -382,8 +420,26 @@ impl Scene {
 /// An image run is not asked about: it carries its own width, height and depth,
 /// which is why this trait did not grow a third method when inline images
 /// arrived.
+///
+/// # Both methods take the whole [`Style`], and that includes [`Family`]
+///
+/// The proportional face is a *different font file* from the monospace one, so
+/// two runs of the same string at the same size can measure differently and
+/// sit on different baselines. Every caller here already passes the style
+/// through untouched, which is what made adding a family a field rather than a
+/// parameter — but an implementation that ignores it will lay a document out
+/// in one face and paint it in another, and nothing downstream can notice.
 pub trait Measure {
     /// Advance width of `text` set in `style`, in pixels.
+    ///
+    /// **Must equal the sum of the advances of `text`'s characters**, because
+    /// that is how the renderer's draw loop steps the pen: one glyph at a time,
+    /// by this function asked one character at a time. An implementation that
+    /// measured a whole string through a shaper would answer narrower than its
+    /// own characters summed — side bearings tucked together, which a
+    /// proportional face has far more of than the grid ever did — and the
+    /// symptom is not a loose line but a *broken* one, the next piece placed at
+    /// the short width and drawn over the tail of this one.
     fn advance(&self, text: &str, style: Style) -> i32;
     /// Line height and ascent for `style`, in pixels — in that order.
     fn line(&self, style: Style) -> (i32, i32);

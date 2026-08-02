@@ -47,13 +47,42 @@
 ;;;
 ;;; Five tables, all `defparameter' so a config can set them and re-run
 ;;; `org-modern-refresh' without reloading anything.
+;;;
+;;; **Every glyph in them has to be in the editor's own font.** That reads as an
+;;; obvious constraint and was not obeyed: this file was written against Emacs's
+;;; org-modern, whose glyphs come from whatever font your Emacs falls back
+;;; through, and this editor falls back through nothing at all. `FONT_CANDIDATES'
+;;; in `crates/render' picks the first monospace face that exists and draws every
+;;; character out of it; SFNSMono is first on every modern macOS, and SFNSMono has
+;;; no `◉', no `✸', no `✿', no `❀', no `✜' and no `☐'. Six of the eleven glyphs
+;;; below drew *nothing* — a blank where the bullet should be, on every heading
+;;; of every org buffer — and it went unnoticed for as long as it did because a
+;;; missing glyph looks like indentation.
+;;;
+;;; So the tables below are chosen from what SFNSMono and Menlo both have, which
+;;; is the first two entries of that list and therefore every Mac. The bullets
+;;; lost some of their variety and gained the property of existing.
+;;;
+;;; ponytail: the coverage is checked by hand, once, by whoever edits these — a
+;;; config that sets its own bullets can still pick a glyph its font does not
+;;; have and get a blank with nothing anywhere saying why. Ceiling: exactly the
+;;; bug this note is about, happening again in somebody's config. The real fix is
+;;; one crate out and fixes it for every glyph rather than for these eleven: a
+;;; *fallback* in `draw_char', trying the next face in `FONT_CANDIDATES' for a
+;;; character the current one does not carry, which is what every other text
+;;; stack on the machine does and what would also rescue the `☐' that
+;;; `math.lisp' draws its status pills out of.
 
-(defparameter *org-modern-stars* '("◉" "○" "✸" "✿" "❀" "✜")
+(defparameter *org-modern-stars* '("●" "○" "■" "□" "▸" "‣")
   "One bullet per heading level, cycling past the end.
 
 A level-N heading substitutes N-1 spaces and then its bullet for its N stars,
 so the glyph steps right as the level deepens and the heading *text* does not
-move at all — the substitution is the same width as what it replaces.")
+move at all — the substitution is the same width as what it replaces.
+
+Filled and hollow alternating, and a shape change every two levels, so the depth
+is readable at a glance rather than by counting. Every one of them is in both
+SFNSMono and Menlo — see the note above, which is what this list used to fail.")
 
 (defparameter *org-modern-heading-scale* '(1.5 1.25)
   "Type size per heading level, as a multiple of the body's.
@@ -75,10 +104,14 @@ reason `crates/syntax' gives: a number is not one character and has no glyph to
 become.")
 
 (defparameter *org-modern-checkboxes*
-  '((#\Space . "☐") (#\X . "☑") (#\x . "☑") (#\- . "☒"))
+  '((#\Space . "□") (#\X . "✓") (#\x . "✓") (#\- . "✗"))
   "One glyph per `[ ]' cookie, keyed by the character between the brackets.
 Three cells become one, so the item text does shift left — which is what
-org-modern does too, and what makes a checkbox read as one thing.")
+org-modern does too, and what makes a checkbox read as one thing.
+
+An empty box, a tick and a cross rather than the ballot boxes `☐ ☑ ☒' Emacs's
+org-modern uses: those three are the clearer set and *none of them is in
+SFNSMono*, so all three drew nothing. See the note at the head of this section.")
 
 (defparameter *org-modern-emphasis*
   '((#\* . "bold") (#\/ . "italic") (#\_ . "italic")
@@ -914,7 +947,7 @@ saying it twice per redraw would be the editor talking over you."
 
 (define-minor-mode org-modern
   "Draw org's markup instead of its punctuation: heading stars become bullets,
-`- ' becomes `•', `[X]' becomes `☑', `[[a][b]]' becomes `b', and `*bold*'
+`- ' becomes `•', `[X]' becomes `✓', `[[a][b]]' becomes `b', and `*bold*'
 becomes bold text with its asterisks hidden until the cursor is inside it.
 
 Turning it off removes exactly the overlays it made."

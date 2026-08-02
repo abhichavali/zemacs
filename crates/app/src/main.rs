@@ -314,7 +314,10 @@ impl Perf {
 /// receiving typing.
 fn mac_window_hints() {
     sdl2::hint::set("SDL_VIDEO_MAC_FULLSCREEN_SPACES", "1");
-    sdl2::hint::set("SDL_HINT_MAC_BACKGROUND_APP", "0");
+    // `SDL_MAC_BACKGROUND_APP`, not `SDL_HINT_MAC_BACKGROUND_APP`: the latter is
+    // the *name of the C macro*, and SDL reads the string it expands to. Setting
+    // the macro's name sets a hint nothing has ever asked for.
+    sdl2::hint::set("SDL_MAC_BACKGROUND_APP", "0");
     // Ctrl-click is a right click on this platform, and taking it would make
     // the trackpad's own secondary click unreachable.
     sdl2::hint::set("SDL_MAC_CTRL_CLICK_EMULATE_RIGHT_CLICK", "1");
@@ -333,6 +336,12 @@ fn main() -> anyhow::Result<()> {
     let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL init: {e}"))?;
     // One renderer per frame, in frame order. See the module docs.
     let mut renderers = vec![Renderer::new(&sdl, "zemacs", WINDOW_W, WINDOW_H)?];
+    // Ask for the keyboard, exactly as a new frame does. macOS hands focus to a
+    // window the application opened itself only when the application is already
+    // the active one — so `zemacs` typed at a shell put a window on screen and
+    // left the keystrokes going to whatever was in front, which reads as the
+    // editor ignoring every key you press.
+    renderers[0].focus();
     let mut pump = sdl
         .event_pump()
         .map_err(|e| anyhow::anyhow!("SDL event pump: {e}"))?;
@@ -371,6 +380,10 @@ fn main() -> anyhow::Result<()> {
     let highlighter = zemacs_syntax::spawn_worker();
 
     let mut last_revision = u64::MAX;
+    // Where point was when the image was last told. `usize::MAX` cannot be a
+    // real offset, so the first pass through the loop always reports — which is
+    // what makes a config see the cursor it started next to.
+    let mut last_point = usize::MAX;
     let mut last_file_query: Option<String> = None;
     let mut last_grep: Option<String> = None;
     let mut keys: Vec<Key> = Vec::new();
@@ -539,6 +552,17 @@ fn main() -> anyhow::Result<()> {
                         if let Some(window) = mouse.press(&editor.frames[i], i, area, x, y) {
                             let cmd = EditorCommand::FocusWindow(window);
                             dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                            // ...and then land on the character that was
+                            // clicked. Focusing alone made the pointer a way to
+                            // pick a *pane* and nothing smaller, which is the
+                            // one thing everybody expects a mouse to do. The
+                            // arithmetic belongs to the renderer — see
+                            // `click_target` for why — and it comes back after
+                            // the focus so the window it names is live.
+                            if let Some((_, at)) = renderers[i].click_target(&editor, i, x, y) {
+                                let cmd = EditorCommand::MoveTo(at);
+                                dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                            }
                         }
                         // A program that asked for mouse events gets the click:
                         // that is what makes vim, htop and tmux usable in here.
@@ -547,12 +571,33 @@ fn main() -> anyhow::Result<()> {
                         // program in one gesture.
                         if editor.mode == zemacs_core::Mode::Terminal {
                             let (col, row) = cell_at(&editor, &renderers, x, y);
-                            term.mouse(&editor, zemacs_term::Mouse {
+                            let taken = term.mouse(&editor, zemacs_term::Mouse {
                                 button: zemacs_term::Button::Left,
                                 kind: zemacs_term::MouseKind::Press,
                                 col,
                                 row,
                             });
+                            // Nobody wanted it. A shell never turns mouse
+                            // reporting on, so this is the click that used to
+                            // do nothing at all — it goes to Lisp with the row
+                            // it landed on and whatever OSC 8 link the child
+                            // hung on that cell, and which of the two is a link
+                            // is decided there. Same guard as a mode hook: a
+                            // config that never defined it is silence.
+                            if !taken {
+                                if let Some((line, uri)) =
+                                    term.click_context(&editor, col, row)
+                                {
+                                    let uri = uri.map_or("nil".into(), |u| {
+                                        zemacs_rpc::lisp::string(&u)
+                                    });
+                                    lisp.eval(format!(
+                                        "(let ((h (find-symbol \"%TERMINAL-CLICK\" :zemacs))) \
+                                           (when (and h (fboundp h)) (funcall h {} {col} {uri})))",
+                                        zemacs_rpc::lisp::string(&line)
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -632,6 +677,12 @@ fn main() -> anyhow::Result<()> {
                 // SDL reports natural-scroll wheels with `direction: Flipped`
                 // and the raw sign, so undo that first; then negate, because a
                 // wheel push (positive y) moves the view *up* the file.
+                //
+                // ponytail: and then negate *again*, below, because the wheel
+                // that reads right on this desk is the other one. Hard-coded
+                // rather than a setting — a `set-scroll-direction` primitive is
+                // a C shim, an extern, a defprim and an export for one bool.
+                // Add it when a second person disagrees about which way is up.
                 Event::MouseWheel {
                     window_id,
                     y,
@@ -640,7 +691,7 @@ fn main() -> anyhow::Result<()> {
                     mouse_y,
                     ..
                 } => {
-                    let y = match direction {
+                    let y = -match direction {
                         MouseWheelDirection::Flipped => -y,
                         _ => y,
                     };
@@ -761,6 +812,32 @@ fn main() -> anyhow::Result<()> {
                 None => {}
             }
         }
+        // The other signal the image gets about a buffer, and the twin of the
+        // one above: the *cursor* moved. Without it a config only ever hears
+        // about a buffer when the document changes, which is the wrong half for
+        // anything whose job is to react to where you are looking — org's
+        // markup would reveal itself as you typed and stay hidden as you
+        // navigated, because `j` and `w` change no text at all.
+        //
+        // Queued rather than called, through the same `pending_hooks` and the
+        // same `fboundp` guard, so it costs nothing until something defines
+        // `point-moved-hook` — `runtime/modes/modes.lisp` does.
+        //
+        // Compared against `buffer.cursor` and not the focused window's: a
+        // buffer switch changes it too, and "the text under point is not the
+        // text that was under point" is exactly what a mover wants to hear.
+        //
+        // ponytail: no *previous* position is carried, so a config that wants
+        // to act on the range you left — re-rendering the equation you just
+        // stepped out of, say — has to remember it in the image. The upgrade
+        // path is the same one `after-change-hook` wants: a hook with
+        // arguments, which needs an argument-passing route through
+        // `pending_hooks` that today only carries a name.
+        if editor.buffer.cursor != last_point && !editor.buffer.kind.is_generated() {
+            last_point = editor.buffer.cursor;
+            editor.pending_hooks.push("point-moved-hook".into());
+        }
+
         // Mode hooks: core records that one is due, the image runs it. Guarded
         // with `fboundp` so a mode with no hook defined is silence rather than
         // an "undefined function" every time you open a file.
@@ -908,6 +985,12 @@ fn main() -> anyhow::Result<()> {
             // count of presents; it is about not spending a blank at all on a
             // frame nobody asked for.
             if !renderer.changed() {
+                // Not a bare `continue`. The frame we are refusing to show is
+                // still sitting in SDL's command list, and only a flush takes it
+                // out — leaving it there leaks every draw call of every skipped
+                // frame, for as long as the editor is open. See
+                // [`Renderer::discard`].
+                renderer.discard();
                 continue;
             }
             renderer.present();

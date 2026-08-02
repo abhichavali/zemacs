@@ -110,6 +110,7 @@ it does in Emacs, and passing OF makes it a question about a mode you name."
     (line-numbers          set-line-numbers          t)
     (relative-line-numbers set-relative-line-numbers nil)
     (tab-width             set-tab-width             4)
+    (text-width            set-text-width            0)
     (font-size             set-font-size             18))
   "The settings a mode may claim: (NAME PRIMITIVE DEFAULT). DEFAULT is what the
 editor itself starts with, and is where a setting lands when a mode releases it
@@ -388,6 +389,42 @@ binds in its buffers only, and minor modes are consulted before the major one."
          (%toggle-minor-mode ,mode))
        (register-command ,mode)
        ,mode)))
+
+;;; ---------------------------------------------------------------------------
+;;; The cursor moved
+;;;
+;;; The editor reports two things about a buffer and this is the second of them.
+;;; `after-change-hook' says the *document* moved; this one says *point* did —
+;;; you pressed `j', or `w', or clicked, or switched buffers. The application
+;;; queues it exactly as it queues that one, through `pending_hooks' and behind
+;;; the same `fboundp' guard, so an image that never defines the function pays
+;;; nothing.
+;;;
+;;; It lives here because this is the standard library — the file a mode is
+;;; defined with — and a hook every mode may want does not belong in whichever
+;;; feature happened to want it first. (`*after-change-functions*' is still in
+;;; the LSP client for that historical reason, and the note beside it in
+;;; `org-modern.lisp' says so.)
+;;;
+;;; A function on this list runs on **every** cursor movement in every buffer,
+;;; which is once per keystroke at worst — the same budget `after-change-hook'
+;;; has while you type. So the rule for what goes on it is the rule org-appear
+;;; already follows: a constant amount of work, or a cheap test that decides
+;;; whether to do any. A buffer rescan here would be felt.
+;;;
+;;; DEFVAR and a guarded DEFUN, both on purpose: a config reload must not throw
+;;; away the functions already registered, and must not replace a `point-moved-hook'
+;;; a config wrote for itself.
+
+(defvar *point-moved-functions* nil
+  "Functions called with no arguments after point moves in the live buffer.")
+
+(unless (fboundp 'point-moved-hook)
+  (defun point-moved-hook ()
+    ;; IGNORE-ERRORS per function, as `after-change-hook' does: one config's
+    ;; broken mover must not stop the next one from running, and it must not
+    ;; turn every keystroke into a backtrace.
+    (dolist (f *point-moved-functions*) (ignore-errors (funcall f)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The modes we ship live next door.

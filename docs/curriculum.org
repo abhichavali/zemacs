@@ -1,0 +1,448 @@
+#+TITLE: The zemacs curriculum format
+#+SUBTITLE: an entire interactive course as one .org file
+
+A *curriculum* is a single org file that zemacs reads as a course: units of
+instruction, problems to work, and somewhere for your answers to land. It is
+plain org and nothing else. Every property below is an ordinary org property on
+an ordinary heading, so the same file opens in Emacs, renders on GitHub, and is
+still readable in =cat=.
+
+This document is the specification. It is written to be handed to a language
+model verbatim as "generate a curriculum to this spec", and it is precise enough
+that a file which follows it loads and navigates with no manual fixing. There is
+a short version of the same instructions at the end, under [[#generator-prompt][The generator prompt]],
+for when you want to paste something small.
+
+The reader is =runtime/modes/math.lisp=. When this document and that file
+disagree, the file is right, and =crates/lisp/tests/math.rs= is the arbiter.
+
+* The shape of the thing
+
+#+begin_src org
+,#+TITLE: Linear Algebra I
+,#+ZEMACS_CURRICULUM: 1
+
+,* Contents
+- [[id:unit-1][1. Vectors and Spaces]]
+- [[id:unit-2][2. Matrix Multiplication]]
+
+,* Vectors and Spaces
+:PROPERTIES:
+:ID: unit-1
+:END:
+
+Instruction prose. LaTeX inline as $\dim V = n$ and display as
+
+\[
+  \dim(U + W) = \dim U + \dim W - \dim(U \cap W)
+\]
+
+and figures as ordinary file links on a line of their own:
+
+[[file:fig-1.svg]]
+
+,** Problem
+:PROPERTIES:
+:ZEMACS_PROBLEM: written
+:ZEMACS_STATUS: todo
+:END:
+
+Prove that every basis of a finite-dimensional vector space has the same
+cardinality.
+
+,*** Response
+
+,** Problem
+:PROPERTIES:
+:ZEMACS_PROBLEM: programming
+:ZEMACS_PACKAGES: numpy sympy
+:ZEMACS_STATUS: todo
+:END:
+
+Implement Gaussian elimination with partial pivoting.
+
+,#+begin_src python :tangle gaussian.py
+import numpy as np
+
+def solve(A, b):
+    ...
+
+if __name__ == "__main__":
+    ...
+,#+end_src
+#+end_src
+
+That is the entire format. Everything below says what each part means and what
+is required.
+
+* The file header
+
+| Keyword                | Required | Value                                    |
+|------------------------+----------+------------------------------------------|
+| =#+ZEMACS_CURRICULUM:=   | yes      | the format version — write =1=             |
+| =#+TITLE:=               | no       | shown when the file opens                |
+
+Both go in the *preamble* — above the first heading. A =#+ZEMACS_CURRICULUM=
+written anywhere below the first heading is not seen, which is deliberate: it is
+what lets a document *about* the format quote one without becoming one.
+
+The version is not checked. It is there so a future reader can tell what it is
+looking at.
+
+* Units
+
+A *unit* is a top-level heading (one star) carrying an =:ID:=.
+
+#+begin_src org
+,* Vectors and Spaces
+:PROPERTIES:
+:ID: unit-1
+:END:
+#+end_src
+
+| Property | Required | Value                                                     |
+|----------+----------+-----------------------------------------------------------|
+| =:ID:=     | yes      | unique in the file; lowercase, hyphenated, no spaces      |
+
+*The =:ID:= is what makes a top-level heading a unit.* A one-star heading without
+one is just a heading — which is exactly how =* Contents= stays out of the unit
+list without anything having to know the word "Contents". It also means an
+unresolvable Contents link is impossible to write by accident: drop the id and
+you drop the unit too.
+
+A unit contains prose, LaTeX, figures, and its problems. It runs until the next
+top-level heading.
+
+* The Contents section
+
+#+begin_src org
+,* Contents
+- [[id:unit-1][1. Vectors and Spaces]]
+- [[id:unit-2][2. Matrix Multiplication]]
+#+end_src
+
+Optional but strongly recommended: it is the table of contents you navigate
+with. Put the cursor on a link and press =RET= to jump to that unit.
+
+Rules:
+
+- The heading is =* Contents= with *no* =:ID:=, so that it is not itself a unit.
+- One list item per unit, in document order.
+- The link target is =id:= followed by that unit's =:ID:=.
+- The link description is what you want to read — number it if you like; a
+  description with a colon in it is fine.
+
+* Problems
+
+A *problem* is any heading carrying =:ZEMACS_PROBLEM:=. Write them as two-star
+headings under a unit, titled =Problem=.
+
+#+begin_src org
+,** Problem
+:PROPERTIES:
+:ZEMACS_PROBLEM: written
+:ZEMACS_STATUS: todo
+:END:
+
+The question, in prose and LaTeX.
+
+,*** Response
+#+end_src
+
+| Property             | Required | Legal values                           |
+|----------------------+----------+----------------------------------------|
+| =:ZEMACS_PROBLEM:=     | yes      | =written= or =programming=                 |
+| =:ZEMACS_STATUS:=      | no       | =todo= or =done= — defaults to =todo=        |
+| =:ZEMACS_PACKAGES:=    | no       | space- or comma-separated PyPI names   |
+
+- =written= — you work it on paper. It has a =*** Response= subsection.
+- =programming= — you write code. It has a =#+begin_src python= block.
+
+=:ZEMACS_PACKAGES:= belongs on =programming= problems and is ignored on written
+ones. List only third-party packages: =numpy sympy matplotlib=. The standard
+library needs no declaration.
+
+** Status is the learner's
+
+=:ZEMACS_STATUS:= is =todo= or =done= and *nothing in zemacs decides it*. There is
+no checker, no answer key and no notion of "correct" anywhere in this format.
+You verify your own solutions — with a CAS, a proof assistant, or your own eyes
+— and the editor records what you say. =SPC m t= toggles it.
+
+So: **generate every problem with =:ZEMACS_STATUS: todo=, and never generate an
+answer.** A worked solution in the file is a spoiler, and a curriculum whose
+problems are already answered is a textbook you have already read.
+
+** Written problems and the Response section
+
+#+begin_src org
+,*** Response
+#+end_src
+
+A three-star =Response= heading, immediately after the problem's prose, with an
+empty body. That is where an answer goes — typed, or captured from a photograph
+of handwriting.
+
+- The heading text must be exactly =Response=, matched without regard to case.
+- Leave the body *empty*. The blank line before the next problem is yours to
+  keep; the Response body ends at its last non-blank line.
+- One =Response= per problem.
+
+If you leave the section out altogether, zemacs creates it the first time
+something is written there. Emitting it is still better: an empty =Response=
+heading is a visible invitation to answer.
+
+*** What =SPC m w= does with it
+
+You work a written problem on paper, because that is where mathematics is done.
+Photograph the page, and let the phone drop it in =~/Public/MathSync=: =SPC m w=
+turns on a watcher that notices the file, sends it to a vision model to be
+transcribed into org with LaTeX, and puts the result in the =Response= of the
+problem *point is in*. =SPC m r= does one photograph by hand, now.
+
+Three things to know:
+
+- **Point decides.** There is no filename convention and nothing to arm. The
+  transcription goes to the written problem the cursor is inside when the
+  photograph arrives; if it is somewhere else, the status line says so and the
+  file is *left alone* until you move.
+- **Nothing is deleted.** A captured photograph is moved to =MathSync/done/=, so
+  it is still there when you want to check the transcription against the page.
+- **=done= means captured, not correct.** Nothing here reads your mathematics.
+  =SPC m t= sets the status back.
+
+It needs an OpenRouter key, from =$OPENROUTER_API_KEY= or one line in
+=~/.config/zemacs/openrouter-key= (=chmod 600=), and it says so plainly if there
+is none. The prompt the model is given is
+=*math-written-prompt*=, and it is worth reading before you tune it: it insists
+on fidelity over polish, so a mistake in your working is transcribed as a mistake
+rather than quietly repaired.
+
+** Programming problems and the source block
+
+#+begin_src org
+,#+begin_src python :tangle gaussian.py
+import numpy as np
+
+def solve(A, b):
+    ...
+,#+end_src
+#+end_src
+
+| Part            | Required | Notes                                          |
+|-----------------+----------+------------------------------------------------|
+| language        | yes      | =python=                                         |
+| =:tangle NAME.py= | yes      | the file the block is written to when run      |
+| body            | yes      | a runnable skeleton, not a solution            |
+
+- One source block per problem.
+- Filenames are unique across the whole curriculum — =gaussian.py=, not =main.py=
+  in every unit.
+- The skeleton should import what it needs, define the function the problem asks
+  for with the right signature, leave the body as =...=, and end with an
+  ~if __name__ == "__main__":~ block that exercises it.
+
+*** What =SPC m e= does with it
+
+=SPC m e= on a programming problem turns the block into somewhere to work, and
+for a curriculum at =~/maths/linear-algebra.org= that means:
+
+| =~/maths/linear-algebra/=             | the programs, one file per problem     |
+| =~/maths/linear-algebra/gaussian.py=  | this block's body, written once        |
+| =~/maths/linear-algebra/.venv/=       | one environment for the whole file     |
+
+The template is written **only when the file is not there**, so opening a
+problem you have already worked cannot overwrite it; =SPC m R= is the explicit
+way to ask for the skeleton back, and it asks first. The environment is built in
+the background — numpy always, plus this problem's =:ZEMACS_PACKAGES:=,
+accumulating into the one venv as problems ask for them — so the first open of
+the first programming problem says =building the environment= and stays usable
+while it does. =SPC m x= runs the file with that venv's interpreter, in a
+terminal buffer of its own.
+
+Two things a generator should get right because of it: =:tangle= names a *real
+file in a real directory*, so the names must be unique across the whole
+curriculum and must not contain =/etc=, =~= or =..=; and =:ZEMACS_PACKAGES:=
+lists third-party PyPI names only, since every one of them is installed.
+
+* Figures
+
+A figure is an ordinary org file link *alone on its line*:
+
+#+begin_src org
+[[file:fig-1.svg]]
+#+end_src
+
+zemacs draws the image in place of the link text. The rules:
+
+- **Alone on its line.** A link with prose around it is a reference and stays
+  words; a link on its own line is a figure. That is org's convention and it is
+  what makes the substitution safe.
+- **SVG or PNG.** =.svg=, =.svgz= and =.png=. Nothing else is drawn, and nothing is
+  fetched over the network — an =https:= image link stays a link.
+- **Relative to the .org file.** =[[file:fig-1.svg]]= means the file sitting next
+  to the curriculum. Ship the figures in the same directory.
+- **A caption is a line of prose.** There is no =#+CAPTION:= support; write the
+  caption above or below the link as an ordinary sentence.
+- Figures are drawn at their authored size, capped at 34 ems wide. Author a plot
+  at something like 640×420 and it will sit comfortably beside the text.
+
+Prefer SVG. It is what a diagram wants, it rasterises crisply at any display
+scale, and it is text — so it diffs, and a model can generate it directly.
+
+* LaTeX
+
+Ordinary org LaTeX, typeset automatically when the file opens:
+
+| Written                  | Renders as       |
+|--------------------------+------------------|
+| ~$\dim V = n$~             | inline, in the line |
+| =\[ ... \]=                | a display equation  |
+| =\begin{align} ... \end{align}= | an environment |
+
+Use =$...$= for inline and =\[...\]= for display. Do not use =$$...$$=.
+=amsmath= and =amssymb= are loaded, so =align=, =\text=, =\mathbb= and the usual
+symbol set all work.
+
+A machine without a TeX installation shows the source instead of the image and
+says so once. That is not a reason to avoid LaTeX — it is the whole point of the
+format.
+
+* What a generated file must get right
+
+A checklist, in the order things go wrong:
+
+1. =#+ZEMACS_CURRICULUM: 1= in the preamble, above every heading.
+2. Every unit is a *one-star* heading with a unique =:ID:=.
+3. Every Contents link is =[[id:THE-ID][description]]= and every id exists.
+4. =* Contents= has no =:ID:=.
+5. Every problem heading carries =:ZEMACS_PROBLEM:= with =written= or
+   =programming=, and =:ZEMACS_STATUS: todo=.
+6. Property drawers are =:PROPERTIES:= / =:END:= and sit *directly under* their
+   heading.
+7. Every written problem has an empty =*** Response=.
+8. Every programming problem has one =#+begin_src python :tangle NAME.py= block
+   with a unique filename.
+9. Figure links are alone on their line and name =.svg= or =.png= files that are
+   actually shipped.
+10. No solutions anywhere.
+
+* Working through one
+
+| Key       | What it does                                    |
+|-----------+-------------------------------------------------|
+| =RET=       | follow the link under point                     |
+| =SPC m n=   | next problem                                    |
+| =SPC m p=   | previous problem                                |
+| =SPC m t=   | toggle this problem between =todo= and =done=       |
+| =SPC m g=   | back to the Contents                            |
+| =SPC m s=   | how far through you are                         |
+| =z a=       | fold or unfold the unit under point             |
+| =SPC m l=   | typeset the LaTeX again                         |
+| =SPC m f=   | draw the figures again                          |
+
+...and on a =written= problem:
+
+| Key       | What it does                                            |
+|-----------+---------------------------------------------------------|
+| =SPC m r=   | transcribe the newest photograph into this problem      |
+| =SPC m w=   | watch =~/Public/MathSync= and do it as photographs land   |
+
+...and on a =programming= problem:
+
+| Key       | What it does                                            |
+|-----------+---------------------------------------------------------|
+| =SPC m e=   | open its program beside the question, tangling it once  |
+| =SPC m x=   | run it, in a terminal of its own                        |
+| =SPC m v=   | build or top up the environment, and say where it is    |
+| =SPC m R=   | put the curriculum's skeleton back (asks first)         |
+
+The motions are a minor mode, =math-curriculum=, which switches itself on when a
+buffer declares itself a curriculum. In every other org buffer those keys are
+free.
+
+The program's own buffer gets a second minor mode, =math-code=, switched on for
+any file inside a curriculum's directory: =SPC m x= runs it there too, and
+=SPC m g= goes back to the question. Inside the terminal a run opens, =C-M-r=
+runs it again in the same buffer and =C-M-w= closes it — the session keys every
+terminal in zemacs has.
+
+* For code that reads a curriculum
+
+=runtime/modes/math.lisp= publishes the schema. Character offsets throughout.
+
+#+begin_src lisp
+(math-curriculum-p)                   ; T when this buffer is one
+(math-units)                          ; (:id :title :begin :end), document order
+(math-unit-at-point)                  ; one of those, or NIL
+(math-problems &optional unit)        ; problem plists, document order
+(math-problem-at-point)               ; one problem plist, or NIL
+(math-set-status problem "done")      ; rewrite :ZEMACS_STATUS:, in one edit
+(math-response-insert problem text)   ; replace the Response body, in one edit
+(math-src-block problem)              ; (:lang :tangle :body :begin :end) or NIL
+#+end_src
+
+A problem plist:
+
+| Key               | Value                                                  |
+|-------------------+--------------------------------------------------------|
+| =:kind=             | ="written"= or ="programming"=                             |
+| =:status=           | ="todo"= or ="done"=                                       |
+| =:id=               | the owning unit's =:ID:=, or NIL outside a unit          |
+| =:packages=         | list of strings, possibly empty                        |
+| =:begin= =:end=       | the whole problem subtree                              |
+| =:response-begin=   | the *body* of its Response subsection, or NIL when it  |
+| =:response-end=     | has none                                               |
+
+Two things to know before writing against it:
+
+- **A plist is a reading, not a handle.** It describes the buffer as it was when
+  it was made. Both writers re-read before they write and use the plist only to
+  say which problem was meant, so handing one straight back is safe; reading
+  =:begin= from a plist you have held across an edit is not.
+- **Both writers are a single =replace-region=.** Lisp here is not atomic with
+  respect to the user — see =docs/threading.org= — so a =delete-region= followed
+  by an =insert= can be interrupted, and a half-written property drawer is a
+  corrupted document. =math-response-insert= is also idempotent: writing the same
+  text twice leaves the file identical the second time.
+
+* The generator prompt
+:PROPERTIES:
+:CUSTOM_ID: generator-prompt
+:END:
+
+Short enough to paste, complete enough to produce a file that loads. Fill in the
+subject and the shape you want.
+
+#+begin_example
+Generate a complete interactive curriculum for <SUBJECT> as ONE org file for
+zemacs. <N> units, <M> problems per unit, roughly <LEVEL> level.
+
+Format — follow it exactly:
+
+- Preamble: `#+TITLE: ...` then `#+ZEMACS_CURRICULUM: 1`, above all headings.
+- `* Contents` (no :ID:), a list of `- [[id:unit-1][1. Title]]` links, one per
+  unit, in order.
+- One unit per top-level heading, each with a property drawer directly under it
+  containing `:ID: unit-1`, `:ID: unit-2`, ... The :ID: is what makes it a unit.
+- Instruction prose in each unit: real teaching, worked examples, intuition.
+  LaTeX as `$x$` inline and `\[ ... \]` for display. Never `$$`.
+- Problems are `** Problem` headings with a drawer:
+    :ZEMACS_PROBLEM: written       (or: programming)
+    :ZEMACS_STATUS: todo
+    :ZEMACS_PACKAGES: numpy sympy  (programming only, third-party only)
+- A `written` problem states the question, then an empty `*** Response`
+  subsection. Nothing under it.
+- A `programming` problem states the task, then one
+  `#+begin_src python :tangle unique-name.py` block: imports, the function
+  signature the task asks for with `...` as the body, and an
+  `if __name__ == "__main__":` block. Filenames unique across the whole file.
+- Figures, if any: a link alone on its line, `[[file:fig-1.svg]]`, .svg or .png,
+  sitting next to the .org file. Emit the SVG source separately so I can save it.
+
+Rules:
+- Every problem is `:ZEMACS_STATUS: todo`. Never write a solution, a hint, or an
+  answer key anywhere in the file. The learner verifies their own work.
+- Property drawers are `:PROPERTIES:` / `:END:` directly under their heading.
+- Output the whole file in one code block. No commentary.
+#+end_example

@@ -62,12 +62,28 @@ fn says(shared: &Shared, lisp: &zemacs_lisp::Lisp, form: &str, want: &str) {
 ///
 /// Takes the `Editor` rather than the `Shared`: `wait` runs its predicate with
 /// the lock held, and a second `lock()` in there is a deadlock, not a wait.
+/// The overlays that *substitute* — the ones carrying a display string.
+///
+/// Filtered, because org-modern also makes overlays that only claim an
+/// attribute: a heading's text takes `bold` and nothing else, since weight is a
+/// per-run property and the heading's own overlay covers only the stars it
+/// replaces with a bullet. Those are not substitutions and counting them here
+/// would make "one glyph per substitution" a statement about something else.
 fn displays(ed: &Editor) -> Vec<(usize, usize, Option<String>)> {
     ed.buffer
         .overlays()
         .iter()
+        .filter(|o| o.display.is_some())
         .map(|o| (o.start, o.end, o.display.clone()))
         .collect()
+}
+
+/// True when some overlay covering `at` claims bold.
+fn bold_at(ed: &Editor, at: usize) -> bool {
+    ed.buffer
+        .overlays()
+        .iter()
+        .any(|o| o.start <= at && at < o.end && o.bold == Some(true))
 }
 
 /// The display string of the one overlay starting at `at`, or `None`.
@@ -181,6 +197,21 @@ fn org_markup_is_drawn_as_glyphs_and_revealed_under_the_cursor() {
     let got: Vec<String> = ovs.iter().map(|o| o.2.clone().unwrap_or_default()).collect();
     assert_eq!(got, want, "one glyph per substitution: {ovs:#?}");
 
+    // A heading's *text* is bold, and its stars are not the thing that carries
+    // that. `bold` is a per-run attribute, so claiming it on the overlay that
+    // replaces the stars would embolden exactly the bullet glyph; it needs the
+    // range after them. Checked one character into the heading text, which is
+    // inside that range and outside the bullet's.
+    {
+        let ed = shared.lock().unwrap();
+        let heading_text = ovs[0].1 + 1; // just past `*` on the level-1 heading
+        assert!(bold_at(&ed, heading_text), "a heading's text is bold");
+        assert!(
+            !bold_at(&ed, ed.buffer.len_chars() - 1),
+            "and ordinary prose is not"
+        );
+    }
+
     // A level-2 heading substitutes exactly as many cells as it covers, which
     // is what keeps `Beta` in the column it was typed in.
     let (start, end, _) = ovs[3];
@@ -234,8 +265,12 @@ fn org_markup_is_drawn_as_glyphs_and_revealed_under_the_cursor() {
     // is invisible to every command in the file, which is what the `:org-modern`
     // mark is for and what `remove-overlays` would have got wrong.
     lisp.eval(r#"(overlay-put (make-overlay 3 6) 'display "XX")"#.into());
+    // Six of org-modern's substitutions plus this one. Six and not seven: the
+    // emphasis run was revealed a few lines above, so its overlay is still there
+    // but no longer carries a display — and `displays` counts substitutions, not
+    // overlays.
     wait(&shared, "the foreign overlay", |ed| {
-        (displays(ed).len() == 8).then_some(())
+        (displays(ed).len() == 7).then_some(())
     });
     lisp.eval("(org-modern)".into());
     let left = wait(&shared, "org-modern to clear up after itself", |ed| {
@@ -249,12 +284,34 @@ fn org_markup_is_drawn_as_glyphs_and_revealed_under_the_cursor() {
     //
     // Cheap to ask directly, and it pins the three exclusions to a reason
     // rather than to a count.
+    // A *plist* of overlay properties, so that giving a kind of markup another
+    // one — a bigger type size for a heading, say — is a line in
+    // `%org-modern-render` and no change to the two functions that apply it.
+    // Read with GETF here for the same reason.
+    //
     // Two spaces then the third bullet: as wide as the stars it replaces, which
     // is the whole reason a heading's text does not move when it is drawn.
-    says(&shared, &lisp, r#"(length (car (%org-modern-render :heading "***")))"#, "3");
-    says(&shared, &lisp, r#"(cdr (%org-modern-render :emphasis "/x/"))"#, "italic");
-    says(&shared, &lisp, r#"(car (%org-modern-render :link "[[a][b]]"))"#, "b");
-    says(&shared, &lisp, r#"(car (%org-modern-render :link "[[a]]"))"#, "a");
+    says(&shared, &lisp, r#"(length (getf (%org-modern-render :heading "***") 'display))"#, "3");
+    // ...and the property that made the plist worth having: a heading is
+    // *larger type*, said from here as one more entry on the overlay this file
+    // was already making. Nothing in the renderer knows the word "heading" —
+    // `scale` is a multiple of the body size and this list is the whole policy.
+    says(&shared, &lisp, r#"(getf (%org-modern-render :heading "*") 'scale)"#, "1.5");
+    says(&shared, &lisp, r#"(getf (%org-modern-render :heading "**") 'scale)"#, "1.25");
+    // Past the end of `*org-modern-heading-scale*` is body size, which is what
+    // stops a deep outline from being a wall of large type.
+    says(&shared, &lisp, r#"(getf (%org-modern-render :heading "****") 'scale)"#, "NIL");
+    // Emphasis is really bold and really italic now, rather than the colour that
+    // stood in for both while the renderer opened exactly one font face. The
+    // face stays: it is what carries `code` and `comment`.
+    says(&shared, &lisp, r#"(getf (%org-modern-render :emphasis "*x*") 'weight)"#, "BOLD");
+    says(&shared, &lisp, r#"(getf (%org-modern-render :emphasis "/x/") 'slant)"#, "ITALIC");
+    says(&shared, &lisp, r#"(getf (%org-modern-render :emphasis "=x=") 'weight)"#, "NIL");
+    says(&shared, &lisp, r#"(getf (%org-modern-render :emphasis "/x/") 'face)"#, "italic");
+    says(&shared, &lisp, r#"(getf (%org-modern-render :link "[[a][b]]") 'display)"#, "b");
+    says(&shared, &lisp, r#"(getf (%org-modern-render :link "[[a]]") 'display)"#, "a");
+    // Nothing claims a face where the highlighter already has the colour right.
+    says(&shared, &lisp, r#"(getf (%org-modern-render :heading "**") 'face)"#, "NIL");
     // An overlay whose text stopped being markup cannot draw itself, and says
     // so — which is how `%org-modern-rehide` knows to retire it.
     says(&shared, &lisp, r#"(%org-modern-render :emphasis "*half")"#, "NIL");

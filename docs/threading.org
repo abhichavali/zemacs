@@ -21,6 +21,34 @@ evaluator) without ever running Lisp on the UI thread.
 The main thread and the Lisp thread share the =Editor= through a mutex. That is
 the only shared state.
 
+** ...and any your config starts
+
+=mp:process-run-function= works, and a primitive called from a thread it made
+means the same thing it means anywhere else: the editor handle is a *process-wide*
+static rather than a thread-local, and the lock is taken per primitive on every
+thread alike. So a watcher, a poller or a long download can live in the image
+without freezing it, and can still =message= and still edit.
+
+Two things that follow, both of them just this file's rules applied to one more
+thread:
+
+- **Everything slow belongs on your thread, not the Lisp one.** That is the
+  whole reason to start one. A =(sleep 3)= on the Lisp thread costs the image;
+  on yours it costs nothing.
+- **A sequence that must be all-or-nothing is still one primitive.** Your thread
+  is one more thing that can land between two keystrokes, which is the same
+  problem [[*A Lisp function is not atomic][A Lisp function is not atomic]] already describes and has the same answer.
+
+Do *not* reach for =mp:interrupt-process= to hand work to the Lisp thread. ECL
+services it from a signal handler and allocates on the way in, and doing that
+while another thread has the collector busy is a SIGBUS in
+=ecl_alloc_uncollectable= — reproducibly, about one run in three against a thread
+that allocates hard. There is nothing to catch. Call the primitive from your own
+thread instead; that is what it is for.
+
+=runtime/modes/math-written.lisp= is the worked example: a directory watcher that
+polls, shells out to =curl=, and writes the answer into a buffer.
+
 * Lisp is not synchronous with the command loop
 
 In Emacs, a slow elisp function freezes redisplay and input until it returns.

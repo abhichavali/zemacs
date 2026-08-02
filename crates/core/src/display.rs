@@ -35,7 +35,24 @@ pub fn char_cells(c: char) -> usize {
 /// completion candidate or a dashboard row. Never `chars().count()`, which is
 /// the same lie one cell per character always was.
 pub fn str_cells(s: &str) -> usize {
-    unicode_width::UnicodeWidthStr::width(s)
+    // The sum of [`char_cells`], and *not* `UnicodeWidthStr::width`, which is
+    // not the same function: `width` counts a tab as one column while
+    // `UnicodeWidthChar::width('\t')` is `None` — a control character has no
+    // intrinsic width — and so `char_cells` calls it zero.
+    //
+    // Two measurements of the same string that disagree is a bug wherever they
+    // meet, and they met in `truncate`/`draw_segments`: `truncate` filled its
+    // budget with `char_cells` and the caller subtracted the result measured
+    // with `str_cells`, so a modeline segment containing a tab reported *more*
+    // cells than were asked for and underflowed a `usize`. That is a panic in a
+    // running editor, and it is what `truncate("\t\ta", 2)` did.
+    //
+    // Summing is the right direction of the two because the renderer advances
+    // by `char_cells` per character when it actually draws (`draw_weighted`).
+    // A width that disagrees with the advance is wrong by definition, whatever
+    // the Unicode annex says a tab ought to be — a tab in a *document* never
+    // reaches here anyway, `expand_line` having already turned it into spaces.
+    s.chars().map(char_cells).sum()
 }
 
 /// One display cell: the glyph drawn in it, and the index *within its line* of
@@ -140,6 +157,29 @@ mod tests {
         assert_eq!(char_cells('\u{0301}'), 0); // combining acute
         assert_eq!(str_cells("日本語"), 6);
         assert_eq!(str_cells("e\u{0301}"), 1); // e + acute is one column
+    }
+
+    /// The two must be the same measurement, because the renderer *advances* by
+    /// `char_cells` per character and *measures* with `str_cells`. They were
+    /// not: `UnicodeWidthStr::width` calls a tab one column and
+    /// `UnicodeWidthChar::width('\t')` is `None`, so a string with a tab in it
+    /// measured wider than it drew — which underflowed the modeline's remaining
+    /// budget and panicked the editor.
+    #[test]
+    fn str_cells_is_exactly_the_sum_of_char_cells() {
+        for s in [
+            "", "a", "日本語", "e\u{0301}", "🙂🙂", "a\tb", "\t\ta", "\u{0}\u{1}x",
+            "*tutor-lisp*", "linear-algebra.org", "…", "a\u{301}漢\t…",
+        ] {
+            assert_eq!(
+                str_cells(s),
+                s.chars().map(char_cells).sum::<usize>(),
+                "disagreement on {s:?}"
+            );
+        }
+        // The specific case, spelled out: a tab has no intrinsic width here.
+        assert_eq!(char_cells('\t'), 0);
+        assert_eq!(str_cells("\t\ta"), 1);
     }
 
     /// The cursor and the selection are both resolved through [`visual_col`], so

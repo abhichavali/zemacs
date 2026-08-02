@@ -666,3 +666,187 @@ is finished.
       slurp/barf, and Common Lisp indentation
 - [X] A REPL (~runtime/modes/repl.lisp~) evaluating in the *live* image, with a
       transcript buffer that is still loadable Lisp — SLIME's ~C-c~ family
+
+* Paused agents — resume points                                    :paused:
+
+  Two background agents were stopped mid-task on 2026-08-01. Both left the tree
+  **building clean with 559 tests passing**, so nothing here is blocking; each is
+  a finished-enough feature with a named loose end. Written down because the
+  loose ends are the kind that fail *silently*.
+
+** PAUSED MathSync — handwriting capture (part 2 of the maths environment)
+
+   Landed: ~runtime/modes/math-written.lisp~ (1308 lines) and
+   ~crates/lisp/tests/math_written.rs~, both loaded and passing. Watches
+   ~~/Public/MathSync~ for a photographed solution, sends it to a vision model
+   through OpenRouter, and writes the transcription into the Response section of
+   the *written problem point is inside*.
+
+   - [X] **The blocker is gone.** ~HOST~ in ~crates/lisp/src/lib.rs~ is a
+         process-wide ~OnceLock~ again, set once in ~spawn~, with no
+         ~thread_local!~ left anywhere in the file — so a primitive called from
+         the watcher's own ECL thread reaches the editor.
+   - [X] And it is now *guarded*, which it never was:
+         ~crates/lisp/tests/worker_thread.rs~ ::
+         ~a_primitive_reaches_the_editor_from_a_lisp_worker_thread~ starts a
+         thread with ~mp:process-run-function~ and asserts its ~message~ lands in
+         ~Editor::messages~. The marker is written *by the worker*, so the test
+         cannot pass on the boot thread having done the work. It also proves this
+         ECL has threads at all — without them the watcher cannot run either.
+   - [ ] The agent was killed while checking whether two failures elsewhere were
+         caused by its own Rust change. They were not — they were the org-heading
+         and per-buffer-gutter work landing at the same time, both since fixed.
+   - [ ] Unverified end to end: the OpenRouter model slug is resolved at runtime
+         against ~/api/v1/models~ and had not been exercised against the live API.
+   - [ ] The API key pasted into the session transcript should be treated as
+         burned and rotated. Code reads ~$OPENROUTER_API_KEY~ or
+         ~~/.config/zemacs/openrouter-key~; no key is in a tracked file.
+
+** PAUSED zemacs-tutor — the split-pane redesign
+
+   The first build (24 lessons, 69 exercises, child-~ecl~ sandbox for stage 1,
+   live image for stage 2) is complete and passing. The *redesign* to a
+   Codecademy-style layout — org instruction on the left, ~*tutor-lisp*~ on the
+   right, always opening at the table of contents — is substantially in:
+   ~tutor-contents~, ~tutor-next-exercise~, ~tutor-previous-exercise~,
+   ~tutor-open-at-point~, ~tutor-show-scratch~ and the ~split-window-right~
+   gesture all exist in ~runtime/modes/tutor.lisp~ (3357 lines).
+
+   - [ ] Stopped **during the stage-2 exercise sweep** — the check that every
+         exercise's reference answer passes *and* its shipped template fails.
+         That sweep is what caught seven real defects in the first build (two
+         templates that were the answer, a check satisfied by the wrong
+         function), so it is not optional. Re-run it over the new API.
+   - [ ] ~crates/lisp/tests/tutor.rs~ has been rewritten for the new shape
+         (~the_tutor_opens_two_panes_at_the_contents_and_marks_what_you_write~)
+         and passes; confirm it covers next/previous moving *both* panes.
+   - [ ] Stage 3 is still a deliberate one-screen placeholder.
+
+** Found while they ran — not theirs, not fixed                      :bug:
+
+   - [ ] **Non-ASCII does not survive Rust → Lisp.** ~(message "λ")~ from a
+         keybinding reaches the status line as ~Î»~: the form arrives as UTF-8
+         bytes, ECL's reader parses them as Latin-1, and ~dup_utf8~ re-encodes.
+         Loading a *file* is fine, which is why org's ~◉~ bullets are correct.
+         Reaches an accented answer to ~read-string~ and any path with a
+         non-ASCII component. **Not fixed on purpose**: Lisp deliberately holds
+         buffer text as UTF-8 *bytes* (~buffer-string~, ~%byte-index~,
+         ~%char-index~, ~search-forward~), so decoding eval'd source into real
+         character strings makes it incomparable with buffer text and breaks
+         every search — confirmed, ~(search-forward "γ" 0)~ returns NIL. The
+         coherent fix is moving the whole model to character strings and deleting
+         the two index conversions, which is the ceiling ~f_query~ in ~shim.c~
+         already writes up. A test asserting only "some character is non-ASCII"
+         passes on double-encoded text, which is how this hid.
+
+* Landed since — org-frozen, and what the audit turned up            :done:
+
+  Both background agents finished. Tree builds clean, **565 tests, 49 suites**,
+  green on three consecutive full runs.
+
+** DONE org-frozen — org as a printed page
+
+   ~runtime/modes/org-frozen.lisp~ (1107 lines), ~org-frozen-mode~ deriving from
+   ~org-mode~, ~SPC m z~ to toggle. Entering it runs org-mode's own body first, so
+   org-modern's bullets, emphasis, links, LaTeX previews and inline figures are
+   not reimplemented — they simply happen, and frozen mode is what goes on top.
+
+   - Hidden by *folding*, so the lines genuinely stop occupying rows and ~j~ steps
+     over them: property drawers, ~#+keyword:~ lines, ~#+begin_~/~#+end_~
+     delimiters, ~#~ comments, comment/export bodies.
+   - Typeset: ~#+TITLE:~ at 2× bold, source blocks banded with a gutter *and
+     highlighted in their own language*, quote blocks with a ~▎~ bar, ~-----~ as an
+     unbroken rule, tables aligned booktabs-style with a bold header.
+   - Two general primitives added, neither org-shaped: ~(highlight LANG TEXT)~,
+     a pure two-string function answering char-offset spans — needed because
+     ~%query~'s envelope is a name and two integers; and **real read-only**
+     (~Buffer::read_only~, ~ReadOnly::{No,Generated,Claimed}~), which closes the
+     ~boundary.org~ entry "A buffer Lisp made is not read-only" along the upgrade
+     path that entry had already written down.
+   - ~(with-inhibited-read-only …)~ is how a *program* writes to a frozen buffer —
+     MathSync's transcription lands in the left pane, which is the frozen one, so
+     without it the whole written-problem flow would have died. It lifts a
+     ~:claimed~ flag and never a ~:generated~ kind, so dired cannot quietly become
+     writable.
+
+** DONE Codebase audit — three fixes, all on the boot or draw path
+
+   - [X] **Line numbers were printed on top of the text in every org buffer.**
+         ~gutter_w~ reserved columns per *buffer* while the draw loop inked per
+         *editor*, so org got width 0 and the number painted over the first three
+         characters of every line. One ~gutter_on(buf, set)~ now answers both.
+   - [X] **`cl_format` called with a phantom argument, on every startup.** ECL's
+         ~narg~ counts the destination and control string too, so ~4~ claimed two
+         format arguments where one was pushed and ~cl_grab_rest_args~ consed a
+         word of stack residue in as a ~cl_object~. Proved with a C probe: poison
+         the outgoing-argument area and it segfaults inside ~FORMAT~. Now ~3~.
+   - [X] **Index panic** drawing a truncated line that carried a tall inline
+         image — it was granted the image's rows but sliced with the truncation
+         marker's ~cols - 1~ bound.
+   - [X] **Editor panic in the modeline** (found separately): ~char_cells~ and
+         ~str_cells~ disagreed about a tab, so ~truncate~ budgeted with one and
+         ~draw_segments~ subtracted the other and underflowed a ~usize~. Bit only
+         in *split* panes, where the modeline is narrow enough to truncate —
+         which is exactly the tutor and curriculum layouts. ~str_cells~ is now the
+         sum of ~char_cells~, matching how ~draw_weighted~ actually advances.
+
+** Open — each needs a decision, not a patch                          :bug:
+
+   - [ ] **Inline images: `offset_at` and `visible_lines` do not count an image's
+         rows, `draw_document` does.** Click a line below a display equation and
+         point lands one or two lines high; scrolling clamps against a row count
+         larger than what is drawn. Closing it means handing core the overlay
+         list so it can lay a line out the way the renderer does — a
+         ~boundary.org~ decision.
+   - [ ] **`(line-numbers-p)` is half a reader** — it answers the editor-wide
+         default, but the gutter is now per buffer, so a mode asking "am I
+         showing numbers?" gets the wrong answer on the no-gutter list. Decide
+         whether it becomes per-buffer (breaking configs that read it as the
+         global default) or gains a sibling.
+   - [ ] **Double-encoded text is still live in ~org-modern.lisp~ and
+         ~math.lisp~.** ~(buffer-string)~ hands back one character per UTF-8 byte
+         and ~dup_utf8~ re-encodes it, so an em dash or an accented link
+         description comes back as mojibake. ~%org-frozen-text~ in
+         ~org-frozen.lisp~ is a working Lisp-side decoder; lift it into a shared
+         helper rather than writing a third copy.
+   - [ ] ~prune_images~ is not called after an edit that kills an overlay, so an
+         image whose text was deleted lingers until the next explicit overlay
+         delete. Bounded in practice, not unbounded. Needs a policy on where the
+         sweep belongs — every edit is too often.
+   - [ ] An overlay on an *empty* line never renders (~overlays_for_line~ needs
+         ~o.start < end~). Consistent across all three loops, so nothing
+         disagrees — but Emacs draws it.
+   - [ ] ~point-moved-hook~ misses a buffer switch to the same offset: one
+         ~last_point~ for the whole editor.
+   - [ ] ~eval.rs::init_lisp_drives_editor_commands~ was reported flaking once
+         under full-suite parallel load ("the scratch file should be seeded with
+         a header; got \"\""). Did **not** reproduce in three consecutive full
+         runs; noted in case it returns.
+
+** MathSync — what is left before it can run                       :paused:
+
+   The Rust blocker is fixed and guarded (above). What remains is configuration
+   and one unverified call, not code:
+
+   - [ ] **No API key on this machine.** Neither ~$OPENROUTER_API_KEY~ nor
+         ~~/.config/zemacs/openrouter-key~ exists, so ~SPC m w~ will say so and
+         stay off. The key pasted into a session transcript earlier should be
+         considered burned — rotate it, then write the new one to that file with
+         mode 600.
+   - [ ] **The model slug has never been resolved against the live API.** It is
+         looked up at runtime against ~/api/v1/models~ and fails loudly with a
+         list of vision-capable candidates rather than posting to a wrong model,
+         so the first run is the test.
+
+** NOT a bug — ~SPC m g~ in two modes                                 :note:
+
+   I reported this as a binding collision. It is not one, and nothing was
+   changed. The two bindings are in *different minor modes* which cannot both be
+   on: ~math-curriculum~ is switched on from ~*org-mode-functions*~ for a buffer
+   declaring ~#+ZEMACS_CURRICULUM~, and ~math-code~ from ~*python-mode-functions*~
+   for the tangled ~.py~. A buffer is org or python, never both.
+
+   So ~SPC m g~ means the same thing on both sides of the split — *go back where
+   you came from*: to the Contents in the curriculum, to the curriculum in the
+   program. That is better than two keys for one idea, and it is worth leaving
+   alone.

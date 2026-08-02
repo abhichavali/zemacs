@@ -98,6 +98,25 @@ pub struct Prompt {
     /// Where the cursor was when the prompt opened, so cancelling can put it
     /// back. Only meaningful for prompts that move the cursor while you type.
     pub origin: Option<usize>,
+    /// One buffer id per candidate, for a `Buffer` prompt and empty otherwise.
+    ///
+    /// An **id** and not the index the candidate sits at, because previewing a
+    /// buffer switches to it and switching *reorders* the list — the outgoing
+    /// buffer goes to the front, which is what makes the switcher
+    /// most-recently-used. Indices taken when the prompt opened would therefore
+    /// mean something different after the first arrow key, and the candidate
+    /// under the cursor would walk away from you as you scrolled.
+    pub ids: Vec<crate::BufferId>,
+    /// The buffer that was live when the prompt opened, so cancelling comes
+    /// back to it. The counterpart of [`Prompt::origin`] for a prompt whose
+    /// preview moves between buffers rather than within one.
+    pub origin_buffer: Option<crate::BufferId>,
+    /// Characters at the front of every candidate that are *decoration* rather
+    /// than content — the right-aligned line number `consult-line` puts in
+    /// front of each line. The renderer needs it to line a candidate's text up
+    /// with the buffer's own highlight spans, and it is one number rather than
+    /// a re-parse per row because the format is decided here.
+    pub prefix: usize,
 }
 
 impl PromptKind {
@@ -112,7 +131,16 @@ impl PromptKind {
     /// incremental search, and the reason it is a flag on the prompt rather
     /// than a mode of its own.
     pub fn previews(self) -> bool {
-        matches!(self, PromptKind::Line | PromptKind::Search)
+        // `Buffer` is here for the same reason `Line` is, one scale up: what you
+        // are choosing between is *documents*, and their names are a poor
+        // reminder of which is which. Showing the highlighted one is the whole
+        // of consult-buffer's usefulness. It restores through
+        // [`Prompt::origin_buffer`] rather than [`Prompt::origin`] — the thing
+        // to put back is a buffer, not an offset.
+        matches!(
+            self,
+            PromptKind::Line | PromptKind::Search | PromptKind::Buffer
+        )
     }
 }
 
@@ -126,6 +154,9 @@ impl Prompt {
             matches: Vec::new(),
             selected: 0,
             origin: None,
+            ids: Vec::new(),
+            origin_buffer: None,
+            prefix: 0,
         };
         p.refilter();
         p
@@ -223,7 +254,12 @@ impl Prompt {
 
     /// The rows to draw and which is selected, capped to what fits. Scrolls
     /// with the selection so it is always on screen.
-    pub fn visible(&self, max: usize) -> Vec<(&str, bool)> {
+    ///
+    /// Each row carries its index into `items` as well as its text. For a
+    /// `Line` prompt that index *is* the buffer line, which is what lets the
+    /// renderer colour a candidate out of the highlight spans the buffer
+    /// already has rather than re-parsing the line.
+    pub fn visible(&self, max: usize) -> Vec<(usize, &str, bool)> {
         if max == 0 || self.matches.is_empty() {
             return Vec::new();
         }
@@ -235,7 +271,7 @@ impl Prompt {
             .enumerate()
             .skip(first)
             .take(max)
-            .map(|(row, &i)| (self.items[i].as_str(), row == self.selected))
+            .map(|(row, &i)| (i, self.items[i].as_str(), row == self.selected))
             .collect()
     }
 
@@ -346,7 +382,9 @@ mod tests {
         p.selected = 15;
         let rows = p.visible(5);
         assert_eq!(rows.len(), 5);
-        assert!(rows.iter().any(|(t, sel)| *sel && *t == "item15"));
+        // The item index comes back too, and it is the index into `items` —
+        // which is what lets a renderer look the candidate's source up.
+        assert!(rows.iter().any(|&(i, t, sel)| sel && t == "item15" && i == 15));
         // and it never runs off the end
         p.selected = 19;
         assert_eq!(p.visible(5).len(), 5);

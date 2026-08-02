@@ -56,7 +56,24 @@ pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
             None => "nil".into(),
         },
         "buffer-modified-p" => boolean(buf.modified),
-        "buffer-read-only-p" => boolean(buf.kind.is_generated()),
+        // NIL, `:generated` or `:claimed` — truthy exactly where it used to be
+        // truthy, so `(unless (buffer-read-only-p) ...)` in `lsp.lisp` reads the
+        // same and a frozen org buffer, like dired, has nothing to say to a
+        // language server.
+        //
+        // A keyword rather than T because the *reason* is the one thing a caller
+        // wanting to write anyway has to know, and there is no second reader to
+        // ask. `with-inhibited-read-only` lifts a claim a mode made and must
+        // leave a generated buffer alone — dired quietly becoming writable is
+        // the kind of bug that surfaces as data loss much later — so it needs
+        // these two told apart. A keyword and not a symbol because
+        // `ecl_read_from_cstring` reads in whatever package is current, and
+        // `:claimed` means the same thing in all of them.
+        "buffer-read-only-p" => match buf.read_only() {
+            crate::ReadOnly::No => "nil".into(),
+            crate::ReadOnly::Generated => ":generated".into(),
+            crate::ReadOnly::Claimed => ":claimed".into(),
+        },
         // clipboard: vim's `""`, which is also the system clipboard — writing
         // it has always worked (`copy-region`, `set-register`), and this is the
         // read that `boundary.org` listed as missing. `(TEXT . LINEWISE-P)`
@@ -204,6 +221,7 @@ pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
         // works around by wrapping the setter to remember what it was handed.
         "font-size" => float(ed.settings.font_size),
         "tab-width" => ed.settings.tab_width.to_string(),
+        "text-width" => ed.settings.text_width.to_string(),
         "line-numbers-p" => boolean(ed.settings.line_numbers),
         "relative-line-numbers-p" => boolean(ed.settings.relative_line_numbers),
         "modeline-relief" => ed.settings.modeline_relief.to_string(),

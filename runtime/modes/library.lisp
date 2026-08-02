@@ -43,11 +43,42 @@
 (define-derived-mode text-mode nil)
 (set-mode-local 'text-mode 'line-overflow "wrap")
 
-;;; Org is prose with structure. It takes the wrapping from `text-mode' and
-;;; adds absolute line numbers of its own: relative numbering is a motion aid
-;;; for `5j'-style editing, and prose is read rather than jumped through.
+;;; Org is prose with structure, and takes the wrapping from `text-mode'.
+;;;
+;;; It used to claim `relative-line-numbers' off as well, on the theory that
+;;; relative numbering is a motion aid for `5j'-style editing and prose is read
+;;; rather than jumped through. That theory is wrong about how org is actually
+;;; edited — an outline is exactly the thing you move through in counted jumps
+;;; — and the claim had a worse effect than being wrong: because a mode claim
+;;; beats the global baseline, turning relative numbers on for the editor did
+;;; nothing at all in the buffers where they were wanted. A setting nobody
+;;; claims is a setting the config decides, which is the right default here.
 (define-derived-mode org-mode text-mode)
-(set-mode-local 'org-mode 'relative-line-numbers nil)
+
+;;; No gutter — but said in `init.lisp' with `set-no-gutter-modes', not here
+;;; with `set-mode-local'.
+;;;
+;;; The claim used to be here and it was subtly wrong in the same way the
+;;; `relative-line-numbers' one above was, only harder to see. A mode-local
+;;; setting is *global*: entering org applies it to the editor, so a source file
+;;; in the pane alongside lost its numbers too, and which of the two won came
+;;; down to which mode had been entered last. Line numbers are drawn per pane,
+;;; so they have to be decided per buffer, which is a mechanism this table does
+;;; not have and deliberately is not growing — `set-no-gutter-modes' is a list
+;;; of mode names that core applies to each buffer as its mode is set.
+;;;
+;;; A measure, on the other hand, genuinely is a claim: 80 columns rather than a
+;;; line as wide as the window. 80 is
+;;; the number this file already assumes everywhere else, and it lands inside
+;;; the 45-90 characters typography has settled on for a comfortable line: past
+;;; that the eye loses the start of the next line on the way back to it. The
+;;; renderer centres whatever it is given, so a wide window becomes margin
+;;; rather than a longer line — `olivetti-mode', and what a document looks like.
+;;;
+;;; A number and not a fraction of the window on purpose: a measure is a count
+;;; of characters, so it stays right when the window is resized and when the
+;;; font size changes, and it means the same thing on a laptop as on a 5K panel.
+(set-mode-local 'org-mode 'text-width 80)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Languages
@@ -66,7 +97,11 @@
 ;;; Lisp indents by two, and `eval-dwim' — the built-in verb behind `C-c' —
 ;;; earns a mode-local spelling in the buffers where it means something.
 (set-mode-local 'lisp-mode 'tab-width 2)
-(define-mode-key 'lisp-mode "SPC m e" "eval-dwim")
+;;; `lisp-eval-dwim' rather than the built-in `eval-dwim' verb: same three-way
+;;; decision, but the value goes to the transcript. Defined in `repl.lisp',
+;;; which loads after this — a binding names a command by string and is looked
+;;; up when the key is pressed, so the order does not matter.
+(define-mode-key 'lisp-mode "SPC m e" "lisp-eval-dwim")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Minor modes

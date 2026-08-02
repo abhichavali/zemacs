@@ -21,12 +21,28 @@
 //! # What an overlay carries
 //!
 //! Only what the *renderer* has to know: a face, a background, a substituted
-//! string, an image. Everything else a config wants to hang off an overlay — an
-//! avy hint's target, a diagnostic's message, a closure — stays in the Lisp
-//! image, in a hash table keyed by the same handle. That is the boundary rule
-//! working as intended: Rust owns the storage the frame reads, Lisp owns the
-//! property list, and an arbitrary Lisp value never has to survive a round trip
-//! through C as printed source.
+//! string, an image, and — since typesetting arrived — how big and how heavy the
+//! type is. Everything else a config wants to hang off an overlay — an avy
+//! hint's target, a diagnostic's message, a closure — stays in the Lisp image,
+//! in a hash table keyed by the same handle. That is the boundary rule working
+//! as intended: Rust owns the storage the frame reads, Lisp owns the property
+//! list, and an arbitrary Lisp value never has to survive a round trip through C
+//! as printed source.
+//!
+//! # Cells and lines
+//!
+//! The payloads split in two, and the split is the one thing to understand here.
+//! Most of them are about the *cells* a range covers: a face recolours them, a
+//! `display` string replaces them, `bold` and `italic` change which face
+//! rasterises them. Three are about the *lines* the range touches, whole:
+//! [`Overlay::fold`] makes them stop occupying rows, [`Overlay::line_background`]
+//! paints a band the width of the pane behind them, and
+//! [`Overlay::line_prefix`] pushes their text in and draws something in the gap.
+//! [`Overlay::scale`] is written as a cell payload and behaves as a line one —
+//! see its own note, which is the only surprising thing in this file.
+//!
+//! Nothing here decides *what* gets which. A level-1 heading being 1.5× and bold
+//! is policy, and policy is Lisp's; this is the vocabulary it says it in.
 //!
 //! ponytail: colours are named from `face-list` rather than given as RGB, so an
 //! overlay follows a theme change and no new colour vocabulary exists. An
@@ -91,6 +107,57 @@ pub struct Overlay {
     pub display: Option<String>,
     /// Drawn instead of the covered text, as a bitmap.
     pub image: Option<ImageId>,
+    /// Type size for the covered run, as a **percentage of the body size**:
+    /// `Some(150)` is one and a half times the text around it, `None` and
+    /// `Some(100)` are the body size itself.
+    ///
+    /// A percentage rather than a float because the whole overlay bridge is
+    /// integers and strings — see `command_for` in `zemacs-lisp` — and because
+    /// the renderer is going to snap it to one of a handful of steps anyway, for
+    /// which an exact float was never the input.
+    ///
+    /// **This is written per run and behaves per line.** A scaled cell is wider
+    /// as well as taller, and every piece of layout downstream — where a line
+    /// wraps, which column the cursor is in, which character a click lands on —
+    /// counts in whole cells of one width. Letting a run carry its own advance
+    /// would mean a per-line table of pixel offsets and rewriting all of that in
+    /// pixels; instead the *widest scale claimed by any overlay touching a line*
+    /// sets that line's cell, and the grid stays a grid. That is what a heading
+    /// wants anyway, and it is the only reading under which the line the cursor
+    /// is on and the line the renderer drew agree about where column 12 is.
+    ///
+    /// ponytail: so a scaled run in the middle of a body line enlarges the whole
+    /// line rather than a word. Ceiling: `*this* word bigger`, which nothing has
+    /// asked for. Upgrade path is the per-line advance table `draw_image`
+    /// already names for its own horizontal reflow — one table, both problems.
+    pub scale: Option<u16>,
+    /// Real weight, not a colour. `None` leaves whatever an earlier overlay or
+    /// the syntax highlight decided; `Some(false)` says upright *deliberately*,
+    /// which is how a later overlay takes an earlier one's bold off.
+    ///
+    /// The reason [`HlKind`]'s markup faces carry emphasis as colour is that the
+    /// renderer used to open exactly one font face. It opens more than one now,
+    /// and this is the attribute that lifted it.
+    pub bold: Option<bool>,
+    /// Real slant. Same tri-state as [`Overlay::bold`], same reason.
+    pub italic: Option<bool>,
+    /// A band across the **whole pane**, behind every line this overlay touches,
+    /// named from `face-list` like every other colour here.
+    ///
+    /// Not the same as [`Overlay::background`], and the difference is the point:
+    /// a background paints the cells the range covers, so a source block drawn
+    /// with one is a stripe as ragged as its text. This paints the line, edge to
+    /// edge, so the block reads as a block. Emacs needs a stretch display
+    /// property and a `:extend`ed face to say the same thing.
+    pub line_background: Option<HlKind>,
+    /// Drawn in the left margin of every row of every line this overlay touches,
+    /// with the line's own text pushed right by exactly its width.
+    ///
+    /// Emacs' `line-prefix` and `wrap-prefix` collapsed into one, because the
+    /// case that wants either — a quote bar, an indented source block — wants
+    /// the continuation rows to line up too, and two properties that are always
+    /// set together are one property.
+    pub line_prefix: Option<String>,
     /// **Hide the lines after this overlay's first one.** The one payload here
     /// that is about *lines* rather than about cells, and the whole of code
     /// folding: everything else an overlay carries replaces some characters with
@@ -113,6 +180,11 @@ impl Overlay {
             background: None,
             display: None,
             image: None,
+            scale: None,
+            bold: None,
+            italic: None,
+            line_background: None,
+            line_prefix: None,
             fold: false,
         }
     }
@@ -148,10 +220,14 @@ pub fn fold_starts_in(overlays: &[Overlay], start: usize, end: usize) -> bool {
 /// A change to an overlay, as it arrives from Lisp.
 ///
 /// One [`EditorCommand`](crate::EditorCommand) variant carries all of these
-/// rather than six flat ones: they share a handle and a destination, and none of
-/// them touches the document — an overlay is drawing, not text, which is why
-/// `mutates_document` says no and a face can therefore be put on a *generated*
-/// buffer like dired or magit.
+/// rather than a dozen flat ones: they share a handle and a destination, and
+/// none of them touches the document — an overlay is drawing, not text, which is
+/// why `mutates_document` says no and a face can therefore be put on a
+/// *generated* buffer like dired or magit.
+///
+/// One variant per attribute rather than one carrying a struct of options, for
+/// the reason `overlay-put` has the shape it does: a config sets one thing at a
+/// time and must not have to restate the other ten to do it. `None` clears.
 #[derive(Clone, Debug, PartialEq)]
 pub enum OverlayEdit {
     /// `None` clears the face.
@@ -159,6 +235,14 @@ pub enum OverlayEdit {
     Background(OverlayId, Option<HlKind>),
     Display(OverlayId, Option<String>),
     Image(OverlayId, Option<ImageId>),
+    /// Percent of the body size. `None`, and `Some(100)`, are body size.
+    Scale(OverlayId, Option<u16>),
+    /// `Some(false)` is upright *on purpose*, and outranks an earlier overlay's
+    /// bold; `None` is no opinion. Same for [`OverlayEdit::Italic`].
+    Bold(OverlayId, Option<bool>),
+    Italic(OverlayId, Option<bool>),
+    LineBackground(OverlayId, Option<HlKind>),
+    LinePrefix(OverlayId, Option<String>),
     /// Fold, or unfold, the lines after this overlay's first one.
     Fold(OverlayId, bool),
     Delete(OverlayId),
@@ -216,6 +300,11 @@ impl Overlays {
             | OverlayEdit::Background(id, _)
             | OverlayEdit::Display(id, _)
             | OverlayEdit::Image(id, _)
+            | OverlayEdit::Scale(id, _)
+            | OverlayEdit::Bold(id, _)
+            | OverlayEdit::Italic(id, _)
+            | OverlayEdit::LineBackground(id, _)
+            | OverlayEdit::LinePrefix(id, _)
             | OverlayEdit::Fold(id, _) => id,
         };
         let Some(o) = self.live.iter_mut().find(|o| o.id == id) else {
@@ -226,6 +315,13 @@ impl Overlays {
             OverlayEdit::Background(_, k) => o.background = k,
             OverlayEdit::Display(_, s) => o.display = s,
             OverlayEdit::Image(_, i) => o.image = i,
+            // 100% is the body size, which is what "no scale" already means —
+            // folded here so the renderer never has to ask the question twice.
+            OverlayEdit::Scale(_, s) => o.scale = s.filter(|&s| s != 100),
+            OverlayEdit::Bold(_, b) => o.bold = b,
+            OverlayEdit::Italic(_, i) => o.italic = i,
+            OverlayEdit::LineBackground(_, k) => o.line_background = k,
+            OverlayEdit::LinePrefix(_, s) => o.line_prefix = s,
             OverlayEdit::Fold(_, f) => o.fold = f,
             OverlayEdit::Delete(_) | OverlayEdit::RemoveIn(..) => unreachable!("returned above"),
         }
@@ -380,6 +476,42 @@ mod tests {
         assert_eq!(o.all().len(), 1);
         o.edit(OverlayEdit::Delete(1));
         assert!(o.all().is_empty());
+    }
+
+    /// The attributes that arrived with typesetting. Tri-state throughout, and
+    /// that is the part worth a test: `Some(false)` is a claim ("upright") and
+    /// `None` is the absence of one, which is what lets a later overlay take an
+    /// earlier one's bold off without also clearing its size.
+    #[test]
+    fn rich_display_attributes_are_set_and_cleared_by_handle() {
+        let mut o = overlay(5, 10);
+        o.edit(OverlayEdit::Scale(1, Some(150)));
+        o.edit(OverlayEdit::Bold(1, Some(true)));
+        o.edit(OverlayEdit::Italic(1, Some(false)));
+        o.edit(OverlayEdit::LineBackground(1, Some(HlKind::Code)));
+        o.edit(OverlayEdit::LinePrefix(1, Some("▎ ".into())));
+        let at = |o: &Overlays| {
+            let o = &o.all()[0];
+            (o.scale, o.bold, o.italic, o.line_background, o.line_prefix.clone())
+        };
+        assert_eq!(
+            at(&o),
+            (Some(150), Some(true), Some(false), Some(HlKind::Code), Some("▎ ".into()))
+        );
+        // Body size is not a scale, however it is spelled: the renderer asks
+        // "is this line bigger than the text", and 100% is not.
+        o.edit(OverlayEdit::Scale(1, Some(100)));
+        assert_eq!(at(&o).0, None);
+        // Clearing one leaves the rest, which is the whole of "per attribute".
+        o.edit(OverlayEdit::Bold(1, None));
+        assert_eq!(at(&o).1, None);
+        assert_eq!(at(&o).3, Some(HlKind::Code));
+        o.edit(OverlayEdit::LinePrefix(1, None));
+        assert_eq!(at(&o).4, None);
+        // A handle no overlay has stays silent here too — these arrive from the
+        // same arithmetic in Lisp as every other edit.
+        o.edit(OverlayEdit::Scale(99, Some(200)));
+        assert_eq!(o.all().len(), 1);
     }
 
     /// Folding, as the one predicate the renderer and `j` both ask. "abc\ndef\n

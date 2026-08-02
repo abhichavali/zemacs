@@ -48,7 +48,7 @@ use sdl2::video::WindowContext;
 use zemacs_core::display::{char_cells, expand_line, str_cells, visual_col, wrap_row_count};
 use zemacs_core::modeline;
 use zemacs_core::{
-    fold_hiding, fold_starts_in, Buffer, BufferKind, CompletionStyle, Editor, HlKind, ImageId,
+    fold_hiding, fold_starts_in, Buffer, BufferKind, CompletionStyle, Editor, HlKind, Image, ImageId,
     LineOverflow, Mode, Overlay, Settings, Span, Window,
 };
 use zemacs_term::Screen;
@@ -120,6 +120,26 @@ pub struct Renderer {
     /// the rasterised glyphs differ, so they cannot share a cache either.
     bold: Font<'static, 'static>,
     bold_glyphs: HashMap<char, Option<Texture<'static>>>,
+    /// Every *other* face: any size an overlay's `scale` asked for, and italic
+    /// at any size. See [`Face`] for what one is and [`Renderer::draw_glyph`]
+    /// for the three-way split.
+    ///
+    /// The two fields above are not folded in here, deliberately. They are the
+    /// faces the editor draws essentially all of its text in — every buffer,
+    /// the modeline, every popup — and their cost is a property of the document
+    /// rather than of anyone's config. This map's is the opposite: it exists
+    /// only because a config asked for typesetting, and every dimension of it is
+    /// therefore something policy can be held to a bound on.
+    ///
+    /// **The bound.** The key space is closed by [`SCALE_STEPS`] × four styles =
+    /// 16, of which the body's plain and bold live above, so at most 14 faces
+    /// are ever open here; [`MAX_FACES`] is the assertion of that. Each holds at
+    /// most [`MAX_FACE_GLYPHS`] textures and empties itself rather than growing
+    /// past it. `None` records a face that would not open, so it is not retried
+    /// every frame. All of it is dropped by [`Renderer::sync`], exactly as the
+    /// body caches are, since a font-size or DPI change makes every pixel of it
+    /// stale.
+    faces: HashMap<FaceKey, Option<Face>>,
     /// One texture per overlay image, keyed the way core keys the pixels — by
     /// what produced them. So a second `org-latex-preview` over the same buffer
     /// re-uses these rather than re-uploading a screenful of equations, which is
@@ -210,6 +230,7 @@ impl Renderer {
             font,
             bold,
             bold_glyphs: HashMap::new(),
+            faces: HashMap::new(),
             images: HashMap::new(),
             font_path,
             point_size,
@@ -241,6 +262,9 @@ impl Renderer {
         self.point_size = want;
         self.glyphs.clear(); // rasterised at the old size, all of it is stale
         self.bold_glyphs.clear();
+        // ...and the scaled faces doubly so: their *point sizes* were derived
+        // from the old one, so both the fonts and their glyphs are wrong.
+        self.faces.clear();
         let (cell_w, line_h) = metrics(&self.font);
         self.cell_w = cell_w;
         self.line_h = line_h;
@@ -349,15 +373,26 @@ impl Renderer {
                 .and_then(|(id, scroll)| {
                     let buf = editor.buffer_by_id(id)?;
                     let set = &editor.settings;
-                    let doc = doc_rect(pane, status_h);
-                    let cols =
-                        visible_cols(doc.w - gutter_w(buf, set, self.cell_w), self.cell_w);
-                    Some((visible_lines(buf, scroll, rows, cols, set), cols))
+                    let doc = doc_rect(pane, status_h, measure_px(set, self.cell_w));
+                    let text_w = doc.w - gutter_w(buf, set, self.cell_w);
+                    let cols = visible_cols(text_w, self.cell_w);
+                    Some((
+                        visible_lines(buf, scroll, rows, text_w, self.cell_w, set),
+                        cols,
+                    ))
                 });
             // `cols` goes back too, and it is not decoration: `j` and `k` move
             // by *visual* line, and where a visual line breaks is this number.
             // Core has no other way to learn it — the width of a cell is a font
             // fact and the gutter's width is a layout one.
+            //
+            // ponytail: it is the *body* line's column count. A line an overlay
+            // has scaled or given a prefix to breaks earlier than this says, so
+            // `j` over a wrapped heading steps by the wrong visual line. Ceiling:
+            // a heading long enough to wrap, which a heading rarely is. Upgrade
+            // path is the one core already needs for the same reason — see the
+            // note on `visible_lines` in the draw loop — handing core the overlay
+            // list so it can lay a line out the way the renderer does.
             let (lines, cols) = laid_out.unwrap_or((rows, 0));
             if let Some(w) = editor.frames[frame_index].window_mut(p.window) {
                 w.viewport_lines = lines;
@@ -389,8 +424,13 @@ impl Renderer {
             // neighbour. Cheaper than teaching every primitive about the pane.
             self.set_clip(pane);
             match (buf.kind, terminal) {
+                // Neither of these takes the measure. The dashboard centres its
+                // own art in whatever it is given, and a terminal's width is a
+                // fact the child process has already been told — narrowing
+                // either would be the setting reaching past the documents it is
+                // about.
                 (BufferKind::Dashboard, _) => {
-                    self.draw_dashboard(editor, doc_rect(pane, status_h))
+                    self.draw_dashboard(editor, doc_rect(pane, status_h, 0))
                 }
                 // A terminal is drawn from its live grid rather than from the
                 // rope, because per-cell colour and the block cursor are both
@@ -398,7 +438,7 @@ impl Renderer {
                 // rope is still what the buffer switcher reads.
                 (BufferKind::Terminal, Some(screen)) => {
                     let (bg, fg) = (editor.settings.background, editor.settings.foreground);
-                    self.draw_terminal(screen, doc_rect(pane, status_h), rgb(bg), rgb(fg));
+                    self.draw_terminal(screen, doc_rect(pane, status_h, 0), rgb(bg), rgb(fg));
                 }
                 _ => self.draw_document(editor, buf, win, pane, status_h, active),
             }
@@ -456,6 +496,33 @@ impl Renderer {
         self.shown = Some(self.drawn);
     }
 
+    /// Throw the frame just drawn away instead of putting it on screen.
+    ///
+    /// **The other half of [`Renderer::changed`], and not optional.** Nothing in
+    /// `render` talks to the GPU: every `fill` and every glyph blit is appended
+    /// to a command list inside SDL, and that list is drained only when the
+    /// renderer is *flushed* — which `present` does on its way to the swap.
+    /// Skipping the present therefore does not skip the work; it leaves it
+    /// queued, and the next frame appends to the same list. Nothing ever drops
+    /// it, so an editor sitting still and drawing frames it decides not to show
+    /// grows by a whole frame's worth of commands per display frame.
+    ///
+    /// Measured before this existed, on an untouched window: 3 MB a second, a
+    /// 96-byte command per glyph plus the vertex buffer they index — reallocated
+    /// ever larger because SDL resets its high-water mark only on a flush. An
+    /// idle hour was 11 GB.
+    ///
+    /// So the list is executed and dropped. That spends the GPU the frame we
+    /// just decided nobody wanted, which is a real cost and exactly why this is
+    /// not simply a `present`: what a present *also* does is block until the
+    /// next vertical blank, and that blank is the 14 ms the skip exists to save.
+    pub fn discard(&mut self) {
+        // Safe in spite of the signature. `SDL_RenderFlush` takes the renderer
+        // and answers a status; `sdl2` marks the entry points it added late as
+        // `unsafe` rather than auditing them.
+        unsafe { self.canvas.render_flush() };
+    }
+
     /// Whether the frame [`Renderer::render`] just drew differs from the one on
     /// screen. False means `present` would block for a vertical blank to put up
     /// a picture identical to the one already there.
@@ -503,6 +570,54 @@ impl Renderer {
         (1000 / hz).max(1) as u32
     }
 
+    // --- pointing ----------------------------------------------------------
+
+    /// The window a click at `(x, y)` landed in, and the buffer offset under
+    /// the pointer.
+    ///
+    /// The inverse of [`Renderer::draw_document`]'s row loop, and it has to
+    /// live next to it: every step from a pixel to a character goes through a
+    /// layout fact core cannot see. The gutter's width depends on the font;
+    /// where a line breaks depends on the pane's width; a folded line occupies
+    /// no row at all; a wrapped one occupies several; and a tab or a CJK glyph
+    /// occupies several *cells* per character. Core knows none of that, which
+    /// is why the event loop cannot do this arithmetic itself and why the
+    /// answer comes back as an offset rather than as a (line, column).
+    ///
+    /// `None` when the click was on a divider, or in a pane showing something
+    /// that is not buffer text — the dashboard and a terminal both draw rows
+    /// that no rope position corresponds to.
+    pub fn click_target(
+        &self,
+        editor: &Editor,
+        frame_index: usize,
+        x: i32,
+        y: i32,
+    ) -> Option<(zemacs_core::frame::WindowId, usize)> {
+        let area = area_rect(area_of(self.content_area()));
+        let status_h = modeline_h(self.line_h, &editor.settings);
+        let frame = editor.frames.get(frame_index)?;
+        let p = frame.panes(area).into_iter().find(|p| p.rect.contains(x, y))?;
+        let win = frame.window(p.window)?;
+        let buf = editor.buffer_by_id(win.buffer)?;
+        if matches!(buf.kind, BufferKind::Dashboard | BufferKind::Terminal) {
+            return None;
+        }
+
+        let at = offset_at(
+            buf,
+            win,
+            &editor.settings,
+            area_of(p.rect),
+            status_h,
+            self.line_h,
+            self.cell_w,
+            x,
+            y,
+        );
+        Some((p.window, at))
+    }
+
     // --- document ---------------------------------------------------------
 
     /// One pane's buffer. `win` carries the cursor and scroll — the focused
@@ -524,7 +639,7 @@ impl Renderer {
     ) {
         let set = &editor.settings;
         let (bg, fg) = (set.background, set.foreground);
-        let doc = doc_rect(pane, status_h);
+        let doc = doc_rect(pane, status_h, measure_px(set, self.cell_w));
         let (cur_line, cur_col) = line_col(buf, win.cursor);
         // The selection and the highlight spans both describe `editor.buffer`
         // as the focused window sees it, and there is exactly one of each in
@@ -557,9 +672,18 @@ impl Renderer {
         let block_cursor = editor.mode != Mode::Insert;
 
         let digits = gutter_digits(buf);
+        // The *same* question `gutter_w` answers, asked once and used twice.
+        // Reading `set.line_numbers` here instead is what put an org buffer's
+        // numbers on top of its own first three characters: the width came from
+        // the buffer's answer and the ink came from the editor's.
+        let numbered = gutter_on(buf, set);
         let gutter = gutter_w(buf, set, self.cell_w);
         let x0 = doc.x + gutter;
-        let cols = visible_cols(doc.w - gutter, self.cell_w);
+        // Pixels rather than columns, and that is the shape of the whole change
+        // that let a line be typeset: how many columns a line has depends on how
+        // big its type is and how far its prefix pushed it in, so the pane hands
+        // down a width and each line divides it — see [`line_box`].
+        let text_w = doc.w - gutter;
         let wrap = set.line_overflow == LineOverflow::Wrap;
 
         let sel_bg = rgb(mix(bg, fg, 0.28));
@@ -576,11 +700,12 @@ impl Renderer {
         // monotonic cursor walks them alongside the lines — no rescan per line.
         let mut si = 0usize;
         let rows = doc_lines(pane, status_h, self.line_h);
-        // Relative numbers count *down* to the cursor as well as up from it, so
-        // the row it is on has to be known before the first row is drawn. Per
-        // window: each pane counts from its own cursor, which is what makes an
-        // inactive split's gutter describe itself rather than the focused pane.
-        let cursor_row = cursor_pane_row(buf, win.scroll, (cur_line, cur_col), cols, set);
+        // The cursor's *line* is all a relative number needs — `cur_line` above
+        // — because the count is of buffer lines. Working out which display row
+        // the cursor sits on used to be needed here and is not any more; see
+        // `gutter_number`. Per window either way: each pane counts from its own
+        // cursor, which is what makes an inactive split's gutter describe
+        // itself rather than the focused pane.
 
         // `row` is a display row in the pane, `line` a buffer line: with
         // wrapping the two advance at different rates.
@@ -608,6 +733,23 @@ impl Renderer {
             si = next;
 
             let ov_runs = overlays_for_line(overlays, start, end);
+            // What the overlays say about the *line*, resolved before its cells
+            // because the cell width it decides is the unit everything below is
+            // measured in. `pct` is the type size; 100 is the body, and on a
+            // buffer with no typesetting overlays every derived quantity here
+            // collapses to what it was before any of this existed.
+            let style = line_style(overlays, start, end);
+            let pct = style.scale.max(100);
+            let lb = line_box(&style, text_w, self.cell_w);
+            let lx0 = x0 + lb.indent;
+            let row_h = lb.tall as i32 * self.line_h;
+            // Where the type sits inside the block of rows it claimed: on the
+            // bottom, so the slack is *above* the line. That is the right way up
+            // for the case this exists for — a heading gets its air before it and
+            // its body text tucked under it — and it is also the only placement
+            // that cannot spill: the em box is `line_h * pct/100` tall and the
+            // block is `ceil(pct/100)` rows of `line_h`.
+            let drop = row_h - scaled(self.line_h, pct);
             let mut cells = expand_line(&buf.slice_string(start, end), set.tab_width);
             // `display` and an image both *replace* the cells they cover, which
             // is what makes wrapping, the cursor and the selection follow the
@@ -645,7 +787,7 @@ impl Renderer {
                             let want =
                                 image_rows(img.height, img.depth, self.line_h, self.ascent);
                             tall = tall.max(want.saturating_sub(blanked).max(1));
-                            " ".repeat(image_cells(img.width, self.cell_w))
+                            " ".repeat(image_cells(img.width, lb.cw))
                         }
                         (None, Some(d)) => d.clone(),
                     };
@@ -677,68 +819,108 @@ impl Renderer {
                 })
                 .collect();
 
-            // Rows this line wants: what its text needs, and never fewer than
-            // what an image on it needs. *This is the whole of "rows of variable
-            // height"* — a `max` on one integer rather than a table, because
-            // nothing else in the renderer has an opinion about how tall a row
-            // is and an image is the only thing that ever wanted one.
+            // Rows this line wants. Three claims, resolved as a `max` on one
+            // integer rather than a table: what its text needs at its own type
+            // size, and never fewer than what an image on it needs.
+            //
+            // A *visual* row — one pass across the pane — is `lb.tall` display
+            // rows, which is how a scaled line is taller without any fractional
+            // row heights existing anywhere. `image_rows` established the shape
+            // (a line may own several rows) and this reuses it rather than
+            // teaching `doc_lines`, `line_rows`, `cursor_pane_row`, `scroll` and
+            // `offset_at` about pixels.
             //
             // ponytail: a line taller than the rows left in the pane is cut at
             // the bottom edge, because `scroll` counts buffer lines and there is
-            // no row to scroll to. Ceiling: a paragraph-length line, or a
-            // full-page equation, at the foot of a short pane. Upgrade path: a
-            // scroll position of (line, row).
+            // no row to scroll to. Ceiling: a paragraph-length line, a full-page
+            // equation, or a 2× heading, at the foot of a short pane. Upgrade
+            // path: a scroll position of (line, row).
             //
-            // ponytail: `visible_lines` and `cursor_pane_row` below still count
-            // a line's *text* rows only, so a pane showing a display equation
-            // reports a line or two more than it draws and a relative gutter
-            // number below one is short by the rows the image took. That is the
-            // ceiling core already has — it lays a line out with no overlays at
-            // all, see boundary.org — and closing it is handing both of them the
-            // overlay list this loop is already walking.
-            let text_rows = if wrap { wrap_row_count(cells.len(), cols) } else { 1 };
-            let need = text_rows.max(tall);
+            // ponytail: `visible_lines` and `cursor_pane_row` count a scale and
+            // a fold but still not an *image*, so a pane showing a display
+            // equation reports a line or two more than it draws. That one is
+            // core's ceiling as much as this file's — core lays a line out with
+            // no overlays at all, see boundary.org — and closing it is handing
+            // both of them the overlay list this loop is already walking.
+            let text_rows = if wrap {
+                wrap_row_count(cells.len(), lb.cols)
+            } else {
+                1
+            };
+            let need = (text_rows * lb.tall).max(tall);
             let fits = need.min(rows - row);
+            let shown_rows = drawn_rows(fits, lb.tall, text_rows);
 
             // Only the focused window of the focused frame gets a cursor: two
             // blocks on screen at once is two claims about where typing goes.
             let cursor_at = (active && line == cur_line)
-                .then(|| cursor_pos(visual_col(&cells, cur_col), cols, need));
+                .then(|| cursor_pos(visual_col(&cells, cur_col), lb.cols, text_rows.max(1)));
 
             // ponytail: no horizontal scrolling. A truncated line gives up its
             // last column to the marker; the tail is simply not reachable.
             // Upgrade path: an `hscroll` alongside `scroll`.
-            let marker = (!wrap).then(|| truncation_marker(cells.len(), cols)).flatten();
+            let marker = (!wrap)
+                .then(|| truncation_marker(cells.len(), lb.cols))
+                .flatten();
             // This line is the visible head of a fold, so it says so.
             let folds_here = fold_starts_in(overlays, start, end);
 
             let mut ri = 0usize;
-            for (r, (rs, re)) in wrap_rows(cells.len(), cols).take(fits).enumerate() {
-                let y = doc.y + (row + r) as i32 * self.line_h;
+            for (r, (rs, re)) in wrap_rows(cells.len(), lb.cols)
+                .take(shown_rows)
+                .enumerate()
+            {
+                let y = doc.y + (row + r * lb.tall) as i32 * self.line_h;
+                // Where this row's *type* goes. Body text sits at the top of its
+                // one row, as it always has, because `drop` is zero when nothing
+                // scaled the line.
+                let ty = y + drop;
                 let cursor_col = cursor_at.and_then(|(cr, cc)| (cr == r).then_some(cc));
                 // The marker replaces the last cell rather than following it:
                 // drawn one column further right it would be the overflow it
                 // exists to warn about.
                 let shown = marker.unwrap_or(re - rs);
 
-                if line == cur_line && selection.is_empty() {
-                    self.fill(pane.x, y, pane.w, self.line_h, cur_bg);
+                // A band across the whole pane, and the point of it being a band
+                // rather than a run of cell backgrounds: a source block drawn the
+                // other way is a stripe as ragged as its own text. It replaces
+                // the current-line stripe rather than sitting under it — both are
+                // backgrounds, and the one a config asked for by name wins.
+                match style.background {
+                    Some(k) => {
+                        let c = rgb(editor.theme.color(k, fg));
+                        self.fill(pane.x, y, pane.w, row_h, c);
+                    }
+                    None if line == cur_line && selection.is_empty() => {
+                        self.fill(pane.x, y, pane.w, row_h, cur_bg);
+                    }
+                    None => {}
                 }
                 // Overlay backgrounds go under the selection and the cursor: a
                 // config painting a range must not be able to hide where the
                 // editor thinks you are.
                 for (col, &(_, src)) in cells[rs..rs + shown].iter().enumerate() {
                     if let (_, Some(k)) = overlay_face(&ov_runs, src) {
-                        let x = x0 + col as i32 * self.cell_w;
+                        let x = lx0 + col as i32 * lb.cw;
                         let c = rgb(editor.theme.color(k, fg));
-                        self.fill(x, y, self.cell_w, self.line_h, c);
+                        self.fill(x, y, lb.cw, row_h, c);
                     }
                 }
                 for &s in &sel_cells {
-                    if let Some((a, b)) = row_span(s, rs, cols) {
-                        let x = x0 + a as i32 * self.cell_w;
-                        self.fill(x, y, (b - a) as i32 * self.cell_w, self.line_h, sel_bg);
+                    if let Some((a, b)) = row_span(s, rs, lb.cols) {
+                        let x = lx0 + a as i32 * lb.cw;
+                        self.fill(x, y, (b - a) as i32 * lb.cw, row_h, sel_bg);
                     }
+                }
+                // The prefix, in the gap its own width opened. Every row of the
+                // line gets it, continuation rows included — a quote bar with a
+                // hole in it where a line wrapped is not a quote bar.
+                if let Some((p, face)) = style.prefix {
+                    let c = match face {
+                        Some(k) => rgb(editor.theme.color(k, fg)),
+                        None => rgb(fg),
+                    };
+                    self.draw_run(p, x0, ty, c, Cut::plain(pct));
                 }
 
                 // An *absolute* number belongs to the buffer line, not to each
@@ -748,26 +930,28 @@ impl Renderer {
                 // screen lines, which is what `display-line-numbers-type
                 // 'visual` means — so every row gets one. After the stripe,
                 // which is painted across the gutter too.
-                if set.line_numbers && (r == 0 || set.relative_line_numbers) {
+                if numbered && r == 0 {
                     let c = if line == cur_line { num_cur_c } else { num_c };
-                    let n = gutter_number(line, row + r, cursor_row, set.relative_line_numbers);
+                    let n = gutter_number(line, cur_line, set.relative_line_numbers);
+                    // Body size, always: the gutter is chrome and belongs to the
+                    // pane rather than to the line it happens to be beside.
                     self.draw_str(&format!("{n:>digits$}"), doc.x, y, c);
                 }
 
                 if block_cursor {
                     if let Some(cc) = cursor_col {
-                        let x = x0 + cc as i32 * self.cell_w;
+                        let x = lx0 + cc as i32 * lb.cw;
                         // As wide as the character under it. A one-cell block on
                         // 漢 covers half a glyph and knocks out the whole of it,
                         // so the character under the cursor would vanish. A
                         // tab's cells are spaces, so this leaves tabs at one.
                         let w = cells.get(rs + cc).map_or(1, |&(c, _)| char_cells(c).max(1));
-                        self.draw_cursor(x, y, w as i32 * self.cell_w, pane, cursor_c);
+                        self.draw_cursor(x, y, w as i32 * lb.cw, row_h, pane, cursor_c);
                     }
                 }
 
                 for (col, &(ch, src)) in cells[rs..rs + shown].iter().enumerate() {
-                    let x = x0 + col as i32 * self.cell_w;
+                    let x = lx0 + col as i32 * lb.cw;
                     while ri < runs.len() && runs[ri].1 <= src {
                         ri += 1;
                     }
@@ -780,7 +964,12 @@ impl Renderer {
                         Some(k) => rgb(editor.theme.color(k, fg)),
                         None => rgb(editor.theme.color(kind, fg)),
                     };
-                    self.draw_char(ch, x, y, color);
+                    // Weight and slant are per *cell*, unlike the size: they pick
+                    // which face rasterises the glyph and change no metric, so
+                    // `*bold*` really can be three bold characters in the middle
+                    // of a body line while `scale` cannot.
+                    let (bold, italic) = overlay_emphasis(&ov_runs, src);
+                    self.draw_glyph(ch, x, ty, color, Cut { pct, bold, italic });
                 }
                 // Images last of the text, over the blanks their substitution
                 // reserved. One that started on an earlier display row is
@@ -790,7 +979,7 @@ impl Renderer {
                     if vc < rs || vc >= re {
                         continue;
                     }
-                    let x = x0 + (vc - rs) as i32 * self.cell_w;
+                    let x = lx0 + (vc - rs) as i32 * lb.cw;
                     self.draw_image(editor, id, x, y);
                 }
                 if let Some(mc) = marker {
@@ -799,7 +988,8 @@ impl Renderer {
                     } else {
                         marker_c
                     };
-                    self.draw_char(LineOverflow::MARKER, x0 + mc as i32 * self.cell_w, y, c);
+                    let x = lx0 + mc as i32 * lb.cw;
+                    self.draw_glyph(LineOverflow::MARKER, x, ty, c, Cut::plain(pct));
                 }
                 // The fold indicator, one glyph past the head line's own text on
                 // the last row it occupies, in the same accent-tinted shade the
@@ -807,15 +997,16 @@ impl Renderer {
                 // is more than it drew. ponytail: on a line that exactly fills
                 // the pane it lands on the last column and covers a character,
                 // which is the same trade the truncation marker already makes.
-                if folds_here && r + 1 == fits && cols > 0 {
-                    let col = shown.min(cols - 1);
-                    self.draw_char(FOLD_MARKER, x0 + col as i32 * self.cell_w, y, marker_c);
+                if folds_here && r + 1 == shown_rows && lb.cols > 0 {
+                    let col = shown.min(lb.cols - 1);
+                    let x = lx0 + col as i32 * lb.cw;
+                    self.draw_glyph(FOLD_MARKER, x, ty, marker_c, Cut::plain(pct));
                 }
 
                 if !block_cursor {
                     if let Some(cc) = cursor_col {
-                        let x = x0 + cc as i32 * self.cell_w;
-                        self.draw_cursor(x, y, 2, pane, cursor_c);
+                        let x = lx0 + cc as i32 * lb.cw;
+                        self.draw_cursor(x, y, 2, row_h, pane, cursor_c);
                     }
                 }
             }
@@ -832,13 +1023,34 @@ impl Renderer {
         let (bg, fg) = (editor.settings.background, editor.settings.foreground);
         let accent = editor.theme.color(HlKind::Function, fg);
         let banner_c = rgb(editor.theme.color(HlKind::Keyword, fg));
-        let dim = rgb(mix(bg, fg, 0.72));
+        // Full foreground, not a shade of it. This is the first thing the editor
+        // ever shows and the rows *are* the interface — a dimmed menu reads as a
+        // disabled one. The hierarchy is carried by the banner's hue and the
+        // footer's dimming instead, which is where dimming means something.
+        let row_c = rgb(fg);
+        let foot_c = rgb(mix(bg, fg, 0.45));
         let sel_bg = rgb(mix(bg, accent, 0.18));
 
         let lines = editor.dashboard.lines();
         let cols = visible_cols(doc.w, self.cell_w);
-        let total = lines.len() as i32 * self.line_h;
+
+        // The logo claims whole rows, so the block below it stays on the text
+        // grid and the whole arrangement is still centred as one thing rather
+        // than as a picture with a list under it.
+        let logo = editor.dashboard.logo.and_then(|id| Some((id, editor.image(id)?)));
+        let logo_rows = logo.map_or(0, |(_, im)| {
+            (im.height as i32 + self.line_h - 1) / self.line_h.max(1)
+        });
+        // One blank row between the picture and the text, when there is one.
+        let gap = if logo_rows > 0 { 1 } else { 0 };
+        let total = (lines.len() as i32 + logo_rows + gap) * self.line_h;
         let y0 = doc.y + ((doc.h - total) / 2).max(0);
+
+        if let Some((id, im)) = logo {
+            let x = doc.x + (doc.w - im.width as i32) / 2;
+            self.draw_image_at(id, im, x, y0);
+        }
+        let y0 = y0 + (logo_rows + gap) * self.line_h;
 
         for (i, (text, selected)) in lines.iter().enumerate() {
             let y = y0 + i as i32 * self.line_h;
@@ -856,15 +1068,48 @@ impl Renderer {
                     sel_bg,
                 );
             }
+            // The footer is the only thing here that is genuinely secondary —
+            // it says where the config lives, once, and is not a row you act
+            // on. Everything else is at full contrast.
             let color = if *selected {
                 rgb(accent)
             } else if is_banner_line(text) {
                 banner_c
+            } else if i + 1 == lines.len() {
+                foot_c
             } else {
-                dim
+                row_c
             };
             self.draw_str(text, x, y, color);
         }
+    }
+
+    /// A picture at an exact rectangle, for chrome rather than for a line of a
+    /// document.
+    ///
+    /// [`Renderer::draw_image`] places by the *text baseline* — ascent, depth,
+    /// the rows the line claimed — because an inline figure has to sit on the
+    /// line it belongs to. The dashboard has no line to sit on, and passing it
+    /// through that arithmetic would put the logo wherever a baseline would
+    /// have been. Same cache, same texture lifetime; only the placement differs.
+    fn draw_image_at(&mut self, id: ImageId, image: &Image, x: i32, y: i32) {
+        let (w, h) = (image.width, image.height);
+        // Split borrows, as `draw_image` does: the cache needs `&mut images`
+        // while uploading needs the texture creator, and blitting needs the
+        // canvas.
+        let Renderer {
+            images,
+            textures,
+            canvas,
+            ..
+        } = self;
+        let slot = images
+            .entry(id)
+            .or_insert_with(|| image_texture(textures, image));
+        let Some(tex) = slot else { return };
+        let _ = canvas.copy(tex, None, Rect::new(x, y, w, h));
+        self.mark([id, pack(x, y), pack(w as i32, h as i32), 0]);
+        self.draws += 1;
     }
 
     // --- modeline ---------------------------------------------------------
@@ -957,7 +1202,18 @@ impl Renderer {
             let text = truncate(&seg.text, left);
             // Cells, matching what `truncate` measured — a character count here
             // would let a segment of combining marks underflow `left`.
-            left -= str_cells(&text);
+            //
+            // `saturating_sub` and an assertion rather than a bare `-`, because
+            // this subtraction is only safe if `truncate` never answers wider
+            // than its budget, and that is a promise made in another function.
+            // It was once broken — `str_cells` and `char_cells` disagreed about
+            // a tab — and the symptom was the editor *panicking* in a modeline,
+            // which is a bad way to learn about an off-by-one. The invariant is
+            // restored and tested at both ends; this keeps a future regression a
+            // failing test rather than a crash in someone's session.
+            let used = str_cells(&text);
+            debug_assert!(used <= left, "truncate({:?}, {left}) gave {used}", seg.text);
+            left = left.saturating_sub(used);
             let color = match seg.face {
                 Some(kind) => rgb(editor.theme.color(kind, editor.settings.foreground)),
                 None => default,
@@ -1068,20 +1324,67 @@ impl Renderer {
             return;
         }
         let text_cols = cols.saturating_sub(2); // the "▸ " / "  " marker
-        for (i, (text, selected)) in rows.iter().enumerate() {
+        for (i, &(item, text, selected)) in rows.iter().enumerate() {
             let ry = y + i as i32 * self.line_h;
             if ry + self.line_h > bottom {
                 break;
             }
-            let c = if *selected {
+            let c = if selected {
                 self.fill(b.x + inset, ry, b.w - 2 * inset, self.line_h, sel_bg);
                 self.draw_str("▸", x0, ry, rgb(accent));
                 rgb(accent)
             } else {
                 row_c
             };
-            self.draw_str(&truncate(text, text_cols), x0 + 2 * self.cell_w, ry, c);
+            let shown = truncate(text, text_cols);
+            let runs = candidate_runs(editor, p, item, &shown);
+            let rx = x0 + 2 * self.cell_w;
+            match runs.is_empty() {
+                true => {
+                    self.draw_str(&shown, rx, ry, c);
+                }
+                false => self.draw_coloured(&shown, &runs, rx, ry, c, editor),
+            }
         }
+    }
+
+    /// One candidate row, painted in runs. Anything no run claims keeps `base`,
+    /// so a partly-understood row degrades to the plain one rather than to a
+    /// half-coloured mess.
+    ///
+    /// Segments rather than characters because a run is usually the whole of a
+    /// token: `draw_str` already advances by cells and handles wide glyphs, and
+    /// walking it per character would rasterise the same string a piece at a
+    /// time for no gain.
+    fn draw_coloured(
+        &mut self,
+        text: &str,
+        runs: &[(usize, usize, HlKind)],
+        x: i32,
+        y: i32,
+        base: Color,
+        editor: &Editor,
+    ) {
+        let fg = editor.settings.foreground;
+        let chars: Vec<char> = text.chars().collect();
+        let mut x = x;
+        let mut at = 0usize;
+        let piece = |r: &mut Self, from: usize, to: usize, c: Color, x: &mut i32| {
+            if to > from {
+                let s: String = chars[from.min(chars.len())..to.min(chars.len())].iter().collect();
+                *x = r.draw_str(&s, *x, y, c);
+            }
+        };
+        for &(s, e, kind) in runs {
+            let (s, e) = (s.max(at), e.min(chars.len()));
+            if e <= s {
+                continue;
+            }
+            piece(self, at, s, base, &mut x); // the gap before this run
+            piece(self, s, e, rgb(editor.theme.color(kind, fg)), &mut x);
+            at = e;
+        }
+        piece(self, at, chars.len(), base, &mut x);
     }
 
     // --- which-key ---------------------------------------------------------
@@ -1260,8 +1563,11 @@ impl Renderer {
         (self.cell_w, self.line_h)
     }
 
-    fn draw_cursor(&mut self, x: i32, y: i32, w: i32, pane: Area, color: Color) {
-        self.fill(x, y, w.min(pane.x + pane.w - x), self.line_h, color);
+    /// `h` rather than [`Renderer::line_h`] because a line an overlay has scaled
+    /// owns several rows, and a cursor one row tall on a heading looks like a
+    /// cursor on the line above it.
+    fn draw_cursor(&mut self, x: i32, y: i32, w: i32, h: i32, pane: Area, color: Color) {
+        self.fill(x, y, w.min(pane.x + pane.w - x), h, color);
     }
 
     /// Blit an overlay image into the row whose top-left is `(x, y)`.
@@ -1402,6 +1708,183 @@ impl Renderer {
             self.draws += 1;
         }
     }
+
+    // --- typeset text -----------------------------------------------------
+
+    /// One glyph in whatever face `(pct, bold, italic)` names.
+    ///
+    /// A three-way split rather than one lookup, and it is worth the extra arm:
+    /// body-weight and bold body text is nearly every character the editor ever
+    /// draws, and those two keep the direct field access and the flat
+    /// `HashMap<char, _>` they have always had. Only the rest — anything an
+    /// overlay's `scale` asked for, and italic at any size — pays a second hash
+    /// to find its face first. The fast path is unchanged, which also means the
+    /// glyph cache with the interesting lifetime is unchanged.
+    fn draw_glyph(&mut self, c: char, x: i32, y: i32, color: Color, cut: Cut) {
+        match (cut.pct, cut.bold, cut.italic) {
+            (100, false, false) => self.draw_char(c, x, y, color),
+            (100, true, false) => self.draw_bold_char(c, x, y, color),
+            _ => self.draw_styled_char(c, x, y, color, cut),
+        }
+    }
+
+    /// [`Renderer::draw_weighted`] for a typeset run: draws `s` at `pct` of body
+    /// size and answers the x just past it.
+    ///
+    /// Advances by the *arithmetic* cell width rather than by the face's own,
+    /// for the same reason bold does not measure itself: layout is a grid, and a
+    /// run that measured itself would put the column its neighbour starts in out
+    /// of the renderer's hands. A face opened at 150% of the point size has an
+    /// advance within a pixel of 150% of the cell, so the visible effect is
+    /// slightly loose or tight tracking on a scaled line — never a wrong column.
+    fn draw_run(&mut self, s: &str, x: i32, y: i32, color: Color, cut: Cut) -> i32 {
+        let cw = scaled(self.cell_w, cut.pct);
+        let mut x = x;
+        for c in s.chars() {
+            self.draw_glyph(c, x, y, color, cut);
+            x += char_cells(c) as i32 * cw;
+        }
+        x
+    }
+
+    /// A glyph from the on-demand face map. See [`Renderer::faces`] for the
+    /// bound; this is where both halves of it are enforced.
+    fn draw_styled_char(&mut self, c: char, x: i32, y: i32, color: Color, cut: Cut) {
+        if c == ' ' || c == '\t' {
+            return;
+        }
+        let key = FaceKey {
+            point_size: scaled(i32::from(self.point_size), cut.pct).clamp(4, 400) as u16,
+            style: u8::from(cut.bold) | (u8::from(cut.italic) << 1),
+        };
+        let Renderer {
+            faces,
+            ttf,
+            font_path,
+            textures,
+            canvas,
+            ..
+        } = self;
+        // The key space is closed, so this can only fire if `SCALE_STEPS` grew
+        // without this constant growing with it. Clearing rather than refusing
+        // to draw keeps that a performance bug instead of a rendering one.
+        if faces.len() >= MAX_FACES && !faces.contains_key(&key) {
+            faces.clear();
+        }
+        let face = faces
+            .entry(key)
+            .or_insert_with(|| open_face(ttf, font_path, key));
+        let Some(face) = face else { return };
+        // Emptied rather than evicted one by one: there is no access order to
+        // evict by without keeping one, and a face that has drawn this many
+        // distinct characters is a document whose repertoire is the whole cache
+        // anyway. Costs a re-rasterisation of what is on screen, once.
+        if face.glyphs.len() >= MAX_FACE_GLYPHS && !face.glyphs.contains_key(&c) {
+            face.glyphs.clear();
+        }
+        let slot = face
+            .glyphs
+            .entry(c)
+            .or_insert_with(|| glyph_texture(textures, &face.font, c));
+        if let Some(tex) = slot {
+            tex.set_color_mod(color.r, color.g, color.b);
+            let q = tex.query();
+            let _ = canvas.copy(tex, None, Rect::new(x, y, q.width, q.height));
+            // The size is *not* implied by the frame seed the way the body
+            // face's is, so it goes in: two frames differing only in a heading's
+            // scale would otherwise hash the same and never be presented.
+            self.mark([
+                TAG_STYLED ^ u64::from(c),
+                pack(x, y),
+                pack(i32::from(key.point_size), i32::from(key.style)),
+                bits(color),
+            ]);
+            self.draws += 1;
+        }
+    }
+}
+
+/// A *cut* of the typeface: one size, one weight, one slant — the three things
+/// that together decide which font handle rasterises a glyph.
+///
+/// One value rather than three arguments because it is one decision. The draw
+/// loop resolves it per cell (the size from the line, the weight and slant from
+/// the overlays covering that cell) and hands it straight down; nothing in
+/// between has any business taking the three apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cut {
+    /// Percent of the body size, already snapped to a [`SCALE_STEPS`] entry.
+    pct: u16,
+    bold: bool,
+    italic: bool,
+}
+
+impl Cut {
+    /// The body face at `pct` — what chrome and a prefix are drawn in.
+    fn plain(pct: u16) -> Self {
+        Self {
+            pct,
+            bold: false,
+            italic: false,
+        }
+    }
+}
+
+/// One font opened at one size and style, with the glyphs it has rasterised.
+///
+/// Bundled rather than two parallel maps because they die together: a texture
+/// cached from one `Font` is meaningless against another, so anything that drops
+/// the font must drop the glyphs in the same move.
+struct Face {
+    font: Font<'static, 'static>,
+    glyphs: HashMap<char, Option<Texture<'static>>>,
+}
+
+/// What identifies a [`Face`]: an absolute point size — already through the
+/// display's scale factor and the overlay's percentage — and the two style bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FaceKey {
+    point_size: u16,
+    /// Bit 0 bold, bit 1 italic.
+    style: u8,
+}
+
+/// Open faces [`Renderer::faces`] will hold. `SCALE_STEPS.len() * 4`, which is
+/// the whole key space, so reaching it means the steps grew and this did not.
+const MAX_FACES: usize = SCALE_STEPS.len() * 4;
+
+/// Glyph textures one [`Face`] will cache. At two hundred and fifty-six
+/// characters and a few kilobytes each this is a few megabytes across every
+/// face that could exist, and a config using `scale` for headings opens two or
+/// three of them holding a few dozen glyphs apiece.
+const MAX_FACE_GLYPHS: usize = 256;
+
+/// A font at one size and style, or `None` if it will not open — cached as a
+/// failure so a missing file is not re-`stat`ed sixty times a second.
+fn open_face(
+    ttf: &'static Sdl2TtfContext,
+    path: &std::path::Path,
+    key: FaceKey,
+) -> Option<Face> {
+    let mut font = ttf.load_font(path, key.point_size).ok()?;
+    set_hinting(&mut font);
+    // Synthetic, both of them: FreeType smears the outline for bold and shears
+    // it for italic rather than loading designed faces, which is what keeps the
+    // advance the grid's and not the font's. A designed italic would need a
+    // second file, a second search path, and a per-family table — and would
+    // still be drawn on the same monospace grid.
+    let mut style = sdl2::ttf::FontStyle::NORMAL;
+    if key.style & 1 != 0 {
+        style |= sdl2::ttf::FontStyle::BOLD;
+    }
+    if key.style & 2 != 0 {
+        style |= sdl2::ttf::FontStyle::ITALIC;
+    }
+    font.set_style(style);
+    Some(Face {
+        font,
+        glyphs: HashMap::new(),
+    })
 }
 
 /// FNV-1a's constants, and tags that keep one kind of draw call from colliding
@@ -1414,6 +1897,7 @@ const TAG_FRAME: u64 = 1 << 25;
 const TAG_CLEAR: u64 = 1 << 26;
 const TAG_FILL: u64 = 1 << 27;
 const TAG_CLIP: u64 = 1 << 28;
+const TAG_STYLED: u64 = 1 << 29;
 
 /// Two coordinates in one word, so a draw call is four folds rather than six.
 #[inline]
@@ -1641,18 +2125,226 @@ fn scale_point(scale: f32, x: i32, y: i32) -> (i32, i32) {
 }
 
 /// The text rectangle inside a pane: everything above its modeline, inset by
-/// [`PAD`].
+/// [`PAD`] and, when `measure` is positive, narrowed to that many pixels and
+/// centred in what is left.
 ///
 /// Returned as the *text* rectangle rather than the whole remainder so the row
 /// count and the drawing loop cannot disagree about the inset.
-fn doc_rect(pane: Area, status_h: i32) -> Area {
+///
+/// **The measure is applied here and nowhere else**, and that is the whole
+/// design of it. `visible_cols`, the wrap points, the block cursor, the
+/// relative gutter and the click-to-offset map in [`offset_at`] all take their
+/// geometry from this rectangle, so narrowing it moves every one of them
+/// together. Centring by shifting the glyphs at draw time instead would have
+/// left the mouse and the wrap points reading the pane's full width — which is
+/// the bug `olivetti-mode` spent years having.
+///
+/// The modeline is deliberately *not* narrowed: it belongs to the window rather
+/// than to the page, and a status bar floating in the middle of a pane reads as
+/// a second document rather than as a frame around the first.
+fn doc_rect(pane: Area, status_h: i32, measure: i32) -> Area {
     let modeline = modeline_rect(pane, status_h);
+    let avail = (pane.w - 2 * PAD).max(0);
+    // A measure wider than the pane is not an error and must not become a
+    // negative inset — it simply means the pane is the narrower constraint.
+    let w = match measure {
+        m if m > 0 => m.min(avail),
+        _ => avail,
+    };
     Area {
-        x: pane.x + PAD,
+        x: pane.x + PAD + (avail - w) / 2,
         y: pane.y + PAD,
-        w: (pane.w - 2 * PAD).max(0),
+        w,
         h: (pane.h.max(0) - modeline.h - PAD).max(0),
     }
+}
+
+/// The measure in pixels, from the setting's columns and the font's cell.
+///
+/// Columns rather than pixels is the setting's whole point — see
+/// [`Settings::text_width`] — so this is the one place the two units meet, and
+/// every caller of [`doc_rect`] that draws a *document* goes through it.
+fn measure_px(set: &Settings, cell_w: i32) -> i32 {
+    set.text_width as i32 * cell_w.max(1)
+}
+
+/// Colour runs for one candidate row, as `(start, end, kind)` in **char**
+/// offsets into the row as drawn. Empty means "nothing to say about this one",
+/// and the row is drawn flat.
+///
+/// The interesting case is `consult-line`, and it is interesting because it
+/// costs nothing: those candidates are lines of a buffer that is *already*
+/// highlighted, so a row is one of that buffer's lines shifted right by the
+/// width of the number in front of it. No parser runs, no grammar is loaded,
+/// and the colours in the popup are by construction the same ones the text has
+/// behind it — which is the point. Re-highlighting each visible row per
+/// keystroke would have been a tree-sitter parse per row per frame, and it
+/// would have got single lines torn out of context wrong besides.
+///
+/// A grep hit comes from a file nobody has opened, so there are no spans to
+/// borrow and this colours the structure instead — path, line number, text —
+/// which is what `consult-ripgrep` itself shows and most of what the eye is
+/// using to scan the list anyway.
+///
+/// ponytail: a grep hit's *code* stays the row colour. Highlighting it would
+/// mean this crate depending on tree-sitter, which the layering deliberately
+/// avoids (see the note on [`Span`] in core). The upgrade path, if it ever
+/// matters, is for the app — which already links the highlighter — to attach
+/// spans to the candidates it pushes.
+fn candidate_runs(
+    editor: &Editor,
+    p: &zemacs_core::Prompt,
+    item: usize,
+    shown: &str,
+) -> Vec<(usize, usize, HlKind)> {
+    match p.kind {
+        zemacs_core::PromptKind::Line => {
+            let buf = &editor.buffer;
+            if item >= buf.len_lines() {
+                return Vec::new();
+            }
+            let (start, end) = (buf.line_start(item), buf.line_end(item));
+            // The number in front is chrome, not content — dimmed, the same
+            // way the document's own gutter is.
+            let mut runs = vec![(0, p.prefix, HlKind::Comment)];
+            runs.extend(
+                buf.highlights
+                    .iter()
+                    .filter(|s| s.end > start && s.start < end)
+                    .map(|s| {
+                        (
+                            s.start.max(start) - start + p.prefix,
+                            s.end.min(end) - start + p.prefix,
+                            s.kind,
+                        )
+                    }),
+            );
+            runs
+        }
+        // `path:line:text`, split from the left twice — the same two colons
+        // the app splits on to open the hit, so what reads as a path is what
+        // will be opened as one.
+        zemacs_core::PromptKind::Grep => {
+            let mut colons = shown
+                .chars()
+                .enumerate()
+                .filter(|&(_, c)| c == ':')
+                .map(|(i, _)| i);
+            match (colons.next(), colons.next()) {
+                (Some(a), Some(b)) => vec![
+                    (0, a, HlKind::Function),
+                    (a, a + 1, HlKind::Punctuation),
+                    (a + 1, b, HlKind::Number),
+                    (b, b + 1, HlKind::Punctuation),
+                ],
+                _ => Vec::new(),
+            }
+        }
+        // The mode after the name is chrome, the same way the `Line` prompt's
+        // numbers are — dimmed, so the eye reads a column of buffer names and
+        // only glances right. The gap is the last run of spaces, which is where
+        // the padding core added ends; a truncated row simply loses the tail and
+        // falls back to one colour.
+        zemacs_core::PromptKind::Buffer => match shown.rfind("  ") {
+            Some(i) => vec![(
+                shown[..i].chars().count(),
+                shown.chars().count(),
+                HlKind::Comment,
+            )],
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// The buffer offset a pixel in `pane` points at.
+///
+/// The pure half of [`Renderer::click_target`], split out so it can be tested
+/// against a real buffer without opening a window — the wrapped, folded and
+/// wide-character cases are exactly the ones worth a test and exactly the ones
+/// a hand-run of the app is worst at checking.
+///
+/// The loop is the drawing loop's twin and has to stay one: rows are spent on
+/// lines in the same order, a folded line is skipped without spending a row,
+/// and a wrapped line spends the same number the draw pass gives it. Anything
+/// else and the click lands on a character other than the one under the
+/// pointer.
+#[allow(clippy::too_many_arguments)]
+fn offset_at(
+    buf: &Buffer,
+    win: &Window,
+    set: &Settings,
+    pane: Area,
+    status_h: i32,
+    line_h: i32,
+    cell_w: i32,
+    x: i32,
+    y: i32,
+) -> usize {
+    let doc = doc_rect(pane, status_h, measure_px(set, cell_w));
+    let gutter = gutter_w(buf, set, cell_w);
+    let text_w = doc.w - gutter;
+    let wrap = set.line_overflow == LineOverflow::Wrap;
+    let rows = doc_lines(pane, status_h, line_h);
+
+    // Clamped rather than rejected: a click in the gutter means column zero of
+    // that row, and one past the right edge means end of line — both are what
+    // every other editor does with the same gesture.
+    //
+    // A *pixel* offset rather than a column, because which column that is now
+    // depends on the line: a heading's cells are wider than the body's and its
+    // prefix has already eaten some of the front. Divided per line below.
+    let want_row = ((y - doc.y).max(0) / line_h.max(1)) as usize;
+    let want_x = (x - doc.x - gutter).max(0);
+
+    let (mut row, mut line) = (0usize, win.scroll);
+    while row < rows && line < buf.len_lines() {
+        let start = buf.line_start(line);
+        if fold_hiding(buf.overlays(), start).is_some() {
+            line += 1; // spans a line, occupies no row — as in the draw loop
+            continue;
+        }
+        let b = line_box(
+            &line_style(buf.overlays(), start, start + buf.line_len(line)),
+            text_w,
+            cell_w,
+        );
+        let cells = line_cells(buf, line, set.tab_width);
+        let visual = if wrap {
+            wrap_row_count(cells.len(), b.cols)
+        } else {
+            1
+        };
+        let height = visual * b.tall;
+        if want_row < row + height {
+            // Clamped at `cols` on the right, and it is the margin outside a
+            // centred measure that made it matter: without it, a pointer out in
+            // the white space answered whatever character the *untruncated* line
+            // has that far along — a character nothing on screen is showing.
+            // `cols` and not `cols - 1` so that "one cell past the last
+            // character", where the cursor may legitimately sit at end of line,
+            // still lands there.
+            let want_col = (((want_x - b.indent).max(0) / b.cw.max(1)) as usize).min(b.cols);
+            // The cell the pointer is over, then the *source* character that
+            // cell was expanded from: a tab is one character across several
+            // cells and 漢 is one character across two, so this last step is
+            // the whole reason clicking a wide glyph lands on it rather than
+            // beside it.
+            let cell = ((want_row - row) / b.tall.max(1)) * b.cols + want_col;
+            let src = match cells.get(cell) {
+                Some(&(_, i)) => i,
+                // Past the end of the line: the position after the last
+                // character, which is where the cursor may sit and no further.
+                None => cells.last().map_or(0, |&(_, i)| i + 1),
+            };
+            return start + src;
+        }
+        row += height;
+        line += 1;
+    }
+    // Below the last line. Emacs puts point at the end of the buffer, and so
+    // does a click in the empty space under a short file.
+    buf.len_chars()
 }
 
 /// Document lines that fit in a pane — the window's `viewport_lines`.
@@ -1661,7 +2353,9 @@ fn doc_rect(pane: Area, status_h: i32) -> Area {
 /// just has nowhere to go. Core clamps this with `.max(1)` wherever it divides
 /// by it, so an honest zero is safe and a lie about one row is not.
 fn doc_lines(pane: Area, status_h: i32, line_h: i32) -> usize {
-    (doc_rect(pane, status_h).h / line_h.max(1)).max(0) as usize
+    // No measure: it only ever insets horizontally, and this is a question
+    // about height. Passing one would be an invitation to believe otherwise.
+    (doc_rect(pane, status_h, 0).h / line_h.max(1)).max(0) as usize
 }
 
 /// Whole columns that fit in `w` pixels. Long lines are cut here rather than
@@ -2056,32 +2750,89 @@ fn lines_in_rows(heights: impl IntoIterator<Item = usize>, rows: usize) -> usize
 /// [`lines_in_rows`] for a real buffer. Only the visible lines are expanded —
 /// the iterator is lazy and the count stops as soon as the pane is full — so a
 /// 10k-line file costs one screenful, same as drawing it.
-fn visible_lines(buf: &Buffer, scroll: usize, rows: usize, cols: usize, set: &Settings) -> usize {
+fn visible_lines(
+    buf: &Buffer,
+    scroll: usize,
+    rows: usize,
+    text_w: i32,
+    cell_w: i32,
+    set: &Settings,
+) -> usize {
     let wrap = set.line_overflow == LineOverflow::Wrap;
-    // Truncation with nothing folded is one row per line, and the general path
-    // below would agree with it more slowly. A fold breaks that identity, which
-    // is why this is not simply the overflow mode.
-    if !wrap && !buf.overlays().iter().any(|o| o.fold) {
+    // Truncation with nothing folded and nothing typeset is one row per line,
+    // and the general path below would agree with it more slowly. A fold, a
+    // scale and a prefix each break that identity — the first by removing rows,
+    // the second by claiming extra ones, the third by narrowing the line into an
+    // earlier wrap — which is why this is not simply the overflow mode.
+    if !wrap && !buf.overlays().iter().any(reshapes_lines) {
         return rows;
     }
-    let heights = (scroll..buf.len_lines()).map(|l| line_rows(buf, l, cols, wrap, set.tab_width));
+    let heights =
+        (scroll..buf.len_lines()).map(|l| line_rows(buf, l, text_w, cell_w, wrap, set.tab_width));
     lines_in_rows(heights, rows)
 }
 
+/// Whether an overlay can make a line occupy a different number of rows than its
+/// text alone would. The one predicate [`visible_lines`] skips its whole slow
+/// path on, so anything added to [`LineBox`] belongs here too.
+fn reshapes_lines(o: &Overlay) -> bool {
+    o.fold || o.scale.is_some() || o.line_prefix.is_some()
+}
+
 /// Display rows buffer line `l` occupies: none at all when a fold is hiding it,
-/// one when the pane truncates, and its wrapped height otherwise.
+/// one when the pane truncates body-size text, and its wrapped height times its
+/// type size otherwise.
 ///
 /// The counting twin of the drawing loop, and the reason folding is a *line*
 /// mechanism rather than another overlay payload: everything else an overlay
-/// carries replaces cells with cells, and this is a height of zero.
-fn line_rows(buf: &Buffer, l: usize, cols: usize, wrap: bool, tab_width: usize) -> usize {
-    if fold_hiding(buf.overlays(), buf.line_start(l)).is_some() {
+/// carries replaces cells with cells, and this is a height of zero. A scale is
+/// the same mechanism pointing the other way — a height of two or three — which
+/// is why both are resolved here and not in two places.
+fn line_rows(
+    buf: &Buffer,
+    l: usize,
+    text_w: i32,
+    cell_w: i32,
+    wrap: bool,
+    tab_width: usize,
+) -> usize {
+    let start = buf.line_start(l);
+    if fold_hiding(buf.overlays(), start).is_some() {
         return 0;
     }
-    match wrap {
-        true => wrap_row_count(line_cells(buf, l, tab_width).len(), cols),
+    let b = line_box(
+        &line_style(buf.overlays(), start, start + buf.line_len(l)),
+        text_w,
+        cell_w,
+    );
+    let visual = match wrap {
+        true => wrap_row_count(line_cells(buf, l, tab_width).len(), b.cols),
         false => 1,
-    }
+    };
+    visual * b.tall
+}
+
+/// Visual rows of a line the draw loop actually walks, given the `fits` display
+/// rows it was granted, the `tall` display rows one visual row of it costs, and
+/// the `text_rows` its own text occupies.
+///
+/// Two clamps, and the second is the one worth a function. Rows that *begin*
+/// inside the pane is the first: the last of them may overhang the bottom edge
+/// and is clipped there, the same trade a tall image already makes.
+///
+/// The second is that a line never gets more visual rows than its text has, and
+/// it is load-bearing rather than tidy. `fits` comes from a `max` with the rows
+/// an *image* on the line claimed, so a tall fragment on a **truncated** line
+/// used to buy row 1 and row 2 of a line the pane had already decided to cut at
+/// row 0. The loop then sliced `cells[rs .. rs + shown]` on those rows with a
+/// `shown` the truncation marker had pinned at `cols - 1` — past the end of any
+/// line only a little wider than the pane, and a panic rather than a smear.
+///
+/// It is also the only reading under which the three row counts agree:
+/// [`line_rows`] and [`offset_at`] both spend one visual row on a truncated line
+/// whatever is drawn on it, so a click and a scroll clamp already believed this.
+fn drawn_rows(fits: usize, tall: usize, text_rows: usize) -> usize {
+    fits.div_ceil(tall.max(1)).min(text_rows.max(1))
 }
 
 /// The cells of buffer line `l`. The renderer's one entry into
@@ -2092,47 +2843,35 @@ fn line_cells(buf: &Buffer, l: usize, tab_width: usize) -> Vec<(char, usize)> {
     expand_line(&buf.slice_string(start, start + buf.line_len(l)), tab_width)
 }
 
-/// Pane row a window's cursor is drawn on, counting from the top of the pane.
-///
-/// Needed *before* the row loop: a relative number on a row above the cursor
-/// counts down to it, so it cannot be discovered on the way past. Costs one
-/// `expand_line` per line between the top of the pane and the cursor — work the
-/// loop below is about to do anyway, and bounded by the pane's height.
-fn cursor_pane_row(
-    buf: &Buffer,
-    scroll: usize,
-    (cur_line, cur_col): (usize, usize),
-    cols: usize,
-    set: &Settings,
-) -> usize {
-    let wrap = set.line_overflow == LineOverflow::Wrap;
-    // The same per-line height the drawing loop and `visible_lines` use, so a
-    // folded line between the top of the pane and the cursor costs no row here
-    // either — otherwise every relative number below a fold would be off by the
-    // lines it hid.
-    let height = |l: usize| line_rows(buf, l, cols, wrap, set.tab_width);
-    let above: usize = (scroll..cur_line).map(height).sum();
-    if !wrap {
-        return above;
-    }
-    let cells = line_cells(buf, cur_line, set.tab_width);
-    let within = cursor_pos(visual_col(&cells, cur_col), cols, height(cur_line).max(1)).0;
-    above + within
-}
 
-/// What the gutter says on pane row `row`, which is showing buffer line `line`.
+/// What the gutter says beside buffer line `line`.
 ///
-/// Absolute is the buffer line number. Relative is the distance in **visual**
-/// rows from the cursor's row — `display-line-numbers-type 'visual`, which is
-/// what the config sets, and the only reading that agrees with `j` and `k` now
-/// that they move by row: `3j` must land on the row the gutter says `3`.
-///
-/// The cursor's own row keeps its absolute number, which is vim's
-/// `number relativenumber` pair and Emacs'
+/// Absolute is the buffer line number; relative is the distance in **buffer
+/// lines** from the cursor's, and the cursor's own line keeps its absolute
+/// number — vim's `number relativenumber` pair, and Emacs'
 /// `display-line-numbers-current-absolute`.
-fn gutter_number(line: usize, row: usize, cursor_row: usize, relative: bool) -> usize {
-    match relative && row != cursor_row {
-        true => row.abs_diff(cursor_row),
+///
+/// It used to count *visual rows*, on the argument that `j` and `k` move by row
+/// here, so `3j` should land on the row labelled 3. That argument is correct and
+/// the result was still wrong, because it made the gutter unreadable at exactly
+/// the moment it had the most to say: a wrapped line got a number on every one
+/// of its rows, so one line of prose showed three descending numbers and looked
+/// like three lines. Worse, a wrapped line *containing the cursor* showed its
+/// absolute number on one row and a relative number on the others — the same
+/// line labelled two different things.
+///
+/// One number per line, then, and the continuation rows stay blank in both
+/// modes. What it costs is real and small: with wrapping on, `3j` may land
+/// somewhere other than the line labelled 3, because the count is of lines and
+/// the motion is of rows. Wrapping is off in every code buffer, and counted
+/// jumps are not how anyone reads prose.
+///
+/// ponytail: Emacs makes this a choice — `display-line-numbers-type` is `t`,
+/// `'relative` or `'visual`, and the old behaviour was `'visual`. If someone
+/// wants it back, that is the setting to add, not a second numbering rule.
+fn gutter_number(line: usize, cur_line: usize, relative: bool) -> usize {
+    match relative && line != cur_line {
+        true => line.abs_diff(cur_line),
         false => line + 1,
     }
 }
@@ -2143,11 +2882,36 @@ fn gutter_digits(buf: &Buffer) -> usize {
     buf.len_lines().to_string().len().max(3)
 }
 
+/// Whether `buf` shows a line-number gutter at all.
+///
+/// The buffer decides, falling back to the editor. Per buffer because the
+/// gutter is drawn per *pane*: an org file and a source file side by side want
+/// different answers, and a single editor-wide flag can only give them the same
+/// one — whichever mode was entered last.
+///
+/// The two kinds are not a policy anyone configures. A dashboard is a menu and a
+/// terminal's rows are a grid the shell owns; neither has buffer lines to
+/// number, so neither is a decision Lisp should have to remember to make.
+///
+/// **Its own function because two loops ask it**, and they used to ask it
+/// differently: [`gutter_w`] reserved the columns from *this* answer while the
+/// draw loop decided whether to write a number from `settings.line_numbers`
+/// alone. On the config we ship — `(set-line-numbers t)` plus
+/// `(set-no-gutter-modes '("org-mode" …))` — those two disagree on every org
+/// buffer, which reserved no columns and then printed the numbers into the first
+/// three of the text.
+fn gutter_on(buf: &Buffer, set: &Settings) -> bool {
+    match buf.kind {
+        BufferKind::Dashboard | BufferKind::Terminal => false,
+        _ => buf.line_numbers.unwrap_or(set.line_numbers),
+    }
+}
+
 /// Width of the line-number gutter in pixels — zero when they are off. Both the
 /// row count and the drawing loop need it, and they must not disagree about how
 /// many columns the text has left.
 fn gutter_w(buf: &Buffer, set: &Settings, cell_w: i32) -> i32 {
-    match set.line_numbers {
+    match gutter_on(buf, set) {
         true => (gutter_digits(buf) as i32 + 1) * cell_w,
         false => 0,
     }
@@ -2186,6 +2950,142 @@ fn overlay_face(runs: &[OverlayRun], src: usize) -> (Option<HlKind>, Option<HlKi
         }
     }
     (fg, bg)
+}
+
+/// Whether an overlay's run is set bold and italic at line-relative source char
+/// `src`.
+///
+/// [`overlay_face`]'s sibling, and separate from it on purpose: colour and
+/// weight resolve by the same rule but are consumed at different moments — a
+/// colour picks the `set_color_mod`, a weight picks the *face*, and only the
+/// second can make the renderer open a font. Same tri-state, so `Some(false)`
+/// from a later overlay takes an earlier one's bold off and `None` leaves it.
+fn overlay_emphasis(runs: &[OverlayRun], src: usize) -> (bool, bool) {
+    let (mut bold, mut italic) = (None, None);
+    for &(s, e, o) in runs {
+        if s <= src && src < e {
+            bold = o.bold.or(bold);
+            italic = o.italic.or(italic);
+        }
+    }
+    (bold.unwrap_or(false), italic.unwrap_or(false))
+}
+
+/// The type sizes the renderer will ever open a face at, as percentages of the
+/// body size. A `scale` from Lisp is snapped to the nearest of them.
+///
+/// **This list is the glyph cache's bound**, and that is why it is a list rather
+/// than a range: a face is a `Font` plus a texture per character it has drawn,
+/// so an editor that honoured `1.37×` literally would open a face and grow a
+/// cache per distinct number any config ever passed. Four steps times four
+/// styles is sixteen possible faces, and the two the editor draws almost
+/// everything in are not even in this map (see [`Renderer::faces`]).
+///
+/// Snapping rather than clamping-and-rounding because the steps are not evenly
+/// spaced: they are the sizes a document actually uses — body, a subheading, a
+/// heading, a title — and a config asking for 1.4 wants the 1.5 rather than a
+/// face of its own.
+const SCALE_STEPS: [u16; 4] = [100, 125, 150, 200];
+
+/// The step nearest `pct`. Out of range clamps to the ends, which is the honest
+/// answer for `0.5×` (there is no smaller step: shrinking text is a separate
+/// problem, since a cell narrower than the body's would make a *short* line and
+/// nothing wants that) and for `4×` alike.
+fn scale_step(pct: u16) -> u16 {
+    *SCALE_STEPS
+        .iter()
+        .min_by_key(|s| s.abs_diff(pct))
+        .expect("SCALE_STEPS is not empty")
+}
+
+/// A body-size measurement at `pct` of body size. One pixel minimum, since a
+/// zero-wide cell is a division by zero two functions later.
+fn scaled(v: i32, pct: u16) -> i32 {
+    (v * pct as i32 / 100).max(1)
+}
+
+/// Everything the overlays touching a line say about the **line** rather than
+/// about its cells: how big its type is, what colour the band behind it is, and
+/// what sits in front of it.
+///
+/// Resolved once per line and then consulted by four different loops — the draw
+/// pass, the row count, the cursor's row, and the click map — which is the only
+/// way those four can agree about where a line ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct LineStyle<'a> {
+    /// Percent of body size, already snapped to a [`SCALE_STEPS`] entry. 0 means
+    /// nothing claimed a size, and reads as 100 everywhere below.
+    scale: u16,
+    background: Option<HlKind>,
+    /// The prefix and the colour to draw it in — one overlay carries both, so a
+    /// quote bar is `(overlay-put ov 'line-prefix "▎ ")` beside that overlay's
+    /// own `face` rather than a second colour property nothing else would use.
+    prefix: Option<(&'a str, Option<HlKind>)>,
+}
+
+/// The line attributes in force on `[start, end)`.
+///
+/// Later beats earlier per attribute, as everywhere else here — *except* the
+/// scale, which is a `max`. An overlay cannot shrink a line under another
+/// overlay's type: the row height has to hold every run on the line, and a
+/// last-wins rule would let a later 1× overlay clip a 2× one's glyphs into the
+/// line below.
+fn line_style<'a>(overlays: &'a [Overlay], start: usize, end: usize) -> LineStyle<'a> {
+    let mut style = LineStyle::default();
+    for o in overlays.iter().filter(|o| o.end > start && o.start < end) {
+        if let Some(s) = o.scale {
+            style.scale = style.scale.max(scale_step(s));
+        }
+        style.background = o.line_background.or(style.background);
+        if let Some(p) = &o.line_prefix {
+            style.prefix = Some((p.as_str(), o.face));
+        }
+    }
+    style
+}
+
+/// One buffer line's grid, once its overlays have had their say.
+///
+/// The four numbers every loop that touches a line needs, and the reason they
+/// travel together: a scaled line has a wider cell *and* a taller row *and*
+/// therefore fewer columns, and a prefix takes columns off the front. Working
+/// any one of them out without the others is how the cursor ends up drawn in a
+/// column the text is not in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LineBox {
+    /// Cell width for this line, in pixels.
+    cw: i32,
+    /// Display rows one *visual* row of this line occupies. This is the whole of
+    /// "a scaled line is taller": [`image_rows`] already established that a line
+    /// may own several rows, and a scaled one claims them by the same rule, so
+    /// `doc_lines`, `scroll` and the gutter keep counting whole rows.
+    tall: usize,
+    /// Pixels this line's text is pushed right by its prefix.
+    indent: i32,
+    /// Columns of text left after the prefix.
+    cols: usize,
+}
+
+/// [`LineBox`] for a line styled `style`, given `text_w` pixels between the
+/// gutter and the pane's right edge.
+///
+/// `tall` is `ceil(scale)` and nothing cleverer: a run set at 1.5× has a 1.5×
+/// em box, so it needs two of the body's rows and gets exactly two. The type
+/// sits at the *bottom* of that block — see the draw loop — which puts the slack
+/// above the line, where a heading wants its air.
+fn line_box(style: &LineStyle, text_w: i32, cell_w: i32) -> LineBox {
+    let pct = style.scale.max(100);
+    let cw = scaled(cell_w, pct);
+    let indent = match style.prefix {
+        Some((p, _)) => str_cells(p) as i32 * cw,
+        None => 0,
+    };
+    LineBox {
+        cw,
+        tall: usize::from(pct).div_ceil(100),
+        indent,
+        cols: visible_cols(text_w - indent, cw),
+    }
 }
 
 /// Cells a bitmap `width` pixels across reserves. At least one, so an image
@@ -2390,6 +3290,11 @@ mod tests {
             background: None,
             display: None,
             image: None,
+            scale: None,
+            bold: None,
+            italic: None,
+            line_background: None,
+            line_prefix: None,
             fold: false,
         }
     }
@@ -2562,7 +3467,7 @@ mod tests {
         let set = Settings::default(); // truncating, one row per drawn line
         let plain = Buffer::from_str(text);
         // Four rows of pane, nothing folded: four lines.
-        assert_eq!(visible_lines(&plain, 0, 4, 20, &set), 4);
+        assert_eq!(visible_lines(&plain, 0, 4, 20, 1, &set), 4);
 
         // Fold "b" and "c" under "a" — chars 0..5 of "a\nb\nc\n…".
         let mut ed = Editor::new();
@@ -2574,11 +3479,11 @@ mod tests {
         // Six buffer lines now fit in four rows: a, (b), (c), d, e, f — the two
         // hidden ones cost nothing and are still counted, so `scroll` can step
         // past them.
-        assert_eq!(visible_lines(&ed.buffer, 0, 4, 20, &set), 6);
+        assert_eq!(visible_lines(&ed.buffer, 0, 4, 20, 1, &set), 6);
         // The contrast, in a two-row pane: two lines without the fold, four
         // with it, because two of the four are free.
-        assert_eq!(visible_lines(&plain, 0, 2, 20, &set), 2);
-        assert_eq!(visible_lines(&ed.buffer, 0, 2, 20, &set), 4);
+        assert_eq!(visible_lines(&plain, 0, 2, 20, 1, &set), 2);
+        assert_eq!(visible_lines(&ed.buffer, 0, 2, 20, 1, &set), 4);
         // The head line is drawn, the two under it are not, the rest are.
         let folded = |l: usize| fold_hiding(ed.buffer.overlays(), ed.buffer.line_start(l));
         assert_eq!((folded(0), folded(1), folded(2), folded(3)),
@@ -2586,6 +3491,216 @@ mod tests {
         // ...and it says so, on the line that is still drawn.
         assert!(fold_starts_in(ed.buffer.overlays(), 0, 1));
         assert!(!fold_starts_in(ed.buffer.overlays(), 2, 3));
+    }
+
+    // --- typesetting ------------------------------------------------------
+
+    /// The bound on the face cache, asserted where it is actually enforced.
+    /// Every other number in this file is layout; this one is memory.
+    #[test]
+    fn a_scale_is_snapped_to_one_of_the_few_sizes_a_face_opens_at() {
+        assert_eq!(scale_step(100), 100);
+        assert_eq!(scale_step(150), 150);
+        // Nearest, not next up: 1.4 is a 1.5 and 1.1 is body size. A config
+        // asking for a size between two steps gets the closer one rather than a
+        // font of its own.
+        assert_eq!(scale_step(140), 150);
+        assert_eq!(scale_step(110), 100);
+        assert_eq!(scale_step(113), 125);
+        // Out of range clamps rather than opening a face nobody budgeted for.
+        assert_eq!(scale_step(1), 100);
+        assert_eq!(scale_step(4000), 200);
+        // ...and the declared bound covers the whole key space, which is the
+        // claim `Renderer::faces` makes in prose.
+        assert_eq!(MAX_FACES, SCALE_STEPS.len() * 4);
+        assert!(SCALE_STEPS.contains(&100), "body size must be a step");
+    }
+
+    /// A scaled line's grid: wider cells, fewer columns, more rows — and every
+    /// one of them a whole number, which is the entire design. Nothing in the
+    /// renderer ever holds a fractional row height.
+    #[test]
+    fn a_scaled_line_is_wider_and_taller_by_whole_cells() {
+        // A hundred pixels of text width and a ten-pixel cell.
+        let at = |pct| {
+            line_box(
+                &LineStyle {
+                    scale: pct,
+                    ..Default::default()
+                },
+                100,
+                10,
+            )
+        };
+        // Body size, and the case that matters most: identical to what this was
+        // before any of it existed. `0` is "nothing claimed a size".
+        let body = LineBox { cw: 10, tall: 1, indent: 0, cols: 10 };
+        assert_eq!(at(0), body);
+        assert_eq!(at(100), body);
+        // 1.5×: fifteen-pixel cells, so six fit where ten did, and the line
+        // claims two rows because its em box is one and a half of them.
+        assert_eq!(at(150), LineBox { cw: 15, tall: 2, indent: 0, cols: 6 });
+        // 2× is *still* two rows — `ceil`, so nothing between 1 and 2 costs a
+        // third — and 2.5× is three.
+        assert_eq!(at(200), LineBox { cw: 20, tall: 2, indent: 0, cols: 5 });
+        assert_eq!(at(250), LineBox { cw: 25, tall: 3, indent: 0, cols: 4 });
+        // A degenerate cell must not make a zero-wide one two divisions later.
+        assert_eq!(line_box(&LineStyle::default(), 100, 0).cw, 1);
+    }
+
+    /// A prefix takes its own width off the front, and the columns left over are
+    /// the ones every loop downstream counts in — which is what makes a wrapped
+    /// quotation line up under itself instead of under the pane's edge.
+    #[test]
+    fn a_line_prefix_takes_columns_off_the_front() {
+        let quote = |scale| LineStyle {
+            scale,
+            prefix: Some(("| ", None)),
+            ..Default::default()
+        };
+        assert_eq!(
+            line_box(&quote(0), 100, 10),
+            LineBox { cw: 10, tall: 1, indent: 20, cols: 8 }
+        );
+        // Measured in the line's *own* cells, so an indented heading is indented
+        // by heading-sized ones and its bar lines up with its type.
+        assert_eq!(
+            line_box(&quote(150), 100, 10),
+            LineBox { cw: 15, tall: 2, indent: 30, cols: 4 }
+        );
+    }
+
+    /// The line attributes, resolved the way the draw loop resolves them.
+    #[test]
+    fn line_attributes_take_the_widest_scale_and_the_latest_of_the_rest() {
+        let mut small = overlay(1, 0, 4);
+        small.scale = Some(125);
+        small.line_background = Some(HlKind::Code);
+        let mut big = overlay(2, 2, 4);
+        big.scale = Some(150);
+        let mut last = overlay(3, 0, 4);
+        last.scale = Some(100);
+        last.line_background = Some(HlKind::Comment);
+        let all = [small, big, last];
+        let style = line_style(&all, 0, 4);
+        // The widest wins rather than the latest, and it is the one place this
+        // file departs from "most recent wins": the row block has to hold every
+        // run on the line, so a later body-size overlay must not be able to clip
+        // an earlier heading's glyphs into the line underneath.
+        assert_eq!(style.scale, 150);
+        // Everything else is last-wins, exactly as a face is.
+        assert_eq!(style.background, Some(HlKind::Comment));
+        // An overlay that only *touches* the line still styles it: that is what
+        // lets org scale a heading with an overlay over its stars.
+        let mut stars = overlay(4, 0, 1);
+        stars.scale = Some(200);
+        let one = [stars];
+        assert_eq!(line_style(&one, 0, 40).scale, 200);
+        assert_eq!(line_style(&[], 0, 4), LineStyle::default());
+    }
+
+    /// Weight and slant stack per attribute the way a face does — and `normal`
+    /// is a claim, which is the whole reason they are tri-state.
+    #[test]
+    fn weight_and_slant_stack_per_attribute_like_a_face() {
+        let mut first = overlay(1, 0, 4);
+        first.bold = Some(true);
+        first.italic = Some(true);
+        let mut second = overlay(2, 2, 4);
+        second.bold = Some(false); // upright, deliberately
+        let both = [first, second];
+        let runs = overlays_for_line(&both, 0, 4);
+        assert_eq!(overlay_emphasis(&runs, 0), (true, true));
+        // The later overlay takes the bold off and leaves the italic alone,
+        // which is the difference between `Some(false)` and `None`.
+        assert_eq!(overlay_emphasis(&runs, 2), (false, true));
+        assert_eq!(overlay_emphasis(&[], 0), (false, false));
+    }
+
+    /// The counting side of a scaled line. `visible_lines` and `line_rows` have
+    /// to spend the same rows on it that the draw loop does, or `scroll` clamps
+    /// against a screen nobody is looking at.
+    ///
+    /// The same thing `a_folded_line_occupies_no_row_but_is_still_a_line`
+    /// asserts, pointing the other way: a fold is a height of zero and a scale
+    /// is a height of two.
+    #[test]
+    fn a_scaled_line_claims_whole_extra_rows() {
+        let text = "one\ntwo\nthree\nfour\n";
+        let set = Settings::default(); // truncating, one row per body line
+        let plain = Buffer::from_str(text);
+        let mut ed = Editor::new();
+        ed.buffer = Buffer::from_str(text);
+        // Over "one" alone — a heading's stars, in the shape org-modern uses.
+        let id = ed.make_overlay(0, 3);
+        ed.apply(zemacs_core::EditorCommand::Overlay(
+            zemacs_core::OverlayEdit::Scale(id, Some(150)),
+        ));
+
+        // A hundred pixels of text at a ten-pixel cell. Four rows of pane: the
+        // heading eats two of them, so three buffer lines are on screen where
+        // four were.
+        assert_eq!(visible_lines(&plain, 0, 4, 100, 10, &set), 4);
+        assert_eq!(visible_lines(&ed.buffer, 0, 4, 100, 10, &set), 3);
+        // ...and everything below it has moved down by the row it took: the
+        // rows spent before line 1 are 1 without the scale and 2 with it.
+        let spent = |b: &Buffer| line_rows(b, 0, 100, 10, false, set.tab_width);
+        assert_eq!(spent(&plain), 1);
+        assert_eq!(spent(&ed.buffer), 2);
+        // Per line, not per buffer: only the line the overlay touches grew.
+        assert_eq!(line_rows(&ed.buffer, 0, 100, 10, false, 4), 2);
+        assert_eq!(line_rows(&ed.buffer, 1, 100, 10, false, 4), 1);
+        // A scale of exactly body size is not a scale, so the fast path in
+        // `visible_lines` is still allowed to skip the whole walk.
+        ed.apply(zemacs_core::EditorCommand::Overlay(
+            zemacs_core::OverlayEdit::Scale(id, Some(100)),
+        ));
+        assert!(!ed.buffer.overlays().iter().any(reshapes_lines));
+        assert_eq!(visible_lines(&ed.buffer, 0, 4, 100, 10, &set), 4);
+    }
+
+    /// A click on a typeset line reads *that line's* grid. The draw loop and
+    /// [`offset_at`] are twins, and a scale is the newest way for them to come
+    /// apart: a heading's cells are wider and its rows are taller, so a pointer
+    /// halfway across one is not halfway along its text.
+    #[test]
+    fn a_click_on_a_scaled_line_reads_its_own_grid() {
+        let set = Settings {
+            line_numbers: false, // no gutter, so a column is a column
+            ..Settings::default()
+        };
+        let pane = Area { x: 0, y: 0, w: 40 * CW + 2 * PAD, h: 9 * LH + 2 * PAD };
+        let mut ed = Editor::new();
+        ed.buffer = Buffer::from_str("HEADING\nbody text\n");
+        let id = ed.make_overlay(0, 7);
+        ed.apply(zemacs_core::EditorCommand::Overlay(
+            zemacs_core::OverlayEdit::Scale(id, Some(200)),
+        ));
+        let buf = &ed.buffer;
+        let win = Window {
+            id: 0,
+            buffer: buf.id,
+            cursor: 0,
+            scroll: 0,
+            viewport_lines: 8,
+            wrap_cols: 0,
+        };
+        let doc = doc_rect(pane, STATUS, 0);
+        // A pixel, rather than a column: which column it is, is the question.
+        let hit = |row: i32, px: i32| {
+            offset_at(buf, &win, &set, pane, STATUS, LH, CW,
+                      doc.x + px, doc.y + row * LH + LH / 2)
+        };
+
+        // The heading's cells are twice as wide, so the character under a
+        // pointer two body-cells along is the *first* one, not the third.
+        assert_eq!(hit(0, CW + CW / 2), 0, "still 'H' at 2x");
+        assert_eq!(hit(0, 2 * CW + CW / 2), 1, "'E'");
+        // The heading owns both of the first two rows, so row 1 is still it...
+        assert_eq!(hit(1, CW / 2), 0);
+        // ...and the body line only begins on the third.
+        assert_eq!(hit(2, CW / 2), buf.line_start(1));
+        assert_eq!(hit(2, CW + CW / 2), buf.line_start(1) + 1, "body is 1x again");
     }
 
     /// The which-key panel is a *grid*, and this is all there is to it: how
@@ -2618,12 +3733,18 @@ mod tests {
     /// `visible_lines` for `text` wrapped in a `cols`-wide, `rows`-tall pane —
     /// the path the renderer actually takes, so a wrap measured in the wrong
     /// unit shows up here rather than only in the helper it was measured with.
+    ///
+    /// A cell one pixel wide throughout the tests below, which is what makes a
+    /// pixel width and a column count the same number and keeps every assertion
+    /// readable. A scaled line is the one place that matters — see
+    /// `a_scaled_line_is_wider_and_taller_by_whole_cells`, which uses a real
+    /// cell so the arithmetic has somewhere to go wrong.
     fn wrapped_lines(text: &str, rows: usize, cols: usize) -> usize {
         let set = Settings {
             line_overflow: LineOverflow::Wrap,
             ..Settings::default()
         };
-        visible_lines(&Buffer::from_str(text), 0, rows, cols, &set)
+        visible_lines(&Buffer::from_str(text), 0, rows, cols as i32, 1, &set)
     }
 
     #[test]
@@ -2726,7 +3847,7 @@ mod tests {
         let mc = truncation_marker(500, cols).unwrap();
         assert!(mc < cols);
         let pane = Area { x: 0, y: 0, w: 2 * PAD + cols as i32 * CW, h: 600 };
-        let doc = doc_rect(pane, mh());
+        let doc = doc_rect(pane, mh(), 0);
         assert!(doc.x + (mc as i32 + 1) * CW <= pane.x + pane.w);
         // And it takes the place of a character rather than following one: the
         // glyphs drawn plus the marker are exactly one paneful.
@@ -2770,7 +3891,7 @@ mod tests {
         // arithmetic `draw_cursor` protects.
         let cols = 30i32;
         let pane = Area { x: 0, y: 0, w: 2 * PAD + cols * CW, h: 600 };
-        let doc = doc_rect(pane, mh());
+        let doc = doc_rect(pane, mh(), 0);
         let x = doc.x + cols * CW;
         assert!(x < pane.x + pane.w, "the margin is inside the pane");
         assert!(CW.min(pane.x + pane.w - x) > 0, "and wide enough to see");
@@ -2829,58 +3950,307 @@ mod tests {
         let mut set = Settings { line_numbers: false, ..Settings::default() };
         // Truncated, every line is one row, so the answer is the pane's height
         // whatever the buffer looks like.
-        assert_eq!(visible_lines(&buf, 0, 20, 10, &set), 20);
+        assert_eq!(visible_lines(&buf, 0, 20, 10, 1, &set), 20);
         set.line_overflow = LineOverflow::Wrap;
         // 100 cells in a 10-column pane is 10 rows for the first line alone,
         // then three one-row lines, then seven rows of nothing.
-        assert_eq!(visible_lines(&buf, 0, 20, 10, &set), 4 + 7);
+        assert_eq!(visible_lines(&buf, 0, 20, 10, 1, &set), 4 + 7);
         // Scrolled past the long line, the wrapped and truncated counts agree
         // again — nothing on screen is wider than the pane.
-        assert_eq!(visible_lines(&buf, 1, 20, 10, &set), 20);
+        assert_eq!(visible_lines(&buf, 1, 20, 10, 1, &set), 20);
         // Tall enough to matter: the long line alone fills a 5-row pane, and
         // the count must not drop to zero or scrolling stops dead.
-        assert_eq!(visible_lines(&buf, 0, 5, 10, &set), 1);
-        assert_eq!(visible_lines(&buf, 0, 0, 10, &set), 0);
+        assert_eq!(visible_lines(&buf, 0, 5, 10, 1, &set), 1);
+        assert_eq!(visible_lines(&buf, 0, 0, 10, 1, &set), 0);
         // A pane with no columns must not hang: every line is one row.
-        assert_eq!(visible_lines(&buf, 0, 5, 0, &set), 4 + 1);
+        assert_eq!(visible_lines(&buf, 0, 5, 0, 1, &set), 4 + 1);
     }
 
     // --- the gutter -------------------------------------------------------
 
-    /// `display-line-numbers-type 'visual`: a relative number is a distance in
-    /// *screen* rows, so a wrapped line above the cursor counts once per row it
-    /// occupies. Anything else and `3j` lands somewhere other than the row the
-    /// gutter labelled `3`.
+    /// One number per *buffer line*, counted in buffer lines.
+    ///
+    /// This is the assertion that changed when the gutter stopped counting
+    /// screen rows. The old rule numbered every visual row, so a line wrapped
+    /// across three of them showed three descending numbers and read as three
+    /// lines — and a wrapped line holding the cursor showed its absolute number
+    /// on one row and a relative number on the others. See `gutter_number` for
+    /// what that bought and why it was not worth it.
     #[test]
-    fn relative_line_numbers_count_visual_lines() {
-        let wrap = Settings {
+    fn relative_line_numbers_count_buffer_lines() {
+        // Cursor on line 4. Distances are in lines, whatever any of them are
+        // doing on screen.
+        let label = |line| gutter_number(line, 4, true);
+        assert_eq!((label(1), label(2), label(3)), (3, 2, 1));
+        assert_eq!((label(5), label(6)), (1, 2), "and below it too");
+        // The cursor's own line keeps the absolute buffer line number, 1-based.
+        assert_eq!(gutter_number(4, 4, true), 5);
+        // With relative off, every line is absolute.
+        assert_eq!(gutter_number(1, 4, false), 2);
+        assert_eq!(gutter_number(4, 4, false), 5);
+    }
+
+    /// ...and a wrapped line is numbered once, on the row it starts on.
+    ///
+    /// Asserted through the draw loop's own condition rather than through
+    /// `gutter_number`, because "how many numbers does a wrapped line get" is a
+    /// question about the loop, and it is the half of this the user actually
+    /// sees. `r` is the visual row within the line.
+    #[test]
+    fn a_wrapped_line_gets_one_number_on_its_first_row() {
+        let on = Settings::default();
+        let buf = Buffer::from_str("a long line that wraps\n");
+        // The draw loop's own condition. `gutter_on` and not `set.line_numbers`,
+        // because the buffer gets the last word — see
+        // `the_gutter_is_drawn_exactly_when_columns_were_reserved_for_it`.
+        let numbered = |r: usize, set: &Settings| gutter_on(&buf, set) && r == 0;
+        assert!(numbered(0, &on));
+        assert!(!numbered(1, &on), "a continuation row's gutter stays blank");
+        assert!(!numbered(2, &on));
+
+        // ...including in relative mode, which is the case that was wrong: this
+        // used to be `r == 0 || relative`, so every row got one.
+        let rel = Settings { relative_line_numbers: true, ..on };
+        assert!(numbered(0, &rel));
+        assert!(!numbered(1, &rel));
+
+        let off = Settings { line_numbers: false, ..on };
+        assert!(!numbered(0, &off));
+    }
+
+    /// A click lands on the character under the pointer, through every layout
+    /// step between the two: the gutter, the pane's scroll, a tab spread over
+    /// several cells, a wide glyph spread over two, and a wrapped line spread
+    /// over several rows.
+    #[test]
+    fn a_click_lands_on_the_character_under_it() {
+        // Big enough for eight rows of text plus a modeline.
+        let pane = Area { x: 0, y: 0, w: 40 * CW, h: 9 * LH + 2 * PAD };
+        let set = Settings::default();
+        let buf = Buffer::from_str("alpha\n\tbeta\n漢字 kanji\nomega");
+        let win = Window {
+            id: 0,
+            buffer: buf.id,
+            cursor: 0,
+            scroll: 0,
+            viewport_lines: 8,
+            wrap_cols: 0,
+        };
+        let doc = doc_rect(pane, STATUS, 0);
+        let gutter = gutter_w(&buf, &set, CW);
+        // The centre of the cell at (row, col), which is where a pointer is.
+        let hit = |row: i32, col: i32| {
+            let x = doc.x + gutter + col * CW + CW / 2;
+            let y = doc.y + row * LH + LH / 2;
+            offset_at(&buf, &win, &set, pane, STATUS, LH, CW, x, y)
+        };
+
+        assert_eq!(hit(0, 0), 0, "first character of the file");
+        assert_eq!(hit(0, 3), 3, "'h' of alpha");
+        // Past the end of a five-character line: one past the last character,
+        // never the newline and never the line below.
+        assert_eq!(hit(0, 30), 5);
+        // A click in the gutter is column zero of that row, not a negative one.
+        assert_eq!(
+            offset_at(&buf, &win, &set, pane, STATUS, LH, CW, doc.x, doc.y + LH / 2),
+            0
+        );
+
+        // Line 1 is "\tbeta": the tab is one character occupying `tab_width`
+        // cells, so every cell across it answers the tab itself, and 'b' is at
+        // the cell after them.
+        let line1 = buf.line_start(1);
+        assert_eq!(hit(1, 0), line1);
+        assert_eq!(hit(1, set.tab_width as i32 - 1), line1, "still the tab");
+        assert_eq!(hit(1, set.tab_width as i32), line1 + 1, "'b' of beta");
+
+        // Line 2 is "漢字 kanji": two cells per kanji, and clicking either half
+        // of one lands on the character rather than beside it.
+        let line2 = buf.line_start(2);
+        assert_eq!(hit(2, 0), line2);
+        assert_eq!(hit(2, 1), line2, "the right half of 漢 is still 漢");
+        assert_eq!(hit(2, 2), line2 + 1, "字");
+        assert_eq!(hit(2, 4), line2 + 2, "the space");
+
+        // Scrolling moves what the top row shows, and nothing else.
+        let scrolled = Window { scroll: 2, ..win };
+        assert_eq!(
+            offset_at(&buf, &scrolled, &set, pane, STATUS, LH, CW,
+                      doc.x + gutter + CW / 2, doc.y + LH / 2),
+            line2
+        );
+
+        // Below the last line: the end of the buffer, as Emacs does.
+        assert_eq!(hit(7, 0), buf.len_chars());
+    }
+
+    /// Wrapping is the case the arithmetic is easiest to get wrong: one buffer
+    /// line owns several pane rows, so the rows spent before the next line are
+    /// not the lines above it.
+    #[test]
+    fn a_click_on_a_wrapped_line_counts_rows_not_lines() {
+        let set = Settings {
             line_overflow: LineOverflow::Wrap,
+            line_numbers: false, // no gutter, so a column is a column
             ..Settings::default()
         };
-        // Ten columns: line 0 is one row, line 1 is three, line 2 is one.
-        let buf = Buffer::from_str("short\n0123456789abcdefghijABCDE\nlast");
-        let cols = 10;
-        // Cursor on the last line, which is therefore pane row 4: 1 + 3 above.
-        assert_eq!(cursor_pane_row(&buf, 0, (2, 0), cols, &wrap), 4);
-        // Every row of the wrapped line gets its own number, counting up to the
-        // cursor: rows 1, 2, 3 are 3, 2, 1 away — *not* "line 2 is 1 away".
-        let label = |row| gutter_number(1, row, 4, true);
-        assert_eq!((label(1), label(2), label(3)), (3, 2, 1));
-        // The cursor's own row keeps the absolute buffer line number.
-        assert_eq!(gutter_number(2, 4, 4, true), 3);
-        // ...and with relative off, so does every row.
-        assert_eq!(gutter_number(1, 3, 4, false), 2);
+        // Ten columns of text; "0123456789abcdefghij" is exactly two rows.
+        let pane = Area { x: 0, y: 0, w: 10 * CW + 2 * PAD, h: 9 * LH + 2 * PAD };
+        let buf = Buffer::from_str("0123456789abcdefghij\ntail");
+        let win = Window {
+            id: 0,
+            buffer: buf.id,
+            cursor: 0,
+            scroll: 0,
+            viewport_lines: 8,
+            wrap_cols: 10,
+        };
+        let doc = doc_rect(pane, STATUS, 0);
+        let hit = |row: i32, col: i32| {
+            offset_at(&buf, &win, &set, pane, STATUS, LH, CW,
+                      doc.x + col * CW + CW / 2, doc.y + row * LH + LH / 2)
+        };
 
-        // Scrolled to the middle of the file, the count is from the top of the
-        // pane, so the same cursor is on row 3.
-        assert_eq!(cursor_pane_row(&buf, 1, (2, 0), cols, &wrap), 3);
-        // And the cursor inside a wrapped line lands on that line's own row.
-        assert_eq!(cursor_pane_row(&buf, 0, (1, 15), cols, &wrap), 2);
+        assert_eq!(hit(0, 0), 0);
+        assert_eq!(hit(0, 9), 9, "last cell of the first row");
+        assert_eq!(hit(1, 0), 10, "'a' — the continuation row, same buffer line");
+        assert_eq!(hit(1, 9), 19);
+        // Only *now* does the second buffer line begin, on the third pane row.
+        assert_eq!(hit(2, 0), buf.line_start(1));
+    }
 
-        // Truncating, every line is one row and this is the old arithmetic.
-        let cut = Settings::default();
-        assert_eq!(cursor_pane_row(&buf, 0, (2, 0), cols, &cut), 2);
-        assert_eq!(cursor_pane_row(&buf, 1, (2, 0), cols, &cut), 1);
+    /// A centred measure is only worth having if the mouse agrees with it, so
+    /// this is the same click test one pane-width to the right: with
+    /// `text_width` set, column zero is no longer at the pane's left edge, and
+    /// every step between a pixel and a character has to have moved with it.
+    ///
+    /// The failure this exists to catch is the tempting one — centring by
+    /// shifting the glyphs at draw time and leaving the layout alone — which
+    /// looks perfect until you click, and then puts point a dozen characters to
+    /// the left of the pointer.
+    #[test]
+    fn a_click_lands_on_the_character_under_it_in_a_centred_measure() {
+        // A 60-column pane holding a 20-column measure: 20 columns of margin on
+        // each side, which is a large enough offset that an un-inset hit test
+        // could not accidentally pass.
+        let set = Settings {
+            line_numbers: false, // no gutter, so a column is a column
+            text_width: 20,
+            ..Settings::default()
+        };
+        let pane = Area { x: 0, y: 0, w: 60 * CW + 2 * PAD, h: 9 * LH + 2 * PAD };
+        //                            0         1         2         3
+        //                            0123456789012345678901234567890123
+        let buf = Buffer::from_str("alpha beta gamma delta epsilon zeta\nsecond line");
+        let win = Window {
+            id: 0,
+            buffer: buf.id,
+            cursor: 0,
+            scroll: 0,
+            viewport_lines: 8,
+            wrap_cols: 20,
+        };
+
+        let doc = doc_rect(pane, STATUS, measure_px(&set, CW));
+        assert_eq!(doc.w, 20 * CW, "the measure is the text column's width");
+        assert_eq!(doc.x, PAD + 20 * CW, "...and it is centred in the pane");
+
+        let hit = |col: i32| {
+            offset_at(&buf, &win, &set, pane, STATUS, LH, CW,
+                      doc.x + col * CW + CW / 2, doc.y + LH / 2)
+        };
+        assert_eq!(hit(0), 0, "the first character, twenty columns in");
+        assert_eq!(hit(6), 6, "'b' of beta");
+        // Left of the measure is column zero of that row, exactly as a click in
+        // the gutter is: the margin is chrome, not text you can point into.
+        assert_eq!(
+            offset_at(&buf, &win, &set, pane, STATUS, LH, CW, pane.x, doc.y + LH / 2),
+            0
+        );
+        // Right of it, the margin is not text: the pointer is clamped to one
+        // column past the measure rather than answering the 40th character of a
+        // line that is only twenty columns wide on screen. Column 19 carries
+        // the truncation marker, so character 20 is exactly what that marker
+        // stands for — the first of the tail it is hiding.
+        assert_eq!(
+            offset_at(&buf, &win, &set, pane, STATUS, LH, CW,
+                      pane.x + pane.w - 1, doc.y + LH / 2),
+            20
+        );
+
+        // Turning the measure off moves the *same pixel* twenty columns along
+        // the line, which is the proof that the two layouts really do differ
+        // and that `doc_rect` is the only thing that made them.
+        let full = Settings { text_width: 0, ..set };
+        assert_eq!(
+            offset_at(&buf, &win, &full, pane, STATUS, LH, CW,
+                      doc.x + CW / 2, doc.y + LH / 2),
+            20
+        );
+    }
+
+    /// `consult-line` rows wear the buffer's own colours, taken from the spans
+    /// it already has and shifted right by the number in front of them. Nothing
+    /// is re-parsed, so this is also the check that the shift is right: an
+    /// off-by-`prefix` here would colour the wrong token in the popup.
+    #[test]
+    fn a_consult_line_row_borrows_the_buffer_s_own_highlight() {
+        let mut ed = Editor::new();
+        //                             0123456789
+        ed.buffer = Buffer::from_str("one\nlet x = 1\nthree");
+        // "let" on line 1: chars 4..7 of the buffer.
+        ed.buffer.highlights = vec![span(4, 7, HlKind::Keyword), span(12, 13, HlKind::Number)];
+        ed.open_prompt(zemacs_core::PromptKind::Line);
+        let p = ed.prompt.as_ref().unwrap();
+
+        // Three lines, so "3" plus two spaces.
+        assert_eq!(p.prefix, 3);
+        let row = p.items[1].clone();
+        assert_eq!(row, "2  let x = 1");
+
+        let runs = candidate_runs(&ed, p, 1, &row);
+        assert_eq!(
+            runs,
+            vec![
+                (0, 3, HlKind::Comment),  // the number, dimmed like the gutter
+                (3, 6, HlKind::Keyword),  // "let", shifted by the prefix
+                (11, 12, HlKind::Number), // "1"
+            ]
+        );
+        // ...and the run really does cover "let" in the row as drawn.
+        assert_eq!(&row[3..6], "let");
+        assert_eq!(&row[11..12], "1");
+
+        // A row whose line is gone (the buffer changed under the prompt) is
+        // drawn flat rather than reaching past the end of the rope.
+        assert!(candidate_runs(&ed, p, 99, &row).is_empty());
+    }
+
+    /// A grep hit is `path:line:text` and has no spans to borrow — the file is
+    /// not open. Its structure gets the colour instead, split on the same two
+    /// colons the app splits on to open it.
+    #[test]
+    fn a_grep_row_colours_its_path_and_line_number() {
+        let mut ed = Editor::new();
+        ed.open_prompt(zemacs_core::PromptKind::Grep);
+        let p = ed.prompt.as_ref().unwrap();
+
+        let row = "src/main.rs:42:    let x = 1;";
+        assert_eq!(
+            candidate_runs(&ed, p, 0, row),
+            vec![
+                (0, 11, HlKind::Function),   // src/main.rs
+                (11, 12, HlKind::Punctuation),
+                (12, 14, HlKind::Number),    // 42
+                (14, 15, HlKind::Punctuation),
+            ]
+        );
+        assert_eq!(&row[0..11], "src/main.rs");
+        assert_eq!(&row[12..14], "42");
+
+        // A row that is not a hit at all — ripgrep printed something else, or
+        // the list is still empty — is left alone rather than mis-split.
+        assert!(candidate_runs(&ed, p, 0, "no colons here").is_empty());
     }
 
     #[test]
@@ -2898,13 +4268,158 @@ mod tests {
         assert_eq!(gutter_w(&long, &off, CW), 0);
     }
 
+    /// The gutter is a fact about the *buffer*, not about the editor — which is
+    /// the whole point, because it is drawn once per pane. Two buffers on screen
+    /// at once must be able to disagree, and before this they could not: the
+    /// setting was global, so opening prose took the numbers off the source file
+    /// beside it and the winner was whichever mode was entered last.
+    #[test]
+    fn each_buffer_answers_the_gutter_question_for_itself() {
+        let set = Settings::default(); // editor-wide: on
+        let code = Buffer::from_str("fn main() {}\n");
+        let mut prose = Buffer::from_str("Once upon a time\n");
+        prose.line_numbers = Some(false);
+
+        assert_eq!(gutter_w(&code, &set, CW), 4 * CW, "code keeps its gutter");
+        assert_eq!(gutter_w(&prose, &set, CW), 0, "prose beside it does not");
+
+        // ...and the buffer can dissent the other way too, so turning numbers
+        // off globally still leaves a buffer able to ask for them.
+        let off = Settings { line_numbers: false, ..set };
+        let mut wants = Buffer::from_str("1\n2\n");
+        wants.line_numbers = Some(true);
+        assert_eq!(gutter_w(&code, &off, CW), 0);
+        assert_eq!(gutter_w(&wants, &off, CW), 4 * CW);
+
+        // A dashboard and a terminal never have one, whatever anybody set:
+        // there are no buffer lines to number. Not a policy Lisp has to
+        // remember — the renderer knows what those two are.
+        for kind in [BufferKind::Dashboard, BufferKind::Terminal] {
+            let mut b = Buffer::from_str("x\n");
+            b.kind = kind;
+            b.line_numbers = Some(true);
+            assert_eq!(gutter_w(&b, &set, CW), 0, "{kind:?} shows no gutter");
+        }
+    }
+
+    /// The gutter's *ink* and the gutter's *columns* are one decision.
+    ///
+    /// They were two, and on the configuration we ship they disagreed on every
+    /// org buffer: `init.lisp` says `(set-line-numbers t)` and
+    /// `(set-no-gutter-modes '("org-mode" …))`, so `Buffer::line_numbers` is
+    /// `Some(false)` and the width came out zero — while the draw loop asked
+    /// `settings.line_numbers`, said yes, and wrote `format!("{n:>3}")` at
+    /// `doc.x`, which with no gutter reserved is the first three characters of
+    /// the line. Prose with its first three letters overprinted by a number.
+    ///
+    /// Asserted as the equivalence rather than as a pixel, because the equivalence
+    /// is the invariant: whatever decides one has to decide the other.
+    #[test]
+    fn the_gutter_is_drawn_exactly_when_columns_were_reserved_for_it() {
+        let set = Settings::default(); // editor-wide: on, as `init.lisp` sets it
+        let mut org = Buffer::from_str("* A heading\nand its prose\n");
+        org.major_mode = "org-mode".into();
+        org.line_numbers = Some(false); // what `set-no-gutter-modes` parks here
+
+        // The draw loop's condition, and the width, from one answer.
+        for buf in [&org, &Buffer::from_str("fn main() {}\n")] {
+            assert_eq!(
+                gutter_on(buf, &set),
+                gutter_w(buf, &set, CW) > 0,
+                "ink and columns disagree for {:?}",
+                buf.major_mode
+            );
+        }
+        assert!(!gutter_on(&org, &set), "no gutter, so no number over the text");
+
+        // ...and the other three corners of the same matrix, including a buffer
+        // dissenting *into* a gutter the editor has turned off.
+        let off = Settings { line_numbers: false, ..set };
+        let mut wants = Buffer::from_str("1\n2\n");
+        wants.line_numbers = Some(true);
+        for (buf, s) in [(&wants, &off), (&wants, &set), (&org, &off)] {
+            assert_eq!(gutter_on(buf, s), gutter_w(buf, s, CW) > 0);
+        }
+        assert!(gutter_on(&wants, &off));
+
+        // A dashboard and a terminal have no lines to number, so neither half
+        // fires however loudly anyone asked.
+        for kind in [BufferKind::Dashboard, BufferKind::Terminal] {
+            let mut b = Buffer::from_str("x\n");
+            b.kind = kind;
+            b.line_numbers = Some(true);
+            assert!(!gutter_on(&b, &set), "{kind:?}");
+            assert_eq!(gutter_w(&b, &set, CW), 0, "{kind:?}");
+        }
+    }
+
+    /// A truncated line spends one visual row, whatever an image on it claims —
+    /// and the slice the draw loop takes out of its cells stays inside them.
+    ///
+    /// The failing shape: truncation on, a line a little wider than the pane, and
+    /// an overlay image tall enough to want three display rows. `need` is a `max`
+    /// over the two claims, so the loop was granted three rows and walked
+    /// `wrap_rows` three times — on a line it had already decided to cut at row
+    /// zero. Row 1 then sliced `cells[cols .. cols + (cols - 1)]`, because the
+    /// truncation marker pins `shown` at `cols - 1` on *every* row, and a line of
+    /// `cols + 1` cells has nothing like that much left. An index panic, taking
+    /// the frame and the editor with it.
+    ///
+    /// Asserted through [`drawn_rows`] because that is the function the loop
+    /// calls; the arithmetic below it is the loop's, transcribed.
+    #[test]
+    fn a_truncated_line_stays_one_row_even_under_a_tall_image() {
+        let cols = 30usize;
+        // One cell past the pane: the narrowest line that both trips the marker
+        // and is too short for a second full row.
+        let cells = expand_line(&"x".repeat(cols + 1), 4);
+        let marker = truncation_marker(cells.len(), cols);
+        assert_eq!(marker, Some(cols - 1), "the line is wide enough to be cut");
+
+        // Truncation: one visual row of text, and an image claiming three.
+        let (text_rows, tall, image) = (1usize, 1usize, 3usize);
+        let need = (text_rows * tall).max(image);
+        let rows_left = 8usize;
+        let shown_rows = drawn_rows(need.min(rows_left), tall, text_rows);
+        assert_eq!(shown_rows, 1, "a truncated line is one row however tall");
+
+        // ...and every row it does walk indexes inside the line. This is the
+        // slice that panicked.
+        for (rs, re) in wrap_rows(cells.len(), cols).take(shown_rows) {
+            let shown = marker.unwrap_or(re - rs);
+            assert!(
+                rs + shown <= cells.len(),
+                "cells[{rs}..{}] is past {}",
+                rs + shown,
+                cells.len()
+            );
+        }
+
+        // The counting twins already believed this, which is why the draw loop
+        // disagreeing with them was the bug rather than the feature: one row for
+        // the line, whatever is on it.
+        let mut buf = Buffer::from_str(&"x".repeat(cols + 1));
+        buf.line_numbers = Some(false);
+        assert_eq!(line_rows(&buf, 0, cols as i32 * CW, CW, false, 4), 1);
+
+        // Wrapping is untouched: there the text really does own those rows, and
+        // `take` was never the thing bounding them.
+        let wrapped = wrap_row_count(cells.len(), cols);
+        assert_eq!(wrapped, 2);
+        assert_eq!(drawn_rows(wrapped * tall, tall, wrapped), 2);
+        // A 2× line still claims two display rows per visual row, and the row
+        // budget still cuts it at the bottom of the pane rather than the clamp.
+        assert_eq!(drawn_rows(4, 2, wrapped), 2);
+        assert_eq!(drawn_rows(1, 2, wrapped), 1, "half a scaled row still draws");
+    }
+
     #[test]
     fn neither_mode_puts_a_cell_outside_its_pane() {
         // A 30-column left pane and a 500-character line, in both modes: every
         // column that gets drawn ends inside the pane, cursor and marker
         // included. This is the bug the whole feature exists for.
         let pane = Area { x: 0, y: 0, w: 2 * PAD + 30 * CW, h: 600 };
-        let doc = doc_rect(pane, mh());
+        let doc = doc_rect(pane, mh(), 0);
         let right = pane.x + pane.w;
         let cells = expand_line(&"x".repeat(500), 4);
 
@@ -3227,7 +4742,7 @@ mod tests {
     #[test]
     fn a_panes_document_stops_above_its_modeline() {
         let pane = Area { x: 550, y: 100, w: 450, h: 300 };
-        let doc = doc_rect(pane, mh());
+        let doc = doc_rect(pane, mh(), 0);
         let strip = modeline_rect(pane, mh());
         assert!(doc.x >= pane.x && doc.y >= pane.y, "{doc:?} outside {pane:?}");
         assert!(doc.x + doc.w <= pane.x + pane.w, "{doc:?} outside {pane:?}");
@@ -3243,13 +4758,13 @@ mod tests {
         for h in [-5, 0, 1, mh(), mh() + PAD, mh() + PAD + LH - 1] {
             let pane = Area { x: 0, y: 0, w: 400, h };
             assert_eq!(doc_lines(pane, mh(), LH), 0, "h={h}");
-            let doc = doc_rect(pane, mh());
+            let doc = doc_rect(pane, mh(), 0);
             assert!(doc.w >= 0 && doc.h >= 0, "h={h} -> {doc:?}");
         }
         // One pixel more than the chrome plus a line, and one row appears.
         let pane = Area { x: 0, y: 0, w: 400, h: mh() + PAD + LH };
         assert_eq!(doc_lines(pane, mh(), LH), 1);
-        assert_eq!(doc_lines(pane, mh(), 0), doc_rect(pane, mh()).h as usize); // no /0
+        assert_eq!(doc_lines(pane, mh(), 0), doc_rect(pane, mh(), 0).h as usize); // no /0
     }
 
     #[test]
@@ -3289,7 +4804,7 @@ mod tests {
         // The real case: 500 characters in a 30-column left pane. The last cell
         // drawn ends inside the pane, so the right pane keeps its pixels.
         let pane = Area { x: 0, y: 0, w: 2 * PAD + 30 * CW, h: 600 };
-        let doc = doc_rect(pane, mh());
+        let doc = doc_rect(pane, mh(), 0);
         let cols = visible_cols(doc.w, CW);
         assert_eq!(cols, 30);
         let cells = expand_line(&"x".repeat(500), 4);
@@ -3353,6 +4868,94 @@ mod tests {
             Err(e) => {
                 let msg = e.to_string();
                 assert!(msg.contains("ZEMACS_FONT") && msg.contains(FONT_CANDIDATES[0]));
+            }
+        }
+    }
+
+    /// A scaled face really opens, and really is bigger.
+    ///
+    /// Everything else about typesetting in this file is arithmetic and is
+    /// tested as arithmetic. This is the one step that talks to FreeType, and it
+    /// is the step whose failure mode is silent: `open_face` answering `None`,
+    /// or the point size not moving, would draw a heading at body size and no
+    /// amount of layout testing would notice.
+    ///
+    /// No window — `Sdl2TtfContext` needs no video subsystem — so this runs on a
+    /// headless box like every other test here. The `Box::leak` is the same
+    /// trade `Renderer::new` makes and is documented there.
+    #[test]
+    fn a_scaled_face_opens_and_is_bigger_than_the_body() {
+        let Ok(path) = find_font() else {
+            return; // no font on this box; the test above already said so
+        };
+        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
+        let advance = |pct: u16, style: u8| {
+            let key = FaceKey {
+                point_size: scaled(18, pct).clamp(4, 400) as u16,
+                style,
+            };
+            let face = open_face(ttf, &path, key).expect("the body font opens at every step");
+            metrics(&face.font)
+        };
+        let (body_w, body_h) = advance(100, 0);
+        for &pct in &SCALE_STEPS[1..] {
+            let (w, h) = advance(pct, 0);
+            // Bigger in both directions, and roughly by the factor asked for.
+            // Roughly, because a point size is rounded to a whole number and a
+            // rasteriser rounds again — which is exactly why the *grid* is
+            // arithmetic and the face is only a rasteriser. See `draw_run`.
+            assert!(w > body_w, "{pct}% is no wider than the body: {w} vs {body_w}");
+            assert!(h > body_h, "{pct}% is no taller than the body: {h} vs {body_h}");
+            let want = scaled(body_w, pct);
+            assert!(
+                (w - want).abs() <= 2,
+                "{pct}% advance {w} is not within a pixel or two of {want}"
+            );
+        }
+        // Bold and italic open at every size too — the `expect` inside is the
+        // assertion, since a style FreeType refused would draw nothing at all.
+        //
+        // Their advance is deliberately *not* asserted equal to the plain one.
+        // It is not: SDL_ttf's synthetic bold smears the outline and gains a
+        // pixel on this font, and the italic shears it. That it does not matter
+        // is the design — `draw_run` and `draw_weighted` step by the grid's cell
+        // and never by the face's advance, so a bold run occupies the columns a
+        // plain one would and overhangs its last one by a pixel, exactly as the
+        // modeline's bold segments already do.
+        for &pct in &SCALE_STEPS {
+            for style in 1..4u8 {
+                assert!(advance(pct, style).0 > 0, "{pct}%/{style} has no advance");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod truncate_invariant {
+    use super::*;
+
+    /// `draw_segments` subtracts `str_cells(truncate(s, left))` from `left`, so
+    /// truncate must never answer something wider than it was asked for. A
+    /// `usize` underflow here is a panic in a release-mode editor, not a wrong
+    /// pixel — and the modeline is where it bites, because that is the one strip
+    /// whose text is arbitrary and whose width runs out.
+    #[test]
+    fn truncate_never_exceeds_its_budget() {
+        let cases = [
+            "", "a", "ab", "abc", "…", "……", "漢", "漢字", "漢字漢字",
+            "e\u{301}", "e\u{301}e\u{301}e\u{301}", "a\u{301}漢b",
+            "very long modeline segment that will certainly not fit",
+            "linear-algebra.org", "*tutor-lisp*", "\t\ta", "\u{0}\u{1}a",
+            "🙂", "🙂🙂🙂", "a🙂漢e\u{301}…",
+        ];
+        for s in cases {
+            for n in 0..12usize {
+                let out = truncate(s, n);
+                assert!(
+                    str_cells(&out) <= n,
+                    "truncate({s:?}, {n}) = {out:?} is {} cells, over budget",
+                    str_cells(&out)
+                );
             }
         }
     }

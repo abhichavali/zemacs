@@ -20,6 +20,14 @@ pub struct Item {
 
 pub struct Dashboard {
     pub banner: String,
+    /// A picture drawn above the banner, or `None` for the text alone.
+    ///
+    /// An [`ImageId`](crate::ImageId) rather than a path, so the dashboard
+    /// borrows the image machinery inline figures already use — one decoder,
+    /// one cache, one texture lifetime — instead of learning to read files.
+    /// Lisp makes the id with `image-file` and hands it over, which is also
+    /// what keeps *which* picture a matter of configuration.
+    pub logo: Option<crate::ImageId>,
     /// Recently opened files. Owned by the editor, seeded at startup.
     pub recents: Vec<Item>,
     /// Configured rows. Owned by Lisp.
@@ -33,6 +41,7 @@ impl Default for Dashboard {
     fn default() -> Self {
         Self {
             banner: DEFAULT_BANNER.into(),
+            logo: None,
             recents: Vec::new(),
             items: vec![
                 item('f', "Find file", "find-file"),

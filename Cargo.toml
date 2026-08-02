@@ -10,6 +10,7 @@ members = [
     "crates/project",
     "crates/term",
     "crates/latex",
+    "crates/figure",
     "crates/tramp",
     "crates/rpc",
     "crates/app",
@@ -30,6 +31,7 @@ zemacs-dired = { path = "crates/dired" }
 zemacs-project = { path = "crates/project" }
 zemacs-term = { path = "crates/term" }
 zemacs-latex = { path = "crates/latex" }
+zemacs-figure = { path = "crates/figure" }
 zemacs-tramp = { path = "crates/tramp" }
 zemacs-rpc = { path = "crates/rpc" }
 

@@ -76,15 +76,43 @@ component of their path.")
   (handler-case (progn (%repl-ensure-file) (find-file (namestring *repl-file*)))
     (error (e) (message (format nil "repl: ~a" e)))))
 
+(defun %repl-open-p ()
+  "True when the transcript is already a buffer, and so already has somewhere
+to go. A buffer whose window was closed counts: reopening it would mean
+guessing which pane the user wanted it back in, and guessing wrong takes a
+window away from them. `C-c C-z' is the unambiguous way to ask."
+  (member *repl-buffer* (buffer-names) :test #'string=))
+
+(defun %repl-show ()
+  "Put the transcript on screen *beside* what you are working on.
+
+The first evaluation from a source buffer is the one that needs this: without
+it the value goes to the status line, scrolls away, and the transcript is a
+file you have to know to go looking for. Splitting once, on the first eval,
+is what makes `C-c C-e' feel like talking to the image rather than like
+sending mail to it.
+
+Three commands in the editor's queue, in order: split (which focuses the new
+pane), open the transcript into it, and hand focus back to the window the
+evaluation came from. `window-id' is read *before* the split, because
+`split-window-below' makes the new pane current — and the ordering holds even
+though `find-file' lands a moment later, since these all travel the same queue
+the app drains in order."
+  (unless (%repl-open-p)
+    (let ((here (window-id)))
+      (split-window-below)
+      (find-file (namestring *repl-file*))
+      (select-window here))))
+
 (defun %repl-write (text)
   "Append TEXT to the transcript: into the buffer when it is open, into the
 file when it is not.
 
-Deliberately never opens it. An eval from a source buffer must not take the
-window you are working in — `C-c C-z' is how you ask for that — and appending
-to the file keeps the record complete either way, so the transcript is all
-there the first time you look at it."
-  (if (member *repl-buffer* (buffer-names) :test #'string=)
+Deliberately never opens it — `%repl-show' is what does that, and it runs
+*after* this, so the entry is already in the file by the time the editor is
+asked to read it. Appending to the file keeps the record complete either way,
+so the transcript is all there the first time you look at it."
+  (if (%repl-open-p)
       ;; Two locks and a switch: the REPL is genuinely the live buffer for the
       ;; length of one insert, which is short enough that a keystroke landing
       ;; in it is a curiosity rather than a hazard. `insert-at' leaves point on
@@ -156,6 +184,7 @@ Common Lisp, and it is precisely the one a REPL produces by accident."
       (message "nothing to evaluate")
       (multiple-value-bind (value error) (%eval-source source)
         (%repl-write (%repl-entry source value error))
+        (%repl-show)
         (message (if error
                      (format nil "lisp error: ~a" (%one-line error))
                      (%one-line (%repl-print value)))))))
@@ -194,6 +223,18 @@ Common Lisp, and it is precisely the one a REPL produces by accident."
 (defun lisp-eval-buffer ()
   "Evaluate the whole buffer."
   (%repl-eval (buffer-string)))
+
+(defun lisp-eval-dwim ()
+  "The selection, or the top-level form point is in, or the whole buffer — in
+that order. The built-in `eval-dwim' verb decides the same three ways and is
+what bare `C-c' runs everywhere else; this one exists so that a Lisp buffer's
+`dwim' lands in the transcript like the other four commands here, rather than
+flashing its value past on the status line."
+  (cond ((region) (lisp-eval-region))
+        ((%with-lisp-scan (text classes here)
+           (%toplevel-form text classes (min (length text) (1+ here))))
+         (lisp-eval-defun))
+        (t (lisp-eval-buffer))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys

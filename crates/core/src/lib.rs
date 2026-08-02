@@ -284,10 +284,16 @@ pub enum HlKind {
     Modeline,
     ModelineInactive,
     ModelineText,
-    /// Markup faces, used by org mode. Emphasis is carried by *colour* rather
-    /// than by weight or slant: the renderer opens exactly one font face, so
-    /// real bold and italic would mean loading two more and a per-span face
-    /// switch. ponytail: colour-only until that is worth doing.
+    /// Markup faces, used by org mode. These carry *colour* and nothing else,
+    /// which is all a highlight span can carry: a span is a fact about the text
+    /// the parser found, and it is recomputed from scratch on every keystroke.
+    ///
+    /// Emphasis used to be colour-only for a second reason — the renderer opened
+    /// exactly one font face — and that one is gone. Real weight, slant and type
+    /// size live on [`Overlay`](crate::Overlay) instead of here, where they can
+    /// be *put* by a mode rather than derived by a parser, and where clearing
+    /// one does not mean re-parsing the buffer. `org-modern.lisp` sets both: the
+    /// face for the hue, `weight`/`slant` for the shape.
     Heading1,
     Heading2,
     Heading3,
@@ -451,6 +457,9 @@ pub enum EditorCommand {
     SetSyntaxColor(String, [f32; 3]),
     SetLineNumbers(bool),
     SetTabWidth(usize),
+    /// Columns of text to centre in the pane; 0 turns it off. See
+    /// [`Settings::text_width`].
+    SetTextWidth(usize),
     /// `"minibuffer"`, `"bottom"` (consult-like) or `"center"` (telescope-like).
     SetCompletionStyle(String),
     /// Negative sinks the modeline instead of raising it.
@@ -466,10 +475,16 @@ pub enum EditorCommand {
     RegisterCommand(String),
     /// Index into [`Editor::buffer_names`]; 0 is the current buffer.
     SwitchBuffer(usize),
+    /// The same, by id. What the switcher's preview uses, because switching
+    /// reorders the list and an index taken before one is stale after it.
+    SwitchBufferId(BufferId),
 
     // --- major and minor modes ---
     /// Replace the current buffer's major mode. Fires `<name>-hook` in Lisp.
     SetMajorMode(String),
+    /// Major modes whose buffers show no line-number gutter, space-separated.
+    /// One string rather than a list because the write envelope carries one.
+    SetNoGutterModes(String),
     /// Turn a minor mode on or off in the current buffer.
     SetMinorMode(String, bool),
 
@@ -513,6 +528,8 @@ pub enum EditorCommand {
 
     // --- dashboard, configured from Lisp ---
     SetDashboardBanner(String),
+    /// The picture above the banner. `None` takes it away again.
+    SetDashboardLogo(Option<ImageId>),
     ClearDashboardItems,
     AddDashboardItem {
         key: char,
@@ -577,6 +594,18 @@ pub enum EditorCommand {
     /// Lisp dispatches on, a language is what gets highlighted, and a buffer
     /// created from Lisp had no way to ask for colour.
     SetLanguage(Option<String>),
+    /// Refuse, or stop refusing, every edit to the live buffer.
+    ///
+    /// The writer that made [`BufferKind::is_generated`] stop being the only
+    /// answer to "may I type here". A mode that renders rather than edits — the
+    /// first is `org-frozen-mode` — sets it on entry and clears it on exit, and
+    /// gets `i`, `x`, `p`, `u` and every Lisp `insert` refused for as long as it
+    /// is on. See [`Buffer::read_only`] for why this is not a [`BufferKind`].
+    ///
+    /// Deliberately *not* [`EditorCommand::mutates_document`]: turning the flag
+    /// off would then be the one edit a read-only buffer could never accept, and
+    /// the mode could never be left.
+    SetReadOnly(bool),
 
     /// Put a prompt up whose answer goes **back to Lisp**, as
     /// `(%prompt-reply ID ANSWER)` through [`EditorCommand::CallLisp`]. `id`
@@ -686,6 +715,16 @@ pub struct Settings {
     /// Count from the cursor rather than from the top of the file. Orthogonal
     /// to `line_numbers`, which is whether the gutter is drawn at all.
     pub relative_line_numbers: bool,
+    /// Columns the text column is held to, centred in its pane — Emacs'
+    /// `olivetti-mode`, and what makes a prose buffer read like a page rather
+    /// than like a terminal. **0 is off** and means the full width of the pane,
+    /// which is what every code buffer wants: indentation is structure, and
+    /// centring it puts the structure in the middle of nowhere.
+    ///
+    /// In columns rather than pixels because a measure is a count of
+    /// characters — "66 characters per line" is the typographic rule, and it
+    /// stays true when the font size changes.
+    pub text_width: usize,
 }
 
 impl Default for Settings {
@@ -701,6 +740,7 @@ impl Default for Settings {
             modeline_pad: 8,
             line_overflow: LineOverflow::default(),
             relative_line_numbers: false,
+            text_width: 0,
         }
     }
 }
@@ -757,11 +797,44 @@ impl BufferKind {
     }
 }
 
+/// Why a buffer refuses an edit, or [`ReadOnly::No`].
+///
+/// Two reasons and they are genuinely different, which is the whole reason this
+/// is not a bool: a *generated* buffer has no document to edit — its text is a
+/// rendering of state and the next refresh would throw an edit away — while a
+/// buffer Lisp has *frozen* has a perfectly good file behind it and is refusing
+/// on purpose. The user needs to be told which, because one of them is
+/// something they can turn off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadOnly {
+    No,
+    /// `*dashboard*`, `*magit*`, dired, a terminal.
+    Generated,
+    /// [`EditorCommand::SetReadOnly`] — org-frozen, and anything else that
+    /// wants a file on screen without a way to type into it.
+    Claimed,
+}
+
 /// A text document plus a cursor expressed as a character index into the rope.
 pub struct Buffer {
     /// Stable handle. Windows refer to buffers by this, never by index.
     pub id: BufferId,
     pub kind: BufferKind,
+    /// lisp-api: this buffer refuses every edit, because a mode said so.
+    ///
+    /// Per buffer and not per mode, for the reason [`Buffer::line_numbers`]
+    /// gives: a split routinely shows two documents, and "the mode the image
+    /// last entered" is not a fact about the one you are typing into. A mode
+    /// sets it on entry and clears it on exit, exactly as it would a claim on a
+    /// setting, and the flag travels with the buffer between
+    /// [`Editor::buffer`] and [`Editor::others`] like the undo history does.
+    ///
+    /// Deliberately *not* folded into [`BufferKind`]. A generated buffer is a
+    /// view with no document behind it; this is an ordinary file buffer whose
+    /// mode has decided you are reading rather than writing, and it must still
+    /// save, still highlight, and still be an honest `.org` file when the mode
+    /// is turned off. See [`ReadOnly`].
+    pub read_only: bool,
     pub text: Rope,
     pub cursor: usize,
     pub path: Option<PathBuf>,
@@ -779,6 +852,20 @@ pub struct Buffer {
     /// axis from [`Mode`], which is the modal editing state — a buffer is in
     /// org-mode whether you are in Normal or Insert.
     pub major_mode: String,
+    /// Whether *this buffer* shows a line-number gutter. `None` follows the
+    /// editor-wide [`Settings::line_numbers`].
+    ///
+    /// Per buffer and not per editor, because the gutter is drawn per *pane*
+    /// and two panes routinely show different kinds of thing. The mode-local
+    /// machinery in `runtime/modes/modes.lisp` cannot express that: its
+    /// settings are global by construction, so `org-mode` claiming the gutter
+    /// off took it off in the code buffer beside it too, and which pane won
+    /// depended on which mode was entered last.
+    ///
+    /// Recomputed whenever the buffer's major mode is set — see
+    /// [`Editor::gutter_for_mode`] — so it is a cache of a decision, never a
+    /// second place to state one.
+    pub line_numbers: Option<bool>,
     /// Minor modes, on top of the major one. Order is the order enabled.
     pub minor_modes: Vec<String>,
     /// Scroll position, parked here while another buffer is on screen.
@@ -814,12 +901,17 @@ impl Buffer {
         Self {
             id: 0,
             kind: BufferKind::Text,
+            read_only: false,
             text: Rope::from_str(s),
             cursor: 0,
             path: None,
             given_name: None,
             modified: false,
             language: None,
+            // Follow the editor until something decides otherwise, which is
+            // what makes a buffer nobody has an opinion about look like every
+            // other one.
+            line_numbers: None,
             major_mode: FUNDAMENTAL.into(),
             minor_modes: Vec::new(),
             saved_scroll: 0,
@@ -829,6 +921,21 @@ impl Buffer {
             redo: Vec::new(),
             markers: marker::Markers::default(),
             overlays: overlay::Overlays::default(),
+        }
+    }
+
+    /// Why this buffer refuses an edit, if it does.
+    ///
+    /// The one predicate, asked by [`Editor::apply`], by the `i` guard in
+    /// `evil.rs` and by `(buffer-read-only-p)` — the same reason
+    /// [`overlay::fold_hiding`] is one predicate. A buffer the renderer draws
+    /// as read-only and a buffer the keyboard treats as read-only must be the
+    /// same buffer, or the modeline lies.
+    pub fn read_only(&self) -> ReadOnly {
+        match (self.kind.is_generated(), self.read_only) {
+            (true, _) => ReadOnly::Generated,
+            (false, true) => ReadOnly::Claimed,
+            (false, false) => ReadOnly::No,
         }
     }
 
@@ -1157,6 +1264,9 @@ pub struct Editor {
     /// picks this map when the mode name is not an editing mode, so
     /// `(define-key "org-mode" ...)` needs no new primitive.
     pub mode_keymap: HashMap<(String, String), String>,
+    /// Major modes whose buffers show no gutter, lowercased. Set from Lisp; see
+    /// [`Editor::gutter_for_mode`].
+    pub no_gutter_modes: Vec<String>,
 
     /// `Some` while the `:` or `/` prompt is active.
     pub prompt: Option<Prompt>,
@@ -1267,6 +1377,7 @@ impl Editor {
             dashboard: Dashboard::default(),
             keymap: HashMap::new(),
             mode_keymap: HashMap::new(),
+            no_gutter_modes: Vec::new(),
             prompt: None,
             status: String::from("zemacs — Common Lisp inside."),
             messages: Vec::new(),
@@ -1490,12 +1601,57 @@ impl Editor {
     }
 
     /// Open buffer names, active first — the candidate list for the switcher.
+    /// The ids behind [`Editor::buffer_names`], in the same order.
+    ///
+    /// The switcher needs these because [`Editor::switch_buffer`] takes an index
+    /// and *reorders the list as it goes* — so an index is only good until the
+    /// next switch, which is exactly one keystroke when the switcher previews.
+    pub fn buffer_ids(&self) -> Vec<BufferId> {
+        std::iter::once(&self.buffer)
+            .chain(self.others.iter())
+            .map(|b| b.id)
+            .collect()
+    }
+
+    /// Switch to the buffer with `id`, wherever it has drifted to. A no-op when
+    /// it is already live, which is what keeps a preview from churning the
+    /// most-recently-used order on every arrow key.
+    pub fn switch_buffer_id(&mut self, id: BufferId) {
+        if self.buffer.id == id {
+            return;
+        }
+        if let Some(i) = self.others.iter().position(|b| b.id == id) {
+            self.switch_buffer(i + 1);
+        }
+    }
+
     pub fn buffer_names(&self) -> Vec<String> {
         std::iter::once(&self.buffer)
             .chain(self.others.iter())
             .map(|b| {
                 let mark = if b.modified { " [+]" } else { "" };
                 format!("{}{mark}", b.name())
+            })
+            .collect()
+    }
+
+    /// The switcher's rows: each name, padded to a column, then the mode the
+    /// modeline would name for that buffer.
+    ///
+    /// Separate from [`Editor::buffer_names`] rather than folded into it,
+    /// because that list is what Lisp's `buffer-list` answers with — a name
+    /// there has to still be a name you can hand back to `switch-to-buffer`.
+    /// Here nothing reads the string back: accepting goes by
+    /// [`Prompt::ids`](crate::Prompt::ids), so the row is free to be legible.
+    pub fn buffer_candidates(&self) -> Vec<String> {
+        let names = self.buffer_names();
+        let width = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+        std::iter::once(&self.buffer)
+            .chain(self.others.iter())
+            .zip(&names)
+            .map(|(b, name)| {
+                let pad = width - name.chars().count();
+                format!("{name}{:pad$}  {}", "", modeline::major_mode_label(b))
             })
             .collect()
     }
@@ -1636,7 +1792,11 @@ impl Editor {
         // are re-rendered from state, so an edit would be silently discarded on
         // the next refresh and `:w` would write a screenshot of a status list.
         // Refuse the edit and say so, rather than letting it look like it took.
-        if self.buffer.kind.is_generated() && cmd.mutates_document() {
+        //
+        // ...and a buffer a *mode* has frozen is refused by the same line, which
+        // is the whole of `SetReadOnly` reaching the keyboard: there is one
+        // place the document is mutated, so there is one place to guard.
+        if self.buffer.read_only() != ReadOnly::No && cmd.mutates_document() {
             self.status = format!("{} is read-only", self.buffer.name());
             return;
         }
@@ -1732,6 +1892,10 @@ impl Editor {
             },
             EditorCommand::SetLineNumbers(on) => self.settings.line_numbers = on,
             EditorCommand::SetTabWidth(n) => self.settings.tab_width = n.clamp(1, 16),
+            // Not clamped at the low end past zero, which is the "off" value:
+            // a measure of one or two columns is silly rather than dangerous,
+            // and the renderer never lets the inset exceed the pane anyway.
+            EditorCommand::SetTextWidth(n) => self.settings.text_width = n.min(1000),
             EditorCommand::SetCompletionStyle(name) => match CompletionStyle::from_name(&name) {
                 Some(s) => self.settings.completion_style = s,
                 None => self.status = format!("unknown completion style: {name}"),
@@ -1754,10 +1918,26 @@ impl Editor {
                 }
             }
             EditorCommand::SwitchBuffer(i) => self.switch_buffer(i),
+            EditorCommand::SwitchBufferId(id) => self.switch_buffer_id(id),
             EditorCommand::SetMajorMode(name) => {
                 self.buffer.major_mode = name.clone();
+                self.buffer.line_numbers = Some(self.gutter_for_mode(&name));
                 self.pending_hooks.push(format!("{name}-hook"));
                 self.status = format!("major mode: {name}");
+            }
+            // Set the policy, then re-decide for every buffer that already
+            // exists — a config reload must not leave the buffers you opened
+            // before it obeying the old list.
+            EditorCommand::SetNoGutterModes(modes) => {
+                self.no_gutter_modes = modes
+                    .split_whitespace()
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect();
+                let decide = |m: &str| !self.no_gutter_modes.iter().any(|x| x == m);
+                self.buffer.line_numbers = Some(decide(&self.buffer.major_mode));
+                for b in &mut self.others {
+                    b.line_numbers = Some(!self.no_gutter_modes.iter().any(|x| *x == b.major_mode));
+                }
             }
             EditorCommand::SetMinorMode(name, on) => {
                 self.buffer.minor_modes.retain(|m| *m != name);
@@ -1819,6 +1999,7 @@ impl Editor {
             }
 
             EditorCommand::SetDashboardBanner(b) => self.dashboard.banner = b,
+            EditorCommand::SetDashboardLogo(id) => self.dashboard.logo = id,
             // Both of these can strand `selected` past the end of the list —
             // init.lisp rewrites the items several hundred ms after startup,
             // by which time you may already have moved the selection down.
@@ -1875,6 +2056,11 @@ impl Editor {
                 self.buffer.highlights.clear();
                 self.revision += 1;
             }
+            // The revision is deliberately *not* bumped: nothing about the text
+            // changed, and moving it would throw away the highlight spans the
+            // syntax thread has already computed for a buffer that is about to
+            // be typeset rather than edited.
+            EditorCommand::SetReadOnly(on) => self.buffer.read_only = on,
             EditorCommand::ReadFromMinibuffer {
                 id,
                 label,
@@ -2153,7 +2339,23 @@ impl Editor {
         self.images.contains_key(&id)
     }
 
+    /// Whether a buffer in major mode `name` should show a gutter.
+    ///
+    /// The whole of the policy, and it is a *list of modes* rather than a flag
+    /// per buffer because that is the shape the question actually has: nobody
+    /// decides gutters buffer by buffer, they decide "not in prose". Lisp owns
+    /// the list; this only applies it.
+    pub fn gutter_for_mode(&self, name: &str) -> bool {
+        !self.no_gutter_modes.iter().any(|m| m == name)
+    }
+
     /// Drop bitmaps no overlay in any buffer still names.
+    ///
+    /// The dashboard's logo is named by no overlay and has to be spared
+    /// explicitly: it belongs to the *editor* rather than to a range of text,
+    /// so the reachability question this asks has one root outside the buffers.
+    /// Without it the logo survives until the first prune and then vanishes,
+    /// which is the kind of bug that only shows up after a while.
     fn prune_images(&mut self) {
         if self.images.is_empty() {
             return;
@@ -2161,6 +2363,7 @@ impl Editor {
         let live: std::collections::HashSet<ImageId> = std::iter::once(&self.buffer)
             .chain(self.others.iter())
             .flat_map(|b| b.overlays.images())
+            .chain(self.dashboard.logo)
             .collect();
         self.images.retain(|id, _| live.contains(id));
     }

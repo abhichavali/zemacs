@@ -420,6 +420,23 @@ One verb into core, =scene-set=.
   forces one, because a paragraph is a flow. Per line is what a listing wants
   anyway — each line carries its own syntax runs, which is exactly what
   =%org-frozen-highlight= already produces.
+- *Prose is measured unshaped, so it is laid out a shade loose.* =SDL2_ttf=
+  2.24 links HarfBuzz and therefore *shapes* — kerning pairs, and ligatures in
+  a text face — which is the root cause of the measure-versus-paint bug this
+  subsystem was born with: the painter stepped the pen per character while
+  layout asked the face for a whole string, and those two numbers differ by
+  exactly what the shaper does. The fix makes both sum per character, which is
+  *exact* for the monospace face and *approximate* for Charter: a kerned pair
+  like =Av= is given a pixel or two more room than its glyphs use. That is the
+  right trade — the two agree, which is what was actually broken — but it is a
+  real residual, and the upgrade path is one shaped run per piece, which needs
+  the renderer to ask HarfBuzz the same question the painter asks.
+- *The SDL underneath is not the SDL in the manifest.* Both crates name
+  =sdl2 = "0.38"=, and on this machine =pkg-config= answers with =sdl2-compat=,
+  which =dlopen=\s SDL3. It reports itself as =2.32.70= — its own version, not
+  SDL2's — so the build cannot tell. Nothing pins or detects it, which means a
+  rendering oddity seen here may not reproduce against genuine SDL2, and is
+  worth knowing before chasing the next one.
 - *No selection, no copy, no search.* =org-frozen= argues out loud that these are
   "the difference between a read-only buffer and a disabled one", and a scene
   takes all three back. They are the first thing to build after it renders, not

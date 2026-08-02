@@ -552,16 +552,54 @@ fn main() -> anyhow::Result<()> {
                         if let Some(window) = mouse.press(&editor.frames[i], i, area, x, y) {
                             let cmd = EditorCommand::FocusWindow(window);
                             dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
-                            // ...and then land on the character that was
-                            // clicked. Focusing alone made the pointer a way to
-                            // pick a *pane* and nothing smaller, which is the
-                            // one thing everybody expects a mouse to do. The
-                            // arithmetic belongs to the renderer — see
-                            // `click_target` for why — and it comes back after
-                            // the focus so the window it names is live.
-                            if let Some((_, at)) = renderers[i].click_target(&editor, i, x, y) {
-                                let cmd = EditorCommand::MoveTo(at);
-                                dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                            // A pane showing a scene has no character to land
+                            // on: there is no point in a scene and no offset a
+                            // click could name, so the gesture is a hit test and
+                            // what it means is Lisp's — the same division of
+                            // labour an `OverlayId` has. Same guard as the
+                            // terminal's click and as a mode hook: a config that
+                            // never defined the handler is silence, not an
+                            // error. Nothing is escaped because a tag is an
+                            // integer, which is the reason a tag *is* an
+                            // integer.
+                            //
+                            // ponytail: `hit` also answers the node id, and this
+                            // drops it — so "you clicked a figure, which means
+                            // nothing" and "you clicked outside the page" both
+                            // arrive as NIL. Ceiling: a mode wanting to react to
+                            // an untagged node. The upgrade path is a second
+                            // argument, since the id is already in hand here.
+                            // Resolved before the match so the borrow of the
+                            // renderer ends with the statement: the other arm
+                            // dispatches, and dispatching wants every renderer.
+                            let on_a_page = renderers[i]
+                                .scene_layout(&editor, i)
+                                .map(|(layout, _)| {
+                                    zemacs_gui::hit(layout, x, y).and_then(|(_, tag)| tag)
+                                });
+                            match on_a_page {
+                                Some(tag) => {
+                                    let tag = tag.map_or("nil".into(), |t| t.to_string());
+                                    lisp.eval(format!(
+                                        "(let ((h (find-symbol \"%SCENE-CLICK\" :zemacs))) \
+                                           (when (and h (fboundp h)) (funcall h {tag})))"
+                                    ));
+                                }
+                                // ...and then land on the character that was
+                                // clicked. Focusing alone made the pointer a way
+                                // to pick a *pane* and nothing smaller, which is
+                                // the one thing everybody expects a mouse to do.
+                                // The arithmetic belongs to the renderer — see
+                                // `click_target` for why — and it comes back
+                                // after the focus so the window it names is live.
+                                None => {
+                                    if let Some((_, at)) =
+                                        renderers[i].click_target(&editor, i, x, y)
+                                    {
+                                        let cmd = EditorCommand::MoveTo(at);
+                                        dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                                    }
+                                }
                             }
                         }
                         // A program that asked for mouse events gets the click:
@@ -720,6 +758,22 @@ fn main() -> anyhow::Result<()> {
                         if editor.mode == zemacs_core::Mode::Terminal {
                             let (col, row) = cell_at(&editor, &renderers, px, py);
                             term.wheel(&editor, -y * SCROLL_LINES, col, row);
+                        } else if let Some(at) = editor.buffer.scene.as_ref().map(|s| s.scroll) {
+                            // A scene scrolls in pixels and has no viewport of
+                            // lines for `ScrollLines` to move — the cursor does
+                            // not exist here, so there is nothing to keep on
+                            // screen and nothing for core to clamp against. The
+                            // notch is the same three lines the document gets,
+                            // in the pane's own line height.
+                            let step = -y * SCROLL_LINES * renderers[i].cell_size().1;
+                            scroll_scene(&mut editor, &mut renderers[i], i, at + step);
+                            // No `invalidate()` here. The offset reaches the
+                            // frame digest — `draw_scene` folds it in, and the
+                            // boxes it moved were folded in anyway — so a notch
+                            // that changed the picture presents and a notch
+                            // against the end of the document does not, which
+                            // is what an unconditional invalidate got wrong in
+                            // the second case.
                         } else {
                             let cmd = EditorCommand::ScrollLines(-y * SCROLL_LINES);
                             dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
@@ -959,6 +1013,19 @@ fn main() -> anyhow::Result<()> {
         // *only* signal that also catches a Lisp primitive editing the buffer
         // through the shared mutex, which raises no event here — and then this
         // loop can skip the draw as well as the present, and sleep properly.
+        // The third writer named on `scroll_scene`, and the one core cannot do
+        // for itself: a scene is swapped in whole and carries the outgoing
+        // page's offset across, so a page that re-rendered *shorter* is left
+        // scrolled past its own end — until here, because the height that says
+        // so belongs to a laid-out scene and laying one out needs a font. A
+        // no-op on every frame where the offset was already legal, and the
+        // layout it asks for is the one the pane loop is about to want anyway.
+        let focus = editor.focus_frame;
+        let at = editor.buffer.scene.as_ref().map(|s| s.scroll);
+        if let (Some(renderer), Some(at)) = (renderers.get_mut(focus), at) {
+            scroll_scene(&mut editor, renderer, focus, at);
+        }
+
         let drawing = Instant::now();
         for (i, renderer) in renderers.iter_mut().enumerate() {
             renderer.render(&mut editor, i, screen.as_ref())?;
@@ -1728,6 +1795,35 @@ fn display_path(path: &Path) -> String {
             }
         }
         None => full,
+    }
+}
+
+// --- scenes ----------------------------------------------------------------
+
+/// Put the focused pane's scene at `offset` pixels, clamped to what there is to
+/// scroll: `[0, content_height - viewport]`.
+///
+/// The one place this side writes a scroll offset, and a function rather than
+/// two lines at the wheel because there are three writers and one rule. The
+/// wheel is the first. The scroll-into-view a curriculum's "next problem" needs
+/// is the second. The third is the swap, and it is called once a frame from the
+/// main loop: core carries the outgoing scene's offset onto the incoming one so
+/// that a document re-rendering under the reader does not throw them back to the
+/// top, and core *cannot* clamp it — clamping needs a height only a laid-out
+/// scene has, and core cannot measure a font. So a `Scene::scroll` core wrote is
+/// a request rather than a position, and stays one until this has run.
+///
+/// The layout comes from the renderer's cache, so the three callers between them
+/// cost one relayout per change rather than one per call.
+fn scroll_scene(editor: &mut Editor, renderer: &mut Renderer, frame_index: usize, offset: i32) {
+    let Some(limit) = renderer
+        .scene_layout(editor, frame_index)
+        .map(|(l, v)| (l.content_height() - v.h).max(0))
+    else {
+        return;
+    };
+    if let Some(scene) = editor.buffer.scene.as_mut() {
+        scene.scroll = offset.clamp(0, limit);
     }
 }
 

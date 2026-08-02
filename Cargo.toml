@@ -11,6 +11,7 @@ members = [
     "crates/term",
     "crates/latex",
     "crates/figure",
+    "crates/gui",
     "crates/tramp",
     "crates/rpc",
     "crates/app",
@@ -32,6 +33,7 @@ zemacs-project = { path = "crates/project" }
 zemacs-term = { path = "crates/term" }
 zemacs-latex = { path = "crates/latex" }
 zemacs-figure = { path = "crates/figure" }
+zemacs-gui = { path = "crates/gui" }
 zemacs-tramp = { path = "crates/tramp" }
 zemacs-rpc = { path = "crates/rpc" }
 

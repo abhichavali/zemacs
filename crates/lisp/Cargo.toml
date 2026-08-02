@@ -21,6 +21,11 @@ zemacs-syntax.workspace = true
 # the same `add_image` under the same kind of content-derived id, so there is
 # one image cache and one eviction story rather than two.
 zemacs-figure.workspace = true
+# A scene is described in Lisp and laid out in Rust, so the tree crosses the
+# boundary as printed source and something has to read it back. That reader is
+# `scene.rs`, and it lives here rather than in `crates/gui` because that crate
+# deliberately has no dependencies at all and no idea an image of Lisp exists.
+zemacs-gui.workspace = true
 
 [build-dependencies]
 cc = "1"

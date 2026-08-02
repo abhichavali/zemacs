@@ -34,6 +34,13 @@
 //! the rows below. Scrolling stays by *buffer line* either way — core owns
 //! `Window::scroll` — so a wrapped line taller than the room left in the pane
 //! is simply cut at the bottom edge, which is what Emacs does too.
+//!
+//! There is one thing a pane can show that is not a grid: a **scene**, a tree
+//! laid out in pixels by `crates/gui` and painted by [`Renderer::draw_scene`].
+//! It is a second *layout*, not a second renderer — the faces, the glyph cache,
+//! the image uploads, the clip and the frame digest are all the ones above, and
+//! `docs/gui.org` says why that is the constraint the whole design was built
+//! around. See the scene section near the foot of this file.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -51,6 +58,10 @@ use zemacs_core::{
     fold_hiding, fold_starts_in, Buffer, BufferKind, CompletionStyle, Editor, HlKind, Image, ImageId,
     LineOverflow, Mode, Overlay, Settings, Span, Window,
 };
+// `zemacs_gui::Rect` is deliberately not imported: `Rect` in this file is
+// SDL's, and three rectangle types in one namespace is how a blit ends up in
+// the wrong coordinate space. The scene's is spelled out where it is used.
+use zemacs_gui::{FaceId, Frame as SceneFrame, Layout, Measure, Node, Run, Scene, Style};
 use zemacs_term::Screen;
 
 /// Outer margin, in pixels, around the text area and inside the modeline.
@@ -151,6 +162,18 @@ pub struct Renderer {
     /// the texture then sits there costing a few hundred KB of VRAM until exit.
     /// Upgrade path: drop entries `editor.image` no longer resolves.
     images: HashMap<ImageId, Option<Texture<'static>>>,
+    /// The last scene laid out, and the fingerprint of what it was laid out
+    /// *for* — see [`scene_key`], which is where the staleness question is
+    /// actually decided.
+    ///
+    /// ponytail: one slot, so two panes showing scenes at once take turns
+    /// evicting each other and both relay out every frame. That is exactly the
+    /// cost of having no cache at all, which is what this replaced, so the
+    /// degradation is to the old behaviour rather than to a wrong picture — and
+    /// one scene on screen is the case `math-code-edit`'s split has today.
+    /// Upgrade path: key it by `WindowId`, and drop the entries for windows the
+    /// frame did not draw.
+    scenes: Option<(u64, Layout)>,
     /// Digest of every draw call `render` has made this frame, and the digest of
     /// the frame that is actually on screen. Equal means the picture did not
     /// change and [`Renderer::present`] can be skipped — which is the whole
@@ -232,6 +255,7 @@ impl Renderer {
             bold_glyphs: HashMap::new(),
             faces: HashMap::new(),
             images: HashMap::new(),
+            scenes: None,
             font_path,
             point_size,
             glyphs: HashMap::new(),
@@ -423,24 +447,35 @@ impl Renderer {
             // selection or an overhanging glyph cannot paint into its
             // neighbour. Cheaper than teaching every primitive about the pane.
             self.set_clip(pane);
-            match (buf.kind, terminal) {
-                // Neither of these takes the measure. The dashboard centres its
-                // own art in whatever it is given, and a terminal's width is a
-                // fact the child process has already been told — narrowing
-                // either would be the setting reaching past the documents it is
-                // about.
-                (BufferKind::Dashboard, _) => {
-                    self.draw_dashboard(editor, doc_rect(pane, status_h, 0))
+            // A scene is asked for; a buffer's *kind* is merely what it is. So
+            // the page wins over both special-cased renderers below, and the
+            // dashboard in particular: it is the one buffer live at startup, so
+            // a config that installs a page from `init.lisp` installs it there,
+            // and matching on kind first meant that page was stored and silently
+            // never drawn. A scene on a terminal is the same argument — you
+            // asked for it over the grid.
+            if let Some(scene) = &buf.scene {
+                self.draw_pane_scene(editor, scene, doc_rect(pane, status_h, 0));
+            } else {
+                match (buf.kind, terminal) {
+                    // Neither of these takes the measure. The dashboard centres
+                    // its own art in whatever it is given, and a terminal's
+                    // width is a fact the child process has already been told —
+                    // narrowing either would be the setting reaching past the
+                    // documents it is about.
+                    (BufferKind::Dashboard, _) => {
+                        self.draw_dashboard(editor, doc_rect(pane, status_h, 0))
+                    }
+                    // A terminal is drawn from its live grid rather than from
+                    // the rope, because per-cell colour and the block cursor are
+                    // both gone by the time the grid has been flattened into
+                    // text. The rope is still what the buffer switcher reads.
+                    (BufferKind::Terminal, Some(screen)) => {
+                        let (bg, fg) = (editor.settings.background, editor.settings.foreground);
+                        self.draw_terminal(screen, doc_rect(pane, status_h, 0), rgb(bg), rgb(fg));
+                    }
+                    _ => self.draw_document(editor, buf, win, pane, status_h, active),
                 }
-                // A terminal is drawn from its live grid rather than from the
-                // rope, because per-cell colour and the block cursor are both
-                // gone by the time the grid has been flattened into text. The
-                // rope is still what the buffer switcher reads.
-                (BufferKind::Terminal, Some(screen)) => {
-                    let (bg, fg) = (editor.settings.background, editor.settings.foreground);
-                    self.draw_terminal(screen, doc_rect(pane, status_h, 0), rgb(bg), rgb(fg));
-                }
-                _ => self.draw_document(editor, buf, win, pane, status_h, active),
             }
             self.draw_modeline(editor, buf, modeline_rect(pane, status_h), active);
             self.clear_clip();
@@ -1600,6 +1635,20 @@ impl Renderer {
         let (w, h, depth) = (image.width, image.height, image.depth as i32);
         let rows = image_rows(h, image.depth, self.line_h, self.ascent) as i32;
         let iy = y + (rows - 1) * self.line_h + self.ascent + depth - h as i32;
+        self.blit_image(id, image, x, iy, w, h);
+    }
+
+    /// Upload if this is the first sighting, then blit into `(x, y, w, h)`.
+    ///
+    /// The whole of the texture cache's use, shared by the cell grid above and
+    /// by [`Renderer::draw_scene`] below. Where the box comes from is the
+    /// caller's business — a grid works it out from `line_h` and `ascent`, a
+    /// scene was handed it by the layout engine — but the cache, the failure
+    /// contract and the digest fold are one thing and belong in one place.
+    fn blit_image(&mut self, id: ImageId, image: &Image, x: i32, y: i32, w: u32, h: u32) {
+        if w == 0 || h == 0 {
+            return; // SDL rejects an empty destination and there is nothing to see
+        }
         // Split borrows: the cache needs `&mut images` while uploading needs the
         // creator, and blitting needs `&mut canvas`.
         let Renderer {
@@ -1612,8 +1661,8 @@ impl Renderer {
             .entry(id)
             .or_insert_with(|| image_texture(textures, image));
         let Some(tex) = slot else { return };
-        let _ = canvas.copy(tex, None, Rect::new(x, iy, w, h));
-        self.mark([id, pack(x, iy), pack(w as i32, h as i32), 0]);
+        let _ = canvas.copy(tex, None, Rect::new(x, y, w, h));
+        self.mark([id, pack(x, y), pack(w as i32, h as i32), 0]);
         self.draws += 1;
     }
 
@@ -1753,10 +1802,7 @@ impl Renderer {
         if c == ' ' || c == '\t' {
             return;
         }
-        let key = FaceKey {
-            point_size: scaled(i32::from(self.point_size), cut.pct).clamp(4, 400) as u16,
-            style: u8::from(cut.bold) | (u8::from(cut.italic) << 1),
-        };
+        let key = face_key(self.point_size, cut);
         let Renderer {
             faces,
             ttf,
@@ -1765,16 +1811,9 @@ impl Renderer {
             canvas,
             ..
         } = self;
-        // The key space is closed, so this can only fire if `SCALE_STEPS` grew
-        // without this constant growing with it. Clearing rather than refusing
-        // to draw keeps that a performance bug instead of a rendering one.
-        if faces.len() >= MAX_FACES && !faces.contains_key(&key) {
-            faces.clear();
-        }
-        let face = faces
-            .entry(key)
-            .or_insert_with(|| open_face(ttf, font_path, key));
-        let Some(face) = face else { return };
+        let Some(face) = cached_face(faces, ttf, font_path, key) else {
+            return;
+        };
         // Emptied rather than evicted one by one: there is no access order to
         // evict by without keeping one, and a face that has drawn this many
         // distinct characters is a document whose repertoire is the whole cache
@@ -1849,6 +1888,47 @@ struct FaceKey {
     style: u8,
 }
 
+/// The face a [`Cut`] names, given the point size the body is open at.
+///
+/// The one place a percentage becomes a point size, and it has to stay the one
+/// place: a scene *measures* through this and then *draws* through it again, and
+/// a second copy of the arithmetic that rounded differently would lay text out
+/// in one face and paint it in another.
+///
+/// The clamp is SDL_ttf's own range and not policy — a zero or negative point
+/// size is a font it will not open, so the value that reaches [`open_face`] must
+/// already be one it can.
+fn face_key(body_point_size: u16, cut: Cut) -> FaceKey {
+    FaceKey {
+        point_size: scaled(i32::from(body_point_size), cut.pct).clamp(4, 400) as u16,
+        style: u8::from(cut.bold) | (u8::from(cut.italic) << 1),
+    }
+}
+
+/// The face `key` names, opening it on first sighting. `None` is a face that
+/// would not open — see [`open_face`], which caches that failure.
+///
+/// Both halves of the bound documented on [`Renderer::faces`] are enforced here
+/// and nowhere else, so a second caller (a scene's face pre-pass) cannot grow
+/// the cache past what a glyph draw would have.
+fn cached_face<'a>(
+    faces: &'a mut HashMap<FaceKey, Option<Face>>,
+    ttf: &'static Sdl2TtfContext,
+    path: &std::path::Path,
+    key: FaceKey,
+) -> Option<&'a mut Face> {
+    // The key space is closed, so this can only fire if `SCALE_STEPS` grew
+    // without `MAX_FACES` growing with it. Clearing rather than refusing to
+    // draw keeps that a performance bug instead of a rendering one.
+    if faces.len() >= MAX_FACES && !faces.contains_key(&key) {
+        faces.clear();
+    }
+    faces
+        .entry(key)
+        .or_insert_with(|| open_face(ttf, path, key))
+        .as_mut()
+}
+
 /// Open faces [`Renderer::faces`] will hold. `SCALE_STEPS.len() * 4`, which is
 /// the whole key space, so reaching it means the steps grew and this did not.
 const MAX_FACES: usize = SCALE_STEPS.len() * 4;
@@ -1898,6 +1978,7 @@ const TAG_CLEAR: u64 = 1 << 26;
 const TAG_FILL: u64 = 1 << 27;
 const TAG_CLIP: u64 = 1 << 28;
 const TAG_STYLED: u64 = 1 << 29;
+const TAG_SCENE: u64 = 1 << 30;
 
 /// Two coordinates in one word, so a draw call is four folds rather than six.
 #[inline]
@@ -3176,6 +3257,518 @@ fn spans_for_line(
         j += 1;
     }
     (next, out)
+}
+
+// --- scenes ----------------------------------------------------------------
+//
+// A scene is the other thing a window can show: a tree laid out in pixels by
+// `crates/gui` rather than a grid of cells counted here. See `docs/gui.org`.
+//
+// **A scene adds no second font stack.** Everything below measures and paints
+// through the `Face` cache the overlays already opened — same `SCALE_STEPS`,
+// same `MAX_FACES`, same `MAX_FACE_GLYPHS`, same digest. The only thing that is
+// new is that a scene asks the *font* how wide a string is instead of
+// multiplying a cell width, which is the whole point of it: the grid's answer is
+// arithmetic and a scene's has to be the truth, because there is no column for a
+// wrong answer to be corrected against.
+
+/// Everything that would move a box if it changed, in one number.
+///
+/// The scene itself — every node, every run, every byte of text, and the scroll
+/// offset, since layout is what applies it — plus the viewport it is being laid
+/// out in and the point size the body is open at, because a resize and a
+/// font-size change both relayout a document that did not itself change.
+///
+/// A hash rather than a comparison against a kept copy, for the space: a
+/// curriculum's arena is the document, and holding two of them to notice that
+/// one equals the other costs more than measuring it again would have.
+fn scene_key(scene: &Scene, viewport: zemacs_core::Rect, point_size: u16) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    scene.hash(&mut h);
+    (viewport.x, viewport.y, viewport.w, viewport.h, point_size).hash(&mut h);
+    h.finish()
+}
+
+/// The [`Cut`] a scene [`Style`] asks for.
+///
+/// The snap is [`scale_step`], exactly as an overlay's `scale` is snapped, and
+/// it is what keeps the face cache's key space closed: a scene is written by
+/// hand in Lisp and would otherwise open a face per distinct percentage anybody
+/// ever typed. `size: 0` is a legal `u16` and no type size at all, and snaps to
+/// the body — [`scale_step`] answers the nearest step, and nothing is nearer to
+/// nothing than 100.
+fn scene_cut(style: Style) -> Cut {
+    Cut {
+        pct: scale_step(style.size),
+        bold: style.bold,
+        italic: style.italic,
+    }
+}
+
+/// Advance of `text` in `font`, or the grid's own arithmetic when there is no
+/// face to ask.
+///
+/// `None` is a face [`open_face`] refused — a font file that will not open at
+/// that point size — and the fallback is deliberately the *body* metric scaled,
+/// not zero: a paragraph measured at zero wraps every word onto one line and
+/// stacks the whole document in one place, which is a great deal harder to
+/// recognise as a missing font than text that is merely spaced like the grid.
+fn advance_in(font: Option<&Font>, cell_w: i32, text: &str, pct: u16) -> i32 {
+    match font.and_then(|f| f.size_of(text).ok()) {
+        Some((w, _)) => w as i32,
+        // Cells rather than characters, so a wide character still measures two
+        // of them — the same rule `draw_weighted` follows on the grid.
+        None => str_cells(text) as i32 * scaled(cell_w, pct),
+    }
+}
+
+/// Line height and ascent for `font`, or the body's own scaled, on the same
+/// terms as [`advance_in`].
+///
+/// The ascent is the number that puts a 200% word, an inline equation and the
+/// body text around them on one baseline, and it is also where a glyph texture
+/// is blitted *from*: SDL_ttf renders a string with its baseline this far down,
+/// so `baseline - ascent` is the top-left the blit wants. Getting it from the
+/// same call layout got its metrics from is what stops the two disagreeing.
+fn line_in(font: Option<&Font>, line_h: i32, ascent: i32, pct: u16) -> (i32, i32) {
+    match font {
+        Some(f) => (f.recommended_line_spacing().max(1), f.ascent().max(0)),
+        None => (scaled(line_h, pct), scaled(ascent, pct)),
+    }
+}
+
+/// The two questions `crates/gui` asks a font, answered by the faces this
+/// renderer already has open.
+///
+/// # The `&self` in `advance`
+///
+/// `Measure` takes `&self` and the face cache is a `&mut` structure, and the two
+/// are reconciled by a **pre-pass**: [`Renderer::layout_scene`] opens every face
+/// the scene's runs name *before* handing itself to the layout engine, so
+/// measuring is a pure read of a map that is already populated. The alternatives
+/// were a `RefCell` around `faces` — which would put a runtime borrow on
+/// `draw_styled_char`, the hottest typeset path there is, to serve a call that
+/// happens once per relayout — and a separate struct borrowing the fonts, which
+/// would have to be `pub` and would therefore put `sdl2::ttf::Font` in this
+/// crate's public API. The pre-pass costs one walk of the arena and changes
+/// nothing about how a glyph is drawn.
+///
+/// And it degrades rather than fails: a style whose face is not in the map is
+/// measured on the body metric rather than at zero, so a caller who skipped the
+/// pre-pass gets a document spaced like the grid instead of a document collapsed
+/// into a single point.
+impl Measure for Renderer {
+    fn advance(&self, text: &str, style: Style) -> i32 {
+        let cut = scene_cut(style);
+        let font = self.face_font(face_key(self.point_size, cut));
+        advance_in(font, self.cell_w, text, cut.pct)
+    }
+
+    fn line(&self, style: Style) -> (i32, i32) {
+        let cut = scene_cut(style);
+        let font = self.face_font(face_key(self.point_size, cut));
+        line_in(font, self.line_h, self.ascent, cut.pct)
+    }
+}
+
+impl Renderer {
+    /// The font handle behind `key`, without opening anything.
+    ///
+    /// The same three-way split [`Renderer::draw_glyph`] makes, for the same
+    /// reason: the body's plain and bold faces are not in the `faces` map, they
+    /// are fields, and a lookup that missed them would answer `None` for the two
+    /// faces nearly every character is set in.
+    fn face_font(&self, key: FaceKey) -> Option<&Font<'static, 'static>> {
+        if key.point_size == self.point_size {
+            match key.style {
+                0 => return Some(&self.font),
+                1 => return Some(&self.bold),
+                _ => {}
+            }
+        }
+        self.faces.get(&key)?.as_ref().map(|f| &f.font)
+    }
+
+    /// Open every face `scene` will be measured in, so that [`Measure`] can
+    /// answer from `&self`.
+    ///
+    /// Bounded by construction rather than by a cap of its own: [`scene_cut`]
+    /// snaps to a [`SCALE_STEPS`] entry, so the keys a whole document can ask
+    /// for are the same closed set of at most [`MAX_FACES`] that overlays could
+    /// already ask for, and [`cached_face`] is the same door they go through.
+    /// A scene therefore cannot widen the cache, only fill it.
+    fn open_scene_faces(&mut self, scene: &Scene) {
+        // Gathered first and opened after, because the gathering reads `self`
+        // (for the body point size and for what is already open) and the
+        // opening writes it. At most `MAX_FACES` entries, so the linear
+        // `contains` is cheaper than a set.
+        let mut want: Vec<FaceKey> = Vec::new();
+        for id in 0..scene.len() {
+            let Some(Node::Text { runs, .. }) = scene.node(id) else {
+                continue;
+            };
+            for r in runs {
+                let Run::Text { style, .. } = r else { continue };
+                let key = face_key(self.point_size, scene_cut(*style));
+                if self.face_font(key).is_none() && !want.contains(&key) {
+                    want.push(key);
+                }
+            }
+        }
+        let ttf = self.ttf;
+        // Cloned once for the whole pre-pass, not per face: `cached_face` wants
+        // the path while it holds `&mut self.faces`, and those are two fields of
+        // one struct.
+        let path = self.font_path.clone();
+        for key in want {
+            cached_face(&mut self.faces, ttf, &path, key);
+        }
+    }
+
+    /// The text rectangle a scene in frame `frame_index`'s current pane is
+    /// drawn in, or `None` when that frame or pane is not there.
+    ///
+    /// The one place the viewport is decided, so that the paint, the wheel and
+    /// the hit test cannot disagree about it. They would otherwise disagree by
+    /// a padding and a modeline, which is a click landing in the paragraph
+    /// above the one under the pointer.
+    ///
+    /// **No measure.** `doc_rect` takes `settings.text_width` for a document
+    /// and zero here, for the reason the dashboard takes zero: a scene sets its
+    /// own measure — that is what a `Block`'s `pad`, `width` and `align` are —
+    /// and narrowing the pane underneath it would be the setting reaching past
+    /// the document it is about, then the document centring itself inside the
+    /// result.
+    fn scene_viewport(&self, editor: &Editor, frame_index: usize) -> Option<zemacs_core::Rect> {
+        let frame = editor.frames.get(frame_index)?;
+        let pane = frame
+            .panes(self.content_area())
+            .into_iter()
+            .find(|p| p.window == frame.current)?;
+        let status_h = modeline_h(self.line_h, &editor.settings);
+        Some(area_rect(doc_rect(area_of(pane.rect), status_h, 0)))
+    }
+
+    /// The focused pane's scene, laid out where it will be painted, with that
+    /// viewport — `None` for a buffer drawn as a grid of cells, which is nearly
+    /// all of them.
+    ///
+    /// For the app: the wheel needs the content height to clamp a scroll
+    /// against, and a click needs the frames to hit test. Both focus the pane
+    /// they are acting on first, which is what makes `editor.buffer` the buffer
+    /// being scrolled or clicked; doing it any other way would leave the wheel
+    /// moving one document's page while the keyboard was in another.
+    pub fn scene_layout(
+        &mut self,
+        editor: &Editor,
+        frame_index: usize,
+    ) -> Option<(&Layout, zemacs_core::Rect)> {
+        let scene = editor.buffer.scene.as_ref()?;
+        let viewport = self.scene_viewport(editor, frame_index)?;
+        let fresh = self.take_scene_layout(scene, viewport);
+        Some((&self.scenes.insert(fresh).1, viewport))
+    }
+
+    /// The cached layout for `scene` in `viewport`, laid out again if what is
+    /// in the cache was measured for something else — **taken out of the cache
+    /// rather than borrowed from it**, because [`Renderer::draw_scene`] needs
+    /// `&mut self` and a layout borrowed *from* self cannot be passed *to* it.
+    /// Every caller puts it back.
+    ///
+    /// # How it decides the layout is stale
+    ///
+    /// By fingerprinting the scene's contents — see [`scene_key`] — rather than
+    /// by a revision somebody has to remember to bump. Core says out loud that
+    /// installing a scene deliberately does *not* move `Editor::revision`,
+    /// because a scene is typeset rather than edited and the syntax spans that
+    /// built its runs must survive; and a curriculum re-renders its whole page
+    /// when one problem's state changes, so "same node count, same root, same
+    /// buffer" is precisely the case that has to come out *different*. A
+    /// content hash is the only test that cannot be fooled by that, and it is
+    /// the same argument the frame digest makes one screen over: a fingerprint
+    /// of what is actually there beats a list of fields to keep in step.
+    ///
+    /// The cost is one FNV walk of the arena per frame per scene pane, against
+    /// a relayout that is a font call per word of the whole document — hashing
+    /// a page is cheaper than measuring a paragraph of it.
+    fn take_scene_layout(&mut self, scene: &Scene, viewport: zemacs_core::Rect) -> (u64, Layout) {
+        let key = scene_key(scene, viewport, self.point_size);
+        match self.scenes.take() {
+            Some(hit) if hit.0 == key => hit,
+            _ => (key, self.layout_scene(scene, viewport)),
+        }
+    }
+
+    /// One pane's scene, laid out and painted where [`Renderer::draw_document`]
+    /// would have painted its text.
+    ///
+    /// The colour resolver is where a `FaceId` stops being an integer: it is an
+    /// index into the same `face-list` an `HlKind` names, so a scene follows a
+    /// theme change for free and `crates/gui` still holds no dependency on
+    /// core. `None` is the pane's own foreground — the only reading available,
+    /// since there is no face that spells "default" — and it reaches here only
+    /// from a run's style, because `draw_scene` never asks about a background
+    /// or a fill the document left unset.
+    fn draw_pane_scene(&mut self, editor: &Editor, scene: &Scene, doc: Area) {
+        let viewport = area_rect(doc);
+        let laid = self.take_scene_layout(scene, viewport);
+
+        let fg = editor.settings.foreground;
+        let theme = &editor.theme;
+        // A number naming no face falls back to the pane's foreground rather
+        // than to a face picked for it, on the same terms `HlKind::from_face_id`
+        // answers `None`: the number arrived from arithmetic in Lisp. On a run
+        // that is the right answer outright; on a block's background it paints
+        // the foreground colour, which is wrong and *loudly* wrong, which is the
+        // point — a colour quietly substituted is a bug you find by squinting.
+        let colour = |face: Option<FaceId>| match face.and_then(HlKind::from_face_id) {
+            Some(kind) => rgb(theme.color(kind, fg)),
+            None => rgb(fg),
+        };
+        let image = |id: ImageId| editor.image(id);
+        self.draw_scene(scene, &laid.1, viewport, &colour, &image);
+
+        self.scenes = Some(laid);
+    }
+
+    /// Lay `scene` out inside `viewport`, measured in the real faces.
+    ///
+    /// The blessed entry point, because the pre-pass has to happen first and
+    /// this is the only place that ordering is written down. Layout is not
+    /// incremental — a scene relays out whole when it changes, never per frame —
+    /// so this is reached through [`Renderer::take_scene_layout`], which is what
+    /// decides whether it needs reaching at all.
+    pub fn layout_scene(&mut self, scene: &Scene, viewport: zemacs_core::Rect) -> Layout {
+        self.open_scene_faces(scene);
+        let viewport = zemacs_gui::Rect {
+            x: viewport.x,
+            y: viewport.y,
+            w: viewport.w,
+            h: viewport.h,
+        };
+        zemacs_gui::layout(scene, viewport, &*self)
+    }
+
+    /// Paint a laid-out scene into `area`.
+    ///
+    /// `layout` is the answer [`Renderer::layout_scene`] gave for this scene,
+    /// and `area` is the viewport it was given — a [`zemacs_gui::Frame`]'s rect
+    /// is absolute in that viewport, with the scene's scroll already taken out,
+    /// so painting it against a different one moves the whole document. A layout
+    /// belonging to a *different scene* is not a panic either way: every id is
+    /// looked up and a miss is skipped.
+    ///
+    /// `colour` resolves a [`FaceId`] — an index into the same `face-list` that
+    /// names an `HlKind` — to a real colour, and `None` asks for the pane's own
+    /// foreground, which is what a run with no face of its own is set in. It is
+    /// a parameter rather than a `&Theme` so that everything below this line is
+    /// paintable against `crates/gui` alone: the scene model deliberately holds
+    /// an integer instead of a `HlKind`, and resolving it here would put the
+    /// dependency back that the integer was chosen to avoid.
+    ///
+    /// `image` resolves an [`ImageId`] to its pixels, for the first sighting
+    /// only — after that the texture cache answers. Same shape and same reason:
+    /// the bitmap belongs to whoever produced it, and the renderer holds the
+    /// upload rather than the source.
+    ///
+    /// Everything is clipped to `area`, and the clip in force on the way in is
+    /// put back on the way out, so this can be called from inside a pane's own
+    /// clip without stealing it.
+    pub fn draw_scene<'i>(
+        &mut self,
+        scene: &Scene,
+        layout: &Layout,
+        area: zemacs_core::Rect,
+        colour: &dyn Fn(Option<FaceId>) -> Color,
+        image: &dyn Fn(ImageId) -> Option<&'i Image>,
+    ) {
+        let area = area_of(area);
+        if area.w <= 0 || area.h <= 0 {
+            return; // SDL dislikes an empty clip, and there is nowhere to draw
+        }
+        // Reading the clip is not a draw call and is deliberately not folded
+        // into the digest: it changes no pixel, and the `set_clip` /
+        // `clear_clip` that restore it are marked by those primitives.
+        let restore = self.canvas.clip_rect();
+        self.set_clip(area);
+
+        // The scroll offset is already inside every rect below — the layout
+        // engine applies it once, by starting the root above the viewport — so
+        // a wheel notch normally moves the fills and the glyphs and the digest
+        // moves with them. It is folded in anyway because "normally" is not
+        // "always": the cull below drops every frame outside the pane, so a
+        // scene scrolled past its own end draws *nothing*, and two different
+        // offsets that both draw nothing would hash the same and the window
+        // would never be put up again. The frame count comes along for the case
+        // where the scene changed into one that happens to paint the same.
+        self.mark([
+            TAG_SCENE,
+            u64::from(scene.scroll as u32),
+            layout.frames.len() as u64,
+            pack(area.w, area.h),
+        ]);
+
+        for f in &layout.frames {
+            let r = f.rect;
+            // Vertically outside the pane, which for a scrolled document is most
+            // of it. Culled here rather than left to the clip because a
+            // curriculum is thousands of frames and every one of them would
+            // otherwise be a command SDL builds, queues and throws away. Two
+            // scenes that are both entirely off-screen draw nothing and hash the
+            // same, which is correct: they show the same picture.
+            if r.h <= 0 || r.y + r.h <= area.y || r.y >= area.y + area.h {
+                continue;
+            }
+            let Some(node) = scene.node(f.node) else {
+                continue;
+            };
+            match node {
+                Node::Block(b) => {
+                    if let Some(face) = b.background {
+                        self.fill(r.x, r.y, r.w, r.h, colour(Some(face)));
+                    }
+                    if let Some(face) = b.border {
+                        self.stroke(r.x, r.y, r.w, r.h, colour(Some(face)));
+                    }
+                }
+                Node::Rect { fill, .. } => {
+                    if let Some(face) = fill {
+                        self.fill(r.x, r.y, r.w, r.h, colour(Some(*face)));
+                    }
+                }
+                // A figure. `depth` is inert at block level — there is no
+                // baseline in a column of boxes to hang from — so the box is
+                // exactly the rect layout gave it.
+                Node::Image { image: id, .. } => {
+                    if let Some(pixels) = image(*id) {
+                        let (w, h) = (r.w.max(0) as u32, r.h.max(0) as u32);
+                        self.blit_image(*id, pixels, r.x, r.y, w, h);
+                    }
+                }
+                Node::Text { runs, .. } => self.draw_text_frame(runs, f, colour, image),
+            }
+        }
+
+        match restore {
+            sdl2::render::ClippingRect::Some(p) => self.set_clip(Area {
+                x: p.x(),
+                y: p.y(),
+                w: p.width() as i32,
+                h: p.height() as i32,
+            }),
+            // A clip admitting nothing, which is not the same as no clip. It
+            // cannot arise from anything in this file — the pane loop skips a
+            // pane dragged to nothing rather than clipping it away — so this
+            // arm exists to keep the match total and honest.
+            sdl2::render::ClippingRect::Zero => self.set_clip(Area {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            }),
+            sdl2::render::ClippingRect::None => self.clear_clip(),
+        }
+    }
+
+    /// One paragraph: every piece of every line, at the offset and on the
+    /// baseline the layout engine recorded.
+    fn draw_text_frame<'i>(
+        &mut self,
+        runs: &[Run],
+        f: &SceneFrame,
+        colour: &dyn Fn(Option<FaceId>) -> Color,
+        image: &dyn Fn(ImageId) -> Option<&'i Image>,
+    ) {
+        for line in &f.lines {
+            let baseline = f.rect.y + line.y + line.baseline;
+            for p in &line.pieces {
+                let left = f.rect.x + p.x;
+                // A piece naming a run that is not there is arithmetic somebody
+                // got wrong, and the same rule applies as to a dangling node id:
+                // draw the rest of the document rather than take the frame down.
+                let Some(run) = runs.get(p.run) else {
+                    debug_assert!(false, "piece names run {} of {}", p.run, runs.len());
+                    continue;
+                };
+                match run {
+                    // On the baseline, hanging `depth` below it — which is the
+                    // whole of why `depth` exists, and the difference between
+                    // `$x_1$` sitting in the sentence and floating above it.
+                    Run::Image {
+                        image: id,
+                        width,
+                        height,
+                        depth,
+                        ..
+                    } => {
+                        let above = height.saturating_sub(*depth);
+                        let top = baseline - i32::try_from(above).unwrap_or(i32::MAX);
+                        if let Some(pixels) = image(*id) {
+                            self.blit_image(*id, pixels, left, top, *width, *height);
+                        }
+                    }
+                    Run::Text { text, style, .. } => {
+                        // Byte offsets into UTF-8 that another crate computed.
+                        // They *are* character boundaries — `wrap` finds its
+                        // segments with `char_indices` and breaks a long word by
+                        // `len_utf8` — and this is the assertion of that rather
+                        // than the assumption: `get` answers `None` on a
+                        // boundary that is not one, so a release build drops a
+                        // piece where a `&text[..]` would panic mid-frame.
+                        let Some(s) = text.get(p.start..p.end) else {
+                            debug_assert!(
+                                false,
+                                "piece {}..{} is not on a character boundary of {text:?}",
+                                p.start, p.end
+                            );
+                            continue;
+                        };
+                        let cut = scene_cut(*style);
+                        // The blit is from the top-left of the glyph's own box,
+                        // and the box's baseline is `ascent` down from there.
+                        let top = baseline - self.line(*style).1;
+                        let c = colour(style.face);
+                        let mut x = left;
+                        for ch in s.chars() {
+                            // ponytail: one `advance` per character, so the pen
+                            // steps by exactly what the layout engine measured
+                            // and a piece cannot end somewhere other than where
+                            // its `width` said. That is a font call per visible
+                            // character per frame — cheap against the blit next
+                            // to it, and it assumes advances add, which the
+                            // wrapper already assumes for the same fonts.
+                            // Ceiling: a kerned proportional face, where the
+                            // drawn text would be a pixel or two loose against
+                            // its own measure. Upgrade path is one shaped run
+                            // per piece, which needs a shaper this editor does
+                            // not have.
+                            let mut buf = [0u8; 4];
+                            let w = self.advance(ch.encode_utf8(&mut buf), *style);
+                            self.draw_glyph(ch, x, top, c, cut);
+                            x += w;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A hairline around `(x, y, w, h)`, as four fills.
+    ///
+    /// Inside the rect rather than around it, so a border on a block flush with
+    /// the pane's edge is visible rather than clipped away. It takes no part in
+    /// layout — see `Block::border` — so a child pushed in only by `pad` may run
+    /// under it, which is the ceiling that field already writes down.
+    fn stroke(&mut self, x: i32, y: i32, w: i32, h: i32, c: Color) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        self.fill(x, y, w, 1, c);
+        self.fill(x, y + h - 1, w, 1, c);
+        self.fill(x, y, 1, h, c);
+        self.fill(x + w - 1, y, 1, h, c);
+    }
 }
 
 #[cfg(test)]
@@ -4956,6 +5549,213 @@ mod truncate_invariant {
                     "truncate({s:?}, {n}) = {out:?} is {} cells, over budget",
                     str_cells(&out)
                 );
+            }
+        }
+    }
+}
+
+/// What can be tested about scenes with no window open.
+///
+/// Painting cannot: every primitive under `draw_scene` ends at a `WindowCanvas`,
+/// and there is no canvas without a window. Measuring almost entirely can, which
+/// is the half that matters — it is the arithmetic a document's whole layout
+/// hangs off, and its failures are silent rather than loud.
+#[cfg(test)]
+mod scenes {
+    use super::*;
+    use zemacs_gui::{Align, Block, Length, Rect as GuiRect};
+
+    fn style(size: u16, bold: bool, italic: bool) -> Style {
+        Style {
+            size,
+            bold,
+            italic,
+            face: None,
+        }
+    }
+
+    /// A percentage of the body becomes a point size, and only ever one of the
+    /// handful the face cache is bounded by.
+    #[test]
+    fn a_style_percentage_becomes_a_point_size_off_the_body() {
+        let key = |size| face_key(18, scene_cut(style(size, false, false))).point_size;
+        assert_eq!(key(100), 18);
+        assert_eq!(key(200), 36);
+        assert_eq!(key(150), 27);
+        // 18 × 125% is 22.5, and a point size is a whole number.
+        assert_eq!(key(125), 22);
+        // Snapped, not honoured: 140 is nearer 150 than 125, and a face of its
+        // own is exactly what `SCALE_STEPS` exists to refuse. 137 lands the
+        // other way, which is the point of asserting both — the steps are not
+        // evenly spaced and "round it" is not the rule.
+        assert_eq!(key(140), key(150));
+        assert_eq!(key(137), key(125));
+        // A size nobody set. `Style::default` says 100, but the field is a plain
+        // `u16` and a builder in Lisp can leave it at nothing.
+        assert_eq!(key(0), key(100));
+        // Absurd sizes clamp to what SDL_ttf will open rather than wrapping the
+        // `u16` on the way through.
+        assert_eq!(key(u16::MAX), key(200));
+    }
+
+    #[test]
+    fn weight_and_slant_are_the_two_bits_of_the_face_key() {
+        let bits = |b, i| face_key(18, scene_cut(style(100, b, i))).style;
+        assert_eq!(bits(false, false), 0);
+        assert_eq!(bits(true, false), 1);
+        assert_eq!(bits(false, true), 2);
+        assert_eq!(bits(true, true), 3);
+    }
+
+    /// The bound on [`Renderer::faces`] is the one thing a scene could quietly
+    /// break, since a scene's sizes are written by hand in Lisp rather than
+    /// picked from a list. It cannot: every one of them goes through
+    /// [`scene_cut`] first.
+    #[test]
+    fn no_scene_style_can_name_a_face_outside_the_cache_bound() {
+        let mut keys = std::collections::HashSet::new();
+        for size in [0u16, 1, 99, 100, 101, 112, 137, 175, 200, 1000, u16::MAX] {
+            for bold in [false, true] {
+                for italic in [false, true] {
+                    let cut = scene_cut(style(size, bold, italic));
+                    assert!(SCALE_STEPS.contains(&cut.pct), "{size}% escaped as {}", cut.pct);
+                    keys.insert(face_key(18, cut));
+                }
+            }
+        }
+        assert!(keys.len() <= MAX_FACES, "{} faces, bound is {MAX_FACES}", keys.len());
+    }
+
+    /// A face the cache would not open degrades to the body metric.
+    ///
+    /// `None` is exactly what [`Renderer::face_font`] answers for a face
+    /// [`open_face`] refused — a font file that will not load at that point
+    /// size — and the failure this guards is the quiet one: a zero advance wraps
+    /// every word of a paragraph onto one line and stacks a whole document at
+    /// one point, which reads as a layout bug and not as a missing font.
+    #[test]
+    fn a_size_the_face_cache_refuses_measures_on_the_body_metric_instead_of_zero() {
+        // Four characters at a 10-pixel cell, doubled.
+        assert_eq!(advance_in(None, 10, "abcd", 200), 80);
+        assert_eq!(advance_in(None, 10, "abcd", 100), 40);
+        // A wide character is two cells here exactly as it is on the grid.
+        assert_eq!(advance_in(None, 10, "漢", 100), 20);
+        // Nothing to set is nothing wide, which is not the same failure.
+        assert_eq!(advance_in(None, 10, "", 100), 0);
+        // Never zero for text that exists, even where the arithmetic would
+        // round to it — `scaled` has a one-pixel floor for this reason.
+        assert!(advance_in(None, 0, "a", 100) > 0);
+        assert_eq!(line_in(None, 20, 16, 150), (30, 24));
+        assert_eq!(line_in(None, 20, 16, 100), (20, 16));
+    }
+
+    /// The real path, with a real font and no window — `Sdl2TtfContext` needs no
+    /// video subsystem, which is what lets this run on a headless box. The
+    /// `Box::leak` is the trade `Renderer::new` makes and documents.
+    #[test]
+    fn a_real_face_measures_a_string_wider_than_nothing_and_larger_sizes_wider_still() {
+        let Ok(path) = find_font() else {
+            return; // no font on this box; `a_monospace_font_is_findable` says so
+        };
+        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
+        let open = |pct: u16| {
+            open_face(ttf, &path, face_key(18, scene_cut(style(pct, false, false))))
+                .expect("the body font opens at every step")
+        };
+        let (body, big) = (open(100), open(200));
+        let (bw, bh) = (
+            advance_in(Some(&body.font), 0, "measure", 100),
+            line_in(Some(&body.font), 0, 0, 100),
+        );
+        assert!(bw > 0, "a real face measured 'measure' as nothing");
+        assert!(bh.0 > 0 && bh.1 > 0, "a real face has no line box: {bh:?}");
+        // The fallback's `cell_w` and `line_h` are passed as zero above on
+        // purpose: if the real face were being ignored those calls would answer
+        // the one-pixel floor, and the assertions above would have caught it.
+        let (gw, gh) = (
+            advance_in(Some(&big.font), 0, "measure", 200),
+            line_in(Some(&big.font), 0, 0, 200),
+        );
+        assert!(gw > bw, "200% measured {gw}, no wider than the body's {bw}");
+        assert!(gh.0 > bh.0, "200% is no taller than the body: {gh:?} vs {bh:?}");
+        // An empty string is nothing wide in a real face too, which is what
+        // lets a paragraph hold an empty run without reserving a pixel for it.
+        assert_eq!(advance_in(Some(&body.font), 8, "", 100), 0);
+    }
+
+    /// Eight pixels a character, sixteen a line — the fake metric every wrapping
+    /// test in `crates/gui` is written against.
+    struct Eight;
+
+    impl Measure for Eight {
+        fn advance(&self, text: &str, _style: Style) -> i32 {
+            text.chars().count() as i32 * 8
+        }
+        fn line(&self, _style: Style) -> (i32, i32) {
+            (16, 12)
+        }
+    }
+
+    /// `Piece::start` and `Piece::end` are byte offsets into a run's string, and
+    /// `draw_text_frame` slices with them.
+    ///
+    /// The doc comment on `Piece` promises they are always on character
+    /// boundaries, and the painter's `text.get(..)` is written not to trust it —
+    /// but a promise nothing checks is a promise that quietly stops being true.
+    /// This is the check, at the widths where it would break: one pixel, where
+    /// every word overflows and `wrap` falls into its per-character path, and a
+    /// few just wide enough to break in the middle of a multi-byte word.
+    #[test]
+    fn every_piece_of_a_wrapped_paragraph_starts_and_ends_on_a_character_boundary() {
+        let runs = vec![
+            Run::Text {
+                text: "漢字 café — naïve 🙂🙂 x".into(),
+                style: style(100, false, false),
+                tag: None,
+            },
+            Run::Text {
+                text: "e\u{301}e\u{301}e\u{301}".into(),
+                style: style(200, true, false),
+                tag: None,
+            },
+        ];
+        let mut scene = Scene::default();
+        let text = scene.push(Node::Text {
+            runs: runs.clone(),
+            align: Align::Start,
+        });
+        let root = scene.push(Node::Block(Block {
+            children: vec![text],
+            width: Length::Fill,
+            ..Block::default()
+        }));
+        scene.set_root(root);
+
+        for w in [1, 7, 8, 9, 16, 41, 400] {
+            let laid = zemacs_gui::layout(
+                &scene,
+                GuiRect {
+                    x: 0,
+                    y: 0,
+                    w,
+                    h: 4000,
+                },
+                &Eight,
+            );
+            for f in &laid.frames {
+                for line in &f.lines {
+                    for p in &line.pieces {
+                        let Some(Run::Text { text, .. }) = runs.get(p.run) else {
+                            continue;
+                        };
+                        assert!(
+                            text.get(p.start..p.end).is_some(),
+                            "at width {w}, piece {}..{} does not slice {text:?}",
+                            p.start,
+                            p.end
+                        );
+                    }
+                }
             }
         }
     }

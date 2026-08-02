@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 zemacs-core.workspace = true
 zemacs-term.workspace = true
+zemacs-gui.workspace = true
 anyhow.workspace = true
 unicode-width.workspace = true
 

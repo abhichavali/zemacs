@@ -853,6 +853,19 @@ static const char *LIBRARY_FORM =
      * here has to remember to. */
     " (defun zemacs::which-key-row (&optional row)"
     "   (zemacs::%do \"which-key\" (and row (string row)) 0 0))"
+    /* The one verb a scene needs. PAGE is a *printed* node — `(block :pad 48
+     * (text (run \"hi\")))' — because a scene crosses the boundary as source,
+     * like every other structure; NIL takes the page down and gives the buffer
+     * its text back. `crates/lisp/src/scene.rs' is the reader on the other side
+     * and `docs/gui.org' has the grammar.
+     *
+     * The name a config writes is `scene-set', in `runtime/gui.lisp', beside the
+     * builders that print the argument and beside the click table it has to
+     * retire when a new page goes up — none of which belongs in a C string
+     * literal. This is the floor under it: a runtime that failed to load leaves
+     * the verb reachable, exactly as `%save-file' and `%image-file' are reachable
+     * without the wrappers written over them. */
+    " (defun zemacs::%scene-set (&optional page) (zemacs::%do \"scene-set\" page 0 0))"
     /* --- end of the lisp-api block --------------------------------------- */
 
     /* --- buffers -------------------------------------------------------- */

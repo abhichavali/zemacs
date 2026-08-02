@@ -58,6 +58,11 @@
 //! and the list of what is deliberately out of reach — lives in `docs/` at the
 //! repository root.
 
+// A scene arrives from the image as printed source, the way every other
+// structure does, so reading one is this crate's job rather than the GUI
+// crate's — `crates/gui` has no idea Lisp exists and is not about to learn.
+pub mod scene;
+
 use std::ffi::{c_char, c_double, c_int, c_long, CStr, CString};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -768,6 +773,28 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
             let (start, end) = ordered(a as c_long, b as c_long);
             EditorCommand::Overlay(OverlayEdit::RemoveIn(start, end))
         }
+
+        // --- a scene ---------------------------------------------------------
+        //
+        // The whole of the GUI bridge, and it fits the write envelope for a
+        // reason that is worth stating: the *tree is the string*. `docs/gui.org`
+        // says a scene is described in one form and swapped in whole, so what
+        // crosses is one printed form — the same way every other structure
+        // reaches Rust — and there is nothing left over for the two integers to
+        // carry. An empty string is the clear, which is what `(scene-set)` with
+        // nothing to show prints as.
+        //
+        // A parse error is a `Message` and *not* an installed scene, which is
+        // the whole of the error handling and is why it is one arm rather than
+        // two: this string was printed by somebody's config, so the mistake is
+        // theirs to read, and it reaches the status line by the route `latex:`
+        // and `no such command:` already take. Silence would leave a page that
+        // did not change with no way to find out why.
+        "scene-set" if arg.is_empty() => EditorCommand::SetScene(None),
+        "scene-set" => match scene::parse(&arg) {
+            Ok(scene) => EditorCommand::SetScene(Some(scene)),
+            Err(e) => EditorCommand::Message(format!("scene-set: {e}")),
+        },
 
         // --- lisp-api: the verbs that closed `boundary.org`'s table ----------
         //

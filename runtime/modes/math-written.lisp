@@ -1016,8 +1016,32 @@ sets it straight back. See the refusal at the top of `math.lisp'."
               (message "math: that problem has moved, or is in another buffer — photograph kept")
               nil)
              ((null (math-response-insert problem text)) nil)
-             (t (math-set-status problem *math-done*) t)))
+             (t (math-set-status problem *math-done*)
+                (%mw-typeset)
+                t)))
       (delete-marker marker))))
+
+(defun %mw-typeset ()
+  "Typeset the equations a landed transcription just brought in.
+
+Automatic previews hang off *point movement* — `org-latex-maybe-preview' runs
+when you leave the line you edited — and a transcription is written by the
+watcher thread, which moves no point and leaves no line. So without this a
+capture lands as `$\\int_0^1 f$' in plain text and stays that way until you
+happen to move the cursor, which is the one moment you are not looking at it.
+The prompt asks for org's own LaTeX dialect precisely so that this is the only
+step needed.
+
+A frozen page does not need it — installing a scene rebuilds the page and its
+builder rasterises through the same cache — but calling it there is harmless
+and one branch cheaper than asking which mode is up.
+
+`fboundp' because `runtime/modes/' is loaded from the middle of `init.lisp' and
+these live below it, so at load time the name is genuinely not there yet. The
+same guard `org-frozen.lisp' puts on `*org-latex-auto*', for the same reason."
+  (ignore-errors
+   (let ((preview (find-symbol "ORG-LATEX-PREVIEW-NEW" :zemacs)))
+     (when (and preview (fboundp preview)) (funcall preview)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The directory

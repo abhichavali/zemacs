@@ -823,20 +823,30 @@ is finished.
          a header; got \"\""). Did **not** reproduce in three consecutive full
          runs; noted in case it returns.
 
-** MathSync — what is left before it can run                       :paused:
+** MathSync — what is left before it can run
 
-   The Rust blocker is fixed and guarded (above). What remains is configuration
-   and one unverified call, not code:
+   Both blockers are cleared. What has *not* happened is one real transcription:
+   the vision call has still never run against a photograph, only against the
+   stub in ~crates/lisp/tests/math_written.rs~.
 
-   - [ ] **No API key on this machine.** Neither ~$OPENROUTER_API_KEY~ nor
-         ~~/.config/zemacs/openrouter-key~ exists, so ~SPC m w~ will say so and
-         stay off. The key pasted into a session transcript earlier should be
-         considered burned — rotate it, then write the new one to that file with
-         mode 600.
-   - [ ] **The model slug has never been resolved against the live API.** It is
-         looked up at runtime against ~/api/v1/models~ and fails loudly with a
-         list of vision-capable candidates rather than posting to a wrong model,
-         so the first run is the test.
+   - [X] **API key.** Written to ~~/.config/zemacs/openrouter-key~, mode 600.
+         ~/api/v1/models~ answers 200 with it.
+   - [X] **The model slug resolves.** ~%mw-resolve-model~, run through the
+         editor's own code against the live list, answers ~openai/gpt-5.6-luna~
+         for ~*math-written-model-wanted*~ = ~"GPT 5.6 luna"~. 337 models, 180
+         of them vision-capable.
+   - [ ] **One real photograph, end to end.** Everything up to the request is
+         tested; the request body itself never has been.
+
+   - [ ] **Rotate this key.** It was pasted into a session transcript, which is
+         the same thing that burned the last one. The rule in this file has not
+         changed just because the key currently works.
+
+   A separate write-path bug was found and fixed while the curriculum page was
+   being built: neither ~math-set-status~ nor ~math-response-insert~ went
+   through ~with-inhibited-read-only~, so ~%mw-land~ writing a transcription
+   into a frozen buffer was silently refused by ~Editor::apply~. A comment in
+   ~org-frozen.lisp~ asserted the opposite; a grep found zero callers.
 
 ** NOT a bug — ~SPC m g~ in two modes                                 :note:
 

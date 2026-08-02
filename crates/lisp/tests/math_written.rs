@@ -200,6 +200,11 @@ fn a_photograph_becomes_the_answer_to_the_problem_point_is_in() {
 (defvar *stub-text* "Let $B$ and $C$ be bases.")
 (setf *math-written-transport*
       (lambda (path) (declare (ignore path)) (incf *stub-calls*) *stub-text*))
+;; The typesetting seam. `org-latex-preview-new' lives in `init.lisp', which this
+;; image deliberately does not load — so without this the `fboundp' guard in
+;; `%mw-typeset' would hold and the call would be untestable rather than tested.
+(defvar *typeset-calls* 0)
+(defun org-latex-preview-new () (incf *typeset-calls*))
 (message "math-written test init loaded")
 "#,
             runtime("modes/modes.lisp"),
@@ -445,6 +450,11 @@ fn a_photograph_becomes_the_answer_to_the_problem_point_is_in() {
         !landed.contains("cardinality.\n\n*** Response\nLet $B$"),
         "and not under the first written problem: {landed}"
     );
+    // ...and it was asked to be typeset. The automatic previews hang off point
+    // *movement*, and the watcher thread writes without moving anything — so
+    // nothing else in the editor would ever ask, and `$B$` would sit there as
+    // four characters until the cursor happened to leave the line.
+    says(&shared, &lisp, "*typeset-calls*", "1");
     // Captured, not marked correct: `done` here means "there is an answer in the
     // file", and `SPC m t' sets it straight back. Nothing in this system judges
     // a proof.

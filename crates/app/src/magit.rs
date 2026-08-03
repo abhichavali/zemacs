@@ -17,6 +17,32 @@ use zemacs_git as git;
 /// Comment prefix in the commit message buffer, as in `COMMIT_EDITMSG`.
 const COMMENT: &str = "#";
 
+/// The question to ask before `verb`, or `None` if it cannot lose work.
+///
+/// The list is `zemacs-git`'s own — the module doc there names every function
+/// that can lose work, and this is that list read back as verbs. Most are not
+/// wired to a verb yet; they are here anyway, because the moment somebody adds
+/// `"discard" =>` to `try_run` the guard should already be in front of it
+/// rather than be a second thing to remember.
+///
+/// Deliberately *not* everything git can undo. `stash` is recoverable with `z
+/// p`, `amend` and `unstage-all` leave the work in the tree or the reflog, and
+/// `push` is checked by the remote — asking about those is how a confirmation
+/// prompt becomes something you dismiss without reading, which would cost the
+/// one below its whole value.
+fn confirm_question(verb: &str) -> Option<&'static str> {
+    match verb {
+        "rebase-abort" => Some("Abort the rebase and throw away its work?"),
+        "reset-hard" => Some("Reset --hard, discarding all uncommitted changes?"),
+        "discard" => Some("Discard the changes to this file?"),
+        "discard-hunk" => Some("Discard this hunk?"),
+        "stash-drop" => Some("Drop this stash for good?"),
+        "branch-delete-force" => Some("Delete this branch even if unmerged?"),
+        "drop-commit" => Some("Drop this commit?"),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 pub struct Magit {
     /// Repository the status buffer is showing.
@@ -30,9 +56,26 @@ pub struct Magit {
 }
 
 impl Magit {
-    /// Run a `magit-*` verb. Errors are reported in the status line and are
-    /// never fatal: a failed push is ordinary news, not a crash.
+    /// Run a `magit-*` verb, asking first if it can lose work.
+    ///
+    /// The guard is here rather than in the arms of `try_run` because this is
+    /// the funnel: a keybinding, `M-x`, and `(git "...")` from Lisp all arrive
+    /// as one `EditorCommand::Git`, so one check in front of them covers all
+    /// three and cannot be forgotten by whoever adds the fourth.
     pub fn run(&mut self, editor: &mut Editor, verb: &str) {
+        if let Some(question) = confirm_question(verb) {
+            editor.confirm(
+                question,
+                EditorCommand::Confirmed(Box::new(EditorCommand::Git(verb.to_string()))),
+            );
+            return;
+        }
+        self.run_confirmed(editor, verb)
+    }
+
+    /// The same verb with the guard already spent — reached only by answering
+    /// `yes`, or by being a verb that never needed asking about.
+    pub fn run_confirmed(&mut self, editor: &mut Editor, verb: &str) {
         if let Err(e) = self.try_run(editor, verb) {
             // `{e:#}` so anyhow's context chain (which carries git's stderr)
             // is shown rather than just the outermost message.
@@ -357,6 +400,40 @@ mod tests {
         assert!(t.contains("M  a.rs"));
         // and the template alone is not a message
         assert_eq!(strip_comments(&t), "");
+    }
+
+    /// `r a` was one keystroke away from discarding a whole rebase. It has to
+    /// stop at a question, and it has to stop *before* touching the repository —
+    /// which is why the guard is in `run` and not in `try_run`'s arm.
+    #[test]
+    fn a_destructive_verb_asks_before_it_runs() {
+        let mut magit = Magit::default();
+        let mut ed = Editor::new();
+        // No repository located, so reaching git at all would fail loudly with
+        // "no repository" — the absence of that message is the proof it stopped.
+        magit.run(&mut ed, "rebase-abort");
+
+        let prompt = ed.prompt.as_ref().expect("a confirmation is open");
+        assert_eq!(prompt.kind, zemacs_core::PromptKind::Confirm);
+        assert!(prompt.label.contains("throw away"), "{}", prompt.label);
+        assert!(!ed.status.contains("no repository"), "{}", ed.status);
+        assert_eq!(
+            ed.pending_confirm.as_deref(),
+            Some(&EditorCommand::Confirmed(Box::new(EditorCommand::Git(
+                "rebase-abort".into()
+            ))))
+        );
+    }
+
+    /// And the ordinary ones must not grow a prompt: a confirmation in front of
+    /// `stage` is how people learn to answer without reading.
+    #[test]
+    fn an_ordinary_verb_is_not_guarded() {
+        assert!(confirm_question("stage").is_none());
+        assert!(confirm_question("stash").is_none());
+        assert!(confirm_question("commit").is_none());
+        assert!(confirm_question("push").is_none());
+        assert!(confirm_question("rebase-abort").is_some());
     }
 
     #[test]

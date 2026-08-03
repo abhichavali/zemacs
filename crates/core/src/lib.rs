@@ -557,6 +557,16 @@ pub enum EditorCommand {
     OpenAt(String),
     SaveFile(Option<PathBuf>),
 
+    /// "The user has already said yes to this" — the answer to a
+    /// [`PromptKind::Confirm`], carrying the command it was guarding.
+    ///
+    /// The wrapper exists because the guard lives at the same place that runs
+    /// the action: a bare `SaveFile` coming back from the prompt would be
+    /// checked again and ask again, forever. Wrapping is what lets one guarded
+    /// site both ask the question and recognise its own answer, instead of every
+    /// guarded command needing a twin variant that skips the check.
+    Confirmed(Box<EditorCommand>),
+
     /// Change or remove an overlay. Deliberately *not* in
     /// [`EditorCommand::mutates_document`]: an overlay is drawing rather than
     /// text, so a face can be put on dired's listing or magit's status without
@@ -702,6 +712,9 @@ impl EditorCommand {
             self,
             EditorCommand::OpenFile(_)
                 | EditorCommand::SaveFile(_)
+                // Whatever it wraps was guarded by a layer that only the app
+                // has — the filesystem, or git.
+                | EditorCommand::Confirmed(_)
                 | EditorCommand::Git(_)
                 | EditorCommand::Dired(_)
                 | EditorCommand::OpenAt(_)
@@ -893,6 +906,20 @@ pub struct Buffer {
     /// Unix mode bits of the file behind this buffer, for the modeline. Set by
     /// the app when the file is read or written; core cannot stat anything.
     pub file_mode: Option<u32>,
+    /// The file's modification time as of the last read or write *by this
+    /// buffer* — Emacs' `visited-file-modtime`, and the answer to "has anyone
+    /// else touched this since I last looked?"
+    ///
+    /// Set by the app for the same reason [`Buffer::file_mode`] is: core cannot
+    /// stat anything. It lives on the buffer rather than in a side table keyed
+    /// by path because the question is about *this document's* view of the file
+    /// — two buffers on one path can honestly disagree about when they last
+    /// synced, and a path-keyed table would have to pick one of them.
+    ///
+    /// `None` for a buffer with no file behind it yet, which is what makes
+    /// `:w newfile` skip the check instead of asking about a file nobody has
+    /// read.
+    pub visited: Option<std::time::SystemTime>,
     /// Syntax spans for *this* buffer's text, recomputed by the app.
     ///
     /// Per buffer rather than per editor, and that is the whole point: a split
@@ -961,6 +988,7 @@ impl Buffer {
             minor_modes: Vec::new(),
             saved_scroll: 0,
             file_mode: None,
+            visited: None,
             highlights: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -1365,6 +1393,11 @@ pub struct Editor {
 
     /// `Some` while the `:` or `/` prompt is active.
     pub prompt: Option<Prompt>,
+    /// What a [`PromptKind::Confirm`] runs if the answer is `yes`. Parked here
+    /// for exactly as long as that prompt is open — [`Editor::confirm`] sets it,
+    /// and both accepting and cancelling take it back out, so a question that
+    /// was answered "no" cannot leave a loaded gun behind for the next one.
+    pub pending_confirm: Option<Box<EditorCommand>>,
     /// Last message, shown in the status line.
     pub status: String,
     /// Every message, oldest first, capped at [`MESSAGE_LIMIT`]. The status line
@@ -1455,6 +1488,7 @@ impl Editor {
         Self {
             buffer: dash,
             others: vec![scratch],
+            pending_confirm: None,
             frames: vec![frame::Frame::new(0)],
             focus_frame: 0,
             next_buffer_id: 2,
@@ -2217,6 +2251,9 @@ impl Editor {
             EditorCommand::OpenFile(p) => self.status = format!("cannot open {}", p.display()),
             EditorCommand::OpenAt(hit) => self.status = format!("cannot open {hit}"),
             EditorCommand::SaveFile(_) => self.status = "cannot save: no file backend".into(),
+            EditorCommand::Confirmed(_) => {
+                self.status = "cannot confirm: no file backend".into()
+            }
         }
         if self.revision != before && !history {
             self.buffer.redo.clear();

@@ -1521,6 +1521,18 @@ impl Editor {
                 "(%prompt-reply {id} {})",
                 crate::query::lisp_string(&p.value())
             ))],
+            // Anything that is not `yes` is no. Emacs' `yes-or-no-p` rejects
+            // and re-asks instead, which is the one behaviour worth *not*
+            // copying: the answer to a question guarding a discarded rebase
+            // should never be one keystroke away from being retyped.
+            PromptKind::Confirm => match self.pending_confirm.take() {
+                Some(cmd) if p.text.trim().eq_ignore_ascii_case("yes") => vec![*cmd],
+                Some(_) => vec![EditorCommand::Message("cancelled".into())],
+                // Nothing parked: the prompt outlived its command, which can
+                // only happen if something else cleared the slot. Doing nothing
+                // is the safe half of that.
+                None => vec![],
+            },
         }
     }
 
@@ -1538,6 +1550,11 @@ impl Editor {
         let Some(p) = self.prompt.take() else {
             return vec![];
         };
+        // Escape on a confirmation is "no". Dropped here rather than left for
+        // the next `confirm` to overwrite, because a parked command that
+        // outlives its question is a discarded rebase waiting for an unrelated
+        // Enter.
+        self.pending_confirm = None;
         // Back to the buffer you were in *before* the cursor, because the
         // cursor offset means nothing until the right document is live again.
         let mut out: Vec<EditorCommand> = p
@@ -1600,6 +1617,24 @@ impl Editor {
         }
     }
 
+    /// Ask a yes-or-no question, and run `on_yes` if the answer is `yes`.
+    ///
+    /// The caller is whoever is about to do something that can lose work, and it
+    /// parks the *already-guarded* form of its own action — see
+    /// [`EditorCommand::Confirmed`] for why that is a wrapper rather than a flag.
+    ///
+    /// Not part of [`Editor::open_prompt`]: that builds a prompt from its kind
+    /// alone, and this one needs both a question and a command that only the
+    /// caller knows.
+    pub fn confirm(&mut self, question: &str, on_yes: EditorCommand) {
+        self.pending_confirm = Some(Box::new(on_yes));
+        self.prompt = Some(Prompt::new(
+            PromptKind::Confirm,
+            &format!("{question} (yes or no) "),
+            Vec::new(),
+        ));
+    }
+
     /// Open one of the completing prompts.
     pub fn open_prompt(&mut self, kind: PromptKind) {
         let (label, items) = match kind {
@@ -1647,6 +1682,9 @@ impl Editor {
             // Reaching this arm means `(open-prompt "...")` was handed a kind
             // only `read-string` can make, which the shim refuses by name.
             PromptKind::Lisp { .. } => ("", Vec::new()),
+            // Likewise: its label is the question, and there is no question
+            // without the command it guards. `Editor::confirm` is the door.
+            PromptKind::Confirm => ("", Vec::new()),
         };
         let mut prompt = Prompt::new(kind, label, items);
         prompt.origin = kind.previews().then_some(self.buffer.cursor);

@@ -461,6 +461,14 @@ fn main() -> anyhow::Result<()> {
                 // this, the fallback is a once-a-second pull beside the
                 // auto-save timer — same call, worse latency.
                 Event::ClipboardUpdate { .. } => clipboard.pull(&mut editor),
+                // How a file arrives from *outside* the process. Finder's "Open
+                // With" and a double-click on a file zemacs is the default for
+                // do not use argv — macOS sends an `odoc` Apple event, which SDL
+                // turns into this. Dragging a file onto the window is the same
+                // event, so both work off one arm.
+                Event::DropFile { filename, .. } => {
+                    open_file(&mut editor, &PathBuf::from(filename), &init_path)
+                }
                 Event::Window {
                     window_id,
                     win_event,

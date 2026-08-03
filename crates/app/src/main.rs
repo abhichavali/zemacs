@@ -1149,8 +1149,21 @@ fn dispatch(
             let root = project.search_root(editor);
             open_at(editor, &root, &hit, init_path);
         }
-        EditorCommand::SaveFile(path) => save_file(editor, path),
+        EditorCommand::SaveFile(path) => save_file(editor, path, Save::Guarded),
         EditorCommand::Git(verb) => magit.run(editor, &verb),
+        // The far side of a `yes`. Each arm goes to the *same* worker its
+        // guarded twin does, with the guard spent — so the question is asked in
+        // exactly one place and answered in exactly one place.
+        EditorCommand::Confirmed(inner) => match *inner {
+            EditorCommand::SaveFile(path) => save_file(editor, path, Save::Forced),
+            EditorCommand::Git(verb) => magit.run_confirmed(editor, &verb),
+            // Nothing else parks a command, so this is a confirmation for
+            // something that never asked — a bug in the caller, not in the
+            // answer, and worth saying rather than running.
+            other => editor.apply(EditorCommand::Message(format!(
+                "confirmed a command that is not guarded: {other:?}"
+            ))),
+        },
         EditorCommand::Dired(verb) => {
             dired.run(editor, &verb);
             // `RET` on a file leaves dired; opening a buffer is this layer's
@@ -1183,6 +1196,9 @@ fn open_file(editor: &mut Editor, path: &Path, init_path: &Path) {
             let shown = display_path(&path);
             editor.load(&text, Some(path.clone()), lang);
             editor.buffer.file_mode = file_mode(&path);
+            // The buffer and the file agree as of now, which is what a later
+            // `:w` compares against to find out whether anyone else has been in.
+            editor.buffer.visited = disk_stamp(&path);
             editor.apply(EditorCommand::Message(match recovery_for(&path) {
                 // Deliberately does not load it: the disk file is what was
                 // asked for, and silently showing different text is worse than
@@ -1278,7 +1294,17 @@ fn refresh_grep(editor: &mut Editor, project: &Project, last: &mut Option<String
     }
 }
 
-fn save_file(editor: &mut Editor, path: Option<PathBuf>) {
+/// Whether `save_file` still has to ask about a file that moved underneath it.
+///
+/// `Forced` is only ever produced by answering the question, so the check
+/// cannot be skipped by accident — see [`EditorCommand::Confirmed`].
+#[derive(Clone, Copy, PartialEq)]
+enum Save {
+    Guarded,
+    Forced,
+}
+
+fn save_file(editor: &mut Editor, path: Option<PathBuf>, guard: Save) {
     // A dired buffer's `path` is the *directory* it lists, and a magit buffer's
     // text is a rendered status. Writing either would overwrite something real
     // with a screenshot of a view.
@@ -1291,11 +1317,34 @@ fn save_file(editor: &mut Editor, path: Option<PathBuf>) {
         editor.apply(EditorCommand::Message("no file name — use :w <path>".into()));
         return;
     };
+    // Emacs' "has changed since visited; save anyway?". Only for the file this
+    // buffer is actually visiting: `:w somewhere-else` is a save-as, and the
+    // stamp on record describes the *original*, so comparing the two would be
+    // asking about the wrong file.
+    if guard == Save::Guarded && editor.buffer.path.as_ref() == Some(&target) {
+        if let (Some(seen), Some(now)) = (editor.buffer.visited, disk_stamp(&target)) {
+            if seen != now {
+                let shown = display_path(&target);
+                let question = format!("{shown} changed on disk — save anyway?");
+                editor.confirm(
+                    &question,
+                    EditorCommand::Confirmed(Box::new(EditorCommand::SaveFile(Some(target)))),
+                );
+                return;
+            }
+        }
+    }
     let text = editor.buffer.text.to_string();
-    match std::fs::write(&target, &text) {
+    // Before the old contents stop existing. Taken here rather than inside
+    // `write_file` so the two promises stay separable: one is about the write
+    // not tearing, the other about the previous version surviving, and a test
+    // for either should not have to arrange the other.
+    backup(&target);
+    match write_file(&target, &text) {
         Ok(()) => {
             editor.buffer.modified = false;
             editor.buffer.file_mode = file_mode(&target);
+            editor.buffer.visited = disk_stamp(&target);
             if editor.buffer.path.is_none() {
                 editor.buffer.language = zemacs_syntax::language_for_path(&target);
                 editor.buffer.path = Some(target.clone());
@@ -1563,10 +1612,150 @@ fn autosave_forget(buffer: &zemacs_core::Buffer) {
     }
 }
 
-// ponytail: auto-save only, no numbered backups — the config keeps 20 versions
-// of every file, and that is a separate mechanism (copy the old contents aside
-// *before* writing) rather than a knob on this one. Add it when losing the
-// previous saved version actually bites.
+// --- writing a file ------------------------------------------------------
+//
+// Two separate promises, and they fail in different ways, which is why they are
+// two mechanisms rather than one.
+//
+// **The write must not tear.** `fs::write` truncates the target and then fills
+// it, so a crash, a full disk or a killed process in between leaves a file that
+// is neither the old text nor the new one. Auto-save does not cover this: it
+// copies the *buffer* aside, and the thing that just became rubble is the file.
+// So the text goes to a sibling temp file, is flushed to the platter, and is
+// then `rename`d over the target — atomic within a filesystem, which reduces
+// the outcomes to "the old file" or "the new file" and deletes "half of either"
+// from the list.
+//
+// **The previous saved version must survive.** That is a different question —
+// nothing tore, you simply want back what was there before — and no amount of
+// care during the write answers it. Hence numbered backups, taken before the
+// rename.
+
+/// The file's modification time, or `None` if it cannot be stat'd. What
+/// [`zemacs_core::Buffer::visited`] is compared against.
+fn disk_stamp(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Write `text` to `target` so that a crash can never leave it half-written.
+///
+/// ponytail: the directory entry is not itself fsync'd after the rename, so a
+/// power cut in the instant after a save can still lose the *whole* save — but
+/// never half of one, which is the property being bought here. `File::sync_all`
+/// on the parent directory is the upgrade, and it costs a second syscall per
+/// save. ponytail: `rename` also breaks a hard link, where Emacs would copy —
+/// rare enough to name rather than solve, and the fix is
+/// `backup-by-copying-when-linked`'s: write in place when `st_nlink > 1`.
+fn write_file(target: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    // Follow a symlink rather than replacing it. `rename` swaps a *name*, so
+    // without this a save over `~/.zshrc -> dotfiles/zshrc` would leave a real
+    // file where the link had been and the repository untouched — the exact
+    // opposite of the reason that link exists. `canonicalize` needs the file to
+    // be there, so a file being created keeps the name it was given.
+    let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    // Beside the target, never in a temp directory: `rename` is only atomic
+    // within one filesystem, and `/tmp` is routinely a different one — which
+    // would silently turn this back into a copy that can tear.
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    // The pid keeps two zemacs processes saving the same file out of each
+    // other's way. Two *frames* of one process cannot collide: saving happens
+    // on the main thread, one command at a time.
+    let tmp = dir.join(format!(".#{name}.zemacs{}#", std::process::id()));
+
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        // The whole point. Without it the rename can reach the disk before the
+        // bytes do, and a power cut leaves an empty file under the right name —
+        // which is worse than a torn one, because it looks fine.
+        file.sync_all()?;
+        // A fresh file is created at the umask's mercy, so a script's
+        // executable bit — and anything else the file's own mode said — has to
+        // be put back by hand. Nothing to restore for a file being created.
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &target)
+    };
+    let outcome = write();
+    if outcome.is_err() {
+        // The target has not been touched at this point — the rename is last —
+        // so all that is left is not to litter the directory.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    outcome
+}
+
+/// How many past versions of a file to keep. The config keeps 20; so does this.
+///
+/// ponytail: a copy per *save*, not per session as Emacs does — so the twenty
+/// are your last twenty saves rather than twenty points from whenever each
+/// buffer was first written. Strictly the more useful of the two, and it costs
+/// twenty times the file on disk. The condition for changing it is a real one:
+/// if this is ever pointed at files big enough for that to matter, the fix is
+/// Emacs' `buffer-backed-up` flag, not a smaller number.
+const BACKUP_KEEP: usize = 20;
+
+/// In `~/.config/zemacs/backup/` and not beside the file, for the reason
+/// auto-save is not beside it either: a project tree must not grow litter that
+/// its `.gitignore` has to know about. Same `!`-mangled naming, so the two
+/// directories read the same way when you go looking by eye.
+fn backup_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config/zemacs/backup"))
+}
+
+/// Copy the current contents of `target` aside as the next numbered version.
+///
+/// Silent on every failure, like auto-save and `remember_recent`: the save
+/// itself is about to report whether *it* worked, and a second line about the
+/// backup directory in front of someone mid-sentence is noise. A file being
+/// created has nothing to preserve and takes the same quiet path.
+fn backup(target: &Path) {
+    if let Some(dir) = backup_dir() {
+        backup_into(&dir, target);
+    }
+}
+
+/// The half of [`backup`] that does not need to know where backups live, which
+/// is what lets a test point it at a directory of its own instead of at `$HOME`.
+fn backup_into(dir: &Path, target: &Path) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let stem = format!("#{}#", target.to_string_lossy().replace('/', "!"));
+    // Versions of *this* file, by number. Read fresh each save rather than
+    // counted in memory, so the numbering survives a restart and a directory
+    // somebody has pruned by hand.
+    let mut versions: Vec<u32> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.strip_prefix(&stem)?
+                .strip_prefix(".~")?
+                .strip_suffix('~')?
+                .parse()
+                .ok()
+        })
+        .collect();
+    versions.sort_unstable();
+
+    let next = versions.last().copied().unwrap_or(0) + 1;
+    if std::fs::copy(target, dir.join(format!("{stem}.~{next}~"))).is_err() {
+        return;
+    }
+    // Oldest first, so a file saved for years keeps its last twenty saves
+    // rather than the first twenty it ever had.
+    let excess = (versions.len() + 1).saturating_sub(BACKUP_KEEP);
+    for old in versions.into_iter().take(excess) {
+        let _ = std::fs::remove_file(dir.join(format!("{stem}.~{old}~")));
+    }
+}
 
 // --- auto-revert ---------------------------------------------------------
 //
@@ -1678,10 +1867,10 @@ impl Revert {
         // the new stamp, so this is said once per external change rather than
         // four times a second until you deal with it.
         //
-        // ponytail: saving over the newer file afterwards is still allowed and
-        // still silent — that is Emacs' "has changed since visited; save
-        // anyway?", and it belongs with the confirmation flow the destructive
-        // git verbs are waiting on rather than bolted on here.
+        // Saving over the newer file afterwards is what `save_file`'s own guard
+        // asks about — this message and that question are the two halves of the
+        // same event, and the stamp deliberately left stale here is what the
+        // question is asked from.
         if buffer.modified {
             editor.apply(EditorCommand::Message(format!(
                 "{} changed on disk — not reverted, this buffer has unsaved changes",
@@ -1698,6 +1887,18 @@ impl Revert {
         // it makes a bare `touch` a no-op — which is the honest answer, since
         // nothing about the document moved.
         if text == buffer.text.to_string() {
+            // Nothing moved, so the buffer is still in sync and the save prompt
+            // has nothing to warn about. Said here as well as in `revert`
+            // because `touch` reaches this arm and not that one, and a stamp
+            // left stale would ask "changed on disk — save anyway?" about a
+            // change that did not alter a byte.
+            let stamp = disk_stamp(path);
+            if let Some(buffer) = std::iter::once(&mut editor.buffer)
+                .chain(editor.others.iter_mut())
+                .find(|b| b.id == id)
+            {
+                buffer.visited = stamp;
+            }
             return;
         }
         revert(editor, id, path, &text);
@@ -1719,11 +1920,16 @@ fn revert(editor: &mut Editor, id: zemacs_core::BufferId, path: &Path, text: &st
     // Permissions travel with the content — a `chmod +x` between saves shows up
     // in the modeline instead of going stale there.
     let mode = file_mode(path);
+    // And so does the stamp: this buffer has just taken the file's own text, so
+    // it is back in sync and a later `:w` has nothing to ask about. Without
+    // this, every auto-revert would arm the save prompt for the next save.
+    let stamp = disk_stamp(path);
     if let Some(buffer) = std::iter::once(&mut editor.buffer)
         .chain(editor.others.iter_mut())
         .find(|b| b.id == id)
     {
         buffer.file_mode = mode;
+        buffer.visited = stamp;
     }
     // Loud, because the text changed without anyone typing — and louder still
     // for a buffer you are not looking at, which is the only notice you get.
@@ -2361,13 +2567,204 @@ mod tests {
         ed.buffer.move_to_line_col(2, 0);
         ed.apply(EditorCommand::InsertText("delta ".into()));
         let at = ed.buffer.cursor;
-        save_file(&mut ed, None);
+        save_file(&mut ed, None, Save::Guarded);
         touch_forward(&path); // a save moves the stamp; make sure it is noticed
         watch.poll(&mut ed);
 
         assert_eq!(ed.buffer.text.to_string(), "alpha\nbeta\ndelta gamma\n");
         assert_eq!(ed.buffer.cursor, at, "point did not move");
         assert!(!ed.status.contains("reverted"), "{}", ed.status);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- saving --------------------------------------------------------
+
+    /// The mode bits have to survive the rename, or every save of a shell
+    /// script silently takes its executable bit off.
+    #[test]
+    #[cfg(unix)]
+    fn an_atomic_write_keeps_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = scratch("script.sh", "#!/bin/sh\necho one\n");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        write_file(&path, "#!/bin/sh\necho two\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "#!/bin/sh\necho two\n");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "the executable bit survived the save");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A dotfile is routinely a symlink into a repository. `rename` swaps a
+    /// name, so without following the link first a save would put a real file
+    /// where the link was and leave the repository untouched.
+    #[test]
+    #[cfg(unix)]
+    fn saving_through_a_symlink_writes_the_file_it_points_at() {
+        let real = scratch("real-target.txt", "before\n");
+        let dir = real.parent().unwrap().to_path_buf();
+        let link = dir.join("link-to-target.txt");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_file(&link, "after\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "after\n");
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "the link is still a link"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&real);
+    }
+
+    /// The promise, stated as a test: a write that fails leaves the file it was
+    /// replacing exactly as it was. `fs::write` fails this — it has already
+    /// truncated by the time anything can go wrong.
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_write_leaves_the_original_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        // Its own directory, because making it read-only is the way to force
+        // the failure and that must not stop the other tests writing.
+        let dir = std::env::temp_dir().join("zemacs_failed_write_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("precious.txt");
+        std::fs::write(&path, "the original\n").unwrap();
+
+        // No new files in here, so the temp file cannot be created.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = write_file(&path, "the replacement\n");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(outcome.is_err(), "the write really did fail");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "the original\n",
+            "a failed save is a save that did not happen"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The previous saved version is what a backup is for, and the count is
+    /// bounded so a long-lived file does not keep every save it ever had.
+    #[test]
+    fn backups_are_numbered_and_pruned_to_the_last_twenty() {
+        let path = scratch("versioned.txt", "v0\n");
+        let store = std::env::temp_dir().join("zemacs_backup_test");
+        let _ = std::fs::remove_dir_all(&store);
+
+        // One more save than the cap, so the pruning arm actually runs.
+        for version in 0..=BACKUP_KEEP {
+            std::fs::write(&path, format!("v{version}\n")).unwrap();
+            backup_into(&store, &path);
+        }
+
+        let stem = format!("#{}#", path.to_string_lossy().replace('/', "!"));
+        let mut kept: Vec<String> = std::fs::read_dir(&store)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&stem))
+            .collect();
+        kept.sort();
+
+        assert_eq!(kept.len(), BACKUP_KEEP, "kept exactly the cap");
+        // The *oldest* is the one that goes: v0 was pruned, and the newest
+        // backup holds the contents from just before the last save.
+        assert!(!kept.contains(&format!("{stem}.~1~")), "v0's backup was pruned");
+        assert_eq!(
+            std::fs::read_to_string(store.join(format!("{stem}.~{}~", BACKUP_KEEP + 1))).unwrap(),
+            format!("v{BACKUP_KEEP}\n"),
+            "the newest backup is the version the last save replaced"
+        );
+        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The clobber this closes: edit here, let something else write the file,
+    /// then save. The old behaviour overwrote it without a word.
+    #[test]
+    fn saving_over_a_file_that_changed_underneath_asks_first() {
+        let path = scratch("contested.txt", "mine\n");
+        let mut ed = Editor::new();
+        open_file(&mut ed, &path, &resolve_init_path());
+        ed.apply(EditorCommand::InsertText("edited ".into()));
+
+        // Somebody else — `git pull`, a formatter, an agent.
+        std::fs::write(&path, "theirs\n").unwrap();
+        touch_forward(&path);
+        save_file(&mut ed, None, Save::Guarded);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "theirs\n",
+            "the file was not written while the question was open"
+        );
+        let prompt = ed.prompt.as_ref().expect("a confirmation is open");
+        assert_eq!(prompt.kind, PromptKind::Confirm);
+        assert!(prompt.label.contains("changed on disk"), "{}", prompt.label);
+
+        // "no" is anything that is not `yes`, and it must leave the file alone.
+        ed.prompt.as_mut().unwrap().text = "n".into();
+        for cmd in ed.handle_key(Key::Enter) {
+            ed.apply(cmd);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+        assert!(ed.pending_confirm.is_none(), "the parked save was dropped");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// And `yes` goes through — the prompt is a speed bump, not a wall.
+    #[test]
+    fn confirming_the_clobber_writes_the_buffer() {
+        let path = scratch("conceded.txt", "mine\n");
+        let mut ed = Editor::new();
+        open_file(&mut ed, &path, &resolve_init_path());
+        ed.apply(EditorCommand::InsertText("edited ".into()));
+        std::fs::write(&path, "theirs\n").unwrap();
+        touch_forward(&path);
+
+        save_file(&mut ed, None, Save::Guarded);
+        ed.prompt.as_mut().unwrap().text = "yes".into();
+        // The answer comes back as `Confirmed(SaveFile(..))`, which is the
+        // whole mechanism: dispatching it must reach the *forced* save rather
+        // than land back on the guard and ask again.
+        let answer = ed.handle_key(Key::Enter);
+        assert_eq!(
+            answer,
+            vec![EditorCommand::Confirmed(Box::new(EditorCommand::SaveFile(
+                Some(path.clone())
+            )))]
+        );
+        save_file(&mut ed, Some(path.clone()), Save::Forced);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited mine\n");
+        assert!(!ed.buffer.modified);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The stamp has to be re-taken on every path that puts the buffer back in
+    /// sync, or the *next* save asks about a change that was already settled.
+    #[test]
+    fn a_save_after_a_revert_does_not_ask() {
+        let path = scratch("settled.txt", "one\n");
+        let mut ed = Editor::new();
+        open_file(&mut ed, &path, &resolve_init_path());
+        let mut watch = Revert::default();
+        watch.poll(&mut ed);
+
+        std::fs::write(&path, "two\n").unwrap();
+        touch_forward(&path);
+        watch.poll(&mut ed); // unmodified, so this reverts and re-syncs
+
+        ed.apply(EditorCommand::InsertText("three ".into()));
+        save_file(&mut ed, None, Save::Guarded);
+
+        assert!(ed.prompt.is_none(), "nothing to ask about after a revert");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "three two\n");
         let _ = std::fs::remove_file(&path);
     }
 

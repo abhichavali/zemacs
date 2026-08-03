@@ -251,11 +251,37 @@ characters and a display column is not reachable from Lisp, because nothing in
 Lisp draws. Left open: a wide character straddling the wrap point is cut rather
 than moved down (Emacs moves it), and a control character draws as nothing
 rather than as =^G=.
-** TODO Backups — config keeps 20 versions, zemacs keeps none
-Auto-save itself is *done*: every modified buffer is copied to
+** DONE Backups — config keeps 20 versions, and so does zemacs now
+Auto-save was already *done*: every modified buffer is copied to
 =~/.config/zemacs/auto-save/#!mangled!path#= every 30 s, the copy is deleted on
 a real save, and opening a file whose copy is newer says so. Numbered backups
-of the previous *saved* version are the separate half, and are still missing.
+of the previous *saved* version were the separate half, and now exist:
+=~/.config/zemacs/backup/#!mangled!path#.~N~=, same mangling, capped at 20.
+
+The other half of the same entry, and the more important one: *the write itself
+could tear.* =fs::write= truncates and then fills, so a crash in between left a
+file that was neither version — and auto-save does not cover that, because what
+it copies aside is the buffer and what just became rubble is the file. Saving is
+now write-to-sibling-temp, =sync_all=, =rename=, which reduces the outcomes to
+"the old file" or "the new file". Symlinks are followed rather than replaced
+(=~/.zshrc= is a link into a dotfiles repo on most machines) and the mode bits
+are re-applied to the temp file, or every save of a shell script would quietly
+take its =+x= off.
+
+Two ceilings named in the code rather than closed: the directory entry is not
+fsync'd after the rename, so a power cut can still lose a whole save (never half
+of one); and =rename= breaks a hard link where Emacs would copy.
+** DONE =:w= asks before overwriting a file that changed underneath
+=Buffer::visited= is Emacs' =visited-file-modtime= — the file's stamp as of the
+last read or write *by that buffer*, set by the app in the three places a buffer
+comes into sync with disk (open, save, revert) because core cannot stat. =:w=
+compares it and asks "changed on disk — save anyway?" when it moved.
+
+Only for the file the buffer is actually visiting: =:w somewhere-else= is a
+save-as, and the stamp on record describes the original. A bare =touch= is not a
+false alarm, because the auto-revert sweep re-takes the stamp when it finds the
+*content* identical — the same comparison that already stopped =:w= reverting
+the buffer that wrote the file.
 ** DONE Auto-revert on external change (=global-auto-revert-mode= is on)
 Polled off =Instant= beside the auto-save timer, at Emacs' own
 =auto-revert-interval= of five seconds — a notification crate is a dependency,
@@ -269,6 +295,10 @@ timestamp (which also makes a bare =touch= a no-op). And point is restored by
 *line and column* rather than by offset, so text inserted above the cursor does
 not drag it off the line you were reading.
 
+The first of those is one half of an event whose other half is now the save
+prompt above: the sweep says "changed on disk — not reverted" and deliberately
+leaves the buffer's stamp stale, and =:w= is what asks about it.
+
 ponytail: the live buffer only — every mutator core exposes goes through
 =editor.buffer=, so a background buffer reverts within five seconds of you
 switching to it rather than before. The upgrade is an
@@ -277,10 +307,28 @@ is still allowed and still silent; that is Emacs' "has changed since visited;
 save anyway?" and it belongs with the confirmation flow the destructive git
 verbs are waiting on.
 ** TODO =M-x= with arguments — it calls =(name)= and so offers zero-arg only
-** TODO Confirmation before destructive git verbs
-=rebase-abort=, =reset --hard=, =discard=, =stash drop=, =branch -D= are all
-reachable and none asks. =r a= is bound *today* and discards a whole rebase
-silently.
+** DONE Confirmation before destructive git verbs
+=r a= was bound *today* and discarded a whole rebase silently. It now asks.
+
+The entry overstated the surface, which is worth recording: of the verbs listed,
+only =rebase-abort= was actually reachable — =reset --hard=, =discard=, =stash
+drop= and =branch -D= exist in =crates/git= but have no arm in =magit.rs=, so
+nothing could call them. They are in the guard's list anyway, so the day one of
+them gets a verb the question is already in front of it.
+
+The guard is in =Magit::run=, not in =try_run='s arms: a keybinding, =M-x= and
+=(git "...")= from Lisp all arrive as one =EditorCommand::Git=, so one check
+covers all three and cannot be forgotten by whoever adds the fourth. Explicitly
+*not* guarded: =stash= (recoverable with =z p=), =amend= and =unstage-all= (work
+stays in the tree or the reflog), =push= (the remote checks it). A prompt in
+front of those is how a prompt becomes something you dismiss without reading.
+
+The mechanism is general: =PromptKind::Confirm= plus =Editor::pending_confirm=,
+answered by a full =yes= (Emacs' =yes-or-no-p=, not =y-or-n-p= — these are
+exactly the prompts where a reflexive =y= is the failure mode). The parked
+command comes back wrapped in =EditorCommand::Confirmed=, which is what lets one
+site both ask the question and recognise its own answer instead of every
+guarded command needing a twin variant that skips the check.
 
 * PACKAGES WITH NO EQUIVALENT
 ** TODO avy

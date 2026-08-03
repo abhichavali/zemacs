@@ -45,6 +45,20 @@ pub enum PromptKind {
     /// [`PromptKind::completes`] on the frame in between. A `read-string` that
     /// flashed an empty "no matches" box would be a bug nobody could reproduce.
     Lisp { id: u64, completing: bool },
+    /// A yes-or-no question guarding something that can lose work, whose "yes"
+    /// runs a command parked in [`crate::Editor::pending_confirm`] when the
+    /// question was asked.
+    ///
+    /// The command is parked rather than carried here so this stays `Copy` like
+    /// every other kind — and parked in the *editor* rather than in the image,
+    /// which is the difference between this and [`PromptKind::Lisp`]: the thing
+    /// waiting for the answer is Rust, so there is no continuation to call back.
+    ///
+    /// Only a full `yes` proceeds. That is Emacs' `yes-or-no-p` rather than
+    /// `y-or-n-p`, and the distinction is the whole point: these prompts appear
+    /// in front of a discarded rebase and an overwritten file, which are exactly
+    /// the two places a reflexive `y` is the failure mode.
+    Confirm,
 }
 
 impl PromptKind {
@@ -52,7 +66,7 @@ impl PromptKind {
     /// there is nothing to draw in a popup.
     pub fn completes(self) -> bool {
         match self {
-            PromptKind::Ex | PromptKind::Search => false,
+            PromptKind::Ex | PromptKind::Search | PromptKind::Confirm => false,
             // Whichever of the two Lisp asked for.
             PromptKind::Lisp { completing, .. } => completing,
             _ => true,

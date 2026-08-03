@@ -86,6 +86,25 @@ $icon_plist
   <key>LSMinimumSystemVersion</key>    <string>11.0</string>
   <key>NSHighResolutionCapable</key>   <true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key> <true/>
+  <!-- Without this zemacs never appears in Finder's "Open With" menu, so it
+       cannot be chosen as the default for anything. public.data is the root of
+       every file type, which is what puts zemacs in the list for an extension
+       nobody has claimed. Rank Alternate rather than Owner: these are types
+       zemacs edits, not types it defines. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>  <string>Text Document</string>
+      <key>CFBundleTypeRole</key>  <string>Editor</string>
+      <key>LSHandlerRank</key>     <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.text</string>
+        <string>public.source-code</string>
+        <string>public.data</string>
+      </array>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST

@@ -6,7 +6,7 @@
 //! flattens its grid back into buffer text so that the buffer switcher, the
 //! modeline and `buffer-string` all work on a terminal without a special case.
 //! The *colour* does not survive that flattening, so the renderer reads the
-//! grid directly — see [`Term::screen`].
+//! grid directly — see [`Term::screens`], one per terminal buffer on screen.
 //!
 //! # Many sessions, not one
 //!
@@ -101,6 +101,12 @@ impl Term {
             // it, which is the half core cannot do.
             "normal" => self.freeze(editor),
             "insert" => self.thaw(editor),
+            // The unnamed register — which *is* the system clipboard, see
+            // `Clipboard` in main.rs — typed into the child. The other
+            // direction needs nothing: `C-M-t` then `v … y` yanks out of the
+            // scrollback, and the register mirrors out to the window system on
+            // its own.
+            "paste" => self.paste(editor),
             // `run:` starts a session; `rerun:` replaces the one of that name.
             //
             // Two verbs because there are two intentions and they are opposites.
@@ -179,12 +185,28 @@ impl Term {
         // terminal that opens in the wrong directory is a terminal you
         // immediately have to `cd` in, and an *agent* in the wrong directory
         // is one that reads the wrong repository.
-        let cwd = editor
-            .buffer
-            .path
-            .as_deref()
-            .and_then(|p| if p.is_dir() { Some(p) } else { p.parent() })
-            .map(PathBuf::from)
+        //
+        // A terminal buffer has no path, so a second session opened from inside
+        // one used to land in whatever directory the *editor* was launched from
+        // — rarely the one you were just working in. It inherits its
+        // neighbour's instead.
+        //
+        // ponytail: the neighbour's *starting* directory, not wherever it has
+        // since `cd`-ed to. Reading a child's live cwd needs its pid plumbed out
+        // of `zemacs-term` and a per-platform lookup (`proc_pidinfo` on macOS,
+        // `/proc/PID/cwd` on Linux); worth it the first time following `cd` is
+        // what someone actually asks for.
+        let cwd = self
+            .current(editor)
+            .and_then(|i| self.sessions[i].cwd.clone())
+            .or_else(|| {
+                editor
+                    .buffer
+                    .path
+                    .as_deref()
+                    .and_then(|p| if p.is_dir() { Some(p) } else { p.parent() })
+                    .map(PathBuf::from)
+            })
             .or_else(|| std::env::current_dir().ok());
         let inner = match Terminal::spawn_command(INITIAL.0, INITIAL.1, cwd.clone(), command) {
             Ok(term) => term,
@@ -332,6 +354,7 @@ impl Term {
             Key::Meta(c) => Input::Alt(c),
             Key::Enter => Input::Enter,
             Key::Tab => Input::Tab,
+            Key::BackTab => Input::BackTab,
             Key::Backspace => Input::Backspace,
             Key::Esc => Input::Esc,
             Key::Up => Input::Up,
@@ -387,6 +410,18 @@ impl Term {
         editor.buffer.move_to_line_col(editor.buffer.len_lines(), 0);
     }
 
+    /// Type the register into the child.
+    ///
+    /// Silent with an empty register or no session: a paste of nothing is
+    /// nothing, not a message worth interrupting a shell for.
+    pub fn paste(&self, editor: &Editor) {
+        let Some(i) = self.current(editor) else { return };
+        let (text, _) = editor.register();
+        if !text.is_empty() {
+            self.sessions[i].inner.paste(text);
+        }
+    }
+
     /// Give the keyboard back to the child.
     pub fn thaw(&mut self, editor: &mut Editor) {
         let Some(i) = self.current(editor) else { return };
@@ -431,6 +466,22 @@ impl Term {
         // to it — which is a frame, not a delay anyone can see, and it keeps
         // `show_named`'s revision bump off every background agent's output.
         let Some(i) = self.current(editor) else { return };
+        // `frozen` follows the mode rather than being set alongside it.
+        //
+        // `freeze` and `thaw` move the two together, but they are not the only
+        // way into a terminal buffer: the switcher, `switch-to-buffer` and
+        // killing the buffer next door all land here through
+        // `Editor::switch_buffer`, which takes the mode from the buffer *kind*
+        // and has never heard of a session. That left `Mode::Terminal` beside
+        // `frozen: true`, which is the one combination that is silently wrong in
+        // both directions at once — the mode routes every keystroke to the child
+        // while the freeze stops the buffer refreshing and makes `screen` answer
+        // `None`, so you type into an agent and watch a stale screenful not
+        // change.
+        //
+        // The mode is the half the user can see, in the modeline and in what the
+        // keys do, so the mode is the half that decides.
+        self.sessions[i].frozen = editor.mode != Mode::Terminal;
         if self.sessions[i].frozen {
             return;
         }
@@ -497,24 +548,36 @@ impl Term {
             .retain(|s| editor.buffer_by_id(s.buffer).is_some());
     }
 
-    /// The live grid, for the renderer to draw in colour.
+    /// The live grid of every session on screen, keyed by the buffer showing it,
+    /// for the renderer to draw in colour.
     ///
-    /// `None` while frozen or outside a session, which is what makes the
-    /// renderer fall back to the ordinary text path — and so the selection, the
-    /// cursor and the line numbers all appear, which is the whole point of
-    /// stepping out of the child.
+    /// This used to answer for the session with the *keyboard* and no other, and
+    /// that was the whole of "a terminal goes grey when you look away": colour
+    /// lives in the grid, the buffer text is a flattening with every attribute
+    /// already gone, and a pane handed no grid falls through to the text path.
+    /// So a shell beside the file you were editing, an agent in the other half
+    /// of a split, and both halves of a two-terminal split were all drawn as
+    /// plain grey text — correct characters, no colour, no block cursor.
     ///
-    /// ponytail: *one* screen, so two terminal buffers visible in two panes at
-    /// once both draw the live session's grid. The upgrade is the renderer
-    /// taking a grid per buffer id instead of a single `Option<&Screen>`, which
-    /// is a signature change in `zemacs-render`; until then a background
-    /// session is correct in the switcher, in `buffer-string` and in its own
-    /// pane the moment you focus it, and wrong only in a split showing two
-    /// terminals simultaneously.
-    pub fn screen(&self, editor: &Editor) -> Option<Screen> {
-        let i = self.current(editor)?;
-        let session = &self.sessions[i];
-        (!session.frozen).then(|| session.inner.screen(fg(editor), bg(editor)))
+    /// Only the sessions actually shown in a pane. A background agent's grid is
+    /// a few thousand cells to copy every frame and nothing to draw them onto.
+    ///
+    /// A frozen session is still left out, and for the same reason as before:
+    /// frozen means the editor has the keyboard and the buffer holds the
+    /// scrollback you stepped out to read, so drawing the child's live screen
+    /// over it would take away the thing freezing is for.
+    pub fn screens(&self, editor: &Editor) -> Vec<(BufferId, Screen)> {
+        let shown = |id: BufferId| {
+            editor
+                .frames
+                .iter()
+                .any(|f| f.windows.iter().any(|w| w.buffer == id))
+        };
+        self.sessions
+            .iter()
+            .filter(|s| !s.frozen && shown(s.buffer))
+            .map(|s| (s.buffer, s.inner.screen(fg(editor), bg(editor))))
+            .collect()
     }
 
     /// What is under the pointer at `(col, row)`: the OSC 8 link the child put
@@ -536,8 +599,16 @@ impl Term {
         col: usize,
         row: usize,
     ) -> Option<(String, Option<String>)> {
-        let screen = self.screen(editor)?;
+        // The live session's own grid, built here rather than looked up in
+        // `screens`: a click lands in the pane with the pointer in it, which is
+        // the one with the keyboard, and a frozen session is being read as text
+        // and has no grid coordinates to answer about.
         let i = self.current(editor)?;
+        let session = &self.sessions[i];
+        if session.frozen {
+            return None;
+        }
+        let screen = session.inner.screen(fg(editor), bg(editor));
         (row < screen.rows).then(|| {
             let text = (0..screen.cols)
                 .filter_map(|col| screen.cell(row, col).map(|cell| cell.c))
@@ -657,6 +728,65 @@ mod tests {
         assert_eq!(names, vec!["*gaussian*", "*independence*", "*gaussian*<2>"]);
     }
 
+    /// The whole route a command name takes, because the halves are tested
+    /// separately and the seam between them is a string: core turns the name
+    /// into a verb by stripping a prefix, and this file matches on what is
+    /// left. Either side can be right about its own half while the two disagree
+    /// about the spelling, and the symptom of that is "unknown terminal verb"
+    /// naming a verb that is plainly in the match below.
+    #[test]
+    fn the_command_name_reaches_the_verb_that_handles_it() {
+        for (name, verb) in [
+            ("terminal-new", "new"),
+            ("terminal-next", "next"),
+            ("terminal-prev", "prev"),
+            ("terminal-close", "close"),
+            ("terminal-restart", "restart"),
+            ("terminal-normal", "normal"),
+            ("terminal-insert", "insert"),
+            ("terminal-paste", "paste"),
+        ] {
+            let mut ed = Editor::new();
+            let out = ed.run_action(name);
+            assert_eq!(
+                out,
+                vec![EditorCommand::Term(verb.into())],
+                "{name} should become the {verb:?} verb"
+            );
+        }
+
+        // ...and the verb the name produces is one this file answers. `run`
+        // reports an unknown verb through the status line rather than by
+        // failing, so the assertion is on what it did *not* say.
+        let mut ed = Editor::new();
+        let mut term = Term::default();
+        for cmd in ed.run_action("terminal-new") {
+            if let EditorCommand::Term(verb) = cmd {
+                term.run(&mut ed, &verb);
+            }
+        }
+        assert!(
+            !ed.status.contains("unknown terminal verb"),
+            "status was {:?}",
+            ed.status
+        );
+        assert_eq!(term.sessions.len(), 1, "a session should have started");
+    }
+
+    /// `terminal-new` from inside a session starts where that session did,
+    /// rather than where the editor was launched from — a terminal buffer has
+    /// no path for the file-buffer rule to read.
+    #[test]
+    fn a_session_opened_from_a_terminal_inherits_its_directory() {
+        let mut ed = Editor::new();
+        let mut term = Term::default();
+        term.run(&mut ed, "run:one:cat");
+        let dir = PathBuf::from("/usr");
+        term.sessions[0].cwd = Some(dir.clone());
+        term.run(&mut ed, "new");
+        assert_eq!(term.sessions[1].cwd, Some(dir));
+    }
+
     /// Keys, freezing and closing all address the session whose buffer is live
     /// — not "the terminal", of which there is no longer one.
     #[test]
@@ -684,7 +814,95 @@ mod tests {
             .position(|b| b.id == first)
             .expect("still open");
         ed.switch_buffer(pos + 1);
-        assert!(term.screen(&ed).is_some(), "the first session still draws");
+        assert!(
+            term.screens(&ed).iter().any(|(id, _)| *id == first),
+            "the first session still draws"
+        );
+    }
+
+    /// The switcher is not `show`, and reaching a frozen session through it used
+    /// to leave the mode saying the child had the keyboard while the session
+    /// said it was parked. Every keystroke then went to the agent and nothing
+    /// on screen moved.
+    #[test]
+    fn reaching_a_frozen_session_through_the_switcher_gives_the_child_the_keyboard() {
+        let mut ed = Editor::new();
+        let mut term = Term::default();
+        term.run(&mut ed, "run:one:cat");
+        let session = ed.buffer.id;
+        // Step out of the child to read the scrollback, then go somewhere else.
+        term.run(&mut ed, "normal");
+        assert!(term.sessions[0].frozen);
+        ed.create_buffer("notes".into());
+        assert_eq!(ed.mode, Mode::Normal);
+
+        // Back through the switcher rather than through `terminal-next`: the
+        // mode comes from the buffer kind, so the session has to follow it.
+        ed.switch_buffer_id(session);
+        assert_eq!(ed.mode, Mode::Terminal);
+        term.sync(&mut ed, &[]);
+        assert!(
+            !term.sessions[0].frozen,
+            "the mode says the child has the keyboard, so it must also be drawing"
+        );
+        assert!(
+            term.screens(&ed).iter().any(|(id, _)| *id == session),
+            "and the grid must be drawn"
+        );
+    }
+
+    /// Colour is per session and not "the terminal's". A session in a pane you
+    /// are not looking at still hands the renderer its grid — without one the
+    /// pane falls through to the text path, which is the same characters with
+    /// every attribute already flattened out of them.
+    #[test]
+    fn every_session_on_screen_offers_its_own_grid() {
+        let mut ed = Editor::new();
+        let mut term = Term::default();
+        term.run(&mut ed, "run:one:cat");
+        let one = ed.buffer.id;
+        // A split, so both buffers are in a window at once. The second session
+        // takes the focused pane; the first is still shown in the other.
+        ed.apply(EditorCommand::SplitWindow(
+            zemacs_core::frame::Split::Columns,
+        ));
+        term.run(&mut ed, "run:two:cat");
+        let two = ed.buffer.id;
+
+        let ids: Vec<BufferId> = term.screens(&ed).into_iter().map(|(id, _)| id).collect();
+        assert!(ids.contains(&two), "the focused session draws: {ids:?}");
+        assert!(ids.contains(&one), "and so does the one beside it: {ids:?}");
+    }
+
+    /// ...but only what is on screen. A background agent's grid is a few
+    /// thousand cells to copy every frame and nothing to draw them onto.
+    #[test]
+    fn a_session_in_no_window_is_not_copied() {
+        let mut ed = Editor::new();
+        let mut term = Term::default();
+        term.run(&mut ed, "run:one:cat");
+        let parked = ed.buffer.id;
+        term.run(&mut ed, "run:two:cat");
+        let ids: Vec<BufferId> = term.screens(&ed).into_iter().map(|(id, _)| id).collect();
+        assert!(!ids.contains(&parked), "nothing shows it: {ids:?}");
+    }
+
+    /// A brand-new session's window starts at the top of its brand-new buffer,
+    /// whatever the buffer it replaced was scrolled to.
+    #[test]
+    fn a_new_session_does_not_inherit_the_previous_buffers_scroll() {
+        let mut ed = Editor::new();
+        ed.viewport_lines = 10;
+        let long: String = (0..400).map(|i| format!("line {i}\n")).collect();
+        ed.load(&long, Some(PathBuf::from("/tmp/scrolled.txt")), None);
+        ed.apply(EditorCommand::ScrollLines(300));
+        assert!(ed.scroll > 0, "the file has to be scrolled for this to test");
+
+        let mut term = Term::default();
+        term.run(&mut ed, "new");
+        assert_eq!(ed.scroll, 0);
+        let frame = &ed.frames[0];
+        assert_eq!(frame.windows[frame.current].scroll, 0);
     }
 
     /// Closing one session must not disturb the other, and must take its buffer

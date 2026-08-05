@@ -69,7 +69,9 @@ use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::Sender;
-use zemacs_core::{Editor, EditorCommand, HlKind, Image, ImageId, OverlayEdit, Shared};
+use zemacs_core::{
+    CompletionEdit, Editor, EditorCommand, HlKind, Image, ImageId, OverlayEdit, Shared,
+};
 
 extern "C" {
     fn zemacs_boot();
@@ -185,6 +187,15 @@ pub extern "C" fn rs_set_syntax_color(face: *const c_char, r: c_double, g: c_dou
     ));
 }
 
+/// The other half of a face. `bold`/`italic` arrive as C ints because the shim
+/// has already flattened Lisp's generalised booleans — anything non-`NIL` is
+/// true, exactly as `set-line-numbers` treats its argument.
+#[no_mangle]
+pub extern "C" fn rs_set_face_style(face: *const c_char, bold: c_int, italic: c_int) {
+    let face = unsafe { str_or_empty(face) };
+    emit(EditorCommand::SetFaceStyle(face, bold != 0, italic != 0));
+}
+
 #[no_mangle]
 pub extern "C" fn rs_set_line_numbers(on: c_int) {
     emit(EditorCommand::SetLineNumbers(on != 0));
@@ -249,13 +260,22 @@ pub extern "C" fn rs_clear_dashboard_items() {
 }
 
 #[no_mangle]
-pub extern "C" fn rs_dashboard_item(key: *const c_char, label: *const c_char, action: *const c_char) {
+pub extern "C" fn rs_dashboard_item(
+    key: *const c_char,
+    label: *const c_char,
+    action: *const c_char,
+    hint: *const c_char,
+) {
     // The shim PRINCs the key, so `#\f` and `"f"` arrive identically.
     let key = unsafe { str_or_empty(key) }.chars().next().unwrap_or('?');
     emit(EditorCommand::AddDashboardItem {
         key,
         label: unsafe { str_or_empty(label) },
         action: unsafe { str_or_empty(action) },
+        // Empty for "no hint". The shim maps NIL to that rather than letting it
+        // PRINC as the three characters "NIL", which would be set flush right
+        // as if it were a key sequence.
+        hint: unsafe { str_or_empty(hint) },
     });
 }
 
@@ -831,6 +851,18 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
         // A row is `"KEY LABEL"`; the renderer splits at the first space, which
         // is unambiguous because a normalised key token never contains one.
         "which-key" => EditorCommand::WhichKey((!arg.is_empty()).then_some(arg)),
+
+        // corfu, and the same one-string-at-a-time shape one level down: `a` is
+        // the buffer offset the popup hangs from and `b` the row to highlight,
+        // which is the whole of what a *position* costs over `which-key`. A
+        // negative anchor takes the popup down, so `(completion-show)` with no
+        // argument reads as "no completion here" rather than as offset zero.
+        "completion-show" => EditorCommand::Completion(CompletionEdit::Show(
+            (a >= 0).then(|| (a as usize, b.max(0) as usize)),
+        )),
+        "completion-row" => {
+            EditorCommand::Completion(CompletionEdit::Row((!arg.is_empty()).then_some(arg)))
+        }
 
         // A keystroke for the shell. `Key::from_token` is the inverse of the
         // spelling `key-bindings` already reports, so the string a config reads

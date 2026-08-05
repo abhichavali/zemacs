@@ -212,12 +212,13 @@ the whole extension mechanism; there is nothing to register.
 
 Org rendering covers headings (coloured by level), =*bold*=, =/italic/=,
 =~code~=, =[[links][with descriptions]]=, =#+DIRECTIVES=, tables and lists.
-Emphasis is carried by *colour rather than weight*: the renderer opens exactly
-one font face, so real bold and italic would mean loading two more.
+Emphasis is carried by real weight and slant, not by colour standing in for
+them: the renderer opens a bold face and an italic one alongside the body face,
+so =*bold*= is bold. Syntax faces can ask for the same — see =set-face= below.
 
 * Configuration
 
-=runtime/init.lisp= (or =~/.config/zemacs/init.lisp= if present) is loaded at
+=runtime/init.lisp= (or =~/.zemacs.d/init.lisp= if present) is loaded at
 startup, into a live ECL image.
 
 #+begin_src lisp
@@ -225,7 +226,8 @@ startup, into a live ECL image.
 
 (set-font-size 18)
 (set-background 0.11 0.12 0.18)          ; r g b in 0.0 .. 1.0
-(set-syntax-color "keyword" 0.78 0.57 0.94)
+(set-face "keyword" '(0.78 0.57 0.94) :bold t)
+(load-theme "tokyo-night")                ; or M-x theme / SPC t t
 
 (set-line-numbers t)
 (set-relative-line-numbers t)            ; count from the cursor, vim-style

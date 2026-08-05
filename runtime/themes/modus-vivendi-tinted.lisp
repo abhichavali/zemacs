@@ -24,11 +24,23 @@
 ;;;; a staged file `string' and an unstaged one `keyword'. So the same lines
 ;;;; that colour a source buffer colour those too.
 ;;;;
-;;;; The three mappings that are not Modus' own are the same three the plain
-;;;; vivendi file documents, and for the same reasons: `number' borrows
-;;;; `identifier', the three `heading-N' take Modus' coloured levels 0/2/3, and
-;;;; `bold'/`italic' take `fg-prose-verbatim'/`docstring' because zemacs carries
-;;;; emphasis in colour where Modus carries it in weight.
+;;;; The mappings that are not Modus' own are the same ones the plain vivendi
+;;;; file documents, and for the same reasons: `number' borrows `identifier',
+;;;; the three `heading-N' take Modus' coloured levels 0/2/3 *and* the bold
+;;;; weight Modus puts on its headings, and `bold'/`italic' take
+;;;; `fg-prose-verbatim'/`docstring' on top of the real weight and slant they
+;;;; now carry.
+;;;;
+;;;; Nothing else in this file is bold. Modus' own `modus-themes-bold-constructs'
+;;;; and `modus-themes-italic-constructs' both default to nil — keywords are not
+;;;; heavy and comments are not slanted in Modus, and a port that reached for the
+;;;; new weight everywhere would stop being this theme.
+;;;;
+;;;; What you actually see may still be heavier, because `*bold-constructs*' in
+;;;; init.lisp is applied on top of whichever theme is loaded and bolds
+;;;; keywords, functions and types by default. That is zemacs' taste rather than
+;;;; Modus', and it is a variable for exactly that reason — set it to NIL for
+;;;; this theme as Protesilaos published it.
 
 (in-package :zemacs)
 
@@ -59,8 +71,11 @@
   (apply #'set-background bg-main)
   (apply #'set-foreground fg-main)
 
-  ;; All of them. Anything skipped keeps the last theme's colour.
-  (flet ((face (name rgb) (apply #'set-syntax-color name rgb)))
+  ;; All of them. Anything skipped keeps the last theme's colour *and weight*,
+  ;; which is the half that bites: an unset face inheriting a bold from the
+  ;; theme before it looks like a highlighter bug rather than a missing line.
+  (flet ((face (name rgb &key bold italic)
+           (set-face name rgb :bold bold :italic italic)))
     (face "default"           fg-main)                ; #ffffff  Modus `fg-main'
     (face "keyword"           magenta-cooler)         ; #b6a0ff  Modus `keyword'
     (face "function"          magenta)                ; #feacd0  Modus `fnname'
@@ -72,11 +87,11 @@
     (face "variable"          cyan)                   ; #00d3d0  Modus `variable'
     (face "operator"          fg-main)                ; #ffffff  Modus `operator'
     (face "punctuation"       fg-main)                ; #ffffff  Modus `punctuation'
-    (face "heading-1"         cyan-cooler)            ; #6ae4b9  Modus `fg-heading-0'
-    (face "heading-2"         yellow-faint)           ; #d2b580  Modus `fg-heading-2'
-    (face "heading-3"         blue-faint)             ; #82b0ec  Modus `fg-heading-3'
-    (face "bold"              magenta-warmer)         ; #f78fe7  Modus `fg-prose-verbatim'
-    (face "italic"            green-faint)            ; #88ca9f  Modus `docstring'
+    (face "heading-1"         cyan-cooler   :bold t)  ; #6ae4b9  Modus `fg-heading-0'
+    (face "heading-2"         yellow-faint  :bold t)  ; #d2b580  Modus `fg-heading-2'
+    (face "heading-3"         blue-faint    :bold t)  ; #82b0ec  Modus `fg-heading-3'
+    (face "bold"              magenta-warmer :bold t) ; #f78fe7  Modus `fg-prose-verbatim'
+    (face "italic"            green-faint :italic t)  ; #88ca9f  Modus `docstring'
     (face "link"              blue-warmer)            ; #79a8ff  Modus `fg-link'
     (face "code"              cyan-cooler)            ; #6ae4b9  Modus `fg-prose-code'
     (face "markup"            fg-dim)                 ; #9d9d9d  Modus `prose-metadata'

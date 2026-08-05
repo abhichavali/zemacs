@@ -49,6 +49,19 @@
 ;;;; `%org-lines' does the conversion once per line; nothing above that layer
 ;;;; ever sees a byte.
 ;;;;
+;;;; The same is true of the *text* in a plist, and it has to be said separately
+;;;; because it is a different conversion: `:title' and every property value go
+;;;; through `utf8-text' as they are read. Offsets and text were decoded in
+;;;; different places for a while, and the symptom was a status line reading
+;;;; `Ãlgebra â€" Vectores' under a page whose cursor landed exactly right. The
+;;;; readers below are therefore the boundary: a caller may `message' a title or
+;;;; put a status in a `run' without asking where it came from.
+;;;;
+;;;; The line *vector* is still raw, deliberately — the writers re-find their
+;;;; heading in it by offset, and `%org-property' matches ASCII markers in it —
+;;;; so a `first' out of `%org-lines' is bytes and everything a plist carries is
+;;;; characters.
+;;;;
 ;;;; Offsets go stale. A plist is a *reading*, not a handle: it describes the
 ;;;; buffer as it was when it was made, and a keystroke that lands afterwards
 ;;;; moves everything after it. So the two writers below re-read before they
@@ -194,7 +207,13 @@ Searched in the **preamble** only — the lines above the first heading — and 
 is not an optimisation. It is where org puts keywords and where this format
 specifies them, and it is what stops a `#+ZEMACS_CURRICULUM' quoted inside a
 source block, in a document *about* the format, from turning that document into
-a curriculum. `docs/curriculum.org' is exactly such a document."
+a curriculum. `docs/curriculum.org' is exactly such a document.
+
+The *value* is decoded and the matching is not. A keyword's name is ASCII by the
+format, so the prefix compare can run against the raw bytes and the tail after it
+still starts on a character boundary; the value is free text a person wrote —
+`#+TITLE:' most of all — and `math-progress' puts it straight in the status
+line, where undecoded bytes come out as mojibake."
   (let ((want (concatenate 'string "#+" name ":")))
     (dolist (l lines)
       (let ((text (first l)))
@@ -202,7 +221,9 @@ a curriculum. `docs/curriculum.org' is exactly such a document."
         (let ((s (%math-trim text)))
           (when (and (>= (length s) (length want))
                      (string-equal want s :end2 (length want)))
-            (return (string-trim '(#\Space #\Tab) (subseq s (length want))))))))))
+            (return (utf8-text
+                     (string-trim '(#\Space #\Tab)
+                                  (subseq s (length want)))))))))))
 
 (defun %math-drawer-lines (v n i)
   "(OPEN . CLOSE) line indices of the property drawer belonging to the heading on
@@ -231,11 +252,18 @@ answer is NIL rather than a drawer that swallows the rest of the document."
 An alist and not a plist: the names come out of a file and are therefore
 strings, and `assoc' with `string-equal' is the case-insensitive lookup org
 promises. Interning them as keywords would put every typo in a generated file
-into the image's symbol table forever."
+into the image's symbol table forever.
+
+The whole drawer line is decoded before it is split, rather than the value
+afterwards. One call instead of one per property, and it leaves the name and the
+value in the same index space as the `position' that separated them — a value
+decoded after the split would be right and a name decoded nowhere would be a
+second rule to remember. Values are why it matters: a property is free text a
+generator wrote, and `%math-page-problem' puts one straight in a `run'."
   (let ((d (%math-drawer-lines v n i)))
     (when d
       (loop for j from (1+ (car d)) below (cdr d)
-            for trimmed = (%math-trim (first (aref v j)))
+            for trimmed = (utf8-text (%math-trim (first (aref v j))))
             for colon = (and (> (length trimmed) 1)
                              (char= (char trimmed 0) #\:)
                              (position #\: trimmed :start 1))
@@ -278,7 +306,13 @@ the quadratic walk the obvious version does on a flat document."
                          (next (find-if (lambda (e) (<= (cdr e) level)) rest))
                          (last (max i (if next (1- (car next)) (1- n)))))
                     (list :level level
-                          :title (%math-trim (subseq (first line) level))
+                          ;; Decoded, like every other piece of *text* in a
+                          ;; plist here: a title is prose and `math-units'
+                          ;; hands it to whatever draws a curriculum. LEVEL is
+                          ;; a count of leading stars, so the SUBSEQ still
+                          ;; starts on a character boundary.
+                          :title (utf8-text
+                                  (%math-trim (subseq (first line) level)))
                           :begin (second line)
                           :head-end (third line)
                           :end (third (aref v last))

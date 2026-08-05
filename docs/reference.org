@@ -445,9 +445,10 @@ Two things to get right when calling it:
   UTF-8 *byte* — the convention =docs/threading.org= writes up and the reason
   =%char-index= exists — and handing that over unchanged makes the parser count a
   longer string than the buffer holds, so every run after the first accented
-  character lands a byte or two to the right. =%org-frozen-text= in
-  =runtime/modes/org-frozen.lisp= is the decoder, and the note above it is where
-  the whole story is written down.
+  character lands a byte or two to the right. =utf8-text= in
+  =runtime/modes/modes.lisp= is the decoder — every mode file and every mode test
+  loads that file, which is why it lives there — and its docstring is where the
+  whole story is written down.
 
 The image is rasterised to match the text it sits in and placed against the
 *baseline*, so =$x_1$= hangs below the line the way a descender does. A fragment
@@ -934,6 +935,27 @@ not to be a prefix all clear it without Lisp being called at all. And it is not 
 prompt, deliberately — a prompt would swallow the next keystroke, which is the
 one which-key exists to help you aim.
 
+** The completion popup at point
+
+=completion-show= and =completion-row= are the same mechanism anchored to the
+*document* rather than to the frame: a box of candidates hanging off the caret.
+=(completion-show AT INDEX)= says where it goes and which row is lit, no argument
+takes it down; =(completion-row TEXT)= appends a candidate and =(completion-row)=
+empties the list. Rows survive a re-=show= at the same =AT= and are dropped when it
+moves, so cycling the selection is one call rather than one per candidate.
+
+The editor retires it the same way it retires which-key, and =(completion-at)= is
+how you find out: it answers the anchor of the popup that is *on screen*, and NIL
+once point has left the word, Insert mode has ended, or the cursor has moved to
+another line. Ask it before inserting a candidate — the image cannot see a
+keystroke resolve, so what you last set and what the user can see are different
+questions.
+
+=runtime/lsp.lisp= is the shipped consumer (=textDocument/completion=, bound to
+=C-n= / =C-p= / =C-y= / =C-e= in Insert mode), and it is only a consumer: nothing in
+these three forms knows what a language server is, so a completion source over
+the buffer's own words, or over a REPL's symbols, is Lisp and nothing else.
+
 #+begin_src lisp
 (where-is "find-file")
 ;; => (("normal" "SPC f f" "find-file") ...)  — one row per mode it is bound in
@@ -1038,7 +1060,8 @@ reply and stays in the table. =(clrhash *prompt-continuations*)= is the sweep.
 |-------------------------------------+---+-------------------------------------------|
 | =(dashboard-banner text)=             | P | The centred banner. Plain text; newlines allowed. |
 | =(clear-dashboard-items)=             | P | Empty the item list.                      |
-| =(dashboard-item key label action)=   | P | Add one. =key= may be =#\f= or ="f"=.          |
+| =(%dashboard-item key label action hint)= | P | Add one. =key= may be =#\f= or ="f"=. =hint= is the key sequence printed dim on the right; =NIL= for none. |
+| =(dashboard-item key label action &optional hint)= | L | The one to call. Defaults =hint= to the leader sequence bound to =action=. |
 | =(show-dashboard)=                    | P | Show it.                                  |
 
 =action= is a command string, exactly as in =define-key=.
@@ -1061,6 +1084,7 @@ Every setting now has both halves. Writers are primitives, readers are readers.
 | =(set-background r g b)=                | =(background)= → =(R G B)=      | Components 0.0–1.0, clamped.      |
 | =(set-foreground r g b)=                | =(foreground)= → =(R G B)=      | Also sets the =default= face.       |
 | =(set-syntax-color face r g b)=         | =(syntax-color face)=         | =NIL= for an unknown face.          |
+| =(set-face-style face bold italic)=     | —                           | Weight and slant for the same face. No reader: nothing has needed one. |
 | —                                     | =(face-list)=                 | The whole closed vocabulary.      |
 | =(set-line-numbers on)=                 | =(line-numbers-p)=            | Whether the gutter is drawn.      |
 | =(set-relative-line-numbers on)=        | =(relative-line-numbers-p)=   | Count from the cursor, in *visual* rows — Emacs' =display-line-numbers-type 'visual=. Orthogonal to whether the gutter is drawn at all. |
@@ -1072,6 +1096,10 @@ Every setting now has both halves. Writers are primitives, readers are readers.
 | =(set-modeline-pad n)=                  | =(modeline-pad)=              | Pixels. Clamped 0–64.             |
 
 Anything =NIL= is false and only =NIL= is false, as in Lisp.
+
+The two face writers are almost always wanted together, so =init.lisp= defines
+=(set-face name rgb &key bold italic)= over them — a =defun=, not a third primitive.
+That is the whole reason the editor learned only one new verb for weight.
 
 The faces are one closed set shared by syntax highlighting, the modeline, org
 markup, dired and magit:
@@ -1270,6 +1298,9 @@ would be aliases for the one that already is the clipboard.
 | =(messages &optional n)= | R | The last =n= messages, or all of them. Capped at 500.  |
 | =(status)=          | R | What the status line last said.                          |
 | =(which-key-row &optional row)= | H | Append one ="KEY LABEL"= row to the which-key panel; no argument empties it. |
+| =(completion-show &optional at index)= | H | Put the in-buffer completion popup at offset =at= with row =index= lit; no argument takes it down. |
+| =(completion-row &optional row)= | H | Append one candidate; no argument empties the list. |
+| =(completion-at)=   | R | Where the *live* popup is anchored, or NIL.              |
 | =(quit)=            | P | Quit the editor.                                         |
 
 =message= takes a string, so =format= does the work:

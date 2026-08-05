@@ -29,10 +29,27 @@
 ;;;;   tiated foreground is the exact complaint a theme is here to answer, so it
 ;;;;   borrows Modus' `identifier' colour.
 ;;;; * `heading-1' — Modus' `fg-heading-1' is `fg-main' and leans on bold weight
-;;;;   to carry the level. zemacs opens one font face and has no bold, so its
-;;;;   three heading levels take Modus' three *coloured* ones: 0, 2 and 3.
-;;;; * `bold' and `italic' — the same problem. They take the colours Modus gives
-;;;;   the nearest thing it does colour, `fg-prose-verbatim' and `docstring'.
+;;;;   to carry the level. zemacs has the weight now, so the headings below take
+;;;;   it; they keep Modus' three *coloured* levels — 0, 2 and 3 — rather than
+;;;;   `fg-main', because zemacs has one heading size and hue is the only thing
+;;;;   left to rank three levels with once they are all bold.
+;;;; * `bold' and `italic' — these used to be colours standing in for weight and
+;;;;   slant, the renderer having neither. It has both, so they carry both, and
+;;;;   they keep the colours Modus gives the nearest thing it does colour,
+;;;;   `fg-prose-verbatim' and `docstring'.
+;;;;
+;;;; Nothing else in this file is bold, and that is faithful rather than lazy:
+;;;; `modus-themes-bold-constructs' and `modus-themes-italic-constructs' both
+;;;; default to nil upstream. Modus carries meaning in hue at AAA contrast and
+;;;; deliberately does not shout — which on a white ground matters more than it
+;;;; does on a dark one, since bold black text is the heaviest thing a light
+;;;; theme can put on a screen.
+;;;;
+;;;; What you actually see may still be heavier, because `*bold-constructs*' in
+;;;; init.lisp is applied on top of whichever theme is loaded and bolds
+;;;; keywords, functions and types by default. Set it to NIL for this theme as
+;;;; Protesilaos published it — and this is the theme most worth doing that for,
+;;;; for the reason in the paragraph above.
 
 (in-package :zemacs)
 
@@ -63,8 +80,11 @@
   (apply #'set-background bg-main)
   (apply #'set-foreground fg-main)
 
-  ;; All 22 of them. Anything skipped keeps the last theme's colour.
-  (flet ((face (name rgb) (apply #'set-syntax-color name rgb)))
+  ;; All 22 of them. Anything skipped keeps the last theme's colour *and
+  ;; weight*, which is the half that bites: an unset face inheriting a bold from
+  ;; the theme before it looks like a highlighter bug, not a missing line.
+  (flet ((face (name rgb &key bold italic)
+           (set-face name rgb :bold bold :italic italic)))
     (face "default"           fg-main)                ; #000000  Modus `fg-main'
     (face "keyword"           magenta-cooler)         ; #531ab6  Modus `keyword'
     (face "function"          magenta)                ; #721045  Modus `fnname'
@@ -76,11 +96,11 @@
     (face "variable"          cyan)                   ; #005e8b  Modus `variable'
     (face "operator"          fg-main)                ; #000000  Modus `operator'
     (face "punctuation"       fg-main)                ; #000000  Modus `punctuation'
-    (face "heading-1"         cyan-cooler)            ; #005f5f  Modus `fg-heading-0'
-    (face "heading-2"         yellow-faint)           ; #624416  Modus `fg-heading-2'
-    (face "heading-3"         fg-alt)                 ; #193668  Modus `fg-heading-3'
-    (face "bold"              magenta-warmer)         ; #8f0075  Modus `fg-prose-verbatim'
-    (face "italic"            green-faint)            ; #2a5045  Modus `docstring'
+    (face "heading-1"         cyan-cooler   :bold t)  ; #005f5f  Modus `fg-heading-0'
+    (face "heading-2"         yellow-faint  :bold t)  ; #624416  Modus `fg-heading-2'
+    (face "heading-3"         fg-alt        :bold t)  ; #193668  Modus `fg-heading-3'
+    (face "bold"              magenta-warmer :bold t) ; #8f0075  Modus `fg-prose-verbatim'
+    (face "italic"            green-faint :italic t)  ; #2a5045  Modus `docstring'
     (face "link"              blue-warmer)            ; #3548cf  Modus `fg-link'
     (face "code"              cyan-cooler)            ; #005f5f  Modus `fg-prose-code'
     (face "markup"            fg-dim)                 ; #595959  Modus `prose-metadata'

@@ -72,6 +72,35 @@ impl PromptKind {
             _ => true,
         }
     }
+
+    /// True when the text is a *query over the candidates* and nothing else, so
+    /// splitting it on spaces into components that each match on their own, in
+    /// any order — orderless — narrows the list rather than changing what was
+    /// asked for.
+    ///
+    /// False wherever the text is a payload something else reads back whole: `:`
+    /// is parsed as an ex command, `/` becomes `last_search`, `Grep` is a regex
+    /// handed to ripgrep, `Confirm` is compared against the word `yes`, and a
+    /// `read-string` answer is prose on its way to a Lisp continuation. A space
+    /// in any of those is content, not a separator.
+    ///
+    /// Stated by what the text *is* rather than by whether a candidate list
+    /// happens to be empty, because most of those kinds open with no items and
+    /// that is not the reason: `read-string` is one
+    /// [`crate::EditorCommand::PromptItem`] away from having a list, and it
+    /// would still be answering with a sentence.
+    fn orderless(self) -> bool {
+        match self {
+            PromptKind::Ex | PromptKind::Search | PromptKind::Grep | PromptKind::Confirm => false,
+            // `read-string` is prose; `completing-read` is a picker.
+            PromptKind::Lisp { completing, .. } => completing,
+            // `Line` is in the yes half, which is worth saying out loud: a
+            // consult-line query is a filter and only a filter — the jump goes
+            // by candidate *index*, and the text is never searched with — so
+            // there is nothing for a space to be literal to.
+            _ => true,
+        }
+    }
 }
 
 /// Where the renderer should draw a completing prompt.
@@ -184,18 +213,20 @@ impl Prompt {
     pub fn refilter(&mut self) {
         // A grep prompt's candidates were matched by ripgrep, against the same
         // pattern and with a far better matcher than this one. Filtering them
-        // again drops real hits: `fn main` is not a subsequence of a line
-        // holding `fn  main`, and a regex is not a subsequence of anything.
+        // again drops real hits: the pattern is a regex, and a regex is not a
+        // subsequence of anything — nor is it a list of words, so orderless
+        // does not rescue it either.
         if self.kind == PromptKind::Grep {
             self.matches = (0..self.items.len()).collect();
             self.selected = 0;
             return;
         }
+        let orderless = self.kind.orderless();
         let mut scored: Vec<(u32, usize)> = self
             .items
             .iter()
             .enumerate()
-            .filter_map(|(i, item)| score(&self.text, item).map(|s| (s, i)))
+            .filter_map(|(i, item)| score(&self.text, item, orderless).map(|s| (s, i)))
             .collect();
         // Best score first, then original order so equal matches stay stable.
         scored.sort_by_key(|&(s, i)| (std::cmp::Reverse(s), i));
@@ -244,7 +275,7 @@ impl Prompt {
     /// gave, which is what a hand-written list means; the first keystroke
     /// re-ranks properly.
     pub fn push_item(&mut self, item: String) {
-        if score(&self.text, &item).is_some() {
+        if score(&self.text, &item, self.kind.orderless()).is_some() {
             self.matches.push(self.items.len());
         }
         self.items.push(item);
@@ -295,14 +326,50 @@ impl Prompt {
     }
 }
 
+/// Score `haystack` against a whole query — what the filter actually asks for.
+///
+/// With `orderless`, the query is split on spaces and every component has to
+/// match the candidate on its own, in whatever order they were typed. That is
+/// what makes `fn main` find `pub fn main` and `buffer switch` find
+/// `switch-to-buffer`, neither of which is a subsequence of the query as one
+/// string.
+///
+/// Scores add rather than being taken best-of, so a candidate that matches each
+/// component at a word boundary still outranks one that scrapes each of them
+/// together — the existing ranking survives, it just runs several times. Every
+/// candidate is scored against the same number of components, so the totals
+/// stay comparable.
+///
+/// Components are matched against the whole candidate rather than against what
+/// is left after the previous one. Consuming the match would put them back in
+/// order, which is the thing being removed. The price is that `fn fn` is
+/// satisfied by a line holding one `fn` — orderless pays it too.
+// ponytail: no way to escape a space, so a completing prompt cannot look for
+// one. Orderless spells it `\ `; add that when a candidate set with spaces in
+// it makes the ceiling hurt.
+fn score(needle: &str, haystack: &str, orderless: bool) -> Option<u32> {
+    // Lowered once per candidate, not once per component — a `consult-line`
+    // prompt runs this over every line in the buffer on every keystroke.
+    let hay: Vec<char> = haystack.chars().flat_map(char::to_lowercase).collect();
+    if !orderless {
+        return subsequence(needle, &hay);
+    }
+    // No components at all — nothing typed, or nothing but spaces — matches
+    // everything, which is what an empty needle already meant.
+    let mut total = 0;
+    for part in needle.split_whitespace() {
+        total += subsequence(part, &hay)?;
+    }
+    Some(total)
+}
+
 /// Case-insensitive subsequence match, scored so that better matches sort
 /// first: a prefix beats a word-boundary hit, which beats a scattered one.
-/// `None` means no match at all.
-fn score(needle: &str, haystack: &str) -> Option<u32> {
+/// `None` means no match at all. `hay` arrives lowercased — see [`score`].
+fn subsequence(needle: &str, hay: &[char]) -> Option<u32> {
     if needle.is_empty() {
         return Some(0);
     }
-    let hay: Vec<char> = haystack.chars().flat_map(char::to_lowercase).collect();
     let mut score = 0;
     let mut at = 0;
     for want in needle.chars().flat_map(char::to_lowercase) {
@@ -354,6 +421,95 @@ mod tests {
         p.text = "sb".into();
         p.refilter();
         assert_eq!(p.current(), Some("switch-buffer"));
+    }
+
+    #[test]
+    fn every_space_separated_component_has_to_match() {
+        let mut p = prompt(&["find-file", "find-file-other-window", "save-buffer"]);
+        p.text = "file window".into();
+        p.refilter();
+        assert_eq!(p.matches.len(), 1);
+        assert_eq!(p.current(), Some("find-file-other-window"));
+    }
+
+    #[test]
+    fn components_match_in_any_order() {
+        // The point of orderless: `buffer switch` is not a subsequence of
+        // `switch-to-buffer` as one string, and has to be one as two.
+        let mut p = prompt(&["switch-to-buffer", "save-buffer"]);
+        p.text = "buffer switch".into();
+        p.refilter();
+        assert_eq!(p.matches.len(), 1);
+        assert_eq!(p.current(), Some("switch-to-buffer"));
+    }
+
+    #[test]
+    fn one_component_that_misses_rejects_the_candidate() {
+        let mut p = prompt(&["switch-to-buffer"]);
+        p.text = "switch zzz".into();
+        p.refilter();
+        assert!(p.matches.is_empty());
+        // and Enter still acts on what was typed
+        assert_eq!(p.value(), "switch zzz");
+    }
+
+    #[test]
+    fn a_half_typed_second_word_does_not_empty_the_list() {
+        // Every space is a keystroke someone is in the middle of. A list that
+        // blanked on the space and came back on the next letter would read as a
+        // flicker, and there is no candidate with a literal space to lose.
+        let mut p = prompt(&["find-file"]);
+        p.text = "find ".into();
+        p.refilter();
+        assert_eq!(p.matches.len(), 1);
+    }
+
+    #[test]
+    fn a_consult_line_query_splits_because_it_is_only_a_filter() {
+        let mut p = Prompt::new(
+            PromptKind::Line,
+            "Line: ",
+            vec![
+                "1  pub fn main() {".to_string(),
+                "2  let x = 1;".to_string(),
+            ],
+        );
+        p.text = "main fn".into();
+        p.refilter();
+        assert_eq!(p.matches.len(), 1);
+        // and the item index is still the line number, which is what the jump
+        // goes by — splitting the text changed nothing about that
+        assert_eq!(p.matches[0], 0);
+    }
+
+    #[test]
+    fn a_read_string_keeps_its_spaces_but_a_completing_read_splits_them() {
+        // `read-string` hands the text back to Lisp verbatim, so a space in it
+        // is part of the answer. Items can still arrive — `PromptItem` does not
+        // ask whether the prompt completes — and they get the literal.
+        let mut read = Prompt::new(
+            PromptKind::Lisp {
+                id: 1,
+                completing: false,
+            },
+            "Name: ",
+            Vec::new(),
+        );
+        read.text = "main fn".into();
+        read.push_item("pub fn main() {".to_string());
+        assert!(read.matches.is_empty());
+
+        let mut pick = Prompt::new(
+            PromptKind::Lisp {
+                id: 2,
+                completing: true,
+            },
+            "Pick: ",
+            Vec::new(),
+        );
+        pick.text = "main fn".into();
+        pick.push_item("pub fn main() {".to_string());
+        assert_eq!(pick.matches.len(), 1);
     }
 
     #[test]

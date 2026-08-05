@@ -88,11 +88,15 @@ fn init_lisp_drives_editor_commands() {
 (set-background 0.1 0.2 0.3)
 (set-line-numbers nil)
 (set-syntax-color "keyword" 1.0 0.0 0.0)
+(set-face-style "keyword" 'yes nil)
 (set-completion-style "center")
 (set-modeline-relief -3)
 (set-modeline-pad 12)
-(dashboard-item #\f "Find file" "find-file")
-(dashboard-item "q" "Quit" "quit")
+;; The primitive, not the `dashboard-item' defined over it in the shipped
+;; init.lisp — this test writes its own config, so only the host's own symbols
+;; are in scope here.
+(%dashboard-item #\f "Find file" "find-file" "SPC f f")
+(%dashboard-item "q" "Quit" "quit" nil)
 (define-key "normal" "SPC f f" "find-file")
 (save-file)
 (message (format nil "hello from ~a" (lisp-implementation-type)))
@@ -122,6 +126,17 @@ fn init_lisp_drives_editor_commands() {
     wait(&shared, "SetSyntaxColor", |ed| {
         (ed.theme.color(zemacs_core::HlKind::Keyword, [0.0; 3]) == [1.0, 0.0, 0.0]).then_some(())
     });
+    // The colour and the weight are two primitives and two commands, and the
+    // face has to end up carrying both. `'yes` rather than `T` on purpose: the
+    // argument is a *generalised* boolean, so the C side must test for ECL_NIL
+    // and not for T, exactly as `set-line-numbers` does above.
+    wait(&shared, "SetFaceStyle", |ed| {
+        let want = zemacs_core::FaceStyle {
+            bold: true,
+            italic: false,
+        };
+        (ed.theme.style(zemacs_core::HlKind::Keyword) == want).then_some(())
+    });
     wait(&shared, "SetCompletionStyle", |ed| {
         (ed.settings.completion_style == zemacs_core::CompletionStyle::Center).then_some(())
     });
@@ -139,9 +154,27 @@ fn init_lisp_drives_editor_commands() {
     wait(&shared, "dashboard items", |ed| {
         let items = &ed.dashboard.items;
         (items.iter().any(|i| {
-            i.key == 'f' && i.label == "Find file" && i.action == "find-file"
+            i.key == 'f'
+                && i.label == "Find file"
+                && i.action == "find-file"
+                && i.hint == "SPC f f"
         }) && items.iter().any(|i| i.key == 'q'))
         .then_some(())
+    });
+    // NIL for the hint has to arrive as *nothing*, not as the three characters
+    // "NIL" — which is what a PRINC of it would give, and which the dashboard
+    // would then set flush right as if it were a keybinding.
+    //
+    // `any` and not `find`: this config never calls `clear-dashboard-items`, so
+    // the built-in rows are still there and the first `q` in the list is the
+    // default one, which has a hint. Asserting on it is how this test passed
+    // while proving nothing.
+    wait(&shared, "a NIL hint is empty", |ed| {
+        ed.dashboard
+            .items
+            .iter()
+            .any(|i| i.key == 'q' && i.hint.is_empty())
+            .then_some(())
     });
 
     // --- keymap ---
@@ -226,6 +259,30 @@ fn init_lisp_drives_editor_commands() {
     );
     // The config sets a banner at all.
     assert!(!shared.lock().unwrap().dashboard.banner.is_empty());
+
+    // ...and the theme it loads has to have *applied*, which loading cleanly
+    // does not prove: `load-theme` reports a theme it cannot use with `message`
+    // and carries on, so a config that names a broken one boots to the fallback
+    // palette with a line in the log and no other symptom. That is exactly what
+    // an editor binary older than `set-face-style` did — every theme file died
+    // on its first face and the screen kept whatever colours it already had.
+    //
+    // Two assertions because they fail for different reasons. The colour moving
+    // off the red set earlier in this test says the theme file was read and
+    // reached the editor. The weight says `*bold-constructs*` ran over it
+    // afterwards, and the slant that it did so without straightening a face the
+    // theme had deliberately slanted — Tokyo Night's keywords are italic, and
+    // re-asserting weight is the one operation that can quietly undo that.
+    wait(&shared, "the shipped theme applied", |ed| {
+        let kw = zemacs_core::HlKind::Keyword;
+        (ed.theme.color(kw, [0.0; 3]) != [1.0, 0.0, 0.0]).then_some(())
+    });
+    {
+        let ed = shared.lock().unwrap();
+        let style = ed.theme.style(zemacs_core::HlKind::Keyword);
+        assert!(style.bold, "*bold-constructs* did not reach the keyword face");
+        assert!(style.italic, "re-asserting weight straightened an italic face");
+    }
 
     // NOT asserted here, because it is not true: a non-ASCII string in a form
     // handed to `zemacs_eval` does *not* survive to the editor. It arrives as a

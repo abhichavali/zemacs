@@ -115,6 +115,40 @@ pub struct Window {
     /// thing core can reason about, and `0` means "nothing has drawn this window
     /// yet", which every reader treats as "no wrapping".
     pub wrap_cols: usize,
+    /// Magnification for *this pane*, as a percentage of the body size — one of
+    /// [`ZOOM_STEPS`], and 100 for a window nobody has zoomed.
+    ///
+    /// Per window and not per frame, because the reason to magnify is a
+    /// *document* rather than a display: reading a paper beside the code you are
+    /// writing about it wants one pane larger and the other exactly as it was.
+    ///
+    /// It rides *on top of* `settings.font_size`, which stays the size of text
+    /// everywhere — a window's zoom is a multiplier, so a config that sets a
+    /// font size still sets it and every unzoomed pane still obeys it.
+    ///
+    /// A percentage from a fixed set rather than a free point size, for the same
+    /// reason the renderer's `SCALE_STEPS` is a fixed set: the face cache is
+    /// keyed by size and its bound *is* the number of sizes that can exist.
+    /// These are those same four steps, so a zoomed window opens no face a
+    /// heading had not already opened.
+    pub zoom: u16,
+}
+
+/// The magnifications a window may be at, as percentages of the body size.
+///
+/// Deliberately the same list as the renderer's `SCALE_STEPS`, and the two have
+/// to stay equal: every entry here is a font size the face cache must be able to
+/// hold, and that cache is bounded by exactly that list's length.
+pub const ZOOM_STEPS: [u16; 4] = [100, 125, 150, 200];
+
+/// The step `by` places from `zoom`, clamped to the ends of [`ZOOM_STEPS`].
+///
+/// Clamped rather than wrapped: pressing `M--` at the smallest size should do
+/// nothing, not jump to the largest.
+pub fn zoom_step(zoom: u16, by: i32) -> u16 {
+    let at = ZOOM_STEPS.iter().position(|&z| z == zoom).unwrap_or(0) as i32;
+    let want = (at + by).clamp(0, ZOOM_STEPS.len() as i32 - 1) as usize;
+    ZOOM_STEPS[want]
 }
 
 /// An OS window holding a tree of editor windows.
@@ -135,6 +169,7 @@ impl Frame {
                 scroll: 0,
                 viewport_lines: 24,
                 wrap_cols: 0,
+                zoom: 100,
             }],
             layout: Layout::Leaf(0),
             current: 0,
@@ -175,6 +210,9 @@ impl Frame {
             scroll: current.scroll,
             viewport_lines: current.viewport_lines,
             wrap_cols: current.wrap_cols,
+            // A split inherits the zoom, so `C-<ret>` beside a magnified pane
+            // gives you two of that size rather than one of each.
+            zoom: current.zoom,
         });
         replace_leaf(&mut self.layout, current.id, |leaf| Layout::Split {
             dir,
@@ -597,5 +635,35 @@ mod tests {
                 assert!(p.rect.w >= 0 && p.rect.h >= 0, "{:?} from {area:?}", p.rect);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    /// Clamped at both ends rather than wrapped: `M--` at the smallest size
+    /// should do nothing, not jump to the largest.
+    #[test]
+    fn zoom_steps_through_the_set_and_stops_at_its_ends() {
+        assert_eq!(zoom_step(100, 1), 125);
+        assert_eq!(zoom_step(125, 1), 150);
+        assert_eq!(zoom_step(150, 1), 200);
+        assert_eq!(zoom_step(200, 1), 200, "no wrap at the top");
+        assert_eq!(zoom_step(200, -1), 150);
+        assert_eq!(zoom_step(100, -1), 100, "nor at the bottom");
+        // A value from nowhere — a config writing the field by hand — reads as
+        // the first step rather than panicking on a missing index.
+        assert_eq!(zoom_step(137, 1), 125);
+    }
+
+    /// A split inherits the zoom, so `C-<ret>` beside a magnified pane gives
+    /// two of that size rather than one of each.
+    #[test]
+    fn a_split_inherits_the_zoom() {
+        let mut f = Frame::new(0);
+        f.current_window_mut().zoom = 150;
+        let id = f.split(Split::Columns);
+        assert_eq!(f.window(id).unwrap().zoom, 150);
     }
 }

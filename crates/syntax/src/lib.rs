@@ -1,12 +1,9 @@
 //! zemacs-syntax — tree-sitter highlighting, flattened into [`zemacs_core::Span`].
 //!
 //! The whole crate is three functions ([`language_for_path`], [`highlight`],
-//! [`languages`]) over one idea: `tree-sitter-highlight` already knows how to
-//! run a grammar's `highlights.scm` and stream a stack of nested highlight
-//! events, so we only have to (a) tell it which capture names we recognize,
-//! (b) flatten its event stream to the innermost highlight per byte run, and
-//! (c) convert byte offsets to char offsets, which is what the rope and the
-//! renderer index by.
+//! [`languages`]) over one idea: run a grammar's `highlights.scm` over a parse
+//! tree, keep the innermost capture covering each byte, and convert byte
+//! offsets to char offsets, which is what the rope and the renderer index by.
 //!
 //! The exception is org, which has no grammar we can use (see [`org`]) and is
 //! scanned by hand, a line at a time, straight into char offsets.
@@ -16,15 +13,22 @@
 //! * **Never fail loudly.** An unknown language, a query that won't compile, a
 //!   grammar that panics on garbage input — all of it degrades to "no spans",
 //!   i.e. plain text. Bad highlighting must never take the editor down.
-//! * **Build each `HighlightConfiguration` once.** Compiling a query is
-//!   milliseconds; `highlight` runs on every buffer revision.
+//! * **Build each [`Query`] once.** Compiling a query is milliseconds;
+//!   highlighting runs on every buffer revision.
 //! * A grammar that will not compile against our `tree-sitter` version is
 //!   dropped rather than pinning the workspace backwards.
 //!
-//! ponytail: full reparse of the whole buffer per revision. The ceiling is
-//! roughly "files you can still scroll comfortably" — a few hundred KB. Past
-//! that, keep the `Tree` per buffer and feed it to `Parser::parse` as the old
-//! tree, and only re-run the query over the changed ranges.
+//! # Why this stopped using `tree-sitter-highlight`
+//!
+//! That crate parses the whole source on every call and offers no way to hand
+//! it a tree — the `Tree` it builds lives inside its iterator and dies with it.
+//! Incremental reparsing is the one optimisation that matters here, and it is
+//! unreachable through that API, so [`spans`] below does the flattening
+//! instead. With no injection and no locals query — which is what this crate
+//! configured either way, "lexical color only" — the algorithm it replaces
+//! reduces to three rules, all of them in [`spans`]: captures arrive in tree
+//! order, the last capture on a node wins, and a capture nested inside another
+//! covers it for as long as it lasts.
 
 mod org;
 
@@ -35,8 +39,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
-use zemacs_core::{HlKind, Span};
+use tree_sitter::{
+    InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
+};
+use zemacs_core::{BufferId, Change, HlKind, Span};
 
 /// The capture names we recognize, and the [`HlKind`] each folds onto.
 ///
@@ -101,52 +107,91 @@ pub fn languages() -> &'static [&'static str] {
 /// non-overlapping, in **char** offsets. Unknown language or parse failure
 /// yields an empty `Vec`; runs with no highlight get no span at all, since the
 /// renderer paints uncovered text in the default color.
+///
+/// A full parse every time, which is what a caller with no document to name
+/// wants — a test, or anything holding a string rather than a buffer. Editing
+/// goes through [`Session`], which is the same code with a tree kept.
 pub fn highlight(lang: &str, text: &str) -> Vec<Span> {
-    if lang == "org" {
-        return org::highlight(text); // hand-rolled, already in char offsets
-    }
-    let Some(config) = config(lang) else {
-        return Vec::new();
-    };
-    // A `Highlighter` owns a `Parser`; one per thread, reused across calls.
+    // A `Parser` is worth reusing across calls and cannot cross threads
+    // safely, which is exactly what a thread-local is for.
     thread_local! {
-        static HIGHLIGHTER: RefCell<Highlighter> = RefCell::new(Highlighter::new());
+        static ANON: RefCell<Session> = RefCell::new(Session::new());
     }
-    let mut spans = HIGHLIGHTER.with(|h| byte_spans(&mut h.borrow_mut(), config, text));
-    to_char_offsets(text, &mut spans);
-    spans
+    ANON.with(|s| s.borrow_mut().highlight(None, lang, text, None))
 }
 
-/// Flatten the highlight event stream into sorted, non-overlapping byte spans.
-fn byte_spans(hl: &mut Highlighter, config: &HighlightConfiguration, text: &str) -> Vec<Span> {
-    let Ok(events) = hl.highlight(config, text.as_bytes(), None, |_| None) else {
-        return Vec::new();
-    };
+/// Flatten a tree's captures into sorted, non-overlapping **byte** spans.
+///
+/// The three rules, in order of appearance below:
+///
+/// * captures arrive in tree order, so a capture that starts at or after the
+///   top of the stack ends it;
+/// * every capture on one *node* collapses to the last of them, because the
+///   query's later patterns are its more specific ones — and a last capture
+///   that maps to no [`HlKind`] means the node gets nothing, rather than
+///   falling back to the earlier pattern that did;
+/// * a node's range is either disjoint from or wholly inside every earlier
+///   one — they came out of a tree — so a stack is enough to know which
+///   highlight is innermost, and no interval arithmetic is needed.
+fn spans(config: &Config, cursor: &mut QueryCursor, tree: &Tree, text: &str) -> Vec<Span> {
+    // Read out before flattening rather than streamed, because deciding what a
+    // node's highlight is means looking at the capture *after* it, and the
+    // query cursor is a streaming iterator that cannot be peeked. One `usize`
+    // quadruple per capture is a few MB on the largest file anyone edits here
+    // and it is freed on the way out.
+    let mut caps: Vec<(usize, usize, usize, u32)> = Vec::new();
+    let mut it = cursor.captures(&config.query, tree.root_node(), text.as_bytes());
+    while let Some((m, i)) = it.next() {
+        let capture = m.captures[*i];
+        let range = capture.node.byte_range();
+        caps.push((capture.node.id(), range.start, range.end, capture.index));
+    }
+
     let mut out: Vec<Span> = Vec::new();
-    // `Source` events are already in order and disjoint; the top of the stack is
-    // the innermost (most recent) highlight covering them.
-    let mut stack: Vec<HlKind> = Vec::new();
-    for event in events {
-        match event {
-            Ok(HighlightEvent::HighlightStart(h)) => stack.push(CAPTURES[h.0].1),
-            Ok(HighlightEvent::HighlightEnd) => {
-                stack.pop();
-            }
-            Ok(HighlightEvent::Source { start, end }) => {
-                let (Some(&kind), true) = (stack.last(), start < end) else {
-                    continue;
-                };
-                match out.last_mut() {
-                    // The stream splits runs at every nesting change; glue the
-                    // pieces that ended up the same color back together.
-                    Some(last) if last.kind == kind && last.end == start => last.end = end,
-                    _ => out.push(Span { start, end, kind }),
-                }
-            }
-            Err(_) => return Vec::new(),
+    let mut stack: Vec<(usize, HlKind)> = Vec::new();
+    let mut at = 0usize;
+    let mut i = 0usize;
+    while i < caps.len() {
+        let (node, start, end, mut capture) = caps[i];
+        while i + 1 < caps.len() && caps[i + 1].0 == node {
+            i += 1;
+            capture = caps[i].3;
         }
+        i += 1;
+        while let Some(&(ends, _)) = stack.last() {
+            if ends > start {
+                break;
+            }
+            paint(&mut out, &mut at, ends, stack.last().map(|&(_, k)| k));
+            stack.pop();
+        }
+        let Some(kind) = config.kinds[capture as usize] else {
+            continue;
+        };
+        paint(&mut out, &mut at, start, stack.last().map(|&(_, k)| k));
+        stack.push((end, kind));
+    }
+    while let Some(&(ends, _)) = stack.last() {
+        paint(&mut out, &mut at, ends, stack.last().map(|&(_, k)| k));
+        stack.pop();
     }
     out
+}
+
+/// Colour `at..to` with whatever is innermost there, and move `at` up to it.
+fn paint(out: &mut Vec<Span>, at: &mut usize, to: usize, kind: Option<HlKind>) {
+    if to <= *at {
+        return;
+    }
+    if let Some(kind) = kind {
+        match out.last_mut() {
+            // Nesting splits a run at every boundary; glue the pieces that
+            // ended up the same colour back together.
+            Some(last) if last.kind == kind && last.end == *at => last.end = to,
+            _ => out.push(Span { start: *at, end: to, kind }),
+        }
+    }
+    *at = to;
 }
 
 /// Rewrite byte offsets to char offsets in place.
@@ -180,25 +225,62 @@ fn to_char_offsets(text: &str, spans: &mut [Span]) {
     }
 }
 
+/// A grammar, its highlight query, and what each of the query's captures
+/// paints. Immutable once built, which is what lets one live in a `static`.
+struct Config {
+    language: Language,
+    query: Query,
+    /// Indexed by capture id, so the hot path is an array read rather than a
+    /// string comparison per capture.
+    kinds: Vec<Option<HlKind>>,
+}
+
+/// Which [`HlKind`], if any, a query capture name paints.
+///
+/// The dot-separated prefix rule tree-sitter queries are written against:
+/// `function.macro` and `function.builtin` both land on `function`, longest
+/// recognised name wins, and ties go to the first in [`CAPTURES`]. A capture
+/// name absent from that list — `embedded`, `spell` — gets no highlight, which
+/// is how a grammar's query can carry captures we have no face for.
+fn kind_for(capture_name: &str) -> Option<HlKind> {
+    let parts: Vec<&str> = capture_name.split('.').collect();
+    let (mut best, mut best_len) = (None, 0);
+    for (name, kind) in CAPTURES {
+        let mut len = 0;
+        let mut matches = true;
+        for part in name.split('.') {
+            len += 1;
+            if !parts.contains(&part) {
+                matches = false;
+                break;
+            }
+        }
+        if matches && len > best_len {
+            best = Some(*kind);
+            best_len = len;
+        }
+    }
+    best
+}
+
 /// Every supported language's configuration, built once on first use.
 ///
 /// Building all of them together (rather than one `OnceLock` per language) costs
 /// a few milliseconds once and saves a pile of machinery. A grammar whose query
 /// fails to compile is simply left out of the map.
-fn config(lang: &str) -> Option<&'static HighlightConfiguration> {
-    static CACHE: OnceLock<HashMap<&'static str, HighlightConfiguration>> = OnceLock::new();
+fn config(lang: &str) -> Option<&'static Config> {
+    static CACHE: OnceLock<HashMap<&'static str, Config>> = OnceLock::new();
     CACHE.get_or_init(build_configs).get(lang)
 }
 
-fn build_configs() -> HashMap<&'static str, HighlightConfiguration> {
-    let names: Vec<&str> = CAPTURES.iter().map(|(n, _)| *n).collect();
+fn build_configs() -> HashMap<&'static str, Config> {
     let mut map = HashMap::new();
     let mut add = |id: &'static str, language: tree_sitter::Language, query: &str| {
-        // Injections and locals are deliberately empty: no embedded-language
+        // Only the highlights query is compiled: no embedded-language
         // highlighting, no local-variable resolution. Lexical color only.
-        if let Ok(mut config) = HighlightConfiguration::new(language, id, query, "", "") {
-            config.configure(&names);
-            map.insert(id, config);
+        if let Ok(query) = Query::new(&language, query) {
+            let kinds = query.capture_names().iter().map(|n| kind_for(n)).collect();
+            map.insert(id, Config { language, query, kinds });
         }
     };
 
@@ -240,14 +322,200 @@ fn build_configs() -> HashMap<&'static str, HighlightConfiguration> {
     map
 }
 
+// --- incremental parsing ---------------------------------------------------
+
+/// The tree one buffer was last parsed into, and the text it was parsed from.
+struct Parsed {
+    buffer: BufferId,
+    lang: String,
+    /// The *old* side of the next edit. Keeping it is not optional: a
+    /// [`Change`] is in character offsets, because every offset in this editor
+    /// is, and tree-sitter wants bytes and row/columns — neither of which can
+    /// be worked out from a character offset without the text it indexes.
+    ///
+    /// The translation lives here rather than in core for the same reason: it
+    /// is one consumer's coordinate system, and a core that recorded bytes
+    /// would be recording them for everyone else's benefit too, in the one
+    /// place a stray byte offset silently lies about an accented character.
+    text: String,
+    tree: Tree,
+}
+
+/// A parser that remembers, so a keystroke costs a reparse of what changed
+/// rather than of the file.
+///
+/// One document at a time, and that is deliberate: only the *live* buffer is
+/// ever highlighted — a parked one keeps the spans it had — so a second tree
+/// would only ever earn its memory across a buffer switch, and a switch already
+/// throws nothing away. The first parse after a switch is the full parse that
+/// used to happen on every keystroke.
+///
+/// ponytail: switching back and forth between two large files therefore
+/// reparses each time. The ceiling is a pair of files big enough for that to be
+/// felt, which is the same few hundred KB every other ceiling in this crate
+/// sits at; the upgrade is a small LRU of [`Parsed`] keyed by [`BufferId`],
+/// which is a `HashMap` and an eviction rule and no new idea.
+pub struct Session {
+    parser: Parser,
+    cursor: QueryCursor,
+    parsed: Option<Parsed>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Session {
+    pub fn new() -> Self {
+        Self {
+            parser: Parser::new(),
+            cursor: QueryCursor::new(),
+            parsed: None,
+        }
+    }
+
+    /// Highlight `text` as `lang`, reusing the tree from the previous call when
+    /// `edits` says exactly how this text differs from the one it was built
+    /// from.
+    ///
+    /// `buffer` names the document, and `None` means "do not keep this" — the
+    /// caller has a string rather than a buffer, so there is nothing a tree
+    /// could be reused for and no reason to hold a megabyte of it.
+    ///
+    /// `edits` is `None` for "assume nothing", which is the honest answer after
+    /// a buffer switch, after a language change, or when the reader fell behind
+    /// core's change log. It costs a full parse, which is what every parse used
+    /// to cost.
+    pub fn highlight(
+        &mut self,
+        buffer: Option<BufferId>,
+        lang: &str,
+        text: &str,
+        edits: Option<&[Change]>,
+    ) -> Vec<Span> {
+        if lang == "org" {
+            self.parsed = None; // hand-rolled scanner, no tree to keep
+            return org::highlight(text);
+        }
+        let Some(config) = config(lang) else {
+            self.parsed = None;
+            return Vec::new();
+        };
+        if self.parser.set_language(&config.language).is_err() {
+            self.parsed = None;
+            return Vec::new();
+        }
+        // A tree may only be reused for the same document in the same
+        // language, and only when the caller can say what happened in between.
+        // Anything else is a different text, and handing tree-sitter an old
+        // tree that does not describe it is the one way to get a *wrong* parse
+        // rather than a slow one.
+        let old = match self.parsed.take() {
+            Some(mut old) if Some(old.buffer) == buffer && old.lang == lang => {
+                edits.map(|edits| {
+                    // One `InputEdit` for the whole run rather than one each:
+                    // the intermediate texts are gone, and only the two ends
+                    // are here to convert offsets against. A wider edit than
+                    // strictly happened costs a wider reparse and nothing else.
+                    if let Some(change) = Change::coalesce(edits) {
+                        old.tree.edit(&input_edit(&old.text, text, change));
+                    }
+                    old.tree
+                })
+            }
+            _ => None,
+        };
+        let Some(tree) = self.parser.parse(text, old.as_ref()) else {
+            return Vec::new();
+        };
+        // ponytail: the *query* still runs over the whole tree, so this saves
+        // the parse and not the colouring. The parse is the part that grows
+        // superlinearly and the part that was measured; re-running the query
+        // only over `tree.changed_ranges(&old)` means keeping the previous
+        // spans and splicing the new ones into them, which is a second
+        // stateful thing to get wrong for a smaller win.
+        let mut out = spans(config, &mut self.cursor, &tree, text);
+        to_char_offsets(text, &mut out);
+        if let Some(buffer) = buffer {
+            self.parsed = Some(Parsed {
+                buffer,
+                lang: lang.to_string(),
+                text: text.to_string(),
+                tree,
+            });
+        }
+        out
+    }
+}
+
+/// A [`Change`] in the two shapes tree-sitter wants: byte offsets, and
+/// zero-based row/column where the column is *also* counted in bytes.
+///
+/// `start` is looked up in both texts and agrees in both — everything before it
+/// is identical by the record's own definition, and does for every record this
+/// editor produces. The earlier of the two is taken anyway, because a record
+/// that arrived from some *other* text clamps differently on each side, and the
+/// result must be a wider reparse rather than an edit whose start is past its
+/// own end, which is not an edit at all.
+fn input_edit(old: &str, new: &str, change: Change) -> InputEdit {
+    let [in_old, old_end] = locate(old, [change.start, change.old_end]);
+    let [in_new, new_end] = locate(new, [change.start, change.new_end]);
+    let start = in_old.min(in_new);
+    InputEdit {
+        start_byte: start.0,
+        old_end_byte: old_end.0,
+        new_end_byte: new_end.0,
+        start_position: start.1,
+        old_end_position: old_end.1,
+        new_end_position: new_end.1,
+    }
+}
+
+/// Byte offset and row/column of each character offset in `wanted`, which must
+/// be ascending, in one walk of `text`.
+///
+/// One walk and not one per offset: this runs on every keystroke, and the whole
+/// point of the exercise is to stop doing work proportional to the file. An
+/// offset past the end clamps to the end rather than panicking — the crate's
+/// "never fail loudly" rule, and cheap insurance against a record that arrived
+/// from a text this one is not.
+fn locate<const N: usize>(text: &str, wanted: [usize; N]) -> [(usize, Point); N] {
+    let mut out = [(0, Point { row: 0, column: 0 }); N];
+    let (mut byte, mut chars, mut row, mut line_start) = (0usize, 0usize, 0usize, 0usize);
+    let mut filled = 0;
+    let mut it = text.chars();
+    loop {
+        while filled < N && wanted[filled] <= chars {
+            out[filled] = (byte, Point { row, column: byte - line_start });
+            filled += 1;
+        }
+        if filled == N {
+            return out;
+        }
+        let Some(c) = it.next() else {
+            let end = (byte, Point { row, column: byte - line_start });
+            out[filled..].fill(end);
+            return out;
+        };
+        byte += c.len_utf8();
+        chars += 1;
+        if c == '\n' {
+            row += 1;
+            line_start = byte;
+        }
+    }
+}
+
 // --- background highlighting ---------------------------------------------
 
 /// A highlighting thread.
 ///
-/// Highlighting is a full reparse, which is the one job in the editor whose
-/// cost grows with the file and which the user must never wait on. So it runs
-/// off the UI thread: [`Worker::request`] hands over a snapshot and returns
-/// immediately, [`Worker::poll`] picks up whatever has finished.
+/// Parsing is the one job in the editor whose cost grows with the file and
+/// which the user must never wait on. So it runs off the UI thread:
+/// [`Worker::request`] hands over a snapshot and returns immediately,
+/// [`Worker::poll`] picks up whatever has finished.
 ///
 /// The queue is *coalescing*: a burst of keystrokes produces one parse of the
 /// newest text, not one parse per key. Without that, a fast typist outruns the
@@ -257,10 +525,41 @@ pub struct Worker {
     results: crossbeam_channel::Receiver<(u64, Vec<Span>)>,
 }
 
-struct Request {
-    revision: u64,
-    lang: String,
-    text: String,
+/// One buffer snapshot to highlight, and how it differs from the last one.
+pub struct Request {
+    /// What the editor's revision counter said when `text` was taken. Comes
+    /// back with the spans so a caller can drop an answer the buffer has
+    /// already moved past.
+    pub revision: u64,
+    /// Which document this is. The worker keeps one tree, and this is how it
+    /// knows the tree is not about some other file.
+    pub buffer: BufferId,
+    pub lang: String,
+    pub text: String,
+    /// Every edit between the *previous* request's text and this one, oldest
+    /// first, or `None` for "assume nothing".
+    pub edits: Option<Vec<Change>>,
+}
+
+/// Fold a request that is about to be dropped for a newer one into it.
+///
+/// Dropping the older request drops its `text`, which is stale and unwanted.
+/// It must **not** drop its `edits`: the tree the worker is holding predates
+/// both, so the newer request's edits alone would describe a jump the tree
+/// never took. A list with a hole in it is worse than no list, so a run that
+/// cannot be joined end to end — a different buffer, a different language, or
+/// either side already resigned — collapses to `None` and a full parse.
+fn coalesce_requests(old: Request, mut new: Request) -> Request {
+    new.edits = match (old.edits, new.edits) {
+        (Some(mut before), Some(after))
+            if old.buffer == new.buffer && old.lang == new.lang =>
+        {
+            before.extend(after);
+            Some(before)
+        }
+        _ => None,
+    };
+    new
 }
 
 /// Spawn the highlighting thread. It exits when the [`Worker`] is dropped.
@@ -270,12 +569,19 @@ pub fn spawn_worker() -> Worker {
     std::thread::Builder::new()
         .name("zemacs-syntax".into())
         .spawn(move || {
+            let mut session = Session::new();
             while let Ok(mut req) = req_rx.recv() {
                 // Everything queued behind the newest request is already stale.
                 while let Ok(newer) = req_rx.try_recv() {
-                    req = newer;
+                    req = coalesce_requests(req, newer);
                 }
-                if res_tx.send((req.revision, highlight(&req.lang, &req.text))).is_err() {
+                let spans = session.highlight(
+                    Some(req.buffer),
+                    &req.lang,
+                    &req.text,
+                    req.edits.as_deref(),
+                );
+                if res_tx.send((req.revision, spans)).is_err() {
                     break;
                 }
             }
@@ -289,12 +595,8 @@ pub fn spawn_worker() -> Worker {
 
 impl Worker {
     /// Queue a snapshot for highlighting. Never blocks.
-    pub fn request(&self, revision: u64, lang: &str, text: String) {
-        let _ = self.requests.send(Request {
-            revision,
-            lang: lang.to_string(),
-            text,
-        });
+    pub fn request(&self, req: Request) {
+        let _ = self.requests.send(req);
     }
 
     /// The most recent finished result, or `None`. Older results waiting behind
@@ -412,6 +714,166 @@ mod tests {
             highlight(lang, "");
             highlight(lang, "\u{e9}");
         }
+    }
+
+    // --- incremental parsing -----------------------------------------------
+
+    /// Type `insert` at char offset `at`, and report what the session says the
+    /// colours are afterwards. The one thing a caller must get right is the
+    /// [`Change`], so it is computed here the way core computes it.
+    fn typed(session: &mut Session, lang: &str, text: &str, at: usize, insert: &str) -> (String, Vec<Span>) {
+        let mut next: String = text.chars().take(at).collect();
+        next.push_str(insert);
+        next.extend(text.chars().skip(at));
+        let change = Change {
+            start: at,
+            old_end: at,
+            new_end: at + insert.chars().count(),
+        };
+        let spans = session.highlight(Some(1), lang, &next, Some(&[change]));
+        (next, spans)
+    }
+
+    /// The whole contract of the exercise: a tree fed the edit must colour the
+    /// text exactly as a tree built from scratch would. Anything less and the
+    /// speed is bought with wrong colours, which is worse than slow ones.
+    #[test]
+    fn an_incremental_parse_agrees_with_a_full_one() {
+        let mut session = Session::new();
+        let mut src = include_str!("lib.rs").to_string();
+        // Seed the session with the unedited file, so every edit below is a
+        // reuse rather than a first parse.
+        session.highlight(Some(1), "rust", &src, None);
+        for (at, insert) in [
+            (0, "// leading\n"),
+            (300, "\"a string\""),
+            (12, "\n"),
+            (1000, "fn added() {}\n"),
+            // an edit that opens a comment and therefore recolours what
+            // follows it — the case a naive "reparse the changed line" gets
+            // wrong and an `InputEdit` gets right
+            (2000, "/*"),
+            (2100, "*/"),
+        ] {
+            let at = at.min(src.chars().count());
+            let (next, incremental) = typed(&mut session, "rust", &src, at, insert);
+            assert_eq!(
+                incremental,
+                highlight("rust", &next),
+                "inserting {insert:?} at {at} disagreed with a full parse"
+            );
+            src = next;
+        }
+    }
+
+    /// Deletions and replacements, not only insertions — `old_end > start` is
+    /// the half of the record that a byte/char mix-up destroys, and non-ASCII
+    /// text is where it shows.
+    #[test]
+    fn an_incremental_parse_survives_deletions_and_non_ascii_text() {
+        let mut session = Session::new();
+        let src = "let s = \"héllo ▸ wörld\"; // café\nfn f() { g(); }\n";
+        session.highlight(Some(2), "rust", src, None);
+        // Delete the comment, whose `//` is nine characters past a run of
+        // multi-byte ones: a record read as bytes would cut the wrong text.
+        let comment_at = src.chars().position(|c| c == '/').unwrap();
+        let next: String = src.chars().take(comment_at).collect();
+        let change = Change {
+            start: comment_at,
+            old_end: src.chars().count(),
+            new_end: comment_at,
+        };
+        let incremental = session.highlight(Some(2), "rust", &next, Some(&[change]));
+        assert_eq!(incremental, highlight("rust", &next));
+        assert_eq!(first(&next, &incremental, HlKind::String), "\"héllo ▸ wörld\"");
+    }
+
+    /// A tree may only be reused for the document it was built from. Handing it
+    /// another buffer's text is the one way to get a *wrong* parse rather than
+    /// a slow one, so the session must refuse — even though the caller passed
+    /// edits that look perfectly well formed.
+    #[test]
+    fn a_tree_is_never_reused_for_another_buffer_or_another_language() {
+        let mut session = Session::new();
+        session.highlight(Some(1), "rust", "fn a() { let x = 1; }", None);
+        let other = "fn b() { let y = \"two\"; }";
+        let lie = [Change { start: 0, old_end: 0, new_end: 0 }];
+        assert_eq!(
+            session.highlight(Some(2), "rust", other, Some(&lie)),
+            highlight("rust", other)
+        );
+        let lisp = "(defun f () \"two\")";
+        assert_eq!(
+            session.highlight(Some(2), "lisp", lisp, Some(&lie)),
+            highlight("lisp", lisp)
+        );
+    }
+
+    /// A run of edits arrives as a run — the worker coalesces requests and
+    /// hands over everything since the tree it holds. Feeding tree-sitter the
+    /// folded record has to land in the same place as feeding it each one.
+    #[test]
+    fn a_run_of_edits_lands_where_the_edits_themselves_would() {
+        let src = "fn main() {\n    let x = 1;\n}\n";
+        let (mut batched, mut one_at_a_time) = (Session::new(), Session::new());
+        batched.highlight(Some(3), "rust", src, None);
+        one_at_a_time.highlight(Some(3), "rust", src, None);
+
+        // Two edits, applied in order: insert a line, then delete a word from
+        // the line above it.
+        let after_first = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+        let first_change = Change { start: 26, old_end: 26, new_end: 41 };
+        let after_second = "fn main() {\n    x = 1;\n    let y = 2;\n}\n";
+        let second_change = Change { start: 16, old_end: 20, new_end: 16 };
+
+        one_at_a_time.highlight(Some(3), "rust", after_first, Some(&[first_change]));
+        let stepped =
+            one_at_a_time.highlight(Some(3), "rust", after_second, Some(&[second_change]));
+        let folded = batched.highlight(
+            Some(3),
+            "rust",
+            after_second,
+            Some(&[first_change, second_change]),
+        );
+        assert_eq!(folded, stepped);
+        assert_eq!(folded, highlight("rust", after_second));
+    }
+
+    /// A record that does not describe the two texts is a caller's bug, and the
+    /// crate's rule is that a bug costs colours rather than the editor. The
+    /// shapes here are the ones that reach tree-sitter as an *invalid* edit —
+    /// a start past the end of one side only — rather than merely a wide one.
+    #[test]
+    fn a_record_from_the_wrong_text_costs_colours_not_a_crash() {
+        let mut session = Session::new();
+        let long = "fn a() { let x = 1; let y = 2; let z = 3; }";
+        session.highlight(Some(1), "rust", long, None);
+        for lie in [
+            Change { start: 40, old_end: 41, new_end: 41 },
+            Change { start: 0, old_end: 9_999, new_end: 9_999 },
+            Change { start: 9_999, old_end: 9_999, new_end: 0 },
+        ] {
+            let short = "fn a() {}";
+            let spans = session.highlight(Some(1), "rust", short, Some(&[lie]));
+            assert_eq!(first(short, &spans, HlKind::Keyword), "fn", "{lie:?}");
+            session.highlight(Some(1), "rust", long, None);
+        }
+    }
+
+    /// `locate` is where a character offset becomes the bytes and rows
+    /// tree-sitter counts in. Getting it wrong is silent — the parse succeeds
+    /// and the colours drift — so it is checked directly.
+    #[test]
+    fn character_offsets_become_bytes_and_rows() {
+        let text = "café\n▸ x\nlast";
+        // 0: start; 5: just past the newline after "café" (5 chars, 6 bytes);
+        // 9: after "▸ x\n" — row 2, column 0.
+        let [zero, after_first_line, third_line] = locate(text, [0, 5, 9]);
+        assert_eq!(zero, (0, Point { row: 0, column: 0 }));
+        assert_eq!(after_first_line, (6, Point { row: 1, column: 0 }));
+        assert_eq!(third_line, (12, Point { row: 2, column: 0 }));
+        // past the end clamps rather than panicking
+        assert_eq!(locate(text, [999])[0].0, text.len());
     }
 
     #[test]

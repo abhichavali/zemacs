@@ -25,7 +25,9 @@ use sdl2::keyboard::{Keycode, Mod};
 use sdl2::mouse::{Cursor, MouseButton, MouseWheelDirection, SystemCursor};
 
 use zemacs_core::frame::{Divider, Split};
-use zemacs_core::{Editor, EditorCommand, Frame, Key, PromptKind, Rect, WindowId};
+use zemacs_core::{
+    BufferId, Change, Editor, EditorCommand, Frame, Key, PromptKind, Rect, WindowId,
+};
 use zemacs_lisp::Lisp;
 use zemacs_render::Renderer;
 
@@ -331,7 +333,74 @@ fn focus_after_close(focus: usize, closed: usize, before: usize) -> usize {
     if focus > closed { focus - 1 } else { focus }.min(last)
 }
 
+/// The `after-edit-hook` call for whatever has happened to the live buffer
+/// since the image was last told, or `None` when the answer is "nothing".
+///
+/// `(after-edit-hook START OLD-END NEW-END TEXT)` — character offsets, and
+/// `TEXT` is what now occupies `START..NEW-END`. Replaying it against any copy
+/// of the document is "replace `START..OLD-END` with `TEXT`", which is
+/// `textDocument/didChange` with a range, and `parinfer`'s smart mode, and
+/// anything else that keeps a shadow of the buffer.
+///
+/// **The text is sliced here, and that is the whole answer to the threading
+/// gap.** Lisp is not synchronous with the command loop: this form goes onto
+/// the image's queue and is evaluated a turn or more later, by which time the
+/// buffer will happily have moved on. A hook that was handed three offsets and
+/// told to read the text back would read a *different* document — offsets that
+/// were exact when the record was made and are nonsense two keystrokes later —
+/// and a language server fed that would desynchronise permanently and silently.
+/// So the record is made self-contained under the same lock that produced it,
+/// and nothing downstream ever has to look at the live buffer to interpret it.
+/// See `docs/threading.org`; this is the same rule `replace-region` follows,
+/// applied in the other direction.
+///
+/// `OLD-END` is `nil` when the app cannot say what the reader had — a buffer
+/// switch, a document replaced wholesale, or a reader further behind than
+/// core's log reaches. `TEXT` is then the whole buffer, and the meaning is
+/// "replace everything you have", which is exactly the full-text `didChange`
+/// the LSP client sends on every keystroke today. So the incremental case is
+/// the new one and the resynchronising case is the status quo.
+///
+/// One thing a consumer still owes itself, because no delta shape can supply
+/// it: `OLD-END` is an offset into the document *before* the edit, and LSP
+/// wants it as a line and a character. The buffer no longer holds that text, so
+/// a ranged `didChange` needs the shadow copy of each open file that the client
+/// is already building every keystroke — kept, and updated by applying this
+/// record to it, rather than rebuilt. Emacs' eglot solves the same problem the
+/// other way, with a *before*-change hook, which would be the alternative here
+/// and costs a second signal per keystroke to save one string per open file.
+fn after_edit_form(editor: &Editor, told: &mut Option<(BufferId, u64)>) -> Option<String> {
+    let buffer = editor.buffer.id;
+    let log = told
+        .filter(|(b, _)| *b == buffer)
+        .and_then(|(_, seen)| editor.buffer.changes_since(seen));
+    *told = Some((buffer, editor.buffer.change_count()));
+    let (change, old_end) = match log {
+        // The revision moved and the text did not: `set-language`, a mode
+        // change, a scene. There is no edit, so there is nothing to say — and
+        // saying it anyway would cost a `didChange` per minor-mode toggle.
+        Some([]) => return None,
+        Some(log) => {
+            let change = Change::coalesce(log)?;
+            (change, change.old_end.to_string())
+        }
+        None => (
+            Change { start: 0, old_end: 0, new_end: editor.buffer.len_chars() },
+            "nil".to_string(),
+        ),
+    };
+    let text = editor.buffer.slice_string(change.start, change.new_end);
+    Some(format!(
+        "(let ((h (find-symbol \"AFTER-EDIT-HOOK\" :zemacs))) \
+           (when (and h (fboundp h)) (funcall h {} {old_end} {} {})))",
+        change.start,
+        change.new_end,
+        zemacs_rpc::lisp::string(&text),
+    ))
+}
+
 fn main() -> anyhow::Result<()> {
+    inherit_login_path();
     mac_window_hints();
     let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL init: {e}"))?;
     // One renderer per frame, in frame order. See the module docs.
@@ -380,6 +449,14 @@ fn main() -> anyhow::Result<()> {
     let highlighter = zemacs_syntax::spawn_worker();
 
     let mut last_revision = u64::MAX;
+    // How much of the live buffer's change log each reader has already acted
+    // on, as `(buffer, count)`. Two watermarks and not one, because the two
+    // readers are fed on different conditions — the parser only for a buffer
+    // with a language — and a shared one would hand whichever of them had been
+    // skipped a list of edits starting after text it never saw. `None`, and a
+    // buffer that does not match, both mean "start again".
+    let mut told_lisp: Option<(BufferId, u64)> = None;
+    let mut told_syntax: Option<(BufferId, u64)> = None;
     // Where point was when the image was last told. `usize::MAX` cannot be a
     // real offset, so the first pass through the loop always reports — which is
     // what makes a config see the cursor it started next to.
@@ -604,6 +681,19 @@ fn main() -> anyhow::Result<()> {
                                     if let Some((_, at)) =
                                         renderers[i].click_target(&editor, i, x, y)
                                     {
+                                        // A click collapses whatever was
+                                        // selected, the way it does everywhere
+                                        // else — without this, clicking during
+                                        // a selection drags its far end instead
+                                        // of starting again. Left to `MoveTo`
+                                        // alone the drag below would also find
+                                        // an anchor it never set.
+                                        if editor.mode.is_visual() {
+                                            let cmd = EditorCommand::SetMode(
+                                                zemacs_core::Mode::Normal,
+                                            );
+                                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                                        }
                                         let cmd = EditorCommand::MoveTo(at);
                                         dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
                                     }
@@ -716,6 +806,43 @@ fn main() -> anyhow::Result<()> {
                                     col,
                                     row,
                                 });
+                            }
+                            // ...and everywhere else a drag is a selection. The
+                            // press already put the cursor where the gesture
+                            // started, so entering Visual anchors it there and
+                            // every motion after it moves only the far end —
+                            // the machinery `v` uses, which is the whole reason
+                            // `y`, `d`, `gv` and the modeline all work on what
+                            // was dragged without knowing a mouse was involved.
+                            //
+                            // `click_target` answers `None` over a dashboard or
+                            // a terminal, so neither needs excluding here: one
+                            // is a menu and the other is a grid the child owns.
+                            if mousestate.left() && editor.mode != zemacs_core::Mode::Terminal {
+                                if let Some((window, at)) =
+                                    renderers[i].click_target(&editor, i, x, y)
+                                {
+                                    // Only over the pane the press landed in. A
+                                    // drag that wanders into the next split
+                                    // would otherwise read an offset out of
+                                    // *that* buffer and apply it to this one.
+                                    let same = window == editor.frames[i].current;
+                                    // A click that wobbles by a pixel is still a
+                                    // click. Measured in characters rather than
+                                    // pixels, because a character is the unit a
+                                    // selection is actually made of.
+                                    let moved = at != editor.buffer.cursor;
+                                    if same && (moved || editor.mode.is_visual()) {
+                                        if !editor.mode.is_visual() {
+                                            let cmd = EditorCommand::SetMode(
+                                                zemacs_core::Mode::Visual,
+                                            );
+                                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                                        }
+                                        let cmd = EditorCommand::MoveTo(at);
+                                        dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                                    }
+                                }
                             }
                         }
                     }
@@ -837,10 +964,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Hand each new revision to the syntax thread and carry on drawing.
-        // ponytail: still a full reparse per revision, just off the UI thread,
-        // and the rope is flattened to a String to hand over. Both go away
-        // together by keeping the `Tree` per buffer and feeding tree-sitter the
-        // changed ranges — worth doing when files get big, not before.
+        let mut edit_form = None;
         if editor.revision != last_revision {
             last_revision = editor.revision;
             // The image's one signal that the document moved. Core reports mode
@@ -850,28 +974,44 @@ fn main() -> anyhow::Result<()> {
             // `pending_hooks` so it takes the same route, and the same
             // `fboundp` guard, as every other hook.
             //
-            // ponytail: it carries no *delta*. Lisp is told the buffer changed
-            // and has to read the whole thing back, which is why the LSP client
-            // sends full-text `didChange`. The upgrade is core recording
-            // `(start, old-end, new-end)` per edit — the same record overlays
-            // will want, and worth doing once rather than twice.
-            //
             // Not for a generated buffer: a terminal rewrites itself as fast as
             // the shell prints, and a Lisp form per frame of `ls -R` would
             // starve the image's queue for work no config can act on anyway —
             // every generated buffer is read-only.
             if !editor.buffer.kind.is_generated() {
                 editor.pending_hooks.push("after-change-hook".into());
+                edit_form = after_edit_form(&editor, &mut told_lisp);
             }
             match &editor.buffer.language {
-                Some(lang) => {
-                    highlighter.request(editor.revision, lang, editor.buffer.text.to_string())
-                }
+                Some(lang) => highlighter.request(zemacs_syntax::Request {
+                    revision: editor.revision,
+                    buffer: editor.buffer.id,
+                    lang: lang.clone(),
+                    text: editor.buffer.text.to_string(),
+                    // What the parser's tree has not been told yet. `None` —
+                    // a different buffer, or a reader that fell further behind
+                    // than core's log reaches — is "assume nothing", which
+                    // costs the full parse every revision used to cost.
+                    //
+                    // Advanced only when a request is actually sent, and that
+                    // is the point of it being its own watermark: a buffer with
+                    // no language is highlighted by nobody, and sharing the
+                    // image's watermark would hand the parser, the moment a
+                    // language was set, a list of edits starting after text it
+                    // never saw.
+                    edits: told_syntax
+                        .filter(|(b, _)| *b == editor.buffer.id)
+                        .and_then(|(_, seen)| editor.buffer.changes_since(seen))
+                        .map(<[_]>::to_vec),
+                }),
                 // A generated buffer colours itself — dired and magit hand their
                 // own spans straight to the editor — so clearing here would
                 // wipe them one frame after they were produced.
                 None if !editor.buffer.kind.is_generated() => editor.buffer.highlights.clear(),
                 None => {}
+            }
+            if editor.buffer.language.is_some() {
+                told_syntax = Some((editor.buffer.id, editor.buffer.change_count()));
             }
         }
         // The other signal the image gets about a buffer, and the twin of the
@@ -892,9 +1032,8 @@ fn main() -> anyhow::Result<()> {
         // ponytail: no *previous* position is carried, so a config that wants
         // to act on the range you left — re-rendering the equation you just
         // stepped out of, say — has to remember it in the image. The upgrade
-        // path is the same one `after-change-hook` wants: a hook with
-        // arguments, which needs an argument-passing route through
-        // `pending_hooks` that today only carries a name.
+        // is what `after_edit_form` above already does for the document: build
+        // the call here, where the lock is held, rather than queueing a name.
         if editor.buffer.cursor != last_point && !editor.buffer.kind.is_generated() {
             last_point = editor.buffer.cursor;
             editor.pending_hooks.push("point-moved-hook".into());
@@ -908,6 +1047,15 @@ fn main() -> anyhow::Result<()> {
                 "(let ((h (find-symbol {:?} :zemacs))) (when (and h (fboundp h)) (funcall h)))",
                 hook.to_uppercase()
             ));
+        }
+        // ...and the one hook that carries arguments, queued after the
+        // no-argument ones so that a config which uses both sees the order it
+        // has always seen. It does not go through `pending_hooks` because that
+        // channel carries a *name*: core asks for hooks by name and has no
+        // business holding a Lisp form, and this call is only meaningful with
+        // the delta baked in.
+        if let Some(form) = edit_form {
+            lisp.eval(form);
         }
 
         // Anything a JSON-RPC child said since the last frame. This is the whole
@@ -1003,7 +1151,11 @@ fn main() -> anyhow::Result<()> {
         // Park the live cursor and scroll on the focused window, once, so every
         // pane in every frame can be drawn from its own `Window`.
         editor.sync_focused_window();
-        let screen = term.screen(&editor);
+        // One grid per terminal buffer on screen, not one for "the" terminal:
+        // see `Term::screens`. Gathered after `sync_focused_window`, so a
+        // session that just became visible is measured against the window it is
+        // actually in.
+        let screens = term.screens(&editor);
         perf.input += frame_start.elapsed();
 
         // Every window, every iteration, and `render` syncs the font itself.
@@ -1036,7 +1188,7 @@ fn main() -> anyhow::Result<()> {
 
         let drawing = Instant::now();
         for (i, renderer) in renderers.iter_mut().enumerate() {
-            renderer.render(&mut editor, i, screen.as_ref())?;
+            renderer.render(&mut editor, i, &screens)?;
         }
         perf.draw += drawing.elapsed();
         let draws: u32 = renderers.iter().map(Renderer::draw_calls).sum();
@@ -1467,14 +1619,41 @@ fn seed_dashboard(editor: &mut Editor, init_path: &Path, backend: &str) {
         .enumerate()
         .map(|(i, p)| zemacs_core::dashboard::Item {
             key: char::from_digit(i as u32 + 1, 10).unwrap_or('?'),
-            label: display_path(&p),
+            // The name is the label and the directory is the hint, which is the
+            // split the eye actually wants: you recognise a file by its name,
+            // and you only need the path to tell two `mod.rs` apart. Whole path
+            // in the label made every row a different length and buried the one
+            // distinguishing word at the far end of it.
+            label: p
+                .file_name()
+                .map_or_else(|| display_path(&p), |n| n.to_string_lossy().into_owned()),
             action: format!("open:{}", p.display()),
+            hint: p.parent().map(display_path).map_or_else(String::new, elide),
         })
         .collect();
     editor.dashboard.footer = format!(
-        "config: {}\nrenderer: {backend} · j/k or number to pick · RET to open · q to quit",
+        "{} · {backend} · j/k to move, RET to open",
         display_path(init_path)
     );
+}
+
+/// Longest directory the dashboard will set in its hint column, in characters.
+/// The block is as wide as its widest row, so one deeply-nested recent file
+/// would otherwise stretch the whole menu across the window.
+const HINT_MAX: usize = 44;
+
+/// `…` and the tail, when a path is too long. The tail rather than the head:
+/// what distinguishes two paths is nearly always the end of them, and `/Users/
+/// you/Code/some-org/…` names no directory at all.
+fn elide(s: String) -> String {
+    if s.chars().count() <= HINT_MAX {
+        return s;
+    }
+    let tail: String = s
+        .chars()
+        .skip(s.chars().count() - (HINT_MAX - 1))
+        .collect();
+    format!("…{tail}")
 }
 
 // --- the system clipboard ------------------------------------------------
@@ -1542,7 +1721,7 @@ impl Clipboard {
 // --- auto-save -----------------------------------------------------------
 //
 // Emacs writes `#foo.rs#` beside the file; this writes into
-// `~/.config/zemacs/auto-save/` instead, so a project tree never grows litter
+// `~/.zemacs.d/auto-save/` instead, so a project tree never grows litter
 // that its `.gitignore` has to know about. The name is the absolute path with
 // `/` turned into `!` — Emacs' own mangling, and the reason it is recoverable
 // by eye when you need to go looking.
@@ -1550,8 +1729,7 @@ impl Clipboard {
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
 
 fn autosave_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/zemacs/auto-save"))
+    Some(config_dir()?.join("auto-save"))
 }
 
 fn autosave_file(path: &Path) -> Option<PathBuf> {
@@ -1699,13 +1877,12 @@ fn write_file(target: &Path, text: &str) -> std::io::Result<()> {
 /// Emacs' `buffer-backed-up` flag, not a smaller number.
 const BACKUP_KEEP: usize = 20;
 
-/// In `~/.config/zemacs/backup/` and not beside the file, for the reason
+/// In `~/.zemacs.d/backup/` and not beside the file, for the reason
 /// auto-save is not beside it either: a project tree must not grow litter that
 /// its `.gitignore` has to know about. Same `!`-mangled naming, so the two
 /// directories read the same way when you go looking by eye.
 fn backup_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/zemacs/backup"))
+    Some(config_dir()?.join("backup"))
 }
 
 /// Copy the current contents of `target` aside as the next numbered version.
@@ -2109,12 +2286,12 @@ fn terminal_size(
     let Some(renderer) = renderer else {
         return (80, 24);
     };
-    let (cell_w, line_h) = renderer.cell_size();
-
-    // One line goes to the modeline, and the padding is the renderer's.
-    let cols = (rect.w / cell_w.max(1)).max(1) as usize;
-    let rows = ((rect.h / line_h.max(1)) - 1).max(1) as usize;
-    (cols, rows)
+    // The renderer's own arithmetic, not a second copy of it: this used to
+    // model the modeline as one text row and ignore the document padding, so
+    // the child was told it had a row and a column that the draw loop then
+    // refused to draw — which is why the bottom line of a shell was never on
+    // the screen.
+    renderer.terminal_grid(&editor.settings, rect)
 }
 
 /// Where a character comes from depends on the mode.
@@ -2169,6 +2346,11 @@ fn key_from_keydown(kc: Keycode, keymod: Mod, raw: bool) -> Option<Key> {
         Keycode::Escape => Some(Key::Esc),
         Keycode::Return | Keycode::KpEnter => Some(Key::Enter),
         Keycode::Backspace => Some(Key::Backspace),
+        // Shift is consulted here and nowhere else among the named keys: `⇧⇥`
+        // is not a shifted Tab but a key of its own, and a shell, a pager and
+        // an agent's input box all read it as "backwards". Discarding the bit
+        // meant `⇧⇥` typed a plain tab into whatever was running.
+        Keycode::Tab if shift => Some(Key::BackTab),
         Keycode::Tab => Some(Key::Tab),
         Keycode::Left => Some(Key::Left),
         Keycode::Right => Some(Key::Right),
@@ -2237,14 +2419,102 @@ fn shifted(c: char) -> char {
     }
 }
 
-/// `$ZEMACS_INIT`, else `~/.config/zemacs/init.lisp` if it exists, else the copy
+/// What `launchd` hands an application started from the Dock, the Finder or
+/// Spotlight. Not a guess: it is the compiled-in default `_PATH_DEFPATH`, and
+/// `launchctl getenv PATH` on a normal Mac prints nothing at all, which is how
+/// you can tell nobody has overridden it.
+const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// Take `$PATH` from a login shell when we plainly did not inherit one.
+///
+/// A GUI application on macOS does not get your shell environment. Started from
+/// a terminal, zemacs inherits everything `~/.zshrc` set up; started from the
+/// Dock it gets [`LAUNCHD_PATH`] and nothing else — so `claude`, `cargo`, `rg`
+/// and anything else installed under `~/.local/bin` or Homebrew simply is not
+/// there. The editor is then subtly and inexplicably less capable depending on
+/// how it was launched, which is among the oldest complaints in Mac Emacs and is
+/// what `exec-path-from-shell` exists to answer.
+///
+/// Done here, in the process environment, rather than in Lisp, because three
+/// separate things have to agree about it and only this reaches all of them:
+/// `executable-find` in `runtime/modes/ai.lisp` reads `$PATH` through ECL, the
+/// `which` in `crates/term` reads it through Rust, and a shell or an agent on a
+/// PTY inherits it from the process. One `set_var` before anything starts and
+/// all three are right.
+///
+/// Only when the inherited `PATH` is exactly the launchd default. Overwriting a
+/// `PATH` we really did inherit would throw away whatever the surrounding
+/// terminal had added to it — a `direnv` shim, a virtualenv, a toolchain a
+/// project put there on purpose — and those are deliberate in a way a login
+/// shell's profile cannot know about.
+///
+/// Silent on every failure: a login shell that errors, hangs up or prints
+/// nothing usable leaves the launchd `PATH` in place, which is exactly where we
+/// already were. ponytail: no timeout on the subprocess, so a profile that
+/// blocks forever hangs startup. `$SHELL -l -c` is what every editor on this
+/// platform already does and a wedged profile hangs those too; the upgrade is a
+/// thread and a channel, on the day someone's `.zprofile` actually does it.
+fn inherit_login_path() {
+    if std::env::var("PATH").unwrap_or_default() != LAUNCHD_PATH {
+        return;
+    }
+    let Some(shell) = std::env::var_os("SHELL") else {
+        return;
+    };
+    // `-l` so the profile that sets the interesting parts of `PATH` is read at
+    // all. `printf` and not `echo` because a `PATH` is not a line of text and
+    // some shells' `echo` will happily mangle a backslash in one.
+    let Ok(out) = std::process::Command::new(shell)
+        .args(["-l", "-c", "printf %s \"$PATH\""])
+        .output()
+    else {
+        return;
+    };
+    let Ok(out) = String::from_utf8(out.stdout) else {
+        return;
+    };
+    if let Some(path) = usable_path(&out) {
+        std::env::set_var("PATH", path);
+    }
+}
+
+/// The `PATH` in a login shell's output, or `None` if it does not look like
+/// one.
+///
+/// A profile that prints a banner, warns about a missing tool or asks a question
+/// is the normal reason this is not a path, and the answer is to keep the one we
+/// have. Deliberately not "take the last line": a `PATH` that arrived with
+/// somebody's fortune cookie glued to the front of it is not a `PATH` to trust
+/// the rest of.
+fn usable_path(out: &str) -> Option<&str> {
+    let path = out.trim();
+    (path.contains('/') && !path.contains('\n')).then_some(path)
+}
+
+/// Everything zemacs keeps for you: the config, and the state it writes beside
+/// it. `~/.zemacs.d`, the way Emacs spells `~/.emacs.d`, rather than under
+/// `~/.config` — a Lisp machine's directory is a place you *live in* and open
+/// files from, not a settings folder you visit twice a year, and Lisp on this
+/// side of the boundary reaches it as `(zemacs-file "repl.lisp")`.
+///
+/// `None` only with no `$HOME`, which in practice means a build sandbox. Every
+/// caller degrades to doing nothing rather than to writing somewhere else.
+///
+/// ponytail: no XDG fallback and no migration from the old `~/.config/zemacs`.
+/// Moving the directory is a `mv`, saying so once beats a lookup order nobody
+/// can predict, and a fallback that silently kept finding the old path would
+/// make this change invisible — which is the one outcome it must not have.
+pub fn config_dir() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".zemacs.d"))
+}
+
+/// `$ZEMACS_INIT`, else `~/.zemacs.d/init.lisp` if it exists, else the copy
 /// shipped in the repo — so `cargo run` works out of the box.
 fn resolve_init_path() -> PathBuf {
     if let Some(explicit) = std::env::var_os("ZEMACS_INIT") {
         return PathBuf::from(explicit);
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let user = PathBuf::from(home).join(".config/zemacs/init.lisp");
+    if let Some(user) = config_dir().map(|d| d.join("init.lisp")) {
         if user.exists() {
             return user;
         }
@@ -2258,6 +2528,26 @@ fn resolve_init_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A login shell's output is not always a `PATH`. Asserted on the parsing
+    /// rather than on the environment: `inherit_login_path` sets a process-wide
+    /// variable and forks a shell, and a test doing either would be deciding
+    /// what `$PATH` is for every other test in the binary.
+    #[test]
+    fn only_something_that_looks_like_a_path_replaces_the_one_we_have() {
+        assert_eq!(
+            usable_path("/opt/homebrew/bin:/usr/bin\n"),
+            Some("/opt/homebrew/bin:/usr/bin"),
+        );
+        // A profile that greets you. The path is in there, and taking it would
+        // mean trusting the rest of a shell that is clearly doing other things.
+        assert_eq!(usable_path("Welcome!\n/usr/bin:/bin\n"), None);
+        // Nothing at all: a shell that failed, or one with no profile.
+        assert_eq!(usable_path(""), None);
+        assert_eq!(usable_path("   \n"), None);
+        // Output with no separator in it is a message, not a path.
+        assert_eq!(usable_path("command not found"), None);
+    }
 
     /// The whole reason for mangling instead of using the basename: two
     /// `mod.rs` open at once must not auto-save over each other.
@@ -2319,6 +2609,24 @@ mod tests {
         );
         // named keys keep working either way
         assert_eq!(key_from_keydown(Keycode::Escape, Mod::NOMOD, true), Some(Key::Esc));
+    }
+
+    /// `⇧⇥` is the one named key that reads its shift bit. Both raw states,
+    /// because Insert mode takes the other path and an agent's input box is
+    /// typed into exactly like one.
+    #[test]
+    fn shift_tab_is_backtab_and_plain_tab_is_not() {
+        for raw in [true, false] {
+            assert_eq!(
+                key_from_keydown(Keycode::Tab, Mod::LSHIFTMOD, raw),
+                Some(Key::BackTab)
+            );
+            assert_eq!(
+                key_from_keydown(Keycode::Tab, Mod::RSHIFTMOD, raw),
+                Some(Key::BackTab)
+            );
+            assert_eq!(key_from_keydown(Keycode::Tab, Mod::NOMOD, raw), Some(Key::Tab));
+        }
     }
 
     #[test]
@@ -3010,5 +3318,71 @@ mod tests {
         assert!(f.dividers(AREA).is_empty());
         assert_eq!(mouse.press(&f, 0, AREA, 500, 300), Some(f.current));
         assert_eq!(mouse.dragging(), None);
+    }
+
+    // --- the after-edit delta ------------------------------------------------
+
+    fn typing(editor: &mut Editor, s: &str) {
+        editor.apply(EditorCommand::InsertText(s.into()));
+    }
+
+    /// A keystroke reaches the image as the edit it was, with the text it put
+    /// there — not as three offsets the hook would have to read back.
+    #[test]
+    fn a_keystroke_reaches_lisp_as_a_range_and_the_text_that_now_fills_it() {
+        let mut editor = Editor::new();
+        editor.load("abc", None, None);
+        let mut told = None;
+        // The first look has no watermark, so it is a resync: the whole buffer,
+        // and `nil` for what the image had, because the app cannot know.
+        let form = after_edit_form(&editor, &mut told).expect("a first look always reports");
+        assert!(form.contains("(funcall h 0 nil 3 \"abc\")"), "{form}");
+
+        editor.apply(EditorCommand::MoveTo(1));
+        typing(&mut editor, "XY");
+        let form = after_edit_form(&editor, &mut told).expect("an insert is an edit");
+        assert!(form.contains("(funcall h 1 1 3 \"XY\")"), "{form}");
+        assert_eq!(editor.buffer.text.to_string(), "aXYbc");
+    }
+
+    /// The revision moves for reasons that are not edits. Reporting those would
+    /// cost a `didChange` per minor-mode toggle and per language change.
+    #[test]
+    fn a_revision_that_moved_without_the_text_reaches_lisp_as_silence() {
+        let mut editor = Editor::new();
+        editor.load("(defun f () 1)", None, None);
+        let mut told = None;
+        after_edit_form(&editor, &mut told);
+        editor.apply(EditorCommand::SetLanguage(Some("lisp".into())));
+        assert_eq!(after_edit_form(&editor, &mut told), None);
+    }
+
+    /// Switching buffers is not an edit to either of them, so the image is told
+    /// to start again rather than handed offsets into the wrong document.
+    #[test]
+    fn a_buffer_switch_reports_a_resync_rather_than_the_other_buffer_s_edits() {
+        let mut editor = Editor::new();
+        editor.load("first", None, None);
+        let mut told = None;
+        after_edit_form(&editor, &mut told);
+        editor.create_buffer("*second*".into());
+        typing(&mut editor, "hi");
+        let form = after_edit_form(&editor, &mut told).expect("a new document is news");
+        assert!(form.contains("(funcall h 0 nil 2 \"hi\")"), "{form}");
+    }
+
+    /// The text is escaped for CL's reader, not Rust's. `\n` inside a Common
+    /// Lisp string literal reads as the character `n`, so a newline has to go
+    /// through as itself — which is what makes this worth a test rather than a
+    /// `{:?}`.
+    #[test]
+    fn the_text_crosses_as_a_common_lisp_string_and_not_a_rust_debug_one() {
+        let mut editor = Editor::new();
+        editor.load("", None, None);
+        let mut told = None;
+        after_edit_form(&editor, &mut told);
+        typing(&mut editor, "a\"b\\c\nd");
+        let form = after_edit_form(&editor, &mut told).unwrap();
+        assert!(form.contains("\"a\\\"b\\\\c\nd\""), "{form}");
     }
 }

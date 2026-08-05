@@ -120,6 +120,8 @@ pub enum Input {
     Alt(char),
     Enter,
     Tab,
+    /// `⇧⇥`.
+    BackTab,
     Backspace,
     Esc,
     Up,
@@ -167,6 +169,9 @@ pub fn encode(input: Input, app_cursor: bool) -> Vec<u8> {
         // shell that never runs anything.
         Input::Enter => vec![b'\r'],
         Input::Tab => vec![b'\t'],
+        // CSI Z — `kcbt` in terminfo, and unaffected by DECCKM: backtab has
+        // never had an application-mode spelling the way the arrows do.
+        Input::BackTab => vec![0x1b, b'[', b'Z'],
         // DEL rather than BS, which is what termios expects for erase.
         Input::Backspace => vec![0x7f],
         Input::Esc => vec![0x1b],
@@ -283,6 +288,27 @@ pub struct Modes {
     /// The child wants the wheel translated into arrow keys on the alternate
     /// screen — how `less` and `man` expect to be scrolled.
     pub alternate_scroll: bool,
+    /// The child wants a paste to arrive marked as one rather than as typing.
+    pub bracketed_paste: bool,
+}
+
+/// Clipboard text, as the child expects to receive it.
+///
+/// Newlines become CR for the same reason Enter does: a shell reads LF as
+/// nothing. `bracketed` wraps the text in the markers a program turns the mode
+/// on to ask for — without them a multi-line paste *runs* every line but the
+/// last the instant it lands, which is the oldest footgun a terminal has.
+///
+/// ESC is dropped from a bracketed paste: the clipboard is text from outside,
+/// and an `ESC [ 2 0 1 ~` sitting in it would end the paste early and hand the
+/// rest to the shell as keystrokes. Unbracketed, a paste *is* typing and an ESC
+/// in it means what pressing ESC means.
+pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace('\n', "\r");
+    match bracketed {
+        true => format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")).into_bytes(),
+        false => text.into_bytes(),
+    }
 }
 
 // --- the terminal ---------------------------------------------------------
@@ -488,7 +514,13 @@ impl Terminal {
             sgr_mouse: mode.contains(TermMode::SGR_MOUSE),
             alt_screen: mode.contains(TermMode::ALT_SCREEN),
             alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
+            bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
         }
+    }
+
+    /// Hand TEXT to the child as a paste.
+    pub fn paste(&self, text: &str) {
+        self.send(encode_paste(text, self.modes().bracketed_paste));
     }
 
     /// Report a mouse event to the child. False when it has not asked for
@@ -842,6 +874,33 @@ mod tests {
     fn enter_is_a_carriage_return_and_backspace_is_del() {
         assert_eq!(encode(Input::Enter, false), vec![b'\r']);
         assert_eq!(encode(Input::Backspace, false), vec![0x7f]);
+    }
+
+    /// A paste is typing, so its newlines are the same CR that Enter is — and
+    /// when the child asked for the mode it arrives marked, which is what stops
+    /// three copied lines from being three commands.
+    #[test]
+    fn a_paste_carries_returns_and_is_bracketed_only_when_asked() {
+        assert_eq!(encode_paste("ls -l\nwc\n", false), b"ls -l\rwc\r".to_vec());
+        assert_eq!(
+            encode_paste("ls -l\nwc\n", true),
+            b"\x1b[200~ls -l\rwc\r\x1b[201~".to_vec()
+        );
+        // Text from the clipboard cannot end its own paste and go on typing.
+        assert_eq!(
+            encode_paste("a\x1b[201~rm -rf /", true),
+            b"\x1b[200~a[201~rm -rf /\x1b[201~".to_vec()
+        );
+    }
+
+    /// `⇧⇥` is CSI Z, and stays CSI Z in application-cursor mode — an agent's
+    /// input box cycles its modes backwards on it, and a plain `\t` there just
+    /// cycles forwards.
+    #[test]
+    fn backtab_is_csi_z_in_both_cursor_modes() {
+        assert_eq!(encode(Input::BackTab, false), b"\x1b[Z".to_vec());
+        assert_eq!(encode(Input::BackTab, true), b"\x1b[Z".to_vec());
+        assert_ne!(encode(Input::BackTab, false), encode(Input::Tab, false));
     }
 
     #[test]

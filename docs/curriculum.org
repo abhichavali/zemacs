@@ -212,7 +212,7 @@ Three things to know:
   =SPC m t= sets the status back.
 
 It needs an OpenRouter key, from =$OPENROUTER_API_KEY= or one line in
-=~/.config/zemacs/openrouter-key= (=chmod 600=), and it says so plainly if there
+=~/.zemacs.d/openrouter-key= (=chmod 600=), and it says so plainly if there
 is none. The prompt the model is given is
 =*math-written-prompt*=, and it is worth reading before you tune it: it insists
 on fidelity over polish, so a mistake in your working is transcribed as a mistake

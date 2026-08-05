@@ -20,6 +20,7 @@ extern void rs_set_font_size(double size);
 extern void rs_set_background(double r, double g, double b);
 extern void rs_set_foreground(double r, double g, double b);
 extern void rs_set_syntax_color(const char *face, double r, double g, double b);
+extern void rs_set_face_style(const char *face, int bold, int italic);
 extern void rs_set_line_numbers(int on);
 extern void rs_set_tab_width(long n);
 extern void rs_set_text_width(long n);
@@ -30,7 +31,8 @@ extern void rs_quit(void);
 extern void rs_dashboard_banner(const char *text);
 extern void rs_dashboard_logo(long id);
 extern void rs_clear_dashboard_items(void);
-extern void rs_dashboard_item(const char *key, const char *label, const char *action);
+extern void rs_dashboard_item(const char *key, const char *label,
+                              const char *action, const char *hint);
 extern void rs_define_key(const char *mode, const char *keys, const char *command);
 extern void rs_find_file(const char *path);
 extern void rs_save_file(const char *path);
@@ -132,6 +134,15 @@ static char *dup_utf8_or_empty(cl_object x) {
   return s ? s : strdup("");
 }
 
+/* The same, but NIL means the empty string rather than the three characters
+ * "NIL". For optional arguments, where a caller that has nothing to say passes
+ * NIL and PRINC would otherwise spell the absence out and hand it over as
+ * content — a dashboard row whose keybinding hint reads "NIL" is what that
+ * looks like from the outside. */
+static char *dup_utf8_or_empty_nil(cl_object x) {
+  return x == ECL_NIL ? strdup("") : dup_utf8_or_empty(x);
+}
+
 /* Note on the string model, because it is unusual and everything above depends
  * on it: **Lisp holds text as UTF-8 bytes in base strings**, not as characters.
  * `buffer-string' comes back that way, `%byte-index' and `%char-index' exist to
@@ -165,6 +176,19 @@ static cl_object f_set_syntax_color(cl_object face, cl_object r, cl_object g,
   double rr = ecl_to_double(r), gg = ecl_to_double(g), bb = ecl_to_double(b);
   char *f = dup_utf8_or_empty(face);
   rs_set_syntax_color(f, rr, gg, bb);
+  free(f);
+  return ECL_NIL;
+}
+
+/* Generalised booleans, so `(set-face-style "keyword" t nil)' and
+ * `(set-face-style "keyword" 'yes nil)' agree — the same courtesy the boolean
+ * settings extend, and the reason `set-face' upstairs can pass a &key straight
+ * through without coercing it. No number to convert first, so the string is
+ * duplicated at the top without the usual ordering worry. */
+static cl_object f_set_face_style(cl_object face, cl_object bold,
+                                  cl_object italic) {
+  char *f = dup_utf8_or_empty(face);
+  rs_set_face_style(f, bold != ECL_NIL, italic != ECL_NIL);
   free(f);
   return ECL_NIL;
 }
@@ -229,14 +253,16 @@ static cl_object f_clear_dashboard_items(void) {
 }
 
 static cl_object f_dashboard_item(cl_object key, cl_object label,
-                                  cl_object action) {
+                                  cl_object action, cl_object hint) {
   char *k = dup_utf8_or_empty(key);
   char *l = dup_utf8_or_empty(label);
   char *a = dup_utf8_or_empty(action);
-  rs_dashboard_item(k, l, a);
+  char *h = dup_utf8_or_empty_nil(hint);
+  rs_dashboard_item(k, l, a, h);
   free(k);
   free(l);
   free(a);
+  free(h);
   return ECL_NIL;
 }
 
@@ -598,11 +624,12 @@ static cl_object f_json_quote(cl_object text) {
 static const char *PACKAGE_FORM =
     "(defpackage \"ZEMACS\" (:use \"CL\")"
     " (:export \"SET-FONT-SIZE\" \"SET-BACKGROUND\" \"SET-FOREGROUND\""
-    "          \"SET-SYNTAX-COLOR\" \"SET-LINE-NUMBERS\" \"SET-TAB-WIDTH\""
+    "          \"SET-SYNTAX-COLOR\" \"SET-FACE-STYLE\""
+    "          \"SET-LINE-NUMBERS\" \"SET-TAB-WIDTH\""
     "          \"SET-TEXT-WIDTH\""
     "          \"SET-MODELINE-RELIEF\" \"SET-MODELINE-PAD\""
     "          \"MESSAGE\" \"QUIT\" \"DASHBOARD-BANNER\""
-    "          \"CLEAR-DASHBOARD-ITEMS\" \"DASHBOARD-ITEM\" \"DEFINE-KEY\""
+    "          \"CLEAR-DASHBOARD-ITEMS\" \"%DASHBOARD-ITEM\" \"DEFINE-KEY\""
     "          \"FIND-FILE\" \"SAVE-FILE\" \"SHOW-DASHBOARD\" \"INSERT\""
     "          \"SET-COMPLETION-STYLE\" \"CLEAR-COMMANDS\""
     "          \"REGISTER-COMMAND\" \"SET-LINE-OVERFLOW\""
@@ -614,6 +641,28 @@ static const char *PACKAGE_FORM =
     "          \"MAKE-MARKER\" \"POINT-MARKER\" \"MARKER-POSITION\""
     "          \"SET-MARKER\" \"DELETE-MARKER\" \"GOTO-MARKER\""
     "          \"OPEN-PROMPT\"))";
+
+/* Where zemacs keeps things, in Lisp. The counterpart of `config_dir` in
+ * `crates/app/src/main.rs`, and it has to agree with it: the auto-saves and
+ * backups the editor writes land beside the scratch file, the REPL transcript
+ * and the tutorial's progress, all of which are named through this.
+ *
+ * Booted here rather than defined in `init.lisp` because the modules that use it
+ * do not depend on init.lisp in a test — `runtime/lsp.lisp` and half of
+ * `runtime/modes/` are loaded on their own by the suite, and a path helper that
+ * exists only when a config happens to have been read first is one those files
+ * cannot safely call. Where the editor puts its state is a fact about the
+ * editor.
+ *
+ * ponytail: the directory name is written here *and* in `config_dir`, in two
+ * languages, and nothing checks that they match. A `(config-dir)` primitive
+ * reading the Rust side would; it is one FFI function and a query arm, and it is
+ * worth doing the moment a third thing needs to know the path. */
+static const char *PATHS_FORM =
+    "(defun zemacs::zemacs-file (name)"
+    "  \"NAME inside ~/.zemacs.d/.\""
+    "  (merge-pathnames (concatenate 'string \".zemacs.d/\" name)"
+    "                   (user-homedir-pathname)))";
 
 /* The readers. Each takes no arguments and forwards to %QUERY, so adding one is
  * a name here and an arm of the match in zemacs_core::query — nothing in C.
@@ -656,6 +705,15 @@ static const char *QUERIES_FORM =
     " (defun zemacs::line-start (&optional line) (zemacs::%query \"line-start\" (or line 0) 0))"
     " (defun zemacs::line-end (&optional line) (zemacs::%query \"line-end\" (or line 0) 0))"
     " (defun zemacs::line-string (&optional line) (zemacs::%query \"line-string\" (or line 0) 0))"
+    /* The other end of the bracket at POS, or just before it — which is where
+     * point sits the instant you finish typing a closing one, and is the whole
+     * reason this answers for two positions rather than one. NIL when there is
+     * no bracket there or it is unbalanced. `runtime/modes/show-paren.lisp' is
+     * the only caller; `%' in the evil grammar asks the same primitive, so the
+     * highlight and the jump can never disagree. */
+    " (defun zemacs::matching-bracket (&optional pos)"
+    "   (zemacs::%query \"matching-bracket\" (or pos (zemacs::point)) 0))"
+    " (pushnew \"matching-bracket\" zemacs::*readers* :test #'string=)"
     /* The last N messages, or all of them. This is `*Messages*'. */
     " (defun zemacs::messages (&optional n) (zemacs::%query \"messages\" (or n 0) 0))"
     /* A query takes integers, and a face is named by a string everywhere else in
@@ -853,6 +911,25 @@ static const char *LIBRARY_FORM =
      * here has to remember to. */
     " (defun zemacs::which-key-row (&optional row)"
     "   (zemacs::%do \"which-key\" (and row (string row)) 0 0))"
+    /* corfu: the in-buffer completion popup, which-key's sibling one level down.
+     * `completion-show' says where it hangs and which row is lit; NIL takes it
+     * down. `completion-row' fills it, NIL empties it — which-key's idiom
+     * exactly, and for which-key's reason: one string per call.
+     *
+     * The rows survive a re-`show' at the *same* anchor and are dropped when it
+     * moves, so cycling the selection costs one call rather than one per
+     * candidate, and a new word cannot inherit the last one's list.
+     *
+     * `completion-at' is the reader, and the pair is not symmetric on purpose:
+     * the editor hides a popup point has walked away from without telling
+     * anybody, so what you set and what is on screen are different questions.
+     * Ask before inserting a candidate. */
+    " (defun zemacs::completion-show (&optional at (index 0))"
+    "   (zemacs::%do \"completion-show\" nil (if at at -1) index))"
+    " (defun zemacs::completion-row (&optional row)"
+    "   (zemacs::%do \"completion-row\" (and row (string row)) 0 0))"
+    " (defun zemacs::completion-at () (zemacs::%query \"completion-at\" 0 0))"
+    " (pushnew \"completion-at\" zemacs::*readers* :test #'string=)"
     /* The one verb a scene needs. PAGE is a *printed* node — `(block :pad 48
      * (text (run \"hi\")))' — because a scene crosses the boundary as source,
      * like every other structure; NIL takes the page down and gives the buffer
@@ -1296,6 +1373,7 @@ void zemacs_boot(void) {
   defprim("SET-BACKGROUND", (cl_objectfn_fixed)f_set_background, 3);
   defprim("SET-FOREGROUND", (cl_objectfn_fixed)f_set_foreground, 3);
   defprim("SET-SYNTAX-COLOR", (cl_objectfn_fixed)f_set_syntax_color, 4);
+  defprim("SET-FACE-STYLE", (cl_objectfn_fixed)f_set_face_style, 3);
   defprim("SET-LINE-NUMBERS", (cl_objectfn_fixed)f_set_line_numbers, 1);
   defprim("SET-TAB-WIDTH", (cl_objectfn_fixed)f_set_tab_width, 1);
   defprim("SET-TEXT-WIDTH", (cl_objectfn_fixed)f_set_text_width, 1);
@@ -1313,7 +1391,12 @@ void zemacs_boot(void) {
   defprim("DASHBOARD-LOGO", (cl_objectfn_fixed)f_dashboard_logo, 1);
   defprim("CLEAR-DASHBOARD-ITEMS", (cl_objectfn_fixed)f_clear_dashboard_items,
           0);
-  defprim("DASHBOARD-ITEM", (cl_objectfn_fixed)f_dashboard_item, 3);
+  /* Four arguments, and `%'-prefixed because of the fourth: `defprim' binds a
+     fixed arity, so growing this one would have broken every config that calls
+     `dashboard-item' with the three it has always taken. init.lisp defines the
+     three-or-four-argument `dashboard-item' over it, which is the same shape
+     `%save-file' and `%make-marker' already have. */
+  defprim("%DASHBOARD-ITEM", (cl_objectfn_fixed)f_dashboard_item, 4);
   defprim("DEFINE-KEY", (cl_objectfn_fixed)f_define_key, 3);
   defprim("FIND-FILE", (cl_objectfn_fixed)f_find_file, 1);
   defprim("%SAVE-FILE", (cl_objectfn_fixed)f_save_file, 1);
@@ -1352,6 +1435,8 @@ void zemacs_boot(void) {
 
   cl_safe_eval(ecl_read_from_cstring(HELPERS_FORM), ECL_NIL, ECL_NIL);
   cl_safe_eval(ecl_read_from_cstring(QUERIES_FORM), ECL_NIL, ECL_NIL);
+  /* Depends on nothing, so its position here is only about reading order. */
+  cl_safe_eval(ecl_read_from_cstring(PATHS_FORM), ECL_NIL, ECL_NIL);
   /* Last: everything in it is written in terms of the two above. */
   cl_safe_eval(ecl_read_from_cstring(LIBRARY_FORM), ECL_NIL, ECL_NIL);
   /* ...and this one in terms of all three: `*readers*' comes from QUERIES_FORM. */

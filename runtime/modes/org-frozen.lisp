@@ -351,82 +351,29 @@ certainly saying."
 ;;; ---------------------------------------------------------------------------
 ;;; Buffer text on its way back out
 ;;;
-;;; **Every string this file takes out of the buffer goes through
-;;; `%org-frozen-text' first.** That is one function and one bug, and the bug is
-;;; worth the words because it is invisible: the page is drawn correctly right
-;;; up until somebody puts an em dash in the title — which the curriculum in
-;;; `examples/math/' does, in its first line.
+;;; **Every string this file takes out of the buffer goes through `utf8-text'
+;;; first.** That is one function and one bug, and the bug is worth the words
+;;; because it is invisible: the page is drawn correctly right up until somebody
+;;; puts an em dash in the title — which the curriculum in `examples/math/' does,
+;;; in its first line.
 ;;;
-;;; The shape of it. Lisp holds buffer text as UTF-8 **bytes**, one character per
-;;; byte: that is the deliberate choice `f_query' in `shim.c' writes up, and it
-;;; is what makes `search-forward' and `%char-index' work. `(buffer-string)'
-;;; therefore answers a `(SIMPLE-ARRAY CHARACTER)' in which `—' is *three*
-;;; characters, one per byte, each under 256. Going the other way, `dup_utf8'
-;;; encodes a character string — one UTF-8 sequence per character — which is
-;;; right for a literal a `load'ed file gave it and is exactly wrong for this:
-;;; three already-encoded bytes come out as six, and the em dash is drawn as the
-;;; Latin-1 reading of its own encoding.
+;;; The decoder itself is in `modes/modes.lisp', with the byte model written up
+;;; on its docstring. It was written out here first, and copied into `gui.lisp'
+;;; when that file needed it before this one existed; two copies of a decoder
+;;; that agreed by luck is the thing that got lifted, not this file's rule.
 ;;;
-;;; The scene made this *mandatory* rather than optional, and that is the one way
-;;; the port raised the stakes. Every string a scene hands over is measured by
-;;; `Measure::advance' in a real font, so bytes reaching it are not merely drawn
-;;; wrong — they are three characters wide where the document has one, and every
-;;; wrap, every column width and every centred line is computed from the wrong
-;;; number.
+;;; The scene made the rule *mandatory* rather than merely correct, and that is
+;;; the one way the port raised the stakes. Every string a scene hands over is
+;;; measured by `Measure::advance' in a real font, so bytes reaching it are not
+;;; merely drawn wrong — they are three characters wide where the document has
+;;; one, and every wrap, every column width and every centred line is computed
+;;; from the wrong number.
 ;;;
-;;; So this file decodes **once, per line, at the top of the builder**, and
-;;; everything downstream — the emphasis scanner, the table's column arithmetic,
-;;; the slices handed to `run' — works in characters. That is simpler than what
-;;; the overlay version did, which had to keep byte indices to hand `make-overlay'
-;;; and converted with `%char-index' at every use.
-;;;
-;;; ponytail: this is the local repair and not the general one, and there are now
-;;; *two* copies of it — `utf8-text' in `runtime/gui.lisp' is the same body,
-;;; written because that file needed it before this one could be depended on.
-;;; They agree today. The cheap upgrade path is this function becoming a call to
-;;; that one, which loads first; the coherent fix underneath both is the one
-;;; `docs/boundary.org' names on `f_query' — decode in the shim and delete the
-;;; byte model entirely.
-
-(defun %org-frozen-text (bytes)
-  "BYTES — buffer text, one character per UTF-8 byte — as the characters it
-actually spells.
-
-ASCII is returned unchanged and untouched, which is both the fast path and the
-common one: a document with no accent in it never allocates here.
-
-An invalid or truncated sequence is passed through one character at a time
-rather than replaced or dropped. This is a *renderer*: text it cannot make sense
-of should still be visible, because the alternative is a page that silently
-disagrees with the file behind it."
-  (let ((n (length bytes)))
-    (if (every (lambda (c) (< (char-code c) 128)) bytes)
-        bytes
-        (with-output-to-string (out)
-          (let ((i 0))
-            (loop while (< i n)
-                  do (let* ((b (char-code (char bytes i)))
-                            (len (cond ((< b #x80) 1)
-                                       ((< b #xC0) 0) ; a stray continuation byte
-                                       ((< b #xE0) 2)
-                                       ((< b #xF0) 3)
-                                       (t 4)))
-                            (code (cond ((< b #x80) b)
-                                        ((< b #xE0) (logand b #x1F))
-                                        ((< b #xF0) (logand b #x0F))
-                                        (t (logand b #x07)))))
-                       (cond
-                         ((or (zerop len) (> (+ i len) n))
-                          (write-char (char bytes i) out)
-                          (incf i))
-                         (t
-                          (loop for k from 1 below len
-                                do (setf code
-                                         (logior (ash code 6)
-                                                 (logand (char-code (char bytes (+ i k)))
-                                                         #x3F))))
-                          (write-char (code-char code) out)
-                          (incf i len))))))))))
+;;; So this file decodes **once, per line, at the top of the builder** — see
+;;; `%org-frozen-line' — and everything downstream, the emphasis scanner, the
+;;; table's column arithmetic, the slices handed to `run', works in characters.
+;;; That is simpler than what the overlay version did, which had to keep byte
+;;; indices to hand `make-overlay' and converted with `%char-index' at every use.
 
 ;;; `%org-frozen-repeat' used to live here: N copies of a character, with a
 ;;; comment about `:element-type 'character' because a base string cannot hold
@@ -674,7 +621,7 @@ meant it to stop produces a document that is wrong somewhere you cannot see."
 ;;;   - **a run set in its own size.** `Overlay::scale' is a line property; a
 ;;;     `run' has its own.
 ;;;
-;;; Everything here works on **decoded** text — see `%org-frozen-text'. Offsets
+;;; Everything here works on **decoded** text — see `%org-frozen-line'. Offsets
 ;;; are therefore character offsets into a character string, and there is no
 ;;; `%char-index' anywhere below this line.
 
@@ -761,7 +708,7 @@ wide the result will be. A table's column arithmetic needs the second, and
 getting it by scanning twice would be two chances to disagree about what a cell
 says.
 
-TEXT must already be characters. See `%org-frozen-text'."
+TEXT must already be characters. See `%org-frozen-line'."
   (let ((out nil) (i from) (n (length text)))
     (dolist (s (%org-modern-inline text from))
       (destructuring-bind (a b kind) s
@@ -930,11 +877,11 @@ order — the cursor into V is never rewound.
 
 No `buffer-substring' anywhere, and that is not thrift. `buffer-substring'
 answers UTF-8 *bytes*, so a fragment holding `\\text{café}' would reach TeX
-twice-encoded — the same bug `%org-frozen-text' exists to prevent, one layer
-further down, where it would come back as a wrongly-typeset equation rather than
-as a wrong glyph. The line vector is already decoded and its lines are
-consecutive, so joining the lines a fragment lies on with a newline reproduces
-the buffer's own offsets exactly and the source is a `subseq'.
+twice-encoded — the same bug `utf8-text' exists to prevent, one layer further
+down, where it would come back as a wrongly-typeset equation rather than as a
+wrong glyph. The line vector is already decoded and its lines are consecutive,
+so joining the lines a fragment lies on with a newline reproduces the buffer's
+own offsets exactly and the source is a `subseq'.
 
 A block is opaque to `latex-fragments' — `opaque_ranges' in
 `crates/syntax/src/org.rs' covers every `#+begin_'/`#+end_' pair and every
@@ -1194,7 +1141,7 @@ The plist:
   :LEVEL   the heading's level — 1 for `*', 2 for `**'.
   :TEXT    its text, decoded to real characters, with the tag run removed and
            the surrounding whitespace trimmed. Characters and not bytes: see
-           `%org-frozen-text', and do not undo it.
+           `utf8-text', and do not undo it.
   :TAGS    its `:a:b:' tags as a list of strings, or NIL.
   :LINE    the 0-based index of the line in the buffer.
   :BEGIN   character offset of the line's first character, which is what
@@ -1243,7 +1190,7 @@ it.")
 
 The one place buffer text becomes characters, and every reader below this point
 depends on it having happened exactly once."
-  (%org-frozen-text (first (aref v i))))
+  (utf8-text (first (aref v i))))
 
 (defun %org-frozen-line-pieces (text frags &optional (from 0) (to (length text)))
   "TEXT between FROM and TO as pieces, with FRAGS spliced in as equations.
@@ -1447,7 +1394,7 @@ a *raw* line: handing this an already-decoded one would decode an em dash twice.
           collect (let ((s (1+ a)) (e b))
                     (loop while (and (< s e) (%org-blank-p (char line s))) do (incf s))
                     (loop while (and (< s e) (%org-blank-p (char line (1- e)))) do (decf e))
-                    (%org-frozen-text (subseq line s e))))))
+                    (utf8-text (subseq line s e))))))
 
 (defun %org-frozen-rule-row-p (line)
   "True when LINE is a table's rule row — `|---+---|' and its spellings.

@@ -379,8 +379,20 @@ property on the heading arm and no change to the machinery at all.
 No `face' wherever the syntax highlighter already has the colour right — a
 display string is attributed to the first character it covers, so it inherits
 that character's highlight for free. Only emphasis and links need to say
-otherwise, because the character they start on is a markup marker."
-  (let ((n (length text)))
+otherwise, because the character they start on is a markup marker.
+
+TEXT arrives as buffer **bytes** — the scan's literal, or a `buffer-substring'
+from `%org-modern-rehide' — and is decoded here, once, at the top. It has to be
+decoded *somewhere*: a `display' string goes back to the editor through
+`dup_utf8', which encodes each character as UTF-8, so `[[a][café]]' drawn from
+raw bytes shows `cafÃ©' and `*em—dash*' shows three glyphs where the file has
+one. At the top rather than in the two arms that hand text back, which is the
+decision `org-frozen.lisp' made for the same reason: with it done once, every
+`char' and `length' below counts what the document actually says, and an arm
+added later cannot forget. The arms that only match ASCII markers — stars,
+bullets, `[X]' — are unaffected either way."
+  (let* ((text (utf8-text text))
+         (n (length text)))
     (case kind
       (:heading
        (when (and (plusp n) (every (lambda (c) (char= c #\*)) text))

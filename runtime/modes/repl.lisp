@@ -34,7 +34,7 @@
 (in-package :zemacs)
 
 (defparameter *repl-file*
-  (merge-pathnames ".config/zemacs/repl.lisp" (user-homedir-pathname))
+  (zemacs-file "repl.lisp")
   "Where the transcript lives. A real file for the same reason the scratch
 buffer is one: `find-file' is the only thing that can put the editor in a
 *different* buffer, and there is no way to make one with nothing behind it.")

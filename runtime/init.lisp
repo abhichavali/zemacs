@@ -73,6 +73,41 @@
 (in-package :zemacs)
 
 ;;; ---------------------------------------------------------------------------
+;;; Is the editor new enough to read this file?
+;;;
+;;; An installed binary keeps reading *this* config out of the checkout it was
+;;; built from — see `scripts/install.sh', which says so and means it — so the
+;;; two drift apart the moment a primitive is added here and the install is not
+;;; re-run. Loading then dies at the first call to something the binary does not
+;;; have, and everything below that line silently never happens.
+;;;
+;;; That failure is nasty out of all proportion to its cause, because what you
+;;; see depends entirely on *where* the file stopped. A missing `zemacs-file'
+;;; kills the config at the scratch-file definition — which is above the
+;;; dashboard and above the keymap, so the logo does not appear and no key is
+;;; bound, and neither symptom mentions a version. The status line does say
+;;; "The function ZEMACS::ZEMACS-FILE is undefined", and that is a sentence
+;;; nobody reads as "your application is out of date".
+;;;
+;;; So: check first, name the cause, say what to do about it. The list is the
+;;; primitives this file needs that a binary might plausibly predate; there is
+;;; no need to list the ones that have always existed.
+(defparameter *required-primitives*
+  '("zemacs-file" "set-face-style" "%dashboard-item")
+  "Host functions this config calls that older builds do not have.")
+
+(let ((missing (remove-if (lambda (name)
+                            (let ((s (find-symbol (string-upcase name) :zemacs)))
+                              (and s (fboundp s))))
+                          *required-primitives*)))
+  (when missing
+    ;; A message and not an error: the editor is running and mostly usable, and
+    ;; refusing to load the rest of the config would take the theme away too.
+    (message (format nil "zemacs is older than this config — no ~{~a~^, ~}. ~
+                          Run scripts/install.sh, then restart."
+                     missing))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Themes
 ;;;
 ;;; A theme is an ordinary Lisp file of `set-background', `set-foreground' and
@@ -90,23 +125,130 @@
   "The directory this config was loaded from. `*load-truename*' is only bound
 during a load, so it has to be captured here rather than read later.")
 
+;;; ---------------------------------------------------------------------------
+;;; Where zemacs keeps things
+;;;
+;;; `~/.zemacs.d', the way Emacs spells `~/.emacs.d', and deliberately not under
+;;; `~/.config'. A Lisp machine's directory is somewhere you *live* — the
+;;; scratch file, the REPL transcript and the tutorial's progress are all things
+;;; you open and edit, not settings you visit twice a year — and `SPC f f' into
+;;; `~/.config/zemacs' never stopped feeling like rummaging in a cupboard.
+;;;
+;;; One function rather than the string written out at each site, which is what
+;;; it was: five files across four modes each spelled the directory themselves,
+;;; so moving it meant finding all five.
+;;;
+;;; `zemacs-file' is *not* defined here. It is booted by the editor, in
+;;; `PATHS_FORM' in `crates/lisp/src/shim.c', beside `config_dir' in
+;;; `crates/app/src/main.rs' which has to agree with it — the auto-saves and
+;;; backups the editor writes land next to the files Lisp names. Defining it in
+;;; this file would have made it a thing that only exists once a config has been
+;;; read, and `runtime/lsp.lisp' and half of `runtime/modes/' are loaded without
+;;; one by the test suite. Where the editor keeps its state is a fact about the
+;;; editor rather than a preference, so it comes up with the image.
+
+;;; One face, said once.
+;;;
+;;; `set-syntax-color' takes three floats and `set-face-style' takes two flags,
+;;; and a theme that calls both for all 22 faces is 44 lines of which half say
+;;; nothing. This is the spelling a theme actually wants:
+;;;
+;;;   (set-face "keyword"  '(0.78 0.57 0.94) :bold t)
+;;;   (set-face "comment"  '(0.42 0.46 0.58) :italic t)
+;;;   (set-face "modeline" '(0.16 0.18 0.26))
+;;;
+;;; A Lisp wrapper over two primitives rather than a third primitive, which is
+;;; the standing rule: the editor learned exactly one new verb for weight, and
+;;; the ergonomics are a `defun'. NIL colour styles a face without recolouring
+;;; it, which is how a theme adds weight to a face it is happy with.
+;;;
+;;; Both flags are always sent, not only when true — a theme that leaves `:bold'
+;;; off means *not bold*, and inheriting the last theme's weight is exactly the
+;;; bug the exhaustive face lists exist to prevent.
+;;;
+;;; The slant is also remembered here, in `*face-italic*'. `set-face-style' sets
+;;; weight and slant together and the editor publishes no reader for either, so
+;;; anything that wants to make a face bold *afterwards* — which is exactly what
+;;; `*bold-constructs*' below does — would otherwise straighten a face the theme
+;;; had deliberately slanted. Tokyo Night's italic keywords are the case: forcing
+;;; bold on them without this would silently undo the single thing that theme is
+;;; most recognisable for. ponytail: a `(face-style face)' reader in the editor
+;;; is the honest fix and is perhaps six lines of Rust; a hash table here needs
+;;; none of them and is wrong only if something sets a style behind this
+;;; function's back, which nothing does.
+;;;
+;;; RGB is required rather than `&optional', even though NIL is a legal value
+;;; for it: `&optional' before `&key' is a Common Lisp trap, and this is the
+;;; exact call that springs it. `(set-face "keyword" :bold t)' would bind RGB to
+;;; the keyword `:bold' and then find `t' where a keyword name should be, which
+;;; is a confusing error a long way from the theme file that caused it. Required
+;;; means the mistake is a wrong-number-of-arguments at load time instead.
+(defparameter *face-italic* (make-hash-table :test #'equal)
+  "The slant last asked for, per face name. See `set-face'.")
+
+(defun set-face (name rgb &key bold italic)
+  "Colour and weight the face called NAME.
+RGB is a (R G B) list of floats, or NIL to leave the colour alone."
+  (when rgb (apply #'set-syntax-color name rgb))
+  (setf (gethash name *face-italic*) (and italic t))
+  (set-face-style name (and bold t) (and italic t))
+  name)
+
+;;; Bold constructs.
+;;;
+;;; Almost none of the ported themes bold anything in code, and that is faithful
+;;; rather than lazy: Catppuccin's style guide has no font-style section at all,
+;;; folke's Tokyo Night defaults `styles.keywords` to no weight, and Modus ships
+;;; `modus-themes-bold-constructs' set to nil. Every one of them carries meaning
+;;; in hue, on the assumption that the reader wants the page calm.
+;;;
+;;; That is a taste, and it is a taste about *their* editor rather than about
+;;; this one. So it is a variable here, the way it is a variable in Modus: the
+;;; themes stay honest ports, and the weight the reader wants is applied on top
+;;; of whichever one is loaded. Set it to NIL for the ports exactly as published.
+;;;
+;;; Applied after the theme file rather than inside it, which is why a theme
+;;; needs to know nothing about this: `load-theme' is the only door in.
+(defparameter *bold-constructs* '("keyword" "function" "type")
+  "Faces made bold after any theme loads, whatever that theme asked for.
+NIL for the themes as their authors published them. A short list on purpose —
+a screen where everything is heavy has no emphasis left to give.")
+
+(defun %apply-bold-constructs ()
+  "Re-assert weight on `*bold-constructs*', preserving each face's slant."
+  (dolist (face *bold-constructs*)
+    (set-face-style face t (gethash face *face-italic*))))
+
 (defun load-theme (name)
   "Load theme NAME from the themes/ directory next to this config."
   (let ((path (and *runtime-dir*
                    (merge-pathnames (format nil "themes/~a.lisp" name)
                                     *runtime-dir*))))
     ;; ponytail: themes are found relative to *this file*, so a config copied to
-    ;; ~/.config/zemacs without the themes/ directory finds nothing and says so.
+    ;; ~/.zemacs.d without the themes/ directory finds nothing and says so.
     ;; A search path is the fix when there is somewhere else to look.
     (cond ((null path) (message "load-theme: cannot tell where this config lives"))
           ((probe-file path) (load path :verbose nil :print nil)
+                             (%apply-bold-constructs)
                              (message (format nil "theme: ~a" name)))
           (t (message (format nil "no such theme: ~a" name))))))
 
-(defun modus-vivendi () "Modus Vivendi — black ground." (load-theme "modus-vivendi"))
-(defun modus-vivendi-tinted () "Modus Vivendi, tinted ground — the default."
-  (load-theme "modus-vivendi-tinted"))
-(defun modus-operandi () "Modus Operandi — the light one." (load-theme "modus-operandi"))
+;;; Which themes exist is a question the *directory* answers, not a list kept in
+;;; step with it by hand. There were three themes and three `defun's, and at
+;;; eleven that trade stops being worth making: a list you have to remember to
+;;; edit is a list that will be wrong, and the failure mode — a theme file that
+;;; is present and unofferable — is invisible.
+(defun theme-names ()
+  "Every theme in the themes/ directory, by name, sorted."
+  (when *runtime-dir*
+    (sort (mapcar #'pathname-name
+                  (directory (merge-pathnames "themes/*.lisp" *runtime-dir*)))
+          #'string<)))
+
+(defun theme ()
+  "Pick a theme. Bound to `SPC t t'."
+  (completing-read "Theme: " (theme-names)
+    (lambda (pick) (when pick (load-theme pick)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Appearance
@@ -149,9 +291,14 @@ same way Emacs tracks `text-scale-mode-amount' in a variable.")
 (set-text-width 0)
 
 ;;; What a window does with a line wider than it is.
-;;; "truncate" — cut it at the pane edge and mark the tail with a `→'
 ;;; "wrap"     — continue it on the next row
-(set-line-overflow "truncate")
+;;; "truncate" — cut it at the pane edge and mark the tail with a `→'
+;;;
+;;; Wrapping, because the alternative hides text and says so with one arrow:
+;;; you learn that a line is long without learning what is on it, and the only
+;;; way to read the rest is to scroll sideways. `j' and `k' move by *visual*
+;;; line when this is on, so a wrapped line still steps a row at a time.
+(set-line-overflow "wrap")
 
 ;;; A calm dark theme: a near-black blue-grey ground, cool off-white text.
 (set-background 0.07 0.08 0.12)
@@ -202,9 +349,18 @@ same way Emacs tracks `text-scale-mode-amount' in a variable.")
 (set-syntax-color "modeline-text"     0.80 0.85 0.97) ; what is written on it
 
 ;;; Everything above is the fallback palette. Loading a theme replaces all of
-;;; it; comment this out to keep the defaults, or swap in `modus-operandi' for
-;;; the light one.
-(load-theme "modus-vivendi-tinted")
+;;; it — colour *and* weight — so comment this line out to keep the defaults,
+;;; put any name from the themes/ directory here, or pick one at runtime with
+;;; `M-x theme' / `SPC t t'.
+;;;
+;;; Tokyo Night rather than Modus, which was the default for as long as Modus
+;;; was the only dark theme here. Modus is the better-engineered of the two and
+;;; is still one keystroke away: every colour in it clears WCAG AAA against its
+;;; ground, which is a real property and not a claim most themes can make. It is
+;;; also, by design, quiet — restraint is the thing it is *for*. Tokyo Night is
+;;; not trying to be restrained, and a first boot should show what the editor
+;;; can do rather than how little it is willing to do.
+(load-theme "tokyo-night")
 
 ;;; Where completing prompts (M-x, find-file, buffer switch) are drawn.
 ;;; "center"     — a floating box in the middle of the window, telescope-style
@@ -280,8 +436,7 @@ rest of the primitives unqualified."
 ;;; `insert' would drop a Lisp header into whatever you happened to be editing.
 ;;; A real .lisp file also gets syntax highlighting and survives a restart.
 
-(defparameter *scratch-file*
-  (merge-pathnames ".config/zemacs/scratch.lisp" (user-homedir-pathname))
+(defparameter *scratch-file* (zemacs-file "scratch.lisp")
   "Where the scratch buffer lives on disk.")
 
 (defun %scratch-text ()
@@ -391,7 +546,7 @@ build without it still reads this file.")
 
 (defparameter *hidden-commands*
   (append (when (boundp '*readers*) (symbol-value '*readers*))
-          '("make-marker" "point-marker" "load-theme"
+          '("make-marker" "point-marker" "load-theme" "theme-names"
             "buffer-lines" "buffer-names" "beginning-of-line" "end-of-line"
             ;; ...and one that is worse than useless by hand: called with no
             ;; argument it means "plain text", so `M-x set-language' picked by a
@@ -457,19 +612,21 @@ so the width stays right whichever line comes up.")
 (defun %banner ()
   "The text under the logo.
 
-Block-capital ASCII used to spell the name here, and it is gone for two
-reasons. The logo above says what the application is, in artwork that does not
-depend on a font having the block-drawing characters — and the art *did* depend
-on that: rendered in a font missing some of them it degraded into letters that
-were not the ones intended, which is a worse first impression than no artwork at
-all. Letter-spaced type says the same thing in characters every font has.
+Block-capital ASCII used to spell the name here, then letter-spaced type did,
+and now neither does. The name is the one thing on this screen nobody needs
+told: it is in the window title, it is what you typed to get here, and the logo
+above already says which language the application is made of. What is left is
+the four lines that say something you did not already know — what it is for,
+one koan, and which image is actually running.
+
+The art is gone for a second reason worth keeping written down: block-drawing
+characters degrade into the wrong letters in a font that is missing some of
+them, which is a worse first impression than no artwork at all.
 
 No leading whitespace on any line: the dashboard centres each line itself, so
 padding here would shift the block off-centre rather than move it."
   (let ((koan (nth (random (length *koans*)) *koans*)))
     (format nil "
-z e m a c s
-
 a common lisp machine that edits text
 
 ;; ~a
@@ -496,18 +653,12 @@ a common lisp machine that edits text
   (dashboard-logo
    (image-file (merge-pathnames "../assets/Lisp_logo.svg.png" *runtime-dir*) 10)))
 
-(clear-dashboard-items)
-;; Built-in verbs...
-(dashboard-item #\f "Find file"      "find-file")
-;; ...and functions defined above, on equal footing. `lisp-scratch' rather than
-;; the built-in `scratch' verb, which only drops you in an empty, language-less
-;; buffer nothing can evaluate.
-(dashboard-item #\s "Scratch buffer" "lisp-scratch")
-(dashboard-item #\e "Evaluate Lisp"  "eval-dwim")
-(dashboard-item #\c "Edit configuration" "edit-config")
-(dashboard-item #\r "Reload configuration" "reload-config")
-(dashboard-item #\v "Lisp version" "lisp-version")
-(dashboard-item #\q "Quit" "quit")
+;;; The items themselves are built at the *end* of the keys section below, not
+;;; here. Each row shows the leader sequence for its command in a dim column on
+;;; the right — "this is the key you will use once you know the editor" — and
+;;; that sequence is read out of the leader table, which does not exist until
+;;; the bindings have been made. Building the menu before the keymap would print
+;;; a column of blanks.
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys
@@ -531,8 +682,21 @@ the bindings.")
   "Bind KEYS in every mode."
   (dolist (mode *all-modes*) (define-key mode keys command)))
 
+(defparameter *leader-keys* (make-hash-table :test #'equal)
+  "Command name -> the leader sequence that runs it, for the dashboard to show.
+First binding wins: `switch-buffer' is on both `SPC b b' and `SPC j j', and the
+one worth printing is the one in the group the command belongs to, which is the
+one written first.")
+
+(defun leader-key (command)
+  "The leader sequence bound to COMMAND, or NIL. For display only — nothing
+here makes the binding work, `define-key' below does that."
+  (gethash command *leader-keys*))
+
 (defun define-leader (keys command)
   "Bind a SPC-prefixed sequence in the modes that have a leader."
+  (unless (gethash command *leader-keys*)
+    (setf (gethash command *leader-keys*) keys))
   (dolist (mode *leader-modes*) (define-key mode keys command)))
 
 ;;; Leader bindings work with a selection up, not just from normal mode.
@@ -541,6 +705,7 @@ the bindings.")
 (define-leader "SPC b d" "show-dashboard")
 (define-leader "SPC b b" "switch-buffer")
 (define-leader "SPC j j" "switch-buffer")
+(define-leader "SPC t t" "theme")             ; `SPC t' is the toggle group
 (define-leader "SPC h r" "reload-config")
 (define-leader "SPC h v" "lisp-version")
 (define-leader "SPC h m" "messages-buffer")   ; what Emacs puts on `C-h e'
@@ -601,6 +766,23 @@ the bindings.")
 (define-key "terminal" "C-M-t" "terminal-normal")
 ;;; ...and back in, the way `i' enters Insert mode from Normal.
 (define-key "normal" "C-M-t" "terminal")
+
+;;; Copy and paste across the boundary.
+;;;
+;;; Only paste needs a key. Copying is already whole: `C-M-t' freezes the
+;;; scrollback into an ordinary buffer, where `v'/`V' select and `y' yanks, and
+;;; the unnamed register is mirrored to the system clipboard every frame — so
+;;; what you yank out of a shell is on the pasteboard before you let go of `y'.
+;;; The gutter stays off the whole time: a terminal buffer is a grid the child
+;;; owns and has no line numbers to draw, whatever `set-line-numbers' says.
+;;;
+;;; `M-v' is ⌘V — a Command chord, which is the only kind that reaches the
+;;; editor from inside a session, and which no shell has ever been able to see.
+;;; Bracketing is decided by the child: `terminal-paste' marks the text as a
+;;; paste when the program asked for that mode, so a multi-line yank lands in
+;;; the line editor instead of running every line but the last.
+(define-key "terminal" "M-v" "terminal-paste")
+(pushnew "terminal-paste" *extra-commands* :test #'string=)
 
 ;;; Clickable links in the terminal. A click the child did not ask for used to
 ;;; do nothing at all — a shell never turns mouse reporting on — so the row it
@@ -704,6 +886,42 @@ there is no such link does the row itself get read for one."
 ;;; a prefix, so `gg' falls through to the grammar underneath.
 (define-key "dired" "g r" "dired-refresh")
 (define-key "dired" "q" "show-dashboard")
+
+;;; ---------------------------------------------------------------------------
+;;; The dashboard menu
+;;;
+;;; Down here rather than up in the Dashboard section because of the third
+;;; column: every row prints the leader sequence that runs the same command, so
+;;; the startup screen teaches the keymap instead of being a menu you use once
+;;; and then never see the point of again. `leader-key' reads the table
+;;; `define-leader' built, and the table is only complete now.
+;;;
+;;; The sequence is *looked up*, not typed out beside the label. Written twice
+;;; it would be wrong within a month — someone moves `SPC f f' and the dashboard
+;;; goes on advertising the old one, which is the exact failure a printed hint
+;;; is supposed to prevent.
+
+(defun dashboard-item (key label action &optional hint)
+  "Add a row: press KEY to run ACTION, shown as LABEL.
+HINT is the key sequence printed dim on the right; it defaults to the leader
+sequence bound to ACTION, and NIL means none. The editor primitive underneath
+takes four arguments and this takes three or four, which is the only reason
+this exists — see `%dashboard-item'."
+  (%dashboard-item key label action (or hint (leader-key action) "")))
+
+(clear-dashboard-items)
+;; Built-in verbs...
+(dashboard-item #\f "Find file"      "find-file")
+;; ...and functions defined above, on equal footing. `lisp-scratch' rather than
+;; the built-in `scratch' verb, which only drops you in an empty, language-less
+;; buffer nothing can evaluate.
+(dashboard-item #\s "Scratch buffer" "lisp-scratch")
+(dashboard-item #\e "Evaluate Lisp"  "eval-dwim")
+(dashboard-item #\p "Open project"   "project-switch")
+(dashboard-item #\t "Change theme"   "theme")
+(dashboard-item #\c "Edit configuration" "edit-config")
+(dashboard-item #\r "Reload configuration" "reload-config")
+(dashboard-item #\q "Quit" "quit")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Major and minor modes
@@ -1076,6 +1294,20 @@ has edited costs one comparison per keystroke and nothing else."
 (define-key-everywhere "C-c y" "yank-buffer-file-name")
 (define-key-everywhere "C-q" "delete-window")
 
+;;; The `C-x' family, spelled as Emacs spells it.
+;;;
+;;; A prefix rather than more `C-c' chords, because these three are the ones
+;;; whose Emacs spelling is muscle memory — `C-x C-s' in particular is typed by
+;;; people who have never read a keymap in their lives. `C-c' stays the
+;;; editor's own family; this is the one borrowed wholesale.
+;;;
+;;; Bound everywhere, Insert included: saving is not something to leave a mode
+;;; for. `C-x C-s' reaches `save-file' with no argument, which means "in place"
+;;; — see the wrapper in `shim.c'.
+(define-key-everywhere "C-x C-s" "save-file")
+(define-key-everywhere "C-x k" "kill-buffer")
+(define-key-everywhere "C-x w" "delete-window")
+
 ;;; `execute-command' and `switch-buffer' are built-in verbs — core opens the
 ;;; prompt itself, so these names are not Lisp functions and are not in the M-x
 ;;; list. `SPC ;' is the usual leader spelling for M-x.
@@ -1087,14 +1319,26 @@ has edited costs one comparison per keystroke and nothing else."
 (define-key "dashboard" "f" "find-file")
 (define-key "dashboard" "b" "switch-buffer")
 
-;;; Magnify the buffer. Meta is Command (⌘) first, with Option as a fallback, so
-;;; `M-+' is ⌘-Shift-= ; `M-=' is the same key without the Shift, and works on
-;;; any keyboard layout. Bound in Insert mode too, so zooming does not require
-;;; leaving what you were typing.
-(define-key-everywhere "M-+" "text-scale-increase")
-(define-key-everywhere "M-=" "text-scale-increase")
-(define-key-everywhere "M--" "text-scale-decrease")
-(define-key-everywhere "M-0" "text-scale-reset")
+;;; Magnify *this window*. Meta is Command (⌘) first, with Option as a fallback,
+;;; so `M-+' is ⌘-Shift-= ; `M-=' is the same key without the Shift, and works
+;;; on any keyboard layout. Bound in Insert mode too, so zooming does not
+;;; require leaving what you were typing.
+;;;
+;;; The window and not the frame, because the reason to magnify is a *document*:
+;;; reading a paper beside the code you are writing about it wants one pane
+;;; larger and the other exactly as it was. Four steps — 100, 125, 150, 200 per
+;;; cent — and they are a fixed set rather than a free size for a reason worth
+;;; knowing: the renderer's face cache is keyed by point size and its bound *is*
+;;; the number of sizes that can exist, so these are the same four steps an
+;;; overlay's `scale' may already ask for.
+;;;
+;;; `set-font-size' is untouched and is still the size of text *everywhere* — a
+;;; window's zoom multiplies it. `M-x text-scale-increase' is that global knob;
+;;; these keys are the local one, which is the one you reach for far more often.
+(define-key-everywhere "M-+" "zoom-in")
+(define-key-everywhere "M-=" "zoom-in")
+(define-key-everywhere "M--" "zoom-out")
+(define-key-everywhere "M-0" "zoom-reset")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Scenes — a page in pixels rather than a grid of cells
@@ -1161,6 +1405,25 @@ has edited costs one comparison per keystroke and nothing else."
   (define-leader "SPC l r" "lsp-restart")
   (define-leader "SPC l q" "lsp-stop")
   (define-leader "SPC l s" "lsp-status"))
+
+;;; corfu, in Insert mode, spelled vim's way rather than Emacs': `C-n' and `C-p'
+;;; cycle, `C-y' takes the one that is lit, `C-e' gives up.
+;;;
+;;; Four keys that mean *nothing at all* in Insert mode today — core answers a
+;;; bare Ctrl with no command — so none of these takes anything away, and none
+;;; of them needs the fallback that makes `RET' and `TAB' unbindable from the
+;;; image (see the note in `lsp.lisp': a Lisp fallback lands a queue turn late,
+;;; which would put the newline *after* the character you typed next).
+;;;
+;;; `C-M-i' is Emacs' `completion-at-point' and asks explicitly, which is how you
+;;; get the list one character into a word.
+(when (fboundp 'lsp-complete)
+  (define-leader "SPC l c" "lsp-complete")
+  (define-key "insert" "C-M-i" "lsp-complete")
+  (define-key "insert" "C-n" "lsp-complete-next")
+  (define-key "insert" "C-p" "lsp-complete-previous")
+  (define-key "insert" "C-y" "lsp-complete-accept")
+  (define-key "insert" "C-e" "lsp-complete-abort"))
 
 ;;; ---------------------------------------------------------------------------
 ;;; which-key, Common Lisp editing, a REPL, and org's markup drawn rather than
@@ -1246,7 +1509,8 @@ has edited costs one comparison per keystroke and nothing else."
 ;;; Loaded here rather than next to `modes.lisp' because they use `define-leader'
 ;;; and `define-mode-key', which are defined above this point and not below it.
 (when *runtime-dir*
-  (dolist (file '("modes/which-key.lisp" "modes/lisp-mode.lisp" "modes/repl.lisp"
+  (dolist (file '("modes/which-key.lisp" "modes/show-paren.lisp"
+                  "modes/lisp-mode.lisp" "modes/repl.lisp"
                   "modes/parinfer.lisp" "modes/org-modern.lisp" "modes/org-fold.lisp"
                   "modes/org-frozen.lisp"
                   "modes/math.lisp"

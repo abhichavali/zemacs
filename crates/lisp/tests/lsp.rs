@@ -208,6 +208,16 @@ fn the_lsp_client_talks_to_a_server() {
     lisp.eval("(lsp-diagnostics-at-point)".into());
     wait(&shared, &lisp, "a clean line", |m| m == "no diagnostic on this line");
 
+    // The renderer hung off the seam has already drawn for the diagnostic the
+    // fake server published: one `line-prefix` overlay, on the line it named.
+    // Nothing in this test installed it — `lsp.lisp` pushes it onto the seam
+    // itself, which is the whole claim that the seam is usable.
+    let one = "(overlays-in (point-min) (point-max))";
+    let mark = format!("(string-trim \" \" (overlay-get (first (first {one})) 'line-prefix))");
+    says(&shared, &lisp, &format!("(length {one})"), "1");
+    says(&shared, &lisp, &mark, "●");
+    says(&shared, &lisp, &format!("(= (second (first {one})) (line-start 5))"), "T");
+
     // The seam the overlay renderer attaches to. Nothing in `lsp.lisp` has to
     // change for flymake-style gutter marks to appear — this is the contract.
     lisp.eval(
@@ -226,6 +236,14 @@ fn the_lsp_client_talks_to_a_server() {
     wait(&shared, &lisp, "the overlay seam", |m| {
         m == "overlay hook /tmp/zemacs_lsp_test.py 1"
     });
+
+    // Repainted rather than appended: the warning *replaces* the error, so the
+    // mark changes shape and moves to the new line instead of the two piling
+    // up. A renderer that leaks an overlay per publish is a file wearing a
+    // margin full of marks for problems that were fixed ten minutes ago.
+    says(&shared, &lisp, &format!("(length {one})"), "1");
+    says(&shared, &lisp, &mark, "▲");
+    says(&shared, &lisp, &format!("(= (second (first {one})) (line-start 1))"), "T");
 
     // --- a change is synchronised -------------------------------------------
     //

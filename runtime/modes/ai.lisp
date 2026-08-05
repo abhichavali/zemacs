@@ -145,14 +145,20 @@ entire contribution is one line of text."
             name program (if resume resume-args new-args))))
 
 (defun %ai-start (harness resume)
-  "Fork HARNESS. RESUME picks between its two argument lists."
+  "Fork HARNESS beside the current window. RESUME picks its argument lists."
   (if (null (executable-find (second harness)))
       ;; The editor refuses this too, before it forks. Saying it here as well
       ;; means the answer comes from the thing you picked rather than from a
       ;; buffer that appeared and vanished.
       (message (format nil "~a is not installed — no ~a on $PATH"
                        (first harness) (second harness)))
-      (call-command (%ai-verb harness resume))))
+      ;; Side by side, because the whole point of an agent is reading what it
+      ;; says against the code it is saying it about — taking over the window
+      ;; you were reading is the one layout that cannot do that.
+      ;; `split-window-right' focuses the new pane and the verb travels the
+      ;; same queue behind it, so the session lands there.
+      (progn (split-window-right)
+             (call-command (%ai-verb harness resume)))))
 
 (defun ai ()
   "Pick a coding agent, then start a new conversation or resume one.

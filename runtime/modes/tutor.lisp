@@ -50,7 +50,7 @@
 ;;;; the tutor, which is why it is a `create-buffer' buffer with no file behind
 ;;;; it — `docs/reference.org' calls that the shape for a generated view, and a
 ;;;; file would only be a copy of the data going stale. The *truth* about your
-;;;; progress lives in `~/.config/zemacs/tutor.lisp'; what you see in the org
+;;;; progress lives in `~/.zemacs.d/tutor.lisp'; what you see in the org
 ;;;; buffer is that truth rendered, which is why there is never a question of
 ;;;; the two disagreeing.
 ;;;;
@@ -125,14 +125,14 @@ exercise that replaces the whole buffer would replace the answer you are being
 marked on. `SPC m w' shows it.")
 
 (defparameter *tutor-progress-file*
-  (merge-pathnames ".config/zemacs/tutor.lisp" (user-homedir-pathname))
+  (zemacs-file "tutor.lisp")
   "Where you got to, as ordinary Lisp data. Beside `scratch.lisp' and
 `repl.lisp', because that is where this editor keeps the things it wrote for
 you and you are allowed to edit. This is the *truth* about your progress; the
 marks in the org document are a rendering of it.")
 
 (defparameter *tutor-check-file*
-  (merge-pathnames ".config/zemacs/tutor-check.lisp" (user-homedir-pathname))
+  (zemacs-file "tutor-check.lisp")
   "The program handed to the child `ecl', overwritten before every Stage 1
 check. A file rather than a pipe on purpose: when a check goes wrong you can
 run `ecl --norc --shell' on it yourself and watch it go wrong.")

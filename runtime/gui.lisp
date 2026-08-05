@@ -347,58 +347,13 @@ fills the room its parent left it and does not overhang."
 
 ;;; ---------------------------------------------------------------------------
 ;;; Text out of a buffer
-
-(defun utf8-text (bytes)
-  "BYTES — buffer text, one character per UTF-8 byte — as the characters it
-actually spells.
-
-`(buffer-string)', `(line-string 3)' and every other reader answer bytes, and
-the encoder that carries a scene back to Rust encodes each *character* as UTF-8.
-So a line with an em dash in it goes over twice-encoded and is drawn as the
-Latin-1 reading of its own encoding — three wrong glyphs where the file has one.
-Decoding here, before the string leaves the image, is what makes the page agree
-with the file behind it.
-
-ASCII is returned unchanged and untouched, which is both the fast path and the
-common one. An invalid or truncated sequence is passed through one character at
-a time rather than dropped: this is a *renderer*, and text it cannot make sense
-of should still be visible.
-
-ponytail: this is `%org-frozen-text' in `modes/org-frozen.lisp', a second time.
-That file needed it before this one existed, for the same reason and with the
-same body. Ceiling: two copies of a UTF-8 decoder, which agree today. The
-upgrade path is that file calling this one — it loads later, so nothing but the
-edit is in the way — and the coherent fix underneath both is the one
-`docs/boundary.org' names on `f_query': decode in the shim and delete the byte
-model entirely."
-  (let ((n (length bytes)))
-    (if (every (lambda (c) (< (char-code c) 128)) bytes)
-        bytes
-        (with-output-to-string (out)
-          (let ((i 0))
-            (loop while (< i n)
-                  do (let* ((b (char-code (char bytes i)))
-                            (len (cond ((< b #x80) 1)
-                                       ((< b #xC0) 0) ; a stray continuation byte
-                                       ((< b #xE0) 2)
-                                       ((< b #xF0) 3)
-                                       (t 4)))
-                            (code (cond ((< b #x80) b)
-                                        ((< b #xE0) (logand b #x1F))
-                                        ((< b #xF0) (logand b #x0F))
-                                        (t (logand b #x07)))))
-                       (cond
-                         ((or (zerop len) (> (+ i len) n))
-                          (write-char (char bytes i) out)
-                          (incf i))
-                         (t
-                          (loop for k from 1 below len
-                                do (setf code
-                                         (logior (ash code 6)
-                                                 (logand (char-code (char bytes (+ i k)))
-                                                         #x3F))))
-                          (write-char (code-char code) out)
-                          (incf i len))))))))))
+;;;
+;;; `utf8-text' was written out here, and again in `modes/org-frozen.lisp' — one
+;;; decoder spelled twice, agreeing by luck. It is in `modes/modes.lisp' now,
+;;; which `init.lisp' loads above this file and which every mode loads anyway.
+;;; Nothing in *this* file calls it, so the move costs this file no dependency at
+;;; all; it is the callers above — the ones putting buffer text in a `run' — that
+;;; need it in scope, and they all sit below both files.
 
 ;;; ---------------------------------------------------------------------------
 ;;; What a click means

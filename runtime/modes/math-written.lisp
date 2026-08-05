@@ -127,7 +127,7 @@
 ;;;; ponytail: the model is resolved once per *session*, not cached on disk, so
 ;;;; the first `SPC m w' of the day costs one extra GET. The ceiling is somebody
 ;;;; who restarts the editor forty times an hour; the upgrade is writing the
-;;;; resolved slug into `~/.config/zemacs/', which is a file to invalidate and a
+;;;; resolved slug into `~/.zemacs.d/', which is a file to invalidate and a
 ;;;; new way to be wrong about which model you are paying for. `(setf
 ;;;; *math-written-model* "...")' in your config is the same thing, said once,
 ;;;; where you can see it.
@@ -170,7 +170,7 @@ a phone writes `IMG_0001.JPG'.")
   "The environment variable read first for the OpenRouter key.")
 
 (defparameter *math-written-key-file*
-  (merge-pathnames ".config/zemacs/openrouter-key" (user-homedir-pathname))
+  (zemacs-file "openrouter-key")
   "A file holding the OpenRouter key on one line, read when the environment
 variable is unset. Should be mode 600; a mode that is not gets one warning.")
 

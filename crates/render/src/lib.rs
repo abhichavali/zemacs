@@ -55,8 +55,9 @@ use sdl2::video::WindowContext;
 use zemacs_core::display::{char_cells, expand_line, str_cells, visual_col, wrap_row_count};
 use zemacs_core::modeline;
 use zemacs_core::{
-    fold_hiding, fold_starts_in, Buffer, BufferKind, CompletionStyle, Editor, HlKind, Image, ImageId,
-    LineOverflow, Mode, Overlay, Settings, Span, Window,
+    dashboard::Row as Dash, fold_hiding, fold_starts_in, Buffer, BufferId, BufferKind,
+    CompletionStyle, Editor, FaceStyle, HlKind, Image, ImageId, LineOverflow, Mode, Overlay,
+    Settings, Span, Window,
 };
 // `zemacs_gui::Rect` is deliberately not imported: `Rect` in this file is
 // SDL's, and three rectangle types in one namespace is how a blit ends up in
@@ -249,6 +250,33 @@ pub struct Renderer {
     /// is *positioned* against the baseline, which is what makes `$x_1$` hang
     /// below the line instead of floating over it.
     ascent: i32,
+    /// Where the caret landed this frame, for the one surface that has to hang
+    /// off point rather than off the frame: the in-buffer completion popup.
+    ///
+    /// **Recorded rather than recomputed**, and that is why it is a field and
+    /// not a function. Point's pixel position is the output of the whole line
+    /// loop — wrapping, folds, the window's zoom, an overlay's type scale, the
+    /// gutter's width — and a second derivation of it would be a copy of that
+    /// loop's arithmetic that drifts. A popup that disagreed with the caret
+    /// about where point is would be worse than no popup, so it is drawn from
+    /// the same numbers the caret was.
+    ///
+    /// `None` until a pane draws a caret, which is every frame in a mode with no
+    /// cursor and every frame that is not the focused one.
+    caret: Option<Caret>,
+}
+
+/// The caret's rectangle in window coordinates, and the cell size it was drawn
+/// in — [`Renderer::caret`].
+#[derive(Clone, Copy)]
+struct Caret {
+    x: i32,
+    y: i32,
+    /// This pane's cell width and row height, which are the *window's* and not
+    /// the renderer's: a zoomed split measures in bigger units, and a popup
+    /// beside its caret has to measure in the same ones.
+    cw: i32,
+    row_h: i32,
 }
 
 impl Renderer {
@@ -310,6 +338,7 @@ impl Renderer {
             cell_w,
             line_h,
             ascent,
+            caret: None,
         })
     }
 
@@ -382,6 +411,15 @@ impl Renderer {
     /// The app calls `Editor::sync_focused_window` first, so every window's
     /// `cursor`/`scroll` is live and no pane needs a special case.
     ///
+    /// `terminals` is one live grid per terminal buffer on screen, and it is a
+    /// *list* for the reason this used to be a single `Option<&Screen>` and
+    /// should not have been: a terminal's colour is in the grid and not in the
+    /// buffer text, so a pane given no grid falls through to the text path and
+    /// draws the flattening — which is the same characters with every attribute
+    /// already thrown away. One grid meant only the session with the keyboard
+    /// had one, so a terminal beside the file you were editing, or either half
+    /// of a two-terminal split, quietly turned grey.
+    ///
     /// Drawing only — [`Renderer::present`] puts it on screen. They are separate
     /// because the canvas is vsynced, so `present` parks the thread for most of
     /// a frame, and the editor lock must not be held across that or every Lisp
@@ -390,7 +428,7 @@ impl Renderer {
         &mut self,
         editor: &mut Editor,
         frame_index: usize,
-        terminal: Option<&Screen>,
+        terminals: &[(BufferId, Screen)],
     ) -> anyhow::Result<()> {
         self.sync(editor)?; // cheap no-op; makes an app-side `sync` call optional
         // Start this frame's digest from the two things that move *every* glyph
@@ -400,6 +438,9 @@ impl Renderer {
         let (out_w, out_h) = self.canvas.output_size().unwrap_or((0, 0));
         self.drawn = FNV_SEED;
         self.draws = 0;
+        // Per frame, not per session: a caret from the frame before is a caret
+        // for a scroll position and a window layout that no longer exist.
+        self.caret = None;
         self.mark([
             TAG_FRAME,
             pack(out_w as i32, out_h as i32),
@@ -433,7 +474,19 @@ impl Renderer {
 
         for p in &panes {
             let pane = area_of(p.rect);
-            let rows = doc_lines(pane, status_h, self.line_h);
+            // This pane's own body size. A window's `zoom` multiplies the
+            // editor's font size for *this* pane and no other, so the cell and
+            // the row below are the units this window works in — and every
+            // number handed back to core has to be in them, or `j` and the
+            // click map would answer for a pane nobody is looking at.
+            //
+            // 100 for every unzoomed window, where `scaled` is the identity and
+            // all of this is exactly what it was.
+            let zoom = editor.frames[frame_index]
+                .window(p.window)
+                .map_or(100, |w| w.zoom.max(100));
+            let (cell_w, line_h) = (scaled(self.cell_w, zoom), scaled(self.line_h, zoom));
+            let rows = doc_lines(pane, status_h, line_h);
             // Wrapping breaks the one-row-per-line assumption this used to be a
             // division by, so the lines have to be laid out to be counted.
             let laid_out = editor.frames[frame_index]
@@ -442,13 +495,10 @@ impl Renderer {
                 .and_then(|(id, scroll)| {
                     let buf = editor.buffer_by_id(id)?;
                     let set = &editor.settings;
-                    let doc = doc_rect(pane, status_h, measure_px(set, self.cell_w));
-                    let text_w = doc.w - gutter_w(buf, set, self.cell_w);
-                    let cols = visible_cols(text_w, self.cell_w);
-                    Some((
-                        visible_lines(buf, scroll, rows, text_w, self.cell_w, set),
-                        cols,
-                    ))
+                    let doc = doc_rect(pane, status_h, measure_px(set, cell_w));
+                    let text_w = doc.w - gutter_w(buf, set, cell_w);
+                    let cols = visible_cols(text_w, cell_w);
+                    Some((visible_lines(buf, scroll, rows, text_w, cell_w, set), cols))
                 });
             // `cols` goes back too, and it is not decoration: `j` and `k` move
             // by *visual* line, and where a visual line breaks is this number.
@@ -502,7 +552,12 @@ impl Renderer {
             if let Some(scene) = &buf.scene {
                 self.draw_pane_scene(editor, scene, doc_rect(pane, status_h, 0));
             } else {
-                match (buf.kind, terminal) {
+                // This pane's *own* grid, by buffer id — not "the" terminal.
+                let grid = terminals
+                    .iter()
+                    .find(|(id, _)| *id == buf.id)
+                    .map(|(_, screen)| screen);
+                match (buf.kind, grid) {
                     // Neither of these takes the measure. The dashboard centres
                     // its own art in whatever it is given, and a terminal's
                     // width is a fact the child process has already been told —
@@ -562,6 +617,9 @@ impl Renderer {
         // keyboard, or every open frame would show the same M-x box.
         if focused {
             self.draw_which_key(editor, area.w, area.h, status_h);
+            // corfu, between the two: over the document (it floats), under the
+            // minibuffer's box (which is modal and dims everything anyway).
+            self.draw_completion_at_point(editor, area.w, area.h, status_h);
             self.draw_completion(editor, area.w, area.h, status_h);
         }
 
@@ -667,6 +725,28 @@ impl Renderer {
     /// `None` when the click was on a divider, or in a pane showing something
     /// that is not buffer text — the dashboard and a terminal both draw rows
     /// that no rope position corresponds to.
+    /// The grid a terminal pane can actually show, in cells, for a child that
+    /// has to be told how big its window is.
+    ///
+    /// Here for the same reason [`Renderer::click_target`] is: the draw loop
+    /// lays the child's rows out inside [`doc_rect`] and stops at the first one
+    /// that would cross an edge, so a second opinion about how many fit is not
+    /// a rounding difference — it is invisible. The child believes in rows that
+    /// are never drawn, and whatever it puts on the last one, which is the
+    /// prompt and the line you just typed, is simply not on the screen.
+    ///
+    /// What this replaces was `pane.h / line_h - 1`: one text row for the
+    /// modeline, and nothing for anything else. It was short by two insets that
+    /// have always been there — [`modeline_h`] is a row *plus* its padding and
+    /// two reliefs, and `doc_rect` insets by `PAD` besides — and both are
+    /// settings, so the error grew whenever the modeline did. The same was true
+    /// across: columns were measured on the pane's full width while the glyphs
+    /// were drawn inside a `PAD` on either side, so the last column went the
+    /// same way as the last row.
+    pub fn terminal_grid(&self, set: &Settings, pane: zemacs_core::Rect) -> (usize, usize) {
+        terminal_grid(self.cell_w, self.line_h, set, area_of(pane))
+    }
+
     pub fn click_target(
         &self,
         editor: &Editor,
@@ -684,14 +764,20 @@ impl Renderer {
             return None;
         }
 
+        // In the pane's own units, not the editor's: a click has to land on the
+        // character the eye is over, and in a zoomed window that character is
+        // wider and taller than the body cell. Passing the unscaled metrics here
+        // is the one way this could disagree with what was drawn, since the draw
+        // loop and this function are otherwise the same arithmetic twice.
+        let zoom = win.zoom.max(100);
         let at = offset_at(
             buf,
             win,
             &editor.settings,
             area_of(p.rect),
             status_h,
-            self.line_h,
-            self.cell_w,
+            scaled(self.line_h, zoom),
+            scaled(self.cell_w, zoom),
             x,
             y,
         );
@@ -719,7 +805,12 @@ impl Renderer {
     ) {
         let set = &editor.settings;
         let (bg, fg) = (set.background, set.foreground);
-        let doc = doc_rect(pane, status_h, measure_px(set, self.cell_w));
+        // This pane's body size — see the note in the pane loop. `scaled` is the
+        // identity at 100, which is every window nobody has zoomed, so an
+        // unzoomed pane measures in exactly the numbers it always did.
+        let zoom = win.zoom.max(100);
+        let (cell_w, line_h) = (scaled(self.cell_w, zoom), scaled(self.line_h, zoom));
+        let doc = doc_rect(pane, status_h, measure_px(set, cell_w));
         let (cur_line, cur_col) = line_col(buf, win.cursor);
         // The selection and the highlight spans both describe `editor.buffer`
         // as the focused window sees it, and there is exactly one of each in
@@ -757,7 +848,7 @@ impl Renderer {
         // numbers on top of its own first three characters: the width came from
         // the buffer's answer and the ink came from the editor's.
         let numbered = gutter_on(buf, set);
-        let gutter = gutter_w(buf, set, self.cell_w);
+        let gutter = gutter_w(buf, set, cell_w);
         let x0 = doc.x + gutter;
         // Pixels rather than columns, and that is the shape of the whole change
         // that let a line be typeset: how many columns a line has depends on how
@@ -779,7 +870,7 @@ impl Renderer {
         // Highlight spans are whole-buffer char offsets and sorted, so one
         // monotonic cursor walks them alongside the lines — no rescan per line.
         let mut si = 0usize;
-        let rows = doc_lines(pane, status_h, self.line_h);
+        let rows = doc_lines(pane, status_h, line_h);
         // The cursor's *line* is all a relative number needs — `cur_line` above
         // — because the count is of buffer lines. Working out which display row
         // the cursor sits on used to be needed here and is not any more; see
@@ -820,16 +911,24 @@ impl Renderer {
             // collapses to what it was before any of this existed.
             let style = line_style(overlays, start, end);
             let pct = style.scale.max(100);
-            let lb = line_box(&style, text_w, self.cell_w);
+            // What the glyphs are rasterised at: this line's own scale on top of
+            // the window's, snapped back onto the closed step set both were
+            // drawn from. Snapped rather than exact because the face cache's
+            // bound *is* the number of distinct sizes that can exist — see
+            // `MAX_FACES` — so a heading inside a zoomed pane is drawn at the
+            // nearest step rather than at the exact product. At zoom 100, which
+            // is every unzoomed pane, this is `pct` and nothing has moved.
+            let draw_pct = scale_step((u32::from(pct) * u32::from(zoom) / 100) as u16);
+            let lb = line_box(&style, text_w, cell_w);
             let lx0 = x0 + lb.indent;
-            let row_h = lb.tall as i32 * self.line_h;
+            let row_h = lb.tall as i32 * line_h;
             // Where the type sits inside the block of rows it claimed: on the
             // bottom, so the slack is *above* the line. That is the right way up
             // for the case this exists for — a heading gets its air before it and
             // its body text tucked under it — and it is also the only placement
             // that cannot spill: the em box is `line_h * pct/100` tall and the
             // block is `ceil(pct/100)` rows of `line_h`.
-            let drop = row_h - scaled(self.line_h, pct);
+            let drop = row_h - scaled(line_h, pct);
             let mut cells = expand_line(&buf.slice_string(start, end), set.tab_width);
             // `display` and an image both *replace* the cells they cover, which
             // is what makes wrapping, the cursor and the selection follow the
@@ -865,7 +964,7 @@ impl Renderer {
                             let last = buf.text.char_to_line(o.end.saturating_sub(1));
                             let blanked = last.saturating_sub(line);
                             let want =
-                                image_rows(img.height, img.depth, self.line_h, self.ascent);
+                                image_rows(img.height, img.depth, line_h, self.ascent);
                             tall = tall.max(want.saturating_sub(blanked).max(1));
                             " ".repeat(image_cells(img.width, lb.cw))
                         }
@@ -950,7 +1049,7 @@ impl Renderer {
                 .take(shown_rows)
                 .enumerate()
             {
-                let y = doc.y + (row + r * lb.tall) as i32 * self.line_h;
+                let y = doc.y + (row + r * lb.tall) as i32 * line_h;
                 // Where this row's *type* goes. Body text sits at the top of its
                 // one row, as it always has, because `drop` is zero when nothing
                 // scaled the line.
@@ -1000,7 +1099,7 @@ impl Renderer {
                         Some(k) => rgb(editor.theme.color(k, fg)),
                         None => rgb(fg),
                     };
-                    self.draw_run(p, x0, ty, c, Cut::plain(pct));
+                    self.draw_run(p, x0, ty, c, Cut::plain(draw_pct));
                 }
 
                 // An *absolute* number belongs to the buffer line, not to each
@@ -1013,9 +1112,17 @@ impl Renderer {
                 if numbered && r == 0 {
                     let c = if line == cur_line { num_cur_c } else { num_c };
                     let n = gutter_number(line, cur_line, set.relative_line_numbers);
-                    // Body size, always: the gutter is chrome and belongs to the
-                    // pane rather than to the line it happens to be beside.
-                    self.draw_str(&format!("{n:>digits$}"), doc.x, y, c);
+                    // The *pane's* size, not the line's: the gutter is chrome
+                    // and belongs to the window rather than to the heading it
+                    // happens to be beside — so it follows a window's zoom and
+                    // ignores an overlay's scale.
+                    self.draw_run(
+                        &format!("{n:>digits$}"),
+                        doc.x,
+                        y,
+                        c,
+                        Cut::plain(scale_step(zoom)),
+                    );
                 }
 
                 if block_cursor {
@@ -1027,6 +1134,7 @@ impl Renderer {
                         // tab's cells are spaces, so this leaves tabs at one.
                         let w = cells.get(rs + cc).map_or(1, |&(c, _)| char_cells(c).max(1));
                         self.draw_cursor(x, y, w as i32 * lb.cw, row_h, pane, cursor_c);
+                        self.caret = Some(Caret { x, y, cw: lb.cw, row_h });
                     }
                 }
 
@@ -1039,16 +1147,30 @@ impl Renderer {
                         Some(&(s, _, k)) if s <= src => k,
                         _ => HlKind::Default,
                     };
-                    let color = match overlay_face(&ov_runs, src).0 {
-                        _ if block_cursor && cursor_col == Some(col) => rgb(bg), // knocked out of the cursor block
-                        Some(k) => rgb(editor.theme.color(k, fg)),
-                        None => rgb(editor.theme.color(kind, fg)),
+                    // The face in force: an overlay's if one named a face, the
+                    // parser's otherwise. Resolved *once* and then asked both
+                    // questions, because a face is one thing — one that is
+                    // purple and bold cannot take its hue from this entry of the
+                    // theme and its weight from that one.
+                    let face = overlay_face(&ov_runs, src).0.unwrap_or(kind);
+                    let color = if block_cursor && cursor_col == Some(col) {
+                        rgb(bg) // knocked out of the cursor block
+                    } else {
+                        rgb(editor.theme.color(face, fg))
                     };
                     // Weight and slant are per *cell*, unlike the size: they pick
                     // which face rasterises the glyph and change no metric, so
                     // `*bold*` really can be three bold characters in the middle
                     // of a body line while `scale` cannot.
-                    let (bold, italic) = overlay_emphasis(&ov_runs, src);
+                    //
+                    // The theme's style for that face is the *bottom* of the same
+                    // stack the overlays resolve on, rather than something OR'd
+                    // in afterwards. So a bold face and a bold overlay agree
+                    // instead of cancelling, and an overlay that says `normal`
+                    // out loud can still straighten a face the theme bolded —
+                    // which is what makes `Some(false)` different from `None`
+                    // once there is anything underneath to be different from.
+                    let (bold, italic) = overlay_emphasis(&ov_runs, src, editor.theme.style(face));
                     // Mono, and not a choice: this is the cell grid, where the
                     // cursor's column and the glyph's column are the same
                     // arithmetic. A proportional face here would put them in two
@@ -1058,7 +1180,7 @@ impl Renderer {
                         x,
                         ty,
                         color,
-                        Cut { pct, bold, italic, family: Family::Mono },
+                        Cut { pct: draw_pct, bold, italic, family: Family::Mono },
                     );
                 }
                 // Images last of the text, over the blanks their substitution
@@ -1079,7 +1201,7 @@ impl Renderer {
                         marker_c
                     };
                     let x = lx0 + mc as i32 * lb.cw;
-                    self.draw_glyph(LineOverflow::MARKER, x, ty, c, Cut::plain(pct));
+                    self.draw_glyph(LineOverflow::MARKER, x, ty, c, Cut::plain(draw_pct));
                 }
                 // The fold indicator, one glyph past the head line's own text on
                 // the last row it occupies, in the same accent-tinted shade the
@@ -1090,13 +1212,20 @@ impl Renderer {
                 if folds_here && r + 1 == shown_rows && lb.cols > 0 {
                     let col = shown.min(lb.cols - 1);
                     let x = lx0 + col as i32 * lb.cw;
-                    self.draw_glyph(FOLD_MARKER, x, ty, marker_c, Cut::plain(pct));
+                    self.draw_glyph(FOLD_MARKER, x, ty, marker_c, Cut::plain(draw_pct));
                 }
 
                 if !block_cursor {
                     if let Some(cc) = cursor_col {
                         let x = lx0 + cc as i32 * lb.cw;
                         self.draw_cursor(x, y, 2, row_h, pane, cursor_c);
+                        // The bar cursor, which is Insert mode, which is the
+                        // only mode the completion popup is ever up in — so of
+                        // the two this is the one that matters. Both record it
+                        // anyway: `caret` is "where point is", and answering
+                        // that only in one mode would be a trap for the next
+                        // surface that wants it.
+                        self.caret = Some(Caret { x, y, cw: lb.cw, row_h });
                     }
                 }
             }
@@ -1112,17 +1241,28 @@ impl Renderer {
     fn draw_dashboard(&mut self, editor: &Editor, doc: Area) {
         let (bg, fg) = (editor.settings.background, editor.settings.foreground);
         let accent = editor.theme.color(HlKind::Function, fg);
-        let banner_c = rgb(editor.theme.color(HlKind::Keyword, fg));
-        // Full foreground, not a shade of it. This is the first thing the editor
-        // ever shows and the rows *are* the interface — a dimmed menu reads as a
-        // disabled one. The hierarchy is carried by the banner's hue and the
-        // footer's dimming instead, which is where dimming means something.
+        let banner_c = rgb(mix(bg, fg, 0.72));
+        let head_c = rgb(editor.theme.color(HlKind::Keyword, fg));
+        // Full foreground for a label, not a shade of it. The rows *are* the
+        // interface, and a dimmed menu reads as a disabled one. Everything that
+        // is dimmed here is dimmed because it is genuinely secondary: the key
+        // hint you do not need yet, the footer you read once.
         let row_c = rgb(fg);
+        let hint_c = rgb(mix(bg, fg, 0.40));
         let foot_c = rgb(mix(bg, fg, 0.45));
         let sel_bg = rgb(mix(bg, accent, 0.18));
 
-        let lines = editor.dashboard.lines();
-        let cols = visible_cols(doc.w, self.cell_w);
+        let rows = editor.dashboard.rows();
+
+        // The menu is laid out as a *block*: one left edge for every heading,
+        // key and label, with the hints flush against one right edge. Centring
+        // each row on its own width instead — which is what this used to do —
+        // is what made the old screen look like a poem rather than a menu.
+        let (key_w, body_w, hint_w) = menu_widths(&rows);
+        let block_cols = body_w + hint_w;
+        let x0 = doc.x + (visible_cols(doc.w, self.cell_w).saturating_sub(block_cols) / 2) as i32
+            * self.cell_w;
+        let label_x = x0 + key_w as i32 * self.cell_w;
 
         // The logo claims whole rows, so the block below it stays on the text
         // grid and the whole arrangement is still centred as one thing rather
@@ -1133,7 +1273,7 @@ impl Renderer {
         });
         // One blank row between the picture and the text, when there is one.
         let gap = if logo_rows > 0 { 1 } else { 0 };
-        let total = (lines.len() as i32 + logo_rows + gap) * self.line_h;
+        let total = (rows.len() as i32 + logo_rows + gap) * self.line_h;
         let y0 = doc.y + ((doc.h - total) / 2).max(0);
 
         if let Some((id, im)) = logo {
@@ -1141,36 +1281,65 @@ impl Renderer {
             self.draw_image_at(id, im, x, y0);
         }
         let y0 = y0 + (logo_rows + gap) * self.line_h;
+        let cols = visible_cols(doc.w, self.cell_w);
 
-        for (i, (text, selected)) in lines.iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             let y = y0 + i as i32 * self.line_h;
             if y + self.line_h > doc.y + doc.h {
                 break;
             }
-            let n = str_cells(text) as i32;
-            let x = doc.x + center_col(text, cols) as i32 * self.cell_w;
-            if *selected {
-                self.fill(
-                    x - self.cell_w,
-                    y,
-                    (n + 2) * self.cell_w,
-                    self.line_h,
-                    sel_bg,
-                );
+            match row {
+                Dash::Blank => {}
+                // Prose, centred on its own width — the one thing here that
+                // should be ragged, because that is what centred prose is.
+                Dash::Banner(text) => {
+                    let x = doc.x + center_col(text, cols) as i32 * self.cell_w;
+                    self.draw_str(text, x, y, banner_c);
+                }
+                Dash::Footer(text) => {
+                    let x = doc.x + center_col(text, cols) as i32 * self.cell_w;
+                    self.draw_str(text, x, y, foot_c);
+                }
+                // Bold, which is the whole job of a section title: it has to be
+                // skippable, and a heading you have to read to identify as one
+                // is not.
+                Dash::Heading(text) => {
+                    self.draw_weighted(text, x0, y, head_c, true);
+                }
+                Dash::Item {
+                    key,
+                    label,
+                    hint,
+                    selected,
+                } => {
+                    if *selected {
+                        // A full-width bar across the block, not a box hugging
+                        // the text: rows of different lengths otherwise give
+                        // the selection a different shape on every row.
+                        self.fill(
+                            x0 - self.cell_w,
+                            y,
+                            (block_cols + 2) as i32 * self.cell_w,
+                            self.line_h,
+                            sel_bg,
+                        );
+                    }
+                    // The key is the accent even unselected. It is the one part
+                    // of the row that is an *instruction* rather than a name,
+                    // and colouring it is what makes the column scannable.
+                    let mut buf = [0u8; 4];
+                    self.draw_str(key.encode_utf8(&mut buf), x0, y, rgb(accent));
+                    let label_c = if *selected { rgb(accent) } else { row_c };
+                    self.draw_weighted(label, label_x, y, label_c, *selected);
+                    // Flush against the block's right edge, so the hints line
+                    // up as a column whatever their individual lengths.
+                    if !hint.is_empty() {
+                        let x = x0
+                            + (block_cols.saturating_sub(str_cells(hint))) as i32 * self.cell_w;
+                        self.draw_str(hint, x, y, hint_c);
+                    }
+                }
             }
-            // The footer is the only thing here that is genuinely secondary —
-            // it says where the config lives, once, and is not a row you act
-            // on. Everything else is at full contrast.
-            let color = if *selected {
-                rgb(accent)
-            } else if is_banner_line(text) {
-                banner_c
-            } else if i + 1 == lines.len() {
-                foot_c
-            } else {
-                row_c
-            };
-            self.draw_str(text, x, y, color);
         }
     }
 
@@ -1304,11 +1473,35 @@ impl Renderer {
             let used = str_cells(&text);
             debug_assert!(used <= left, "truncate({:?}, {left}) gave {used}", seg.text);
             left = left.saturating_sub(used);
-            let color = match seg.face {
-                Some(kind) => rgb(editor.theme.color(kind, editor.settings.foreground)),
-                None => default,
+            // The face answers for weight and slant here too, and the segment's
+            // own `bold` stacks with it rather than being replaced: that flag is
+            // the modeline's *structural* emphasis — the buffer name is bold
+            // because it is the buffer name — while the theme's is a claim about
+            // the face, and both are true at once. There is no tri-state to
+            // resolve on this side, since a segment cannot say "upright".
+            let (color, style) = match seg.face {
+                Some(kind) => (
+                    rgb(editor.theme.color(kind, editor.settings.foreground)),
+                    editor.theme.style(kind),
+                ),
+                None => (default, FaceStyle::default()),
             };
-            x = self.draw_weighted(&text, x, y, color, seg.bold);
+            // Through `draw_run` rather than `draw_weighted`, because italic is
+            // a face out of the on-demand map and only the [`Cut`] path can name
+            // one. At `pct` 100 the two advance identically — `scaled(cw, 100)`
+            // is `cw` — so the strip is measured exactly as it was.
+            x = self.draw_run(
+                &text,
+                x,
+                y,
+                color,
+                Cut {
+                    pct: 100,
+                    bold: seg.bold || style.bold,
+                    italic: style.italic,
+                    family: Family::Mono,
+                },
+            );
         }
     }
 
@@ -1544,6 +1737,78 @@ impl Renderer {
             let end = self.draw_str(k, x, y, key_c);
             let left = ((w - PAD - end).max(0) / self.cell_w.max(1)) as usize;
             self.draw_str(&truncate(label, left), end + self.cell_w, y, label_c);
+        }
+    }
+
+    // --- corfu: completion at point -----------------------------------------
+
+    /// Candidates for the word being typed, in a box hanging off the caret.
+    ///
+    /// The third sibling of [`Renderer::draw_completion`] and [`Renderer::
+    /// draw_which_key`], and a third body rather than a shared one — which is
+    /// worth stating, because "the minibuffer already draws a candidate list"
+    /// is the obvious objection and the shared part is six lines. What
+    /// `draw_completion` has that this must not: an *input line*, because there
+    /// the query is typed into the box and here it is typed into the document;
+    /// a `matches/items` count, which answers a question ("how much did I
+    /// narrow it") nobody asks mid-word; `candidate_runs`, which colours a row
+    /// out of the prompt's own kind; and a full-window scrim, which is the one
+    /// that decides it. Dimming the frame is right for a modal picker and wrong
+    /// here — the code around point is what you are choosing *against*, and a
+    /// popup that greys it out has hidden the reason you opened it.
+    ///
+    /// What is genuinely shared is [`Popup`], [`truncate`] and `draw_str`, and
+    /// all three are shared.
+    ///
+    /// Yields to an open prompt for [`Renderer::draw_which_key`]'s reason, and
+    /// draws nothing without a caret: no caret means no point on screen, and
+    /// this box is only ever about where point is.
+    fn draw_completion_at_point(&mut self, editor: &Editor, w: i32, h: i32, status_h: i32) {
+        let (Some(c), Some(caret)) = (editor.completion(), self.caret) else {
+            return;
+        };
+        if c.rows.is_empty() || editor.prompt.is_some() {
+            return;
+        }
+        let widest = c.rows.iter().map(|s| str_cells(s)).max().unwrap_or(0);
+        let b = point_popup(caret, w, h, status_h, self.line_h, widest, c.rows.len());
+        if b.rows == 0 {
+            return;
+        }
+
+        let (bg, fg) = (editor.settings.background, editor.settings.foreground);
+        let accent = editor.theme.color(HlKind::Function, fg);
+        // A shade lighter than the which-key panel's 0.07: that one sits against
+        // the status strip and this one floats over live code, so it has to be
+        // told apart from the text under it rather than from the chrome beside
+        // it. The border does the rest.
+        let panel_c = rgb(mix(bg, fg, 0.11));
+        let border_c = rgb(mix(bg, accent, 0.45));
+        let sel_bg = rgb(mix(bg, accent, 0.22));
+        let row_c = rgb(mix(bg, fg, 0.78));
+
+        self.fill(b.x, b.y, b.w, b.h, panel_c);
+        self.fill(b.x, b.y, b.w, 1, border_c);
+        self.fill(b.x, b.y + b.h - 1, b.w, 1, border_c);
+        self.fill(b.x, b.y, 1, b.h, border_c);
+        self.fill(b.x + b.w - 1, b.y, 1, b.h, border_c);
+
+        let x0 = b.x + PAD;
+        let cols = ((b.w - 2 * PAD).max(0) / self.cell_w.max(1)) as usize;
+        let (first, rows) = c.visible(b.rows);
+        for (i, row) in rows.iter().enumerate() {
+            let ry = b.y + PADV + i as i32 * self.line_h;
+            let selected = first + i == c.selected;
+            let colour = if selected {
+                // Inset by the border rather than over it: the frame is what
+                // separates the box from the code, and a selection that painted
+                // across it would put a hole in that on one row.
+                self.fill(b.x + 1, ry, b.w - 2, self.line_h, sel_bg);
+                rgb(accent)
+            } else {
+                row_c
+            };
+            self.draw_str(&truncate(row, cols), x0, ry, colour);
         }
     }
 
@@ -2513,6 +2778,20 @@ fn doc_rect(pane: Area, status_h: i32, measure: i32) -> Area {
     }
 }
 
+/// How many whole cells fit in the document area of `pane` — the arithmetic
+/// behind [`Renderer::terminal_grid`], as a free function so it can be tested
+/// against [`doc_rect`] without a window to open.
+///
+/// `measure` is 0 because [`Renderer::draw_terminal`] is called with 0: a
+/// terminal is a grid the child owns, so `text-width` does not narrow it the
+/// way it narrows a document.
+fn terminal_grid(cell_w: i32, line_h: i32, set: &Settings, pane: Area) -> (usize, usize) {
+    let doc = doc_rect(pane, modeline_h(line_h, set), 0);
+    let cols = (doc.w / cell_w.max(1)).max(1) as usize;
+    let rows = (doc.h / line_h.max(1)).max(1) as usize;
+    (cols, rows)
+}
+
 /// The measure in pixels, from the setting's columns and the font's cell.
 ///
 /// Columns rather than pixels is the setting's whole point — see
@@ -2936,6 +3215,55 @@ fn center_popup(w: i32, h: i32, status_h: i32, line_h: i32, cell_w: i32, want: u
     }
 }
 
+/// A box hanging off the caret, for the in-buffer completion popup.
+///
+/// Below the caret when the rows fit there and above it otherwise, which is the
+/// only placement rule that survives a cursor on the last line of the pane —
+/// the case a popup is most wanted in, since that is where you cannot see what
+/// comes next. Never off the right edge, and never off the left: `x` is clamped
+/// rather than the box narrowed, because a popup that changes width as you move
+/// across a line reads as broken.
+///
+/// `rows` may come back smaller than `want` and may come back `0`, which the
+/// caller draws as nothing at all. A one-row box shoved into a pane with no room
+/// would cover the line being typed on.
+fn point_popup(
+    caret: Caret,
+    w: i32,
+    h: i32,
+    status_h: i32,
+    line_h: i32,
+    widest: usize,
+    want: usize,
+) -> Popup {
+    let cols = widest.clamp(1, POINT_POPUP_COLS);
+    let box_w = (cols as i32 * caret.cw + 2 * PAD).min(w.max(1));
+    let x = caret.x.min(w - box_w).max(0);
+
+    let chrome = 2 * PADV;
+    let bottom = (h - status_h).max(0);
+    // Below: from the row after the caret's down to the status strip.
+    let below_y = caret.y + caret.row_h;
+    let below = ((bottom - below_y - chrome) / line_h).max(0) as usize;
+    // Above: from the top of the pane's area up to the caret's own row, which
+    // the box must not cover — you are reading the line you are typing on.
+    let above = ((caret.y - chrome) / line_h).max(0) as usize;
+
+    let rows = want.min(POPUP_ROWS).min(below.max(above));
+    let box_h = chrome + rows as i32 * line_h;
+    let y = if rows <= below {
+        below_y
+    } else {
+        (caret.y - box_h).max(0)
+    };
+    Popup { x, y, w: box_w, h: box_h, rows }
+}
+
+/// Widest a completion popup gets, in cells. A candidate is an identifier;
+/// past this it is a signature, and a box wider than the code behind it has
+/// stopped floating over the buffer and started replacing it.
+const POINT_POPUP_COLS: usize = 42;
+
 /// Cells between one which-key column and the next.
 const WHICH_KEY_GUTTER: usize = 2;
 
@@ -3000,12 +3328,38 @@ fn center_col(s: &str, cols: usize) -> usize {
     cols.saturating_sub(str_cells(s)) / 2
 }
 
-/// Box-drawing / block-element art versus prose. Lets the renderer tint the
-/// dashboard banner without `Dashboard` having to describe its own layout.
-fn is_banner_line(s: &str) -> bool {
-    !s.trim().is_empty()
-        && s.chars()
-            .all(|c| c == ' ' || ('\u{2500}'..='\u{259f}').contains(&c))
+/// Cells between the key and the label it names.
+const KEY_PAD: usize = 3;
+/// Least gap between the longest label and the hint column. Four rather than
+/// one or two: with a single space the hint reads as part of the label, and the
+/// whole point of setting it flush right is that it is a different kind of
+/// thing.
+const HINT_PAD: usize = 4;
+
+/// How wide the dashboard's menu block is, in cells: `(key column, everything
+/// left of the hints, hint column)`. Every item shares them, which is what makes
+/// the block a block — one left edge for the keys, one for the labels, one right
+/// edge for the hints.
+///
+/// Headings are measured from the block's left edge rather than from the label
+/// column, because that is where they are drawn. A section title longer than
+/// every row under it would otherwise hang out of the block it is titling.
+fn menu_widths(rows: &[Dash]) -> (usize, usize, usize) {
+    let key_w = 1 + KEY_PAD;
+    let (mut body, mut hint) = (0, 0);
+    for row in rows {
+        match row {
+            Dash::Item { label, hint: h, .. } => {
+                body = body.max(key_w + str_cells(label));
+                if !h.is_empty() {
+                    hint = hint.max(str_cells(h) + HINT_PAD);
+                }
+            }
+            Dash::Heading(h) => body = body.max(str_cells(h)),
+            _ => {}
+        }
+    }
+    (key_w, body, hint)
 }
 
 
@@ -3306,15 +3660,22 @@ fn overlay_face(runs: &[OverlayRun], src: usize) -> (Option<HlKind>, Option<HlKi
     (fg, bg)
 }
 
-/// Whether an overlay's run is set bold and italic at line-relative source char
-/// `src`.
+/// Whether the text at line-relative source char `src` is set bold and italic,
+/// with `base` — the style the theme gives the face in force there — underneath
+/// the overlays.
 ///
 /// [`overlay_face`]'s sibling, and separate from it on purpose: colour and
 /// weight resolve by the same rule but are consumed at different moments — a
 /// colour picks the `set_color_mod`, a weight picks the *face*, and only the
 /// second can make the renderer open a font. Same tri-state, so `Some(false)`
 /// from a later overlay takes an earlier one's bold off and `None` leaves it.
-fn overlay_emphasis(runs: &[OverlayRun], src: usize) -> (bool, bool) {
+///
+/// `base` is the bottom of that same stack rather than a separate thing OR'd on
+/// at the end, and it has to be: the theme's face is the least specific claim
+/// about this cell, so it is the one an overlay saying `normal` out loud gets to
+/// overrule. `FaceStyle::default()` restores the old behaviour exactly, which is
+/// what an unstyled face and an unfaced cell both pass.
+fn overlay_emphasis(runs: &[OverlayRun], src: usize, base: FaceStyle) -> (bool, bool) {
     let (mut bold, mut italic) = (None, None);
     for &(s, e, o) in runs {
         if s <= src && src < e {
@@ -3322,7 +3683,7 @@ fn overlay_emphasis(runs: &[OverlayRun], src: usize) -> (bool, bool) {
             italic = o.italic.or(italic);
         }
     }
-    (bold.unwrap_or(false), italic.unwrap_or(false))
+    (bold.unwrap_or(base.bold), italic.unwrap_or(base.italic))
 }
 
 /// The type sizes the renderer will ever open a face at, as percentages of the
@@ -4221,14 +4582,34 @@ mod tests {
         assert_eq!(center_col("████████", 4), 0);
     }
 
+    /// The block is as wide as the widest thing in it, measured from the left
+    /// edge in each case — a heading from the block's edge, an item from the
+    /// key column. Get that wrong and either the headings hang out of the block
+    /// or the hints overlap the longest label.
     #[test]
-    fn banner_lines_are_box_drawing_only() {
-        assert!(is_banner_line(" ███████╗███████╗"));
-        assert!(is_banner_line(" ╚══════╝"));
-        assert!(!is_banner_line("        a Common Lisp machine that edits text"));
-        assert!(!is_banner_line("▸ [f]  Find file")); // ▸ is U+25B8, outside the range
-        assert!(!is_banner_line(""));
-        assert!(!is_banner_line("   "));
+    fn the_menu_block_is_as_wide_as_its_widest_row() {
+        let item = |label: &str, hint: &str| Dash::Item {
+            key: 'f',
+            label: label.into(),
+            hint: hint.into(),
+            selected: false,
+        };
+        let (key_w, body, hint) = menu_widths(&[item("Find file", "SPC f f")]);
+        assert_eq!(key_w, 4); // one cell of key, three of gap
+        assert_eq!(body, 4 + 9);
+        assert_eq!(hint, 7 + HINT_PAD);
+
+        // A heading is measured from the block's left edge, not the label's.
+        let (_, body, _) = menu_widths(&[Dash::Heading("a-very-long-heading"), item("f", "")]);
+        assert_eq!(body, 19);
+
+        // Nothing has a hint: no hint column at all, rather than an empty gutter.
+        let (_, _, hint) = menu_widths(&[item("Find file", "")]);
+        assert_eq!(hint, 0);
+
+        // Banners and blanks are prose and air; neither is part of the block.
+        let (_, body, hint) = menu_widths(&[Dash::Banner("a very long tagline indeed".into()), Dash::Blank]);
+        assert_eq!((body, hint), (0, 0));
     }
 
     #[test]
@@ -4636,11 +5017,37 @@ mod tests {
         second.bold = Some(false); // upright, deliberately
         let both = [first, second];
         let runs = overlays_for_line(&both, 0, 4);
-        assert_eq!(overlay_emphasis(&runs, 0), (true, true));
+        let plain = FaceStyle::default();
+        assert_eq!(overlay_emphasis(&runs, 0, plain), (true, true));
         // The later overlay takes the bold off and leaves the italic alone,
         // which is the difference between `Some(false)` and `None`.
-        assert_eq!(overlay_emphasis(&runs, 2), (false, true));
-        assert_eq!(overlay_emphasis(&[], 0), (false, false));
+        assert_eq!(overlay_emphasis(&runs, 2, plain), (false, true));
+        assert_eq!(overlay_emphasis(&[], 0, plain), (false, false));
+    }
+
+    /// The face the theme styled is the bottom of that same stack, which is the
+    /// whole of how `(set-face "keyword" ... :bold t)` reaches a glyph.
+    #[test]
+    fn a_styled_face_is_the_bottom_of_the_emphasis_stack() {
+        let bold_face = FaceStyle { bold: true, italic: false };
+        // Nothing overlaying it: the face is the answer.
+        assert_eq!(overlay_emphasis(&[], 0, bold_face), (true, false));
+
+        let mut says_nothing = overlay(1, 0, 4);
+        says_nothing.italic = Some(true); // and nothing about weight
+        let quiet = [says_nothing];
+        let runs = overlays_for_line(&quiet, 0, 4);
+        // Bold from the face, italic from the overlay — they stack rather than
+        // one winning the whole cell.
+        assert_eq!(overlay_emphasis(&runs, 0, bold_face), (true, true));
+
+        // An overlay that says `normal` out loud still straightens it, which is
+        // the reason the overlays are tri-state at all.
+        let mut says_upright = overlay(2, 0, 4);
+        says_upright.bold = Some(false);
+        let loud = [says_upright];
+        let runs = overlays_for_line(&loud, 0, 4);
+        assert_eq!(overlay_emphasis(&runs, 0, bold_face), (false, false));
     }
 
     /// The counting side of a scaled line. `visible_lines` and `line_rows` have
@@ -4710,6 +5117,7 @@ mod tests {
             scroll: 0,
             viewport_lines: 8,
             wrap_cols: 0,
+            zoom: 100,
         };
         let doc = doc_rect(pane, STATUS, 0);
         // A pixel, rather than a column: which column it is, is the question.
@@ -4747,6 +5155,71 @@ mod tests {
         assert_eq!(rows(30, 0), 1);
         // A degenerate width must not divide by zero.
         assert_eq!(which_key_rows(0, 3, 0, 10), 3);
+    }
+
+    // --- corfu ------------------------------------------------------------
+
+    /// A caret `row` rows down a window `LH * 20` tall, in the usual cell.
+    fn caret_at(row: i32) -> Caret {
+        Caret { x: 10 * CW, y: row * LH, cw: CW, row_h: LH }
+    }
+
+    /// The window every test below measures against: 20 rows of text and a
+    /// status strip under them.
+    const POPUP_H: i32 = 20 * LH + STATUS;
+
+    #[test]
+    fn a_completion_popup_hangs_below_the_caret_while_there_is_room_under_it() {
+        let b = point_popup(caret_at(2), 80 * CW, POPUP_H, STATUS, LH, 12, 5);
+        assert_eq!(b.rows, 5, "all five fit under a caret near the top");
+        assert_eq!(b.y, 3 * LH, "the row after the caret's, not over it");
+        assert_eq!(b.x, 10 * CW, "and it starts at the caret");
+    }
+
+    #[test]
+    fn a_completion_popup_flips_above_the_caret_rather_than_shrinking_against_the_bottom() {
+        // Two rows left below, five candidates: the box goes up, because a
+        // popup is most wanted exactly where you cannot see what comes next.
+        let b = point_popup(caret_at(18), 80 * CW, POPUP_H, STATUS, LH, 12, 5);
+        assert_eq!(b.rows, 5);
+        assert!(b.y + b.h <= 18 * LH, "it must not cover the line being typed on");
+    }
+
+    #[test]
+    fn a_completion_popup_never_hangs_off_the_right_edge() {
+        // A caret three cells from the right, a box ten times wider than that.
+        let w = 40 * CW;
+        let caret = Caret { x: 37 * CW, y: 0, cw: CW, row_h: LH };
+        let b = point_popup(caret, w, POPUP_H, STATUS, LH, 30, 4);
+        assert!(b.x >= 0 && b.x + b.w <= w, "clamped, not overflowing: {b:?}");
+        // Moved rather than narrowed: a box that changed width as you typed
+        // across a line would read as broken.
+        assert_eq!(b.w, point_popup(caret_at(0), 80 * CW, POPUP_H, STATUS, LH, 30, 4).w);
+        // The one case where it *is* narrowed, because there is no alternative:
+        // a window narrower than the box. `x` still lands on the left edge
+        // rather than going negative.
+        let tiny = point_popup(caret, 20 * CW, POPUP_H, STATUS, LH, 30, 4);
+        assert_eq!((tiny.x, tiny.w), (0, 20 * CW));
+    }
+
+    #[test]
+    fn a_completion_popup_with_no_room_either_side_asks_for_no_rows_at_all() {
+        // A window two rows tall: nothing fits above or below without covering
+        // the caret, and the caller draws nothing rather than a box over point.
+        let b = point_popup(caret_at(0), 80 * CW, LH + STATUS, STATUS, LH, 12, 5);
+        assert_eq!(b.rows, 0);
+    }
+
+    #[test]
+    fn a_completion_popup_is_as_wide_as_its_widest_candidate_up_to_a_ceiling() {
+        let wide = |widest| point_popup(caret_at(0), 400 * CW, POPUP_H, STATUS, LH, widest, 3).w;
+        assert_eq!(wide(12), 12 * CW + 2 * PAD);
+        assert_eq!(wide(0), CW + 2 * PAD, "an empty row still gets a box");
+        assert_eq!(
+            wide(500),
+            POINT_POPUP_COLS as i32 * CW + 2 * PAD,
+            "a candidate that is really a signature stops widening the box"
+        );
     }
 
     // --- line overflow ----------------------------------------------------
@@ -4973,7 +5446,11 @@ mod tests {
         // Four lines: 100 characters, "short", "short", and the empty line the
         // trailing newline leaves behind.
         let buf = Buffer::from_str(&format!("{}\nshort\nshort\n", "x".repeat(100)));
-        let mut set = Settings { line_numbers: false, ..Settings::default() };
+        let mut set = Settings {
+            line_numbers: false,
+            line_overflow: LineOverflow::Truncate,
+            ..Settings::default()
+        };
         // Truncated, every line is one row, so the answer is the pane's height
         // whatever the buffer looks like.
         assert_eq!(visible_lines(&buf, 0, 20, 10, 1, &set), 20);
@@ -5061,6 +5538,7 @@ mod tests {
             scroll: 0,
             viewport_lines: 8,
             wrap_cols: 0,
+            zoom: 100,
         };
         let doc = doc_rect(pane, STATUS, 0);
         let gutter = gutter_w(&buf, &set, CW);
@@ -5130,6 +5608,7 @@ mod tests {
             scroll: 0,
             viewport_lines: 8,
             wrap_cols: 10,
+            zoom: 100,
         };
         let doc = doc_rect(pane, STATUS, 0);
         let hit = |row: i32, col: i32| {
@@ -5175,6 +5654,7 @@ mod tests {
             scroll: 0,
             viewport_lines: 8,
             wrap_cols: 20,
+            zoom: 100,
         };
 
         let doc = doc_rect(pane, STATUS, measure_px(&set, CW));
@@ -5684,6 +6164,68 @@ mod tests {
             assert_eq!(modeline_bg(&ed, true), [0.5, 0.0, 0.0]);
             assert_eq!(modeline_bg(&ed, false), idle, "inactive is its own face");
         }
+    }
+
+    /// Every row the child is told it has must be one the draw loop will draw.
+    ///
+    /// The bug this pins: rows came from `pane.h / line_h - 1` — one text row
+    /// for the modeline and nothing for its padding, its reliefs or the
+    /// document's own `PAD` — while the glyphs were laid out inside `doc_rect`
+    /// and dropped at the first row that crossed its bottom edge. So the shell
+    /// wrote its prompt onto a row that was never on the screen.
+    ///
+    /// Asserted against `doc_rect` rather than against a number, because the
+    /// number is exactly what must not be written down twice.
+    #[test]
+    fn every_terminal_row_the_child_is_given_actually_fits() {
+        let set = Settings::default();
+        // Sizes that are not multiples of the cell, which is where an off-by-one
+        // hides: a pane that divides evenly forgives the missing insets.
+        for pane in [
+            Area { x: 0, y: 0, w: 1100, h: 760 },
+            Area { x: 550, y: 100, w: 553, h: 301 },
+            Area { x: 0, y: 0, w: 40, h: 30 }, // smaller than one modeline
+        ] {
+            let (cols, rows) = terminal_grid(CW, LH, &set, pane);
+            let doc = doc_rect(pane, modeline_h(LH, &set), 0);
+
+            // The draw loop's own conditions, from `draw_terminal`.
+            let last_row_bottom = doc.y + (rows as i32 - 1) * LH + LH;
+            let last_col_right = doc.x + (cols as i32 - 1) * CW + CW;
+            assert!(
+                last_row_bottom <= doc.y + doc.h || rows == 1,
+                "row {} of {pane:?} is drawn past the bottom of {doc:?}",
+                rows - 1
+            );
+            assert!(
+                last_col_right <= doc.x + doc.w || cols == 1,
+                "column {} of {pane:?} is drawn past the right of {doc:?}",
+                cols - 1
+            );
+        }
+    }
+
+    /// ...and it must not be short, either — a terminal that gives back rows it
+    /// could have drawn is a smaller shell than the pane paid for.
+    #[test]
+    fn a_terminal_uses_every_row_the_pane_can_hold() {
+        let set = Settings::default();
+        let pane = Area { x: 0, y: 0, w: 1100, h: 760 };
+        let (cols, rows) = terminal_grid(CW, LH, &set, pane);
+        let doc = doc_rect(pane, modeline_h(LH, &set), 0);
+        assert!(
+            doc.y + rows as i32 * LH + LH > doc.y + doc.h,
+            "one more row would have fitted"
+        );
+        assert!(
+            doc.x + cols as i32 * CW + CW > doc.x + doc.w,
+            "one more column would have fitted"
+        );
+        // And the old arithmetic really was wrong, so this cannot pass vacuously.
+        assert!(
+            rows < ((pane.h / LH) - 1) as usize,
+            "the pane-height-minus-one-row estimate should be the larger"
+        );
     }
 
     #[test]
@@ -6654,3 +7196,94 @@ mod scenes {
     }
 }
 
+
+#[cfg(test)]
+mod window_zoom {
+    use super::*;
+
+    // The same body metrics `tests` uses, redeclared because they are private
+    // to that module and this one is a sibling.
+    const LH: i32 = 22;
+    const CW: i32 = 11;
+    const STATUS: i32 = LH + PAD;
+
+    /// A zoomed pane measures in its own cell and its own row.
+    ///
+    /// The arithmetic the draw loop and the click map share, asserted on the
+    /// shared half: `scaled` is what turns the editor's body size into this
+    /// window's, and it is the identity at 100 — which is the claim that every
+    /// unzoomed pane is byte-for-byte what it was.
+    #[test]
+    fn a_windows_units_are_its_body_size_times_its_zoom() {
+        assert_eq!((scaled(CW, 100), scaled(LH, 100)), (CW, LH));
+        assert_eq!(scaled(CW, 200), CW * 2);
+        assert_eq!(scaled(LH, 150), LH * 3 / 2);
+        // Never zero, whatever the arithmetic says: a cell of no width is a
+        // division by zero everywhere downstream.
+        assert_eq!(scaled(1, 100), 1);
+    }
+
+    /// Zoom composes with an overlay's own scale onto one of the four steps —
+    /// which is what keeps the face cache bounded while a heading inside a
+    /// magnified pane still draws larger than the text around it.
+    #[test]
+    fn a_windows_zoom_and_a_lines_scale_compose_onto_a_step() {
+        let compose =
+            |pct: u16, zoom: u16| scale_step((u32::from(pct) * u32::from(zoom) / 100) as u16);
+        // An unzoomed pane is exactly what it always was.
+        for pct in SCALE_STEPS {
+            assert_eq!(compose(pct, 100), pct);
+        }
+        // Body text in a zoomed pane is the zoom itself.
+        assert_eq!(compose(100, 150), 150);
+        // A heading in a zoomed pane is bigger still, and snapped.
+        assert_eq!(compose(150, 150), 200);
+        assert_eq!(compose(125, 125), 150);
+        // ...and every answer is a step the cache can hold.
+        for pct in SCALE_STEPS {
+            for zoom in zemacs_core::frame::ZOOM_STEPS {
+                assert!(SCALE_STEPS.contains(&compose(pct, zoom)));
+            }
+        }
+    }
+
+    /// The zoom levels a window may be at have to be sizes the face cache can
+    /// hold — the two lists are one list written twice, and a drift between
+    /// them is an unbounded cache.
+    #[test]
+    fn the_zoom_steps_are_the_scale_steps() {
+        assert_eq!(SCALE_STEPS, zemacs_core::frame::ZOOM_STEPS);
+    }
+
+    /// A click in a zoomed pane lands on the character the eye is over. The
+    /// same test as `a_click_lands_on_the_character_under_it`, in a pane whose
+    /// cells are twice the size — the case that goes wrong if the draw loop and
+    /// the click map are handed different units.
+    #[test]
+    fn a_click_in_a_zoomed_pane_lands_on_the_character_under_it() {
+        let (cw, lh) = (scaled(CW, 200), scaled(LH, 200));
+        let pane = Area { x: 0, y: 0, w: 40 * cw, h: 9 * lh + 2 * PAD };
+        let set = Settings::default();
+        let buf = Buffer::from_str("alpha\nbeta\n");
+        let win = Window {
+            id: 0,
+            buffer: buf.id,
+            cursor: 0,
+            scroll: 0,
+            viewport_lines: 8,
+            wrap_cols: 0,
+            zoom: 200,
+        };
+        let doc = doc_rect(pane, STATUS, 0);
+        let gutter = gutter_w(&buf, &set, cw);
+        let hit = |row: i32, col: i32| {
+            let x = doc.x + gutter + col * cw + cw / 2;
+            let y = doc.y + row * lh + lh / 2;
+            offset_at(&buf, &win, &set, pane, STATUS, lh, cw, x, y)
+        };
+        assert_eq!(hit(0, 0), 0);
+        assert_eq!(hit(0, 3), 3, "'h' of alpha");
+        assert_eq!(hit(1, 0), 6, "'b' of beta, one zoomed row down");
+        assert_eq!(hit(1, 2), 8);
+    }
+}

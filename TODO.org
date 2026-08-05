@@ -87,13 +87,31 @@ it turned out to be a completion prompt like every other picker here — so this
 is on its own: a *xref* buffer wants a generated buffer kind, its own keymap
 and a line-to-location table, which is the magit/dired shape rather than the
 minibuffer one.
-*** TODO flymake — diagnostics in the gutter
-The *data* is done: =(lsp-diagnostics)= answers
-=((LINE COLUMN SEVERITY MESSAGE SOURCE) ...)= and
-=*lsp-diagnostics-functions*= fires when it changes. Only the drawing is
-missing, and overlays now exist for it — a =background= overlay per diagnostic
-range, hung off =*lsp-diagnostics-functions*=, is Lisp. Today they are an
-echo-area summary, =lsp-diagnostics-at-point=, and =lsp-list-diagnostics=.
+*** DONE flymake — diagnostics in the gutter
+The data was already there — =(lsp-diagnostics)= answering =((LINE COLUMN
+SEVERITY MESSAGE SOURCE) ...)=, and =*lsp-diagnostics-functions*= firing when it
+changes — so this was only ever the drawing, and the drawing turned out to be
+forty lines of Lisp at the foot of =runtime/lsp.lisp=. Nothing above the seam
+changed, which was the claim the seam was written to make.
+
+A *mark in the margin* rather than the =background= overlay this entry
+predicted, and the reason is the face list: colours on an overlay are named from
+=face-list= so a theme change recolours them for free, there is no =error= face
+in it, and Lisp cannot add one. Colouring diagnostics would have meant spending
+=keyword= on them with =set-syntax-color=, which changes every keyword in every
+buffer. Severity goes in the *shape* of the mark instead — =●= error, =▲=
+warning, =›= info, =·= hint — which no theme can take away and which reads the
+same light or dark. =line-prefix= is what makes it one overlay per diagnostic:
+it pushes the line right and draws in the gap, continuation rows included.
+
+The seam alone would have left a file you came *back* to wearing stale marks, so
+the buffer switch is noticed on =after-change-hook= — which fires on a switch,
+because the revision moves — at a cost of one string compare per keystroke.
+
+What is still missing is the *message* in the buffer, which wants virtual text:
+=display= replaces the cells it covers, so an inline message would eat the code
+it is about. That is an =after-string= overlay property — a payload in
+=overlay.rs= and a branch in the renderer's line loop. =SPC l e= until then.
 *** DONE AI mode with multi-agent support
 Not the JSON-RPC route in the end, and that is the finding: Claude Code, Cursor
 and opencode are all *terminal* programs, and the editor already runs terminal
@@ -253,10 +271,10 @@ than moved down (Emacs moves it), and a control character draws as nothing
 rather than as =^G=.
 ** DONE Backups — config keeps 20 versions, and so does zemacs now
 Auto-save was already *done*: every modified buffer is copied to
-=~/.config/zemacs/auto-save/#!mangled!path#= every 30 s, the copy is deleted on
+=~/.zemacs.d/auto-save/#!mangled!path#= every 30 s, the copy is deleted on
 a real save, and opening a file whose copy is newer says so. Numbered backups
 of the previous *saved* version were the separate half, and now exist:
-=~/.config/zemacs/backup/#!mangled!path#.~N~=, same mangling, capped at 20.
+=~/.zemacs.d/backup/#!mangled!path#.~N~=, same mangling, capped at 20.
 
 The other half of the same entry, and the more important one: *the write itself
 could tear.* =fs::write= truncates and then fills, so a crash in between left a
@@ -372,9 +390,102 @@ against the *shipped* =init.lisp= — core's arm, the app's dispatch, the =fboun
 guard, the message reaching the modeline, the rows reaching the panel and core
 retiring it again — in Normal and in all three layered modes, because every link
 had a test and the feature was still dead.
-** TODO corfu — in-buffer completion popup
-** TODO orderless — space-separated matching
-The filter is subsequence-only, so =fn main= matches nothing useful.
+** DONE corfu — in-buffer completion popup
+A language server has been running since =lsp.lisp= landed and there was no way
+to see anything it knew while you type. =textDocument/completion= is in
+=runtime/lsp.lisp= beside =goto-definition=, and the popup is which-key's
+mechanism one level down.
+
+*Which-key's answer, moved.* =Editor::completion=, filed beside =ace= and
+=which_key= because it is the same kind of thing — a surface drawn over the frame
+that Lisp fills and core retires. Not overlays, and that answer has now been
+wrong three times for three different reasons: here it is that an overlay's
+payload is drawn *in the flow of the line*, so ten candidates would be ten lines
+of document that are not in the file. Not a prompt either, and here that is the
+whole feature rather than a detail — a prompt owns the keyboard, and completion
+works by your going on typing into the buffer while the list narrows.
+
+*The one thing it has that which-key does not is a position*, and the position
+is a buffer offset rather than pixels: where a character is on screen depends on
+wrapping, folds, a window's zoom and an overlay's type scale, none of which core
+knows. The renderer *records the caret it just drew* (=Renderer::caret=) and hangs
+the box off that, rather than deriving point's pixel a second time — a popup that
+disagreed with the caret about where point is would be worse than no popup.
+=point_popup= flips it above the caret when the rows will not fit below, which is
+the case a popup is most wanted in.
+
+*Retiring it could not go where which-key's does.* =handle_key= asks "is anything
+still pending?" *after* the dispatch, because =Pending= is core's own state and
+dispatch has already updated it. What makes a completion popup stale is the mode
+and the cursor, and on that key those are still sitting in an unapplied command
+list — so a check there is a frame behind on exactly the keys that matter, the
+=Esc= and the backspace off the front of the word. So it is a *predicate*,
+=Editor::completion()=, asked where the editor is read and therefore exact; and
+one line at the *top* of =handle_key= so that hidden also means forgotten, or
+=Esc i= would bring back the candidates for a word you stopped typing.
+
+*Prefix matching, not the minibuffer's scorer, and that is deliberate.* In a
+minibuffer the query is a scratch string thrown away on accept; here the query
+*is the document*. A candidate replaces the characters you typed, so a match that
+is not a prefix rewrites text you chose — subsequence matching offers =from_str=
+for =str=, and accepting it deletes the =str= you meant. The looseness that makes
+=buffer switch= find =switch-to-buffer= is the last thing you want three characters
+into a word. And the server already filtered, with a real index; a looser client
+matcher cannot narrow that, only widen it back out. Case-insensitive is the one
+looseness kept, because =str= → =String= is a completion rather than a substitution.
+
+*Three clocks, all of them late, all of them handled in Lisp.* The hook is a
+queue turn behind the keystroke, so nothing trusts what it was told about the
+edit — =lsp-complete-maybe= re-reads point and asks "what word is point in *now*",
+which is why the delta hook is not used at all (=after-edit-hook= describes an edit
+that may already be two edits old; a read of the buffer is current by
+construction). The server is a subprocess, so the reply is checked against the
+buffer *as it arrives* — same file, anchor unmoved, still a word there — and
+filtered against the prefix re-read at that moment. And core hides the box
+without telling the image, so =lsp-complete-accept= asks =(completion-at)= for the
+anchor rather than trusting its own. The insertion is one =replace-region=.
+
+*Bound to =C-n= =C-p= =C-y= =C-e= in Insert*, which is vim's spelling and not corfu's,
+for a threading reason rather than a taste one: those four are dead keys in
+Insert today, so they need no fallback. =RET= and =TAB= would, and the fallback is
+unwritable from the image — a Lisp =insert= lands a queue turn late, so =a RET b=
+would come out as =ab= and a newline.
+
+The word charset is *ASCII on purpose*: buffer text reaches Lisp as UTF-8 bytes
+while =(point)= counts characters, and a scan back that stops at the first byte
+>= #x80 has counted bytes that are each exactly one character. So the anchor is
+right on any line without decoding anything. A word containing =ï= gets a shorter
+prefix, never a wrong offset.
+
+Left open, and named rather than built: =hover= and =signatureHelp=, which are the
+same round trip and want a *transient paragraph* near point — neither the echo
+area nor a box you navigate. =textEdit= and snippets are declined in the
+capabilities so nothing arrives with =$1= in it. =isIncomplete= is ignored, so a
+server that truncated its answer is not asked again.
+** DONE orderless — space-separated matching
+The filter was subsequence-only. Now the query splits on spaces and every
+component has to match on its own, in any order, so =buffer switch= finds
+=switch-to-buffer= — which is not a subsequence of the query as one string.
+
+*The whole feature is deciding which prompts split*, and the rule is what the
+text *is* rather than whether the candidate list happens to be empty. A payload
+keeps its spaces: =:= is parsed as an ex command, =/= becomes =last_search=,
+=Grep= is a regex handed to ripgrep, =Confirm= is compared against the word
+=yes=, and a =read-string= answer is prose on its way to a Lisp continuation.
+The non-vacuous case is =PromptItem=, which can hand candidates to a
+=read-string= — so "has items" would have been the wrong test.
+
+=consult-line= *does* split, which is worth writing down because it looks like a
+search and is not one: the jump goes by candidate *index* — the item index is the
+line number — so the text is a filter and nothing else.
+
+The old comment justifying the no-split rule was wrong and is corrected in
+place: =fn main= *is* a subsequence of =fn  main=, because a subsequence skips
+freely. The regex half of that sentence was the real reason, and =Grep= is still
+the one kind bypassed outright.
+
+Left open: no way to escape a space, so a completing prompt cannot search for
+one — orderless spells it =\ =. No per-component styles (smart-case, regex).
 ** DONE marginalia — annotations beside candidates
 =M-x= candidates now carry their docstring and their key. No new column in the
 Rust minibuffer: a candidate is already *the source of a call* (core runs an
@@ -485,8 +596,10 @@ that is parinfer's bargain, and it is written down.
 
 *What is not done: paren mode and smart mode.* Paren mode is
 =lisp-indent-defun= plus a paren-trail tracker that must preserve edits made
-inside the trail; smart mode needs to know *what changed*, which is exactly the
-delta =after-change-hook= does not carry. Half-building either gives a command
+inside the trail; smart mode needs to know *what changed*. That delta now exists
+— =(after-edit-hook START OLD-END NEW-END TEXT)= — so this objection is retired
+and the last one below is not, which is the one that was decisive anyway.
+Half-building either gives a command
 that reformats correctly nine times and eats a form on the tenth.
 
 *And it is a command rather than a per-edit hook, deliberately.* Four reasons,
@@ -623,11 +736,41 @@ Still open: project-wide replace.
 ** TODO Project: project-wide replace
 
 * PERFORMANCE
-** TODO Incremental tree-sitter parsing
-Still a full reparse per revision, on a worker thread. Fix is to keep the
-=Tree= per buffer and feed it the changed ranges.
+** DONE Incremental tree-sitter parsing
+=crates/syntax= keeps the =Tree= in its =Session= and feeds it the changed
+ranges, off the record =Buffer::splice= now keeps (see the change log above).
+The worker's coalescing queue *concatenates* edit lists when it drops a stale
+request — dropping a request's text is fine, dropping its edits leaves the tree
+a hole it never took.
+
+Measured on =crates/core/src/lib.rs=, one character inserted mid-file, release:
+
+| buffer | full | incremental |
+|      181 KB | 16.4 ms | 7.2 ms |
+|      727 KB | 66.1 ms | 28.3 ms |
+|      2.9 MB |  270 ms |  117 ms |
+
+The *parse* is where it all is — 155 ms → 0.9 ms at 2.9 MB, about 170×. The
+residual 117 ms is the highlight *query*, still run over the whole tree, and is
+ponytail-noted at the call site with =tree.changed_ranges()= as the upgrade.
+
+*This dropped =tree-sitter-highlight=*, and not by preference: that crate builds
+its =Tree= inside its own iterator and offers no way to hand it one, so the only
+optimisation that matters here is unreachable through its API. With no injection
+and no locals query — which this crate always configured — its algorithm reduces
+to three rules, now in =spans()=. All 34 syntax tests passed unchanged, which is
+the evidence the reimplementation is faithful. One fewer dependency.
 ** TODO Present off-thread, or give up vsync
-With N windows the loop runs at 1/N of the refresh rate.
+With N *frames* the loop runs at 1/N of the refresh rate — each renderer is its
+own =present_vsync()= canvas and =present= parks the thread, so the waits are
+serial. Frames are OS windows, not panes: splits inside one frame share a
+renderer and cost nothing, so this only bites once =new-frame= has been used.
+
+The everyday cost is the other one, at =main.rs='s draw loop: an idle editor
+still redraws at the refresh rate and throws the frame away when the digest says
+it was identical. A couple of milliseconds per display frame doing nothing, and
+the upgrade path is written up there — core stamping a generation on every
+mutation, which the change log now added for the delta is most of the way to.
 
 * THE COMMON LISP MIGRATION
 The goal: as much as possible in Lisp, performance-critical work in Rust.
@@ -748,7 +891,7 @@ is finished.
          against ~/api/v1/models~ and had not been exercised against the live API.
    - [ ] The API key pasted into the session transcript should be treated as
          burned and rotated. Code reads ~$OPENROUTER_API_KEY~ or
-         ~~/.config/zemacs/openrouter-key~; no key is in a tracked file.
+         ~~/.zemacs.d/openrouter-key~; no key is in a tracked file.
 
 ** PAUSED zemacs-tutor — the split-pane redesign
 
@@ -851,12 +994,27 @@ is finished.
          showing numbers?" gets the wrong answer on the no-gutter list. Decide
          whether it becomes per-buffer (breaking configs that read it as the
          global default) or gains a sibling.
-   - [ ] **Double-encoded text is still live in ~org-modern.lisp~ and
-         ~math.lisp~.** ~(buffer-string)~ hands back one character per UTF-8 byte
-         and ~dup_utf8~ re-encodes it, so an em dash or an accented link
-         description comes back as mojibake. ~%org-frozen-text~ in
-         ~org-frozen.lisp~ is a working Lisp-side decoder; lift it into a shared
-         helper rather than writing a third copy.
+   - [X] **Double-encoded text was live in ~org-modern.lisp~ and ~math.lisp~.**
+         ~(buffer-string)~ hands back one character per UTF-8 byte and
+         ~dup_utf8~ re-encodes it, so an em dash or an accented link description
+         came back as mojibake. The decoder is now ~utf8-text~ in
+         ~runtime/modes/modes.lisp~ — the one file every mode and every mode test
+         already loads — and the two copies that existed (~%org-frozen-text~,
+         and a second one in ~gui.lisp~) are gone. org-modern decodes once in
+         ~%org-modern-render~; math decodes at the *reader* boundary, so the
+         plist layer is characters throughout rather than at scattered output
+         sites.
+
+         The proof is byte-exact: ~crates/lisp/tests/utf8.rs~ asserts the
+         *undecoded* answer too, against mojibake computed byte-for-byte from
+         the sample, because a test that only asks "is some character non-ASCII"
+         passes on double-encoded text.
+
+         Still raw, both deliberately, because each desynchronises a pair:
+         org link *targets* (decoding one without ~%org-heading-position~, which
+         matches ~[[*Heading]]~ against raw ~%org-lines~ text, breaks the match),
+         and ~math-src-block~'s ~:body~ (~math-code.lisp~ tangles it to a file,
+         so the fix changes that file's behaviour and its tests).
    - [ ] ~prune_images~ is not called after an edit that kills an overlay, so an
          image whose text was deleted lingers until the next explicit overlay
          delete. Bounded in practice, not unbounded. Needs a policy on where the
@@ -877,7 +1035,7 @@ is finished.
    the vision call has still never run against a photograph, only against the
    stub in ~crates/lisp/tests/math_written.rs~.
 
-   - [X] **API key.** Written to ~~/.config/zemacs/openrouter-key~, mode 600.
+   - [X] **API key.** Written to ~~/.zemacs.d/openrouter-key~, mode 600.
          ~/api/v1/models~ answers 200 with it.
    - [X] **The model slug resolves.** ~%mw-resolve-model~, run through the
          editor's own code against the live list, answers ~openai/gpt-5.6-luna~

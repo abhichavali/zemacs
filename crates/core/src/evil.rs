@@ -26,14 +26,50 @@ pub(crate) enum Op {
     Delete,
     Change,
     Yank,
+    /// `>` and `<`. True shifts right. Always linewise, whatever the motion —
+    /// `>w` indents the line the word is on, because indentation is a property
+    /// of a line and there is nothing else it could mean.
+    Shift(bool),
+    /// `gu`, `gU`, `g~`.
+    Case(Case),
+}
+
+/// What `gu`, `gU` and `g~` do to a run of text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Case {
+    Lower,
+    Upper,
+    Toggle,
 }
 
 impl Op {
-    fn char(self) -> char {
+    /// The key that, typed next, doubles this operator into its linewise form:
+    /// `dd`, `yy`, `>>`, `guu`. Always the operator's *last* key, which is why
+    /// the two-key ones need no special case.
+    fn double(self) -> char {
         match self {
             Op::Delete => 'd',
             Op::Change => 'c',
             Op::Yank => 'y',
+            Op::Shift(true) => '>',
+            Op::Shift(false) => '<',
+            Op::Case(Case::Lower) => 'u',
+            Op::Case(Case::Upper) => 'U',
+            Op::Case(Case::Toggle) => '~',
+        }
+    }
+
+    /// How the operator reads in the which-key trail.
+    fn label(self) -> &'static str {
+        match self {
+            Op::Delete => "d",
+            Op::Change => "c",
+            Op::Yank => "y",
+            Op::Shift(true) => ">",
+            Op::Shift(false) => "<",
+            Op::Case(Case::Lower) => "gu",
+            Op::Case(Case::Upper) => "gU",
+            Op::Case(Case::Toggle) => "g~",
         }
     }
 }
@@ -53,6 +89,9 @@ pub(crate) struct Pending {
     /// and *which* of them is waiting is the character itself, since none of
     /// them needs any other state to finish.
     pub literal: Option<char>,
+    /// `i` or `a` has been typed where a text object can start, and the next
+    /// key names the object: `ciw`, `di(`, `ya"`.
+    pub object: Option<char>,
 }
 
 impl Pending {
@@ -63,6 +102,7 @@ impl Pending {
         self.find = None;
         self.replace = false;
         self.literal = None;
+        self.object = None;
     }
 
     fn count(&self) -> usize {
@@ -76,7 +116,7 @@ impl Pending {
             s.push_str(&n.to_string());
         }
         if let Some(op) = self.op {
-            s.push(op.char());
+            s.push_str(op.label());
         }
         s.push_str(&self.keys.join(""));
         if let Some(f) = self.find {
@@ -87,6 +127,9 @@ impl Pending {
         }
         if let Some(l) = self.literal {
             s.push(l);
+        }
+        if let Some(o) = self.object {
+            s.push(o);
         }
         if s.is_empty() {
             String::new()
@@ -126,6 +169,30 @@ pub(crate) struct Vim {
     last_macro: Option<char>,
     /// Current `@` nesting, against [`MACRO_DEPTH`].
     depth: usize,
+    /// The last `f`/`t` and its target, for `;` and `,`.
+    last_find: Option<(char, char)>,
+    /// The last visual selection, for `gv`. Written by `set_mode` in the parent
+    /// module, which is the one place that knows a selection has *ended*.
+    pub(crate) last_selection: Option<(usize, usize)>,
+    /// The keys of the last change, for `.`.
+    ///
+    /// Keys and not commands, exactly as a macro is, and for the same reason:
+    /// `.` after `ciwfoo` has to change *this* word to `foo`, which means
+    /// re-deciding what the word is. Storing the commands would re-run the
+    /// offsets the original change was computed against and edit whatever
+    /// happens to be there now.
+    change: Vec<Key>,
+    /// The keys since the grammar was last at rest. Promoted to `change` when
+    /// it comes to rest again *having mutated something*; discarded when it
+    /// turns out to have been a motion.
+    candidate: Vec<Key>,
+    /// Whether `candidate` has mutated the document yet.
+    dirty: bool,
+    /// Set by `.` itself, so the repeat does not record `.` as the new change.
+    just_repeated: bool,
+    /// True while `.` is running, so the replay does not record itself as the
+    /// new last change and `..` stays a repeat rather than a fixpoint.
+    repeating: bool,
     /// `ma` — one marker per (buffer, letter).
     ///
     /// Keyed by buffer because vim's lowercase marks are per file and a marker
@@ -193,6 +260,9 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "split-window-below",
     "other-window",
     "delete-window",
+    "zoom-in",
+    "zoom-out",
+    "zoom-reset",
     "new-frame",
     "delete-frame",
     "magit-status",
@@ -261,11 +331,121 @@ impl Editor {
     /// rows up until the image sends the new ones, which is what stops the panel
     /// blinking once per keystroke on the Lisp round trip.
     pub fn handle_key(&mut self, key: Key) -> Vec<EditorCommand> {
+        // corfu, and *before* the dispatch rather than after it, which is the
+        // opposite of which-key below and is explained on `retire_completion`:
+        // what makes a completion popup stale is the mode and the cursor, and
+        // this key's effect on those is still sitting in a command list.
+        self.retire_completion();
         let cmds = self.dispatch_key(key);
+        self.note_change(key, &cmds);
         if self.pending.keys.is_empty() {
             self.which_key.clear();
         }
         cmds
+    }
+
+    /// Note `key` against `.`, and decide whether the change it belongs to has
+    /// finished.
+    ///
+    /// Called before the key is interpreted, because whether a change is *under
+    /// way* is answered by the mode we are in now and whether one has *ended*
+    /// by the mode we are in after — so the recording brackets the dispatch
+    /// rather than sitting inside it.
+    ///
+    /// What counts as a change is decided by what the key produced: a batch
+    /// that mutates the document starts one, and it runs until the grammar is
+    /// back in Normal mode with nothing pending. That is what folds an insert
+    /// session into the change that opened it, so `.` after `cwfoo<esc>` types
+    /// `foo` over the next word instead of only re-entering Insert.
+    fn note_change(&mut self, key: Key, cmds: &[EditorCommand]) {
+        if self.vim.repeating || std::mem::take(&mut self.vim.just_repeated) {
+            return;
+        }
+        // `u` and `C-r` are not changes to repeat: `.` after an undo means the
+        // edit you undid, which is what every vim user expects and is why this
+        // is not simply "the last thing that touched the buffer".
+        if matches!(
+            cmds.first(),
+            Some(EditorCommand::Undo | EditorCommand::Redo)
+        ) {
+            self.vim.candidate.clear();
+            self.vim.dirty = false;
+            return;
+        }
+        // Every key joins the candidate, because whether it turns out to be
+        // part of a change is not knowable when it arrives: the `d` of `dw`
+        // mutates nothing and produces no commands at all. Recording only from
+        // the first mutation is what made `.` repeat the *motion*.
+        self.vim.candidate.push(key);
+        if cmds.iter().any(EditorCommand::mutates_document) {
+            self.vim.dirty = true;
+        }
+        // The mode this batch *lands* in, which is not `self.mode`: the commands
+        // have not been applied yet, so the `SetMode(Insert)` that `ciw` just
+        // produced is still in the list rather than in the editor. Reading the
+        // live mode here ended the change the instant it began — and, for the
+        // Esc that closes one, never ended it at all.
+        let after = cmds
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                EditorCommand::SetMode(m) => Some(*m),
+                _ => None,
+            })
+            .unwrap_or(self.mode);
+        // At rest: Normal mode with the grammar holding nothing. That is what
+        // folds an insert session into the change that opened it — `cwfoo<esc>`
+        // stays incomplete until the Esc, so `.` types `foo` over the next word
+        // rather than merely re-entering Insert.
+        let resting = after == Mode::Normal
+            && self.pending.op.is_none()
+            && self.pending.object.is_none()
+            && self.pending.find.is_none()
+            && self.pending.literal.is_none()
+            && self.pending.count.is_none()
+            && !self.pending.replace
+            && self.pending.keys.is_empty();
+        if resting {
+            if self.vim.dirty {
+                self.vim.change = std::mem::take(&mut self.vim.candidate);
+            }
+            self.vim.candidate.clear();
+            self.vim.dirty = false;
+        }
+    }
+
+    /// `.` — the last change, again, `n` times.
+    fn repeat_change(&mut self, n: usize) -> Vec<EditorCommand> {
+        let keys = self.vim.change.clone();
+        if keys.is_empty() {
+            return vec![EditorCommand::Message("no change to repeat".into())];
+        }
+        if self.vim.repeating {
+            return vec![];
+        }
+        // The `.` itself is still sitting in the pending key sequence — this is
+        // reached from inside `builtin`, which clears it only on the way out.
+        // Replaying on top of that made the first key of the change read as
+        // `. d` rather than `d`, and matched nothing at all.
+        self.pending.clear();
+        // Applied here rather than returned, for the reason `replay` gives:
+        // every key after the first has to see what the one before it did.
+        self.vim.repeating = true;
+        let mut out = Vec::new();
+        for _ in 0..n {
+            for key in keys.iter().copied() {
+                for cmd in self.handle_key(key) {
+                    if cmd.needs_app() {
+                        out.push(cmd);
+                    } else {
+                        self.apply(cmd);
+                    }
+                }
+            }
+        }
+        self.vim.repeating = false;
+        self.vim.just_repeated = true;
+        out
     }
 
     fn dispatch_key(&mut self, key: Key) -> Vec<EditorCommand> {
@@ -354,7 +534,7 @@ impl Editor {
     /// leave a checkpoint behind for it.
     fn delete_word_backward(&mut self) -> Vec<EditorCommand> {
         let end = self.buffer.cursor;
-        let start = word_backward(&self.buffer, end);
+        let start = word_backward(&self.buffer, end, false);
         if start >= end {
             return vec![];
         }
@@ -367,13 +547,39 @@ impl Editor {
     // --- Insert ----------------------------------------------------------
 
     fn insert_key(&mut self, key: Key) -> Vec<EditorCommand> {
-        // Single-key bindings are live in Insert mode too — that is how `M-+`
-        // or `C-s` keep working while you type. Multi-key sequences are Normal
-        // mode only: waiting on a second key would swallow text you meant to
-        // insert.
-        if let Some(cmd) = self.keymap.get(&(Mode::Insert, key.token())) {
-            let action = cmd.clone();
-            return self.run_action(&action);
+        // Bindings are live in Insert mode too — that is how `M-+` or `C-s`
+        // keep working while you type.
+        //
+        // Multi-key sequences are live as well, but only ones that *begin* with
+        // a key which is not text. `C-x C-s` has to save while you are typing,
+        // and pausing after `C-x` costs nothing because `C-x` was never going
+        // into the buffer. A sequence beginning with a printable character
+        // stays Normal-mode only, for the reason this used to refuse all of
+        // them: waiting there swallows the letter you meant to type.
+        if !self.pending.keys.is_empty() || !matches!(key, Key::Char(_)) {
+            self.pending.keys.push(key.token());
+            let seq = self.pending.keys.join(" ");
+            if let Some(cmd) = self.keymap.get(&(Mode::Insert, seq.clone())).cloned() {
+                self.pending.clear();
+                return self.run_action(&cmd);
+            }
+            let prefix = format!("{seq} ");
+            if self
+                .keymap
+                .keys()
+                .any(|(m, k)| *m == Mode::Insert && k.starts_with(&prefix))
+            {
+                return vec![]; // more of the sequence to come
+            }
+            // Not a binding and not a prefix. A sequence that got somewhere and
+            // then died is dropped whole — `C-x z` is a typo, not two commands —
+            // but a *first* key that simply is not bound falls through to be
+            // handled as itself, which is how Esc and the arrows still work.
+            let dead = self.pending.keys.len() > 1;
+            self.pending.clear();
+            if dead {
+                return vec![];
+            }
         }
         match key {
             Key::Esc | Key::Ctrl('c') => vec![EditorCommand::SetMode(Mode::Normal)],
@@ -388,6 +594,11 @@ impl Editor {
             Key::Right => vec![EditorCommand::MoveCursor(Direction::Right)],
             Key::Up => vec![EditorCommand::MoveCursor(Direction::Up)],
             Key::Down => vec![EditorCommand::MoveCursor(Direction::Down)],
+            // Nothing, rather than the tab it used to type by arriving here as
+            // `Tab`: nobody presses `⇧⇥` wanting whitespace. The keymap above
+            // has already had its say, so `(define-key "insert" "<backtab>" …)`
+            // is what gives it a meaning in a file buffer.
+            Key::BackTab => vec![],
             Key::Ctrl(_) | Key::Meta(_) | Key::CtrlMeta(_) => vec![],
             Key::CtrlEnter => vec![EditorCommand::SplitWindow(frame::Split::Columns)],
             Key::CtrlMetaEnter => vec![EditorCommand::SplitWindow(frame::Split::Rows)],
@@ -405,14 +616,40 @@ impl Editor {
             let Key::Char(target) = key else {
                 return vec![];
             };
+            // Remembered before it is resolved, so `;` repeats a find that
+            // found nothing this time and might next time.
+            self.vim.last_find = Some((find, target));
             return match self.find_char(find, target, n) {
                 Some(m) => self.resolve(op, m),
                 None => vec![EditorCommand::Message(format!("not found: {target}"))],
             };
         }
         if self.pending.replace {
+            let visual = self.mode.is_visual();
             self.pending.clear();
             let Key::Char(c) = key else { return vec![] };
+            // Over a selection, `r` replaces every character in it — keeping
+            // the newlines, because replacing those would fuse the lines the
+            // selection spans into one.
+            if visual {
+                let Some((start, end)) = self.selection() else {
+                    return vec![EditorCommand::SetMode(Mode::Normal)];
+                };
+                let out: String = self
+                    .buffer
+                    .slice_string(start, end)
+                    .chars()
+                    .map(|ch| if ch == '\n' { '\n' } else { c })
+                    .collect();
+                return vec![
+                    EditorCommand::SetMode(Mode::Normal),
+                    EditorCommand::Checkpoint,
+                    EditorCommand::DeleteRange(start, end),
+                    EditorCommand::MoveTo(start),
+                    EditorCommand::InsertText(out),
+                    EditorCommand::MoveTo(start),
+                ];
+            }
             let at = self.buffer.cursor;
             let (line, _) = self.buffer.cursor_line_col();
             // Nothing under the cursor on a blank line or an empty buffer —
@@ -427,6 +664,25 @@ impl Editor {
                 EditorCommand::InsertChar(c),
                 EditorCommand::MoveTo(at),
             ];
+        }
+        if let Some(kind) = self.pending.object.take() {
+            let n = self.pending.count();
+            let op = self.pending.op.take();
+            self.pending.clear();
+            let Key::Char(obj) = key else { return vec![] };
+            let Some((start, end, linewise)) = self.text_object(kind, obj, n) else {
+                return vec![];
+            };
+            // With an operator, apply it. Without one — which means visual mode,
+            // since `iw` alone in Normal mode is `i` — the object *becomes* the
+            // selection, which is how `vi(` then `d` works.
+            return match op {
+                Some(op) => self.operate(op, start, end, linewise),
+                None => {
+                    self.visual_anchor = Some(start);
+                    vec![EditorCommand::MoveTo(end.saturating_sub(1).max(start))]
+                }
+            };
         }
         if let Some(kind) = self.pending.literal.take() {
             return self.literal_key(kind, key);
@@ -571,13 +827,31 @@ impl Editor {
             return Some(self.delete_word_backward());
         }
 
+        // `cw` is `ce`, and `cW` is `cE`. vim's one deliberate irregularity in
+        // the operator grammar, and the reason it is there: changing a word
+        // should not swallow the space after it, or every `cw` is followed by
+        // typing the space back in. Only on a non-blank — on whitespace `cw`
+        // really is `dw`, because then the "word" is the run of spaces.
+        let seq = match (op, seq) {
+            (Some(Op::Change), "w" | "W")
+                if self.buffer.char_at(self.buffer.cursor).map(class) != Some(0) =>
+            {
+                if seq == "w" {
+                    "e"
+                } else {
+                    "E"
+                }
+            }
+            _ => seq,
+        };
+
         // Motions first: they compose with a pending operator.
         if let Some(m) = self.motion(seq, n) {
             return Some(self.resolve(op, m));
         }
 
         // Prefixes that need another key.
-        if matches!(seq, "g" | "Z") {
+        if matches!(seq, "g" | "Z" | "z" | "[" | "]") {
             return None;
         }
         if matches!(seq, "f" | "F" | "t" | "T") {
@@ -600,11 +874,25 @@ impl Editor {
             return None;
         }
 
+        // `i` and `a` start a text object wherever one can go: after an
+        // operator (`ciw`) or in visual mode (`vi(`). Everywhere else they are
+        // still the keys that enter Insert, which is why this is not simply an
+        // arm in the match below — in Normal mode with nothing pending, `i` has
+        // no object reading at all.
+        //
+        // Before the operator-abort, which would otherwise eat the `i` of `ciw`
+        // as "not a motion, give up".
+        if (op.is_some() || visual) && matches!(seq, "i" | "a") {
+            self.pending.object = seq.chars().next();
+            self.pending.keys.clear();
+            return None;
+        }
+
         // Doubled operator = linewise over `count` lines: dd, yy, cc.
         if let Some(op) = op {
-            if seq.len() == 1 && seq.starts_with(op.char()) {
+            if seq.len() == 1 && seq.starts_with(op.double()) {
                 let (line, _) = self.buffer.cursor_line_col();
-                let last = (line + n - 1).min(self.buffer.len_lines().saturating_sub(1));
+                let last = (line + n - 1).min(self.buffer.last_line());
                 let m = Motion {
                     target: self.buffer.line_start(last),
                     span: Span::Linewise,
@@ -620,11 +908,16 @@ impl Editor {
         let (line, _) = self.buffer.cursor_line_col();
         let cmds = match seq {
             // --- operators ---
-            "d" | "c" | "y" if !visual => {
+            "d" | "c" | "y" | ">" | "<" | "g u" | "g U" | "g ~" if !visual => {
                 self.pending.op = Some(match seq {
                     "d" => Op::Delete,
                     "c" => Op::Change,
-                    _ => Op::Yank,
+                    "y" => Op::Yank,
+                    ">" => Op::Shift(true),
+                    "<" => Op::Shift(false),
+                    "g u" => Op::Case(Case::Lower),
+                    "g U" => Op::Case(Case::Upper),
+                    _ => Op::Case(Case::Toggle),
                 });
                 self.pending.keys.clear(); // `count` survives: `2dw` == `d2w`
                 return None;
@@ -633,6 +926,24 @@ impl Editor {
             "d" | "x" if visual => self.op_selection(Op::Delete),
             "c" | "s" if visual => self.op_selection(Op::Change),
             "y" if visual => self.op_selection(Op::Yank),
+            ">" if visual => self.op_selection(Op::Shift(true)),
+            "<" if visual => self.op_selection(Op::Shift(false)),
+            // In visual mode these are single keys, not `g`-prefixed: `u`
+            // lowercases the selection where in Normal mode it undoes.
+            "u" | "g u" if visual => self.op_selection(Op::Case(Case::Lower)),
+            "U" | "g U" if visual => self.op_selection(Op::Case(Case::Upper)),
+            "~" | "g ~" if visual => self.op_selection(Op::Case(Case::Toggle)),
+
+            // `~` on its own: flip the character under the cursor and step over
+            // it, which is the one edit vim spells without an operator at all.
+            "~" => {
+                let end = (cursor + n).min(self.buffer.line_end(line));
+                let mut cmds = self.operate(Op::Case(Case::Toggle), cursor, end, false);
+                cmds.push(EditorCommand::MoveTo(end.min(
+                    self.buffer.line_end(line).saturating_sub(1).max(cursor),
+                )));
+                cmds
+            }
 
             // --- entering insert ---
             // `SetMode` comes first in every one of these: in Normal mode the
@@ -660,18 +971,35 @@ impl Editor {
                 EditorCommand::SetMode(Mode::Insert),
                 EditorCommand::MoveTo(self.buffer.line_end(line)),
             ],
+            // Swap which end of the selection the cursor is on, so a selection
+            // taken in the wrong direction can be extended from the other side
+            // rather than started again.
+            "o" if visual => {
+                let anchor = self.visual_anchor.unwrap_or(cursor);
+                self.visual_anchor = Some(cursor);
+                vec![EditorCommand::MoveTo(anchor)]
+            }
+            // Both carry the current line's indent onto the new one — vim's
+            // `autoindent`, which evil leaves on and which every editor written
+            // since has agreed about. Without it every `o` inside a function is
+            // followed by typing back the indentation you were already at.
             "o" => vec![
                 EditorCommand::Checkpoint,
                 EditorCommand::SetMode(Mode::Insert),
                 EditorCommand::MoveTo(self.buffer.line_end(line)),
                 EditorCommand::InsertNewline,
+                EditorCommand::InsertText(self.buffer.line_indent(line)),
             ],
+            // `O` opens *above*, so the newline goes in at the line's start and
+            // point comes back to it — the blank line is now the one at
+            // `line_start`, and the indent lands on it.
             "O" => vec![
                 EditorCommand::Checkpoint,
                 EditorCommand::SetMode(Mode::Insert),
                 EditorCommand::MoveTo(self.buffer.line_start(line)),
                 EditorCommand::InsertNewline,
                 EditorCommand::MoveTo(self.buffer.line_start(line)),
+                EditorCommand::InsertText(self.buffer.line_indent(line)),
             ],
 
             // --- single-key edits ---
@@ -695,6 +1023,58 @@ impl Editor {
                 self.pending.keys.clear();
                 return None;
             }
+            // `s` is `cl` and `S` is `cc` — vim's two abbreviations, and the
+            // reason they exist is that both are one key away from something
+            // you meant to do anyway.
+            "s" => {
+                let end = (cursor + n).min(self.buffer.line_end(line));
+                self.operate(Op::Change, cursor, end, false)
+            }
+            "S" => {
+                let last = (line + n - 1).min(self.buffer.last_line());
+                let end = (self.buffer.line_end(last) + 1).min(self.buffer.len_chars());
+                self.operate(Op::Change, self.buffer.line_start(line), end, true)
+            }
+            // `X` deletes *backwards*, and stops at the line start rather than
+            // pulling the previous line up.
+            "X" => {
+                let start = cursor.saturating_sub(n).max(self.buffer.line_start(line));
+                self.operate(Op::Delete, start, cursor, false)
+            }
+            // `;` and `,` repeat the last `f`/`t`, forwards and backwards.
+            // Without them `f` is a search you cannot continue, which is most
+            // of what makes `f` worth typing.
+            ";" | "," => {
+                let Some((kind, target)) = self.vim.last_find else {
+                    return Some(vec![EditorCommand::Message("no previous f/t".into())]);
+                };
+                // `,` is the same find with its direction turned over.
+                let kind = match seq {
+                    "," => match kind {
+                        'f' => 'F',
+                        'F' => 'f',
+                        't' => 'T',
+                        _ => 't',
+                    },
+                    _ => kind,
+                };
+                match self.find_char(kind, target, n) {
+                    Some(m) => self.resolve(op, m),
+                    None => vec![EditorCommand::Message(format!("not found: {target}"))],
+                }
+            }
+            // `gv` — the selection you last had back again.
+            "g v" => match self.vim.last_selection {
+                Some((a, b)) if b <= self.buffer.len_chars() => vec![
+                    // Point goes to the anchor *first*: entering visual mode
+                    // anchors on wherever the cursor is, so setting the field
+                    // by hand here would be overwritten a command later.
+                    EditorCommand::MoveTo(a),
+                    EditorCommand::SetMode(Mode::Visual),
+                    EditorCommand::MoveTo(b.saturating_sub(1).max(a)),
+                ],
+                _ => vec![EditorCommand::Message("no previous selection".into())],
+            },
             "J" => self.join_lines(n),
             "p" => self.paste_cmds(true),
             "P" => self.paste_cmds(false),
@@ -738,8 +1118,47 @@ impl Editor {
                 self.open_prompt(PromptKind::Search);
                 vec![]
             }
+            "?" => {
+                self.open_prompt(PromptKind::Search);
+                self.search_backward = true;
+                vec![]
+            }
+            // `n` and `N` follow the direction the search was *started* in, so
+            // `?foo` then `n` keeps going backwards. Without this `?` would be
+            // a search you can only repeat forwards, which is not a search
+            // backwards at all.
+            "n" if self.search_backward => self.search_from(self.buffer.cursor, false),
+            "N" if self.search_backward => self.search_from(self.buffer.cursor + 1, true),
             "n" => self.search_from(self.buffer.cursor + 1, true),
             "N" => self.search_from(self.buffer.cursor, false),
+            // `*` and `#`: search for the word under the cursor. The pattern is
+            // anchored on word boundaries, as vim's is — hunting `foo` must not
+            // stop on every `foobar`.
+            "*" | "#" => {
+                let Some(word) = self.word_at_point() else {
+                    return Some(vec![EditorCommand::Message("no word under cursor".into())]);
+                };
+                self.last_search = format!(r"\b{}\b", regex::escape(&word));
+                self.search_backward = seq == "#";
+                match seq {
+                    "*" => self.search_from(self.buffer.cursor + 1, true),
+                    _ => self.search_from(self.buffer.cursor, false),
+                }
+            }
+            // Put the cursor's line at the top, middle or bottom of the window.
+            // The view moves and point does not, which is what separates these
+            // from `H`/`M`/`L` above.
+            "z z" | "z t" | "z b" => {
+                let h = self.viewport_lines.max(1);
+                self.scroll = match seq {
+                    "z t" => line,
+                    "z b" => line.saturating_sub(h - 1),
+                    _ => line.saturating_sub(h / 2),
+                };
+                vec![]
+            }
+            // `.` — do the last change again. See `last_change`.
+            "." => return Some(self.repeat_change(n)),
             // Window splits, reachable in Normal and Visual as well as Insert.
             "C-<ret>" => vec![EditorCommand::SplitWindow(frame::Split::Columns)],
             "C-M-<ret>" => vec![EditorCommand::SplitWindow(frame::Split::Rows)],
@@ -835,7 +1254,7 @@ impl Editor {
         let mut l = line;
         loop {
             l = match (down, l) {
-                (true, l) if l + 1 < buf.len_lines() => l + 1,
+                (true, l) if l < buf.last_line() => l + 1,
                 (false, l) if l > 0 => l - 1,
                 _ => return line,
             };
@@ -904,20 +1323,99 @@ impl Editor {
                 span: Span::Exclusive,
             },
             "$" => Motion {
-                target: buf.line_end((line + n - 1).min(buf.len_lines().saturating_sub(1))),
+                target: buf.line_end((line + n - 1).min(buf.last_line())),
                 span: Span::Inclusive,
             },
-            "w" => Motion {
-                target: (0..n).fold(cur, |p, _| word_forward(buf, p)),
+            // `w`/`W`, and the one deliberate irregularity in vim's grammar
+            // that everybody relies on without noticing: with an operator
+            // pending, a `w` that would carry the range onto the next line
+            // stops at the end of this one instead. `dw` on the last word of a
+            // line deletes the word, not the line break and the indent of
+            // whatever followed.
+            //
+            // Measured from where the *last* step started, so a count that
+            // legitimately crosses lines still does — only the final hop is
+            // clamped, which is the one that ran out of words.
+            "w" | "W" => {
+                let big = seq == "W";
+                let (mut prev, mut pos) = (cur, cur);
+                for _ in 0..n {
+                    prev = pos;
+                    pos = word_forward(buf, pos, big);
+                }
+                let mut target = pos;
+                if self.pending.op.is_some() {
+                    let eol = buf.line_end(buf.text.char_to_line(prev.min(buf.len_chars())));
+                    target = target.min(eol.max(cur));
+                }
+                Motion {
+                    target,
+                    span: Span::Exclusive,
+                }
+            }
+            "b" | "B" => Motion {
+                target: (0..n).fold(cur, |p, _| word_backward(buf, p, seq == "B")),
                 span: Span::Exclusive,
             },
-            "b" => Motion {
-                target: (0..n).fold(cur, |p, _| word_backward(buf, p)),
-                span: Span::Exclusive,
-            },
-            "e" => Motion {
-                target: (0..n).fold(cur, |p, _| word_end(buf, p)),
+            "e" | "E" => Motion {
+                target: (0..n).fold(cur, |p, _| word_end(buf, p, seq == "E")),
                 span: Span::Inclusive,
+            },
+            // Backward to the end of the previous word. `g e` used to mean "the
+            // end of the buffer", which is `G`'s job and is not what any vim
+            // user pressing `ge` is asking for.
+            "g e" | "g E" => Motion {
+                target: (0..n).fold(cur, |p, _| word_end_backward(buf, p, seq == "g E")),
+                span: Span::Inclusive,
+            },
+            // Linewise line motions. `_` is "this line", so `d_` is `dd` and
+            // `3_` reaches two lines down — the off-by-one is vim's, not a slip.
+            "_" => Motion {
+                target: buf.first_non_blank((line + n - 1).min(buf.last_line())),
+                span: Span::Linewise,
+            },
+            "+" | "<ret>" => Motion {
+                target: buf.first_non_blank((line + n).min(buf.last_line())),
+                span: Span::Linewise,
+            },
+            "-" => Motion {
+                target: buf.first_non_blank(line.saturating_sub(n)),
+                span: Span::Linewise,
+            },
+            // `|` — go to a column, counting from 1.
+            "|" => Motion {
+                target: (buf.line_start(line) + n.saturating_sub(1)).min(buf.line_end(line)),
+                span: Span::Exclusive,
+            },
+            // The window's top, middle and bottom line. The only motions that
+            // ask what is *drawn* rather than what is in the buffer, which is
+            // why they read `scroll` and `viewport_lines`.
+            "H" | "M" | "L" => {
+                let h = self.viewport_lines.max(1);
+                let top = self.scroll.min(buf.last_line());
+                let bottom = (self.scroll + h - 1).min(buf.last_line());
+                let target = match seq {
+                    "H" => (top + n - 1).min(bottom),
+                    "L" => bottom.saturating_sub(n - 1).max(top),
+                    _ => top + (bottom - top) / 2,
+                };
+                Motion {
+                    target: buf.first_non_blank(target),
+                    span: Span::Linewise,
+                }
+            }
+            // `%` — the other end of the bracket at or just before point.
+            // Inclusive, so `d%` takes the pair and everything between it,
+            // which is the whole reason anyone uses it with an operator.
+            "%" => Motion {
+                target: buf.matching_bracket(cur)?,
+                span: Span::Inclusive,
+            },
+            // `j`/`k` by *visual* row, explicitly, whatever the window is
+            // doing — vim's `gj`/`gk`.
+            "g j" | "g k" => Motion {
+                target: self.visual_target(seq == "g j", n, self.held_col(self.cursor_vcol())),
+                span: Span::Exclusive,
             },
             "{" => Motion {
                 target: buf.line_start(paragraph(buf, line, false)),
@@ -928,7 +1426,7 @@ impl Editor {
                 span: Span::Linewise,
             },
             "G" => {
-                let last = buf.len_lines().saturating_sub(1);
+                let last = buf.last_line();
                 let target = match self.pending.count {
                     Some(c) => buf.first_non_blank((c - 1).min(last)),
                     None => buf.first_non_blank(last),
@@ -945,13 +1443,36 @@ impl Editor {
                     span: Span::Linewise,
                 }
             }
-            "g e" => Motion {
-                target: buf.len_chars().saturating_sub(1),
-                span: Span::Inclusive,
-            },
             _ => return None,
         };
         Some(m)
+    }
+
+    /// The word under the cursor, for `*` and `#`.
+    ///
+    /// vim's rule when point is not on a word character: take the next one on
+    /// the line. `*` pressed in the indentation searches for the first word of
+    /// the line, which is nearly always what was meant.
+    fn word_at_point(&self) -> Option<String> {
+        let buf = &self.buffer;
+        let line = buf.text.char_to_line(buf.cursor.min(buf.len_chars()));
+        let eol = buf.line_end(line);
+        let mut i = buf.cursor;
+        while i < eol && class_at(buf, i, false) != Some(1) {
+            i += 1;
+        }
+        if class_at(buf, i, false) != Some(1) {
+            return None;
+        }
+        let mut start = i;
+        while start > 0 && class_at(buf, start - 1, false) == Some(1) {
+            start -= 1;
+        }
+        let mut end = i;
+        while end < buf.len_chars() && class_at(buf, end, false) == Some(1) {
+            end += 1;
+        }
+        Some(buf.slice_string(start, end))
     }
 
     fn find_char(&self, kind: char, target: char, n: usize) -> Option<Motion> {
@@ -988,6 +1509,14 @@ impl Editor {
             return vec![EditorCommand::MoveTo(m.target)];
         };
         let cur = self.buffer.cursor;
+        // Indentation is a property of a line, so `>` takes whole ones whatever
+        // the motion said: `>w` and `>j` both shift lines, which is the only
+        // reading either could have.
+        let span = match op {
+            Op::Shift(_) => Span::Linewise,
+            _ => m.span,
+        };
+        let m = Motion { span, ..m };
         let (start, end) = match m.span {
             Span::Exclusive => (cur.min(m.target), cur.max(m.target)),
             Span::Inclusive => (
@@ -1082,10 +1611,19 @@ impl Editor {
         match op {
             Op::Yank => vec![yank, EditorCommand::MoveTo(start)],
             Op::Delete => {
-                // A linewise delete that reaches the end of the buffer has no
-                // trailing newline to remove, so take the *preceding* one
-                // instead — otherwise `dd` on the last line leaves a blank one.
-                let from = if linewise && end == self.buffer.len_chars() && start > 0 {
+                // A linewise range takes its own terminating newline with it.
+                // The last line of a buffer that ends *without* one has none, so
+                // that case takes the newline in front instead — otherwise `dd`
+                // there leaves the blank line it was supposed to remove.
+                //
+                // The test is the range's last character and not `end ==
+                // len_chars`, which is what it used to be and which is wrong for
+                // every file that ends in a newline: `dd` on the last line of
+                // "a\nb\n" ate the final newline too and left "a", where vim
+                // leaves "a\n".
+                let ends_with_newline =
+                    end > start && self.buffer.char_at(end - 1) == Some('\n');
+                let from = if linewise && !ends_with_newline && start > 0 {
                     start - 1
                 } else {
                     start
@@ -1094,7 +1632,7 @@ impl Editor {
                     EditorCommand::Checkpoint,
                     yank,
                     EditorCommand::DeleteRange(from, end),
-                    EditorCommand::MoveTo(from),
+                    EditorCommand::MoveTo(self.after_linewise_delete(linewise, from, start, end)),
                 ]
             }
             Op::Change => {
@@ -1116,7 +1654,292 @@ impl Editor {
                     EditorCommand::MoveTo(start),
                 ]
             }
+            // Neither of these touches the register: vim does not clobber `""`
+            // with what you indented or lowercased, and reaching for `p` after
+            // a `>>` expecting the last yank is exactly why.
+            Op::Case(kind) => {
+                let text = self.buffer.slice_string(start, end);
+                let out: String = match kind {
+                    Case::Lower => text.to_lowercase(),
+                    Case::Upper => text.to_uppercase(),
+                    Case::Toggle => text.chars().flat_map(flip_case).collect(),
+                };
+                if out == text {
+                    return vec![EditorCommand::MoveTo(start)];
+                }
+                vec![
+                    EditorCommand::Checkpoint,
+                    EditorCommand::DeleteRange(start, end),
+                    EditorCommand::MoveTo(start),
+                    EditorCommand::InsertText(out),
+                    EditorCommand::MoveTo(start),
+                ]
+            }
+            Op::Shift(right) => self.shift_lines(right, start, end),
         }
+    }
+
+    /// `>` and `<` over the lines `[start, end)` touches.
+    ///
+    /// Written bottom-up for the reason [`Editor::op_block`] is: every command
+    /// in the batch is computed against the buffer as it stands *now*, so
+    /// re-indenting a later line first leaves every earlier line's offsets
+    /// exactly where they were measured.
+    ///
+    /// ponytail: leading tabs are counted as one column each and rewritten as
+    /// spaces, because the indent this inserts is spaces — `set-tab-width`
+    /// wide, matching what `<tab>` types in Insert. A file indented with tabs
+    /// therefore converts the lines you shift. The upgrade is a
+    /// `indent-with-tabs` setting read here and by `insert_key`, on the day
+    /// someone is editing a Makefile.
+    fn shift_lines(&mut self, right: bool, start: usize, end: usize) -> Vec<EditorCommand> {
+        let buf = &self.buffer;
+        let width = self.settings.tab_width.max(1);
+        let n = buf.len_chars();
+        let first = buf.text.char_to_line(start.min(n));
+        let last = buf.text.char_to_line(end.saturating_sub(1).min(n));
+        let mut cmds = vec![EditorCommand::Checkpoint];
+        let mut landing = buf.line_start(first);
+        for line in (first..=last).rev() {
+            let ls = buf.line_start(line);
+            let text = buf.slice_string(ls, buf.line_end(line));
+            // A blank line is left alone, as vim leaves it: indenting nothing
+            // produces a line of trailing whitespace and no visible change.
+            if text.trim().is_empty() {
+                continue;
+            }
+            let lead = text.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+            let want = match right {
+                true => lead + width,
+                false => lead.saturating_sub(width),
+            };
+            if line == first {
+                landing = ls + want;
+            }
+            if want == lead {
+                continue;
+            }
+            cmds.push(EditorCommand::DeleteRange(ls, ls + lead));
+            cmds.push(EditorCommand::MoveTo(ls));
+            cmds.push(EditorCommand::InsertText(" ".repeat(want)));
+        }
+        if cmds.len() == 1 {
+            return vec![];
+        }
+        // The first non-blank of the first line, which is where vim leaves it —
+        // and it is known exactly, because nothing before that line moved.
+        cmds.push(EditorCommand::MoveTo(landing));
+        cmds
+    }
+
+    /// A text object: `iw`, `a(`, `i"`. `(start, end, linewise)`.
+    ///
+    /// The half of the vim grammar that is not `operator motion` — a range
+    /// named by what it *is* rather than by where the cursor would get to — and
+    /// the reason `ciw` works from anywhere in a word instead of needing `bce`.
+    ///
+    /// `i` is the inside, `a` is the inside plus its delimiters: `di(` leaves
+    /// the parentheses and `da(` takes them. For a word, `a` takes the trailing
+    /// whitespace instead, which is what makes `daw` join two words properly.
+    ///
+    /// ponytail: no `it`/`at` (an HTML tag) and no sentence object. Tags need a
+    /// parser that knows about `<br/>` and about attributes with `>` in them,
+    /// which is a real scanner and not a bracket match; nothing here has asked
+    /// for one.
+    fn text_object(&self, kind: char, obj: char, n: usize) -> Option<(usize, usize, bool)> {
+        let buf = &self.buffer;
+        let cur = buf.cursor.min(buf.len_chars().saturating_sub(1));
+        let inside = kind == 'i';
+        match obj {
+            // A word, from wherever in it point is. `n` extends over following
+            // words, which is what `d3aw` means.
+            'w' | 'W' => {
+                let big = obj == 'W';
+                let here = class_at(buf, cur, big)?;
+                let mut start = cur;
+                while start > 0 && class_at(buf, start - 1, big) == Some(here) {
+                    start -= 1;
+                }
+                let mut end = cur;
+                let advance = |e: &mut usize| {
+                    let c = class_at(buf, *e, big);
+                    while *e < buf.len_chars() && class_at(buf, *e, big) == c {
+                        *e += 1;
+                    }
+                };
+                advance(&mut end);
+                for _ in 1..n {
+                    advance(&mut end);
+                }
+                if !inside {
+                    // `aw` takes the whitespace after the word — and, when
+                    // there is none because the word ended the line, the
+                    // whitespace before it instead. vim's rule, and the one
+                    // that makes `daw` on the last word of a line tidy.
+                    let was = end;
+                    while end < buf.len_chars() && class_at(buf, end, big) == Some(0) {
+                        // Never across the line break: `daw` is not `dj`.
+                        if buf.char_at(end) == Some('\n') {
+                            break;
+                        }
+                        end += 1;
+                    }
+                    if end == was {
+                        while start > 0 && class_at(buf, start - 1, big) == Some(0) {
+                            if buf.char_at(start - 1) == Some('\n') {
+                                break;
+                            }
+                            start -= 1;
+                        }
+                    }
+                }
+                Some((start, end, false))
+            }
+            // A paragraph: the run of non-blank lines around point, or the run
+            // of blank ones if that is where point is. Linewise, like `dap`.
+            'p' => {
+                let line = buf.text.char_to_line(cur);
+                let blank = |l: usize| buf.line_len(l) == 0;
+                let here = blank(line);
+                let mut first = line;
+                while first > 0 && blank(first - 1) == here {
+                    first -= 1;
+                }
+                let mut last = line;
+                while last < buf.last_line() && blank(last + 1) == here {
+                    last += 1;
+                }
+                if !inside {
+                    // `ap` reaches on through the blank lines that follow.
+                    while last < buf.last_line() && blank(last + 1) != here {
+                        last += 1;
+                    }
+                }
+                Some((
+                    buf.line_start(first),
+                    (buf.line_end(last) + 1).min(buf.len_chars()),
+                    true,
+                ))
+            }
+            // A bracketed run. `matching_bracket` does the nesting; all this
+            // has to do is find the opener that encloses point when point is
+            // not already on one.
+            '(' | ')' | 'b' | '[' | ']' | '{' | '}' | 'B' | '<' | '>' => {
+                let (open, close) = match obj {
+                    '(' | ')' | 'b' => ('(', ')'),
+                    '[' | ']' => ('[', ']'),
+                    '<' | '>' => ('<', '>'),
+                    _ => ('{', '}'),
+                };
+                let (a, b) = self.enclosing(open, close, cur)?;
+                match inside {
+                    true if a + 1 >= b => None, // `i()` over an empty pair
+                    true => Some((a + 1, b, false)),
+                    false => Some((a, b + 1, false)),
+                }
+            }
+            // A quoted run. Not `matching_bracket`'s problem: the two ends are
+            // the same character, so there is no nesting to count and the pair
+            // is found by scanning the line from its start — which is also what
+            // makes `ci"` work with point on either quote or anywhere between.
+            '"' | '\'' | '`' => {
+                let (a, b) = self.quoted(obj, cur)?;
+                match inside {
+                    true if a + 1 >= b => None,
+                    true => Some((a + 1, b, false)),
+                    false => Some((a, b + 1, false)),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The innermost `open`/`close` pair containing `pos`, as (open, close).
+    fn enclosing(&self, open: char, close: char, pos: usize) -> Option<(usize, usize)> {
+        let buf = &self.buffer;
+        // Already on one end: the matcher answers straight away.
+        if buf.char_at(pos) == Some(open) {
+            return buf.matching_bracket(pos).map(|b| (pos, b));
+        }
+        if buf.char_at(pos) == Some(close) {
+            return buf.matching_bracket(pos).map(|a| (a, pos));
+        }
+        // Otherwise walk back for an unclosed opener.
+        let mut depth = 0i32;
+        let mut i = pos;
+        loop {
+            match buf.char_at(i) {
+                Some(c) if c == close => depth += 1,
+                Some(c) if c == open && depth == 0 => {
+                    return buf.matching_bracket(i).map(|b| (i, b))
+                }
+                Some(c) if c == open => depth -= 1,
+                _ => {}
+            }
+            i = i.checked_sub(1)?;
+        }
+    }
+
+    /// The `q`-delimited run containing `pos`, as (open, close).
+    ///
+    /// Counted from the start of the line, so which quotes pair with which is
+    /// decided the way you read it rather than by whichever is nearest.
+    fn quoted(&self, q: char, pos: usize) -> Option<(usize, usize)> {
+        let buf = &self.buffer;
+        let line = buf.text.char_to_line(pos.min(buf.len_chars()));
+        let (ls, le) = (buf.line_start(line), buf.line_end(line));
+        let mut open: Option<usize> = None;
+        let mut i = ls;
+        while i < le {
+            // A quote the text escaped is not a delimiter.
+            let escaped = i > ls && buf.char_at(i - 1) == Some('\\');
+            if buf.char_at(i) == Some(q) && !escaped {
+                match open {
+                    None => open = Some(i),
+                    Some(a) => {
+                        if (a..=i).contains(&pos) {
+                            return Some((a, i));
+                        }
+                        open = None;
+                    }
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Where the cursor lands after a delete — the *first non-blank* of the
+    /// line that moved up into the gap, which is what vim does and what makes
+    /// `dd` in indented code leave point on the code rather than in the margin.
+    ///
+    /// Worked out against the pre-edit buffer because every command in the
+    /// returned batch is: `from` is a stable offset (nothing before it moved),
+    /// and how many blanks follow it afterwards is read off the text that is
+    /// about to slide into that position.
+    fn after_linewise_delete(
+        &self,
+        linewise: bool,
+        from: usize,
+        start: usize,
+        end: usize,
+    ) -> usize {
+        if !linewise {
+            return from;
+        }
+        if from < start {
+            // The last-line case: the range and the newline in front of it both
+            // go, so point ends up on the line *before* — which did not move.
+            let line = self.buffer.text.char_to_line(from.min(self.buffer.len_chars()));
+            return self.buffer.first_non_blank(line);
+        }
+        // Everything else: the line beginning at `end` is about to begin at
+        // `from`, so its own indent is the offset to add.
+        let blanks = (end..self.buffer.len_chars())
+            .map(|i| self.buffer.text.char(i))
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .count();
+        from + blanks
     }
 
     /// `J` joins two lines, `{n}J` joins `n`.
@@ -1127,7 +1950,7 @@ impl Editor {
     /// join only once however large the count.
     fn join_lines(&self, n: usize) -> Vec<EditorCommand> {
         let (line, _) = self.buffer.cursor_line_col();
-        let last = (line + n.max(2) - 1).min(self.buffer.len_lines().saturating_sub(1));
+        let last = (line + n.max(2) - 1).min(self.buffer.last_line());
         if last <= line {
             return vec![];
         }
@@ -1153,7 +1976,7 @@ impl Editor {
         let half = (self.viewport_lines / 2).max(1);
         let (line, col) = self.buffer.cursor_line_col();
         let target = if down {
-            (line + half).min(self.buffer.len_lines().saturating_sub(1))
+            (line + half).min(self.buffer.last_line())
         } else {
             line.saturating_sub(half)
         };
@@ -1664,7 +2487,7 @@ impl Editor {
             // One item per line, in order, so `matches[selected]` is the line
             // number itself. The number is in the text purely to read.
             PromptKind::Line => {
-                let n = self.buffer.len_lines();
+                let n = self.buffer.last_line() + 1;
                 let width = n.to_string().len();
                 let items = (0..n)
                     .map(|l| {
@@ -1720,7 +2543,7 @@ impl Editor {
         // `'<,'>` — which `:` in visual mode types for you — the selection.
         // ponytail: no `1,5`, no `.`/`$`, no marks and no offsets. Each is a
         // small parser and none of them is reachable from a keystroke today.
-        let whole = (0, self.buffer.len_lines().saturating_sub(1));
+        let whole = (0, self.buffer.last_line());
         // `None` here is only ever "`'<,'>` with nothing selected", which falls
         // back to the current line rather than silently doing the whole buffer.
         let (rest, lines) = match line {
@@ -1831,7 +2654,7 @@ impl Editor {
     /// `count` lines starting at the cursor's, as an inclusive line range.
     fn line_range(&self, count: usize) -> (usize, usize) {
         let (line, _) = self.buffer.cursor_line_col();
-        let last = self.buffer.len_lines().saturating_sub(1);
+        let last = self.buffer.last_line();
         (line, (line + count.max(1) - 1).min(last))
     }
 
@@ -1983,6 +2806,12 @@ impl Editor {
             "split-window-right" => vec![EditorCommand::SplitWindow(frame::Split::Columns)],
             "split-window-below" => vec![EditorCommand::SplitWindow(frame::Split::Rows)],
             "delete-window" => vec![EditorCommand::CloseWindow],
+            // Magnify this pane and no other. Built-in verbs rather than Lisp,
+            // because the thing being changed is a `Window` and core owns those
+            // — the Lisp side has no handle on one to name.
+            "zoom-in" => vec![EditorCommand::ZoomWindow(1)],
+            "zoom-out" => vec![EditorCommand::ZoomWindow(-1)],
+            "zoom-reset" => vec![EditorCommand::ZoomWindow(0)],
             "other-window" => vec![EditorCommand::FocusNextWindow],
             // Lisp evaluation. `CallLisp` carries *source*, not a function
             // name, so core can hand the image any slice of the live buffer —
@@ -2213,53 +3042,105 @@ fn class(c: char) -> u8 {
     }
 }
 
-fn word_forward(buf: &crate::Buffer, pos: usize) -> usize {
+/// The class of the character at `i`, for a `w`-word or a `W`-WORD.
+///
+/// vim's two vocabularies, and the whole difference between them: a WORD is
+/// delimited by whitespace and nothing else, so `foo.bar(baz)` is one WORD and
+/// five words. One function with a flag rather than two sets of three motions,
+/// because the *only* thing that changes is whether punctuation is its own
+/// class or part of the run.
+fn class_at(buf: &crate::Buffer, i: usize, big: bool) -> Option<u8> {
+    let c = buf.char_at(i)?;
+    Some(match (big, class(c)) {
+        (_, 0) => 0,
+        (true, _) => 1,
+        (false, k) => k,
+    })
+}
+
+fn word_forward(buf: &crate::Buffer, pos: usize, big: bool) -> usize {
     let n = buf.len_chars();
     let mut i = pos;
-    let start_class = buf.char_at(i).map(class).unwrap_or(0);
+    let start_class = class_at(buf, i, big).unwrap_or(0);
     if start_class != 0 {
-        while i < n && buf.char_at(i).map(class) == Some(start_class) {
+        while i < n && class_at(buf, i, big) == Some(start_class) {
             i += 1;
         }
     }
-    while i < n && buf.char_at(i).map(class) == Some(0) {
+    while i < n && class_at(buf, i, big) == Some(0) {
         i += 1;
     }
     i.min(n)
 }
 
-fn word_backward(buf: &crate::Buffer, pos: usize) -> usize {
+fn word_backward(buf: &crate::Buffer, pos: usize, big: bool) -> usize {
     let mut i = pos;
     if i == 0 {
         return 0;
     }
     i -= 1;
-    while i > 0 && buf.char_at(i).map(class) == Some(0) {
+    while i > 0 && class_at(buf, i, big) == Some(0) {
         i -= 1;
     }
-    let c = buf.char_at(i).map(class).unwrap_or(0);
-    while i > 0 && buf.char_at(i - 1).map(class) == Some(c) {
+    let c = class_at(buf, i, big).unwrap_or(0);
+    while i > 0 && class_at(buf, i - 1, big) == Some(c) {
         i -= 1;
     }
     i
 }
 
-fn word_end(buf: &crate::Buffer, pos: usize) -> usize {
+fn word_end(buf: &crate::Buffer, pos: usize, big: bool) -> usize {
     let n = buf.len_chars();
     let mut i = pos + 1;
-    while i < n && buf.char_at(i).map(class) == Some(0) {
+    while i < n && class_at(buf, i, big) == Some(0) {
         i += 1;
     }
-    let c = buf.char_at(i).map(class).unwrap_or(0);
-    while i + 1 < n && buf.char_at(i + 1).map(class) == Some(c) {
+    let c = class_at(buf, i, big).unwrap_or(0);
+    while i + 1 < n && class_at(buf, i + 1, big) == Some(c) {
         i += 1;
     }
     i.min(n.saturating_sub(1))
 }
 
+/// `ge` — backwards to the last character of the previous word.
+///
+/// The mirror of [`word_end`] rather than [`word_backward`]: `b` lands on a
+/// word's *first* character and this lands on the previous word's *last* one,
+/// which is why neither can be written in terms of the other.
+fn word_end_backward(buf: &crate::Buffer, pos: usize, big: bool) -> usize {
+    if pos == 0 {
+        return 0;
+    }
+    let mut i = pos - 1;
+    // Off the end of whatever word point was inside.
+    let here = class_at(buf, pos, big).unwrap_or(0);
+    if here != 0 {
+        while i > 0 && class_at(buf, i, big) == Some(here) {
+            i -= 1;
+        }
+    }
+    while i > 0 && class_at(buf, i, big) == Some(0) {
+        i -= 1;
+    }
+    i
+}
+
+/// `g~`, per character. An iterator because a character's other case is not
+/// always one character — German `ß` uppercases to `SS`, and dropping the
+/// second one would silently eat text.
+fn flip_case(c: char) -> Box<dyn Iterator<Item = char>> {
+    if c.is_lowercase() {
+        Box::new(c.to_uppercase())
+    } else if c.is_uppercase() {
+        Box::new(c.to_lowercase())
+    } else {
+        Box::new(std::iter::once(c))
+    }
+}
+
 /// Next/previous blank line — `{` and `}`.
 fn paragraph(buf: &crate::Buffer, line: usize, forward: bool) -> usize {
-    let last = buf.len_lines().saturating_sub(1);
+    let last = buf.last_line();
     let blank = |l: usize| buf.line_len(l) == 0;
     if forward {
         ((line + 1)..=last).find(|&l| blank(l)).unwrap_or(last)
@@ -3108,7 +3989,8 @@ mod tests {
     #[test]
     fn buffer_lines_are_still_the_rule_without_wrapping() {
         let mut off = fresh("0123456789abcdefghij\nzz");
-        off.wrap_cols = 10; // drawn, but truncating
+        off.wrap_cols = 10; // drawn...
+        off.settings.line_overflow = LineOverflow::Truncate; // ...but truncating
         feed(&mut off, &keys("lllj"));
         assert_eq!(off.buffer.cursor_line_col(), (1, 1));
 
@@ -4105,6 +4987,7 @@ mod tests {
             key: 'p',
             label: "Projects".into(),
             action: "zemacs-projects".into(),
+            hint: String::new(),
         });
         let out = ed.handle_key(Key::Char('p'));
         assert!(out.contains(&EditorCommand::CallLisp("(zemacs-projects)".into())));
@@ -4112,3 +4995,399 @@ mod tests {
 }
 
 
+
+
+#[cfg(test)]
+mod vim_grammar {
+    use crate::tests::{feed, fresh};
+    use crate::*;
+
+    fn keys(s: &str) -> Vec<Key> {
+        s.chars().map(Key::Char).collect()
+    }
+
+    /// Type `s`, then Esc — one insert session, spelled the way a test reads.
+    fn run(text: &str, s: &str) -> Editor {
+        let mut ed = fresh(text);
+        feed(&mut ed, &keys(s));
+        ed
+    }
+
+    fn text(ed: &Editor) -> String {
+        ed.buffer.text.to_string()
+    }
+
+    /// A rope counts the empty string after a trailing newline as a line, and
+    /// every file has one. Everything that reaches for "the last line" was
+    /// landing on a row with no text in it.
+    #[test]
+    fn the_last_line_is_the_last_line_with_text_on_it() {
+        let mut ed = fresh("one\ntwo\nthree\n");
+        feed(&mut ed, &keys("G"));
+        assert_eq!(ed.buffer.cursor_line_col(), (2, 0), "G lands on `three`");
+        // ...and `j` cannot walk off the end onto it either.
+        let mut ed = fresh("one\ntwo\n");
+        feed(&mut ed, &keys("jjjj"));
+        assert_eq!(ed.buffer.cursor_line_col(), (1, 0));
+        // A file that really does end without a newline keeps its last line.
+        let mut ed = fresh("one\ntwo");
+        feed(&mut ed, &keys("G"));
+        assert_eq!(ed.buffer.cursor_line_col(), (1, 0));
+    }
+
+    /// `dd` on the last line took the file's trailing newline with it, so a
+    /// file that ended properly stopped doing so the first time you deleted its
+    /// last line.
+    #[test]
+    fn dd_on_the_last_line_keeps_the_trailing_newline() {
+        assert_eq!(text(&run("one\ntwo\nthree\n", "jjdd")), "one\ntwo\n");
+        // ...and a file with no trailing newline still loses the line before's,
+        // rather than leaving the blank line `dd` was asked to remove.
+        assert_eq!(text(&run("one\ntwo\nthree", "jjdd")), "one\ntwo");
+        assert_eq!(text(&run("one\ntwo\n", "dd")), "two\n");
+    }
+
+    /// vim leaves point on the first non-blank of the line that moved up.
+    #[test]
+    fn a_linewise_delete_lands_on_the_first_non_blank() {
+        let ed = run("a\n    indented\nc\n", "dd");
+        assert_eq!(text(&ed), "    indented\nc\n");
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 4));
+    }
+
+    /// `o` and `O` carry the line's indent — vim's `autoindent`, which evil
+    /// leaves on and without which every open in indented code is followed by
+    /// retyping the indentation.
+    #[test]
+    fn o_and_capital_o_keep_the_indent() {
+        let mut ed = fresh("fn main() {\n    body\n}\n");
+        feed(&mut ed, &keys("joX"));
+        assert_eq!(text(&ed), "fn main() {\n    body\n    X\n}\n");
+
+        let mut ed = fresh("fn main() {\n    body\n}\n");
+        feed(&mut ed, &keys("jOX"));
+        assert_eq!(text(&ed), "fn main() {\n    X\n    body\n}\n");
+    }
+
+    /// `cw` behaves like `ce` — vim's one deliberate irregularity, and the one
+    /// everybody relies on without knowing its name.
+    #[test]
+    fn cw_does_not_eat_the_space_after_the_word() {
+        assert_eq!(text(&run("one two three", "cw")), " two three");
+        // On whitespace it really is `dw`: there the "word" is the run of
+        // spaces, and there is nothing irregular to do.
+        assert_eq!(text(&run("a   b", "lcw")), "ab");
+    }
+
+    /// `dw` on the last word of a line stops there rather than pulling the next
+    /// line up behind it.
+    #[test]
+    fn dw_does_not_cross_the_line_break() {
+        assert_eq!(text(&run("one two\nthree\n", "wdw")), "one \nthree\n");
+        // A count that legitimately spans words on one line still does.
+        assert_eq!(text(&run("one two three\n", "d2w")), "three\n");
+    }
+
+    /// Text objects: the half of the grammar that names a range by what it *is*.
+    #[test]
+    fn text_objects_name_a_range_rather_than_a_destination() {
+        // From anywhere in the word, not just its start.
+        assert_eq!(text(&run("foo bar baz", "wldiw")), "foo  baz");
+        // `aw` takes the trailing space with it, which is what joins the words.
+        assert_eq!(text(&run("foo bar baz", "wldaw")), "foo baz");
+        // Brackets, nested, from inside.
+        assert_eq!(text(&run("f(a, g(b), c)", "fbdi(")), "f(a, g(), c)");
+        assert_eq!(text(&run("f(a, g(b), c)", "fbda(")), "f(a, g, c)");
+        // Point outside any inner pair walks out to the enclosing one.
+        assert_eq!(text(&run("f(a, b)", "fadi(")), "f()");
+        // Quotes pair from the start of the line, so `ci\"` works from either.
+        assert_eq!(text(&run("x = \"hello\" + y", "fhdi\"")), "x = \"\" + y");
+        assert_eq!(text(&run("x = \"hello\" + y", "fhda\"")), "x =  + y");
+        // A paragraph is linewise.
+        assert_eq!(text(&run("a\nb\n\nc\n", "dip")), "\nc\n");
+    }
+
+    /// ...and in visual mode the object *becomes* the selection.
+    #[test]
+    fn a_text_object_in_visual_mode_selects_it() {
+        let mut ed = fresh("foo bar baz");
+        feed(&mut ed, &keys("wvi w"[..2].chars().collect::<String>().as_str()));
+        feed(&mut ed, &keys("iw"));
+        assert_eq!(ed.selection(), Some((4, 7)), "`bar`");
+        feed(&mut ed, &keys("d"));
+        assert_eq!(text(&ed), "foo  baz");
+    }
+
+    /// `>` and `<` shift whole lines whatever the motion, because indentation
+    /// is a property of a line and there is nothing else they could mean.
+    #[test]
+    fn shift_operators_indent_whole_lines() {
+        let mut ed = fresh("a\nb\nc\n");
+        ed.settings.tab_width = 2;
+        feed(&mut ed, &keys(">>"));
+        assert_eq!(text(&ed), "  a\nb\nc\n");
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 2), "on the first non-blank");
+        feed(&mut ed, &keys("<<"));
+        assert_eq!(text(&ed), "a\nb\nc\n");
+        // Over a motion, and over a selection.
+        let mut ed = fresh("a\nb\nc\n");
+        ed.settings.tab_width = 2;
+        feed(&mut ed, &keys(">j"));
+        assert_eq!(text(&ed), "  a\n  b\nc\n");
+        let mut ed = fresh("a\nb\nc\n");
+        ed.settings.tab_width = 2;
+        feed(&mut ed, &keys("Vj>"));
+        assert_eq!(text(&ed), "  a\n  b\nc\n");
+        // A blank line is left alone rather than given trailing whitespace.
+        let mut ed = fresh("a\n\nc\n");
+        ed.settings.tab_width = 2;
+        feed(&mut ed, &keys("Vjj>"));
+        assert_eq!(text(&ed), "  a\n\n  c\n");
+    }
+
+    #[test]
+    fn case_operators_and_tilde() {
+        assert_eq!(text(&run("hello world", "gUw")), "HELLO world");
+        assert_eq!(text(&run("HELLO world", "guw")), "hello world");
+        assert_eq!(text(&run("Hello", "g~~")), "hELLO");
+        // `~` flips the character under point and steps over it.
+        let ed = run("abc", "~");
+        assert_eq!(text(&ed), "Abc");
+        assert_eq!(ed.buffer.cursor, 1);
+        // ...and over a selection, `u`/`U`/`~` are the single-key spellings.
+        assert_eq!(text(&run("hello", "vllU")), "HELlo");
+    }
+
+    /// WORD motions: whitespace-delimited, so `foo.bar` is one of them.
+    #[test]
+    fn a_word_and_a_big_word_are_two_vocabularies() {
+        assert_eq!(text(&run("foo.bar baz", "dW")), "baz");
+        assert_eq!(text(&run("foo.bar baz", "dw")), ".bar baz");
+        // `ge` is backwards to the end of the previous word — not, as it was,
+        // the end of the buffer.
+        let mut ed = fresh("one two three");
+        feed(&mut ed, &keys("$"));
+        feed(&mut ed, &keys("ge"));
+        assert_eq!(ed.buffer.cursor, 6, "the `o` of `two`");
+    }
+
+    /// The matcher `%` and the paren highlight both ask.
+    #[test]
+    fn matching_bracket_answers_from_either_end_and_from_just_past_a_closer() {
+        let b = crate::Buffer::from_str("f(a, g(b), c)");
+        assert_eq!(b.matching_bracket(1), Some(12), "the outer pair, forwards");
+        assert_eq!(b.matching_bracket(12), Some(1), "and backwards");
+        assert_eq!(b.matching_bracket(6), Some(8), "nesting is counted");
+        // Just *past* a closer, which is where point sits the instant you
+        // finish typing one — the case the highlight exists for.
+        assert_eq!(b.matching_bracket(9), Some(6));
+        // ...but not just past an opener: there is nothing to answer about yet.
+        assert_eq!(b.matching_bracket(7), None);
+        // Unbalanced is None rather than a guess.
+        assert_eq!(crate::Buffer::from_str("(a").matching_bracket(0), None);
+        assert_eq!(crate::Buffer::from_str("abc").matching_bracket(1), None);
+    }
+
+    #[test]
+    fn percent_jumps_between_the_brackets() {
+        let mut ed = fresh("if (a && b) {\n}\n");
+        feed(&mut ed, &keys("f("));
+        feed(&mut ed, &keys("%"));
+        assert_eq!(ed.buffer.cursor, 10, "the closing paren");
+        feed(&mut ed, &keys("%"));
+        assert_eq!(ed.buffer.cursor, 3, "and back");
+        // With an operator it is inclusive, so the pair goes with it.
+        assert_eq!(text(&run("f(a, b) rest", "ld%")), "f rest");
+    }
+
+    #[test]
+    fn semicolon_repeats_the_last_find() {
+        let mut ed = fresh("a.b.c.d");
+        feed(&mut ed, &keys("f."));
+        assert_eq!(ed.buffer.cursor, 1);
+        feed(&mut ed, &keys(";"));
+        assert_eq!(ed.buffer.cursor, 3);
+        feed(&mut ed, &keys(","));
+        assert_eq!(ed.buffer.cursor, 1, "`,` is the same find turned over");
+    }
+
+    #[test]
+    fn s_and_capital_s_and_x() {
+        assert_eq!(text(&run("abcd", "sZ")), "Zbcd");
+        assert_eq!(text(&run("  abc\nd\n", "SZ")), "Z\nd\n");
+        // `X` deletes backwards and stops at the line start.
+        assert_eq!(text(&run("ab\ncd\n", "jlX")), "ab\nd\n");
+        assert_eq!(text(&run("ab\ncd\n", "jXX")), "ab\ncd\n");
+    }
+
+    /// `.` repeats the last change, insert session and all.
+    #[test]
+    fn dot_repeats_the_last_change() {
+        // An operator with a motion.
+        let mut ed = fresh("one two three four");
+        feed(&mut ed, &keys("dw"));
+        assert_eq!(text(&ed), "two three four");
+        feed(&mut ed, &keys("."));
+        assert_eq!(text(&ed), "three four");
+
+        // ...and one that opened an insert session: the typing is part of it.
+        let mut ed = fresh("aaa bbb ccc");
+        feed(&mut ed, &keys("ciwX"));
+        feed(&mut ed, &[Key::Esc]);
+        assert_eq!(text(&ed), "X bbb ccc");
+        feed(&mut ed, &keys("w."));
+        assert_eq!(text(&ed), "X X ccc");
+
+        // A motion is not a change, so `.` after one still repeats the edit.
+        feed(&mut ed, &keys("w"));
+        feed(&mut ed, &keys("."));
+        assert_eq!(text(&ed), "X X X");
+    }
+
+    #[test]
+    fn gv_puts_the_last_selection_back() {
+        let mut ed = fresh("hello world");
+        feed(&mut ed, &keys("vll"));
+        feed(&mut ed, &[Key::Esc]);
+        feed(&mut ed, &keys("gv"));
+        assert!(ed.mode.is_visual());
+        assert_eq!(ed.selection(), Some((0, 3)));
+    }
+
+    #[test]
+    fn visual_o_swaps_the_ends_and_r_replaces_the_selection() {
+        let mut ed = fresh("abcdef");
+        feed(&mut ed, &keys("lllvl"));
+        assert_eq!(ed.selection(), Some((3, 5)));
+        feed(&mut ed, &keys("o"));
+        assert_eq!(ed.buffer.cursor, 3, "point is on the other end now");
+
+        let mut ed = fresh("abc\ndef\n");
+        feed(&mut ed, &keys("vjl"));
+        feed(&mut ed, &keys("rz"));
+        assert_eq!(text(&ed), "zzz\nzzf\n", "newlines survive");
+    }
+
+    #[test]
+    fn star_searches_for_the_word_under_the_cursor() {
+        let mut ed = fresh("foo bar\nfoobar\nfoo\n");
+        feed(&mut ed, &keys("*"));
+        // Not `foobar`: the pattern is anchored on word boundaries.
+        assert_eq!(ed.buffer.cursor_line_col(), (2, 0));
+    }
+
+    #[test]
+    fn line_and_screen_motions() {
+        // `|` is a column, counting from 1.
+        let mut ed = fresh("abcdef\n");
+        feed(&mut ed, &keys("4|"));
+        assert_eq!(ed.buffer.cursor, 3);
+        // `+` and `-` are linewise and land on the first non-blank.
+        let mut ed = fresh("a\n    b\nc\n");
+        feed(&mut ed, &keys("+"));
+        assert_eq!(ed.buffer.cursor_line_col(), (1, 4));
+        feed(&mut ed, &keys("-"));
+        assert_eq!(ed.buffer.cursor_line_col(), (0, 0));
+        // `H`/`L` are about the window, so they read what is drawn.
+        let mut ed = fresh("1\n2\n3\n4\n5\n6\n7\n8\n");
+        ed.viewport_lines = 4;
+        ed.scroll = 2;
+        feed(&mut ed, &keys("H"));
+        assert_eq!(ed.buffer.cursor_line_col(), (2, 0));
+        feed(&mut ed, &keys("L"));
+        assert_eq!(ed.buffer.cursor_line_col(), (5, 0));
+    }
+
+    /// `C-x C-s` has to reach `save-file` while you are typing, so Insert mode
+    /// has to hold a sequence whose first key was never going to be text.
+    #[test]
+    fn a_control_prefixed_sequence_works_in_insert_mode() {
+        let mut ed = fresh("");
+        ed.keymap
+            .insert((Mode::Insert, "C-x C-s".into()), "save-file".into());
+        feed(&mut ed, &keys("i"));
+        assert_eq!(ed.mode, Mode::Insert);
+        // `C-x` alone types nothing and waits.
+        for cmd in ed.handle_key(Key::Ctrl('x')) {
+            ed.apply(cmd);
+        }
+        assert_eq!(text(&ed), "", "the prefix is not text");
+        let out = ed.handle_key(Key::Ctrl('s'));
+        assert!(
+            out.iter().any(|c| matches!(c, EditorCommand::CallLisp(s) if s.contains("save-file"))),
+            "{out:?}"
+        );
+        // ...and a letter still types itself rather than starting a sequence.
+        feed(&mut ed, &keys("z"));
+        assert_eq!(text(&ed), "z");
+    }
+}
+
+#[cfg(test)]
+mod window_zoom {
+    use crate::tests::fresh;
+    use crate::*;
+
+    fn zoom(ed: &Editor) -> u16 {
+        ed.frames[0].current_window().zoom
+    }
+
+    /// Magnification is a property of the *window*, so zooming one pane leaves
+    /// its neighbour alone — which is the whole point of it being per window
+    /// and is what a per-frame font size could not do.
+    #[test]
+    fn zooming_one_window_leaves_its_neighbour_alone() {
+        let mut ed = fresh("hello\n");
+        assert_eq!(zoom(&ed), 100);
+        ed.apply(EditorCommand::SplitWindow(frame::Split::Columns));
+        let zoomed = ed.frames[0].current;
+
+        for cmd in ed.run_action("zoom-in") {
+            ed.apply(cmd);
+        }
+        assert_eq!(zoom(&ed), 125);
+        ed.apply(EditorCommand::FocusNextWindow);
+        assert_ne!(ed.frames[0].current, zoomed, "a different pane");
+        assert_eq!(zoom(&ed), 100, "which nobody zoomed");
+    }
+
+    #[test]
+    fn zoom_reset_goes_back_to_the_body_size() {
+        let mut ed = fresh("hello\n");
+        for _ in 0..3 {
+            for cmd in ed.run_action("zoom-in") {
+                ed.apply(cmd);
+            }
+        }
+        assert_eq!(zoom(&ed), 200);
+        for cmd in ed.run_action("zoom-out") {
+            ed.apply(cmd);
+        }
+        assert_eq!(zoom(&ed), 150);
+        for cmd in ed.run_action("zoom-reset") {
+            ed.apply(cmd);
+        }
+        assert_eq!(zoom(&ed), 100);
+    }
+
+    /// The global font size is a separate knob and stays one: a window's zoom
+    /// multiplies it rather than replacing it.
+    #[test]
+    fn the_global_font_size_is_untouched_by_a_window_zoom() {
+        let mut ed = fresh("hello\n");
+        ed.apply(EditorCommand::SetFontSize(20.0));
+        for cmd in ed.run_action("zoom-in") {
+            ed.apply(cmd);
+        }
+        assert_eq!(ed.settings.font_size, 20.0);
+        assert_eq!(zoom(&ed), 125);
+    }
+
+    /// ...and it is reachable by name, so `M-x` and a `define-key` both find it.
+    #[test]
+    fn the_zoom_verbs_are_published() {
+        for name in ["zoom-in", "zoom-out", "zoom-reset"] {
+            assert!(crate::evil::BUILTIN_COMMANDS.contains(&name), "{name} is not offered");
+        }
+    }
+}

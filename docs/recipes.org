@@ -1,7 +1,7 @@
 #+TITLE: Recipes
 #+SUBTITLE: the things people actually write
 
-Everything here goes in =~/.config/zemacs/init.lisp= (or whichever file the
+Everything here goes in =~/.zemacs.d/init.lisp= (or whichever file the
 editor loads), under =(in-package :zemacs)=. Reload with =M-x reload-config= — no
 restart.
 
@@ -145,25 +145,36 @@ it*. Every theme sets every face, which is what makes switching work — nothing
 left behind from the one before.
 
 #+begin_src lisp
-;;;; themes/gruvbox.lisp
+;;;; themes/my-theme.lisp
 (in-package :zemacs)
 
 (set-background 0.16 0.16 0.16)
 (set-foreground 0.92 0.86 0.70)
 
-(set-syntax-color "keyword"  0.98 0.29 0.20)
-(set-syntax-color "function" 0.72 0.73 0.15)
-(set-syntax-color "type"     0.98 0.74 0.18)
-(set-syntax-color "string"   0.72 0.73 0.15)
-(set-syntax-color "number"   0.83 0.53 0.61)
-(set-syntax-color "comment"  0.57 0.51 0.45)
+(set-face "keyword"  '(0.98 0.29 0.20) :bold t)
+(set-face "function" '(0.72 0.73 0.15) :bold t)
+(set-face "type"     '(0.98 0.74 0.18) :bold t)
+(set-face "string"   '(0.72 0.73 0.15))
+(set-face "number"   '(0.83 0.53 0.61))
+(set-face "comment"  '(0.57 0.51 0.45) :italic t)
 ;; ... and the rest of (face-list)
 
-(set-syntax-color "modeline"          0.24 0.22 0.21)
-(set-syntax-color "modeline-inactive" 0.20 0.19 0.18)
-(set-syntax-color "modeline-text"     0.92 0.86 0.70)
+(set-face "modeline"          '(0.24 0.22 0.21))
+(set-face "modeline-inactive" '(0.20 0.19 0.18))
+(set-face "modeline-text"     '(0.92 0.86 0.70))
 (set-modeline-relief 2)
 #+end_src
+
+=set-face= carries weight and slant as well as colour, and both flags are sent on
+every call whether you pass them or not. That is deliberate: a theme that leaves
+=:bold= off means /not bold/, and inheriting the previous theme's weight is exactly
+the bug the exhaustive face list exists to prevent. Passing =NIL= for the colour
+styles a face without recolouring it.
+
+Weight is worth spending. A palette alone has to carry structure with hue, which
+is why a theme of nothing but colours reads flat next to the same palette with
+four or five faces set in bold — but only four or five: a screen where everything
+is heavy has no emphasis left to give.
 
 Because dired and magit colour themselves out of the same faces as source code —
 a directory is a =type=, a size is a =number= — a theme reaches every buffer without
@@ -190,7 +201,9 @@ pasting it means the screen says something true about *this* boot:
 
 #+begin_src lisp
 (defun %banner ()
-  (format nil "~%    z e m a c s~%~%    ~a ~a on ~a~%    ~a buffer~:p open~%"
+  ;; No leading spaces: banner lines are centred individually, so padding here
+  ;; shifts the text off centre rather than moving it.
+  (format nil "~%~a ~a on ~a~%~a buffer~:p open~%"
           (lisp-implementation-type)
           (lisp-implementation-version)
           (string-downcase (software-type))
@@ -206,6 +219,19 @@ pasting it means the screen says something true about *this* boot:
 (dashboard-item #\c "Edit configuration"  "config")
 (dashboard-item #\r "Reload configuration" "reload-config")
 (dashboard-item #\q "Quit"                "quit")
+#+end_src
+
+Each row prints the leader sequence for its command in a dim column on the
+right, so the startup screen teaches the keymap rather than being a menu you use
+once. It is *looked up*, not typed out: =dashboard-item= defaults the hint to
+whatever =define-leader= bound to that action, so moving a key moves the hint.
+Pass a fourth argument to override it, or the empty string to print none.
+
+That lookup is why the shipped config builds its menu *after* its keybindings.
+Items added before the leader table is populated get a blank column.
+
+#+begin_src lisp
+(dashboard-item #\g "Git status" "magit-status" "SPC g g")   ; say it yourself
 #+end_src
 
 An item's action is a command string, so built-in verbs and your own functions

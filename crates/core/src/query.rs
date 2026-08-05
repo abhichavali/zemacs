@@ -49,6 +49,19 @@ pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
             let l = at(a);
             string(&buf.slice_string(buf.line_start(l), buf.line_end(l)))
         }
+        // The bracket matching the one at `a`, or NIL. Zero means point, the
+        // way every other position argument here does.
+        //
+        // In Rust because it is a scan of the rope with a depth counter, and
+        // because `%` in the evil grammar asks the same question — one matcher,
+        // so the highlight can never disagree with where `%` would jump.
+        "matching-bracket" => {
+            let at = if a > 0 { a as usize } else { buf.cursor };
+            match buf.matching_bracket(at.min(n)) {
+                Some(p) => p.to_string(),
+                None => "nil".into(),
+            }
+        }
         "buffer-size" => n.to_string(),
         "buffer-name" => string(&buf.name()),
         "buffer-file-name" => match &buf.path {
@@ -161,6 +174,17 @@ pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
                 .iter()
                 .map(|(id, s, e)| format!("({id} {s} {e})")))
         }
+
+        // corfu: where the live completion popup is anchored, or NIL when there
+        // is none — which includes one core is hiding because point has walked
+        // out of the word it describes. That second case is the reason this
+        // exists at all: the image knows what it asked for and cannot know what
+        // is on screen, so a command that inserts a candidate has to ask, or it
+        // will happily complete a word nobody can see the popup for.
+        "completion-at" => match ed.completion() {
+            Some(c) => c.at.to_string(),
+            None => "nil".into(),
+        },
 
         "window-scroll" => ed.scroll.to_string(),
         "window-height" => ed.viewport_lines.to_string(),

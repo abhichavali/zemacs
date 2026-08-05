@@ -146,9 +146,10 @@ pub enum Key {
     Meta(char),
     /// Both together, `C-M-` in a binding.
     CtrlMeta(char),
-    // ponytail: three named keys now carry modifiers — the two window splits
-    // and `M-<bs>`. A modifier bitset over a `Named` enum is the real answer and
-    // is getting closer; at four, do it.
+    // ponytail: four named keys now carry modifiers — the two window splits,
+    // `M-<bs>` and `<backtab>` — which is the threshold this note set for
+    // itself. A modifier bitset over a `Named` enum is the real answer; it is
+    // now owed, and the debt is a match arm in every crate that reads a `Key`.
     CtrlEnter,
     CtrlMetaEnter,
     /// `⌘⌫`. Deletes the word before point, and in a terminal is handed to the
@@ -156,6 +157,10 @@ pub enum Key {
     MetaBackspace,
     Enter,
     Tab,
+    /// `⇧⇥`. Its own key and not a shifted `Tab`, because that is what every
+    /// terminal has meant by it since the VT100 — `ESC [ Z`, which is how an
+    /// agent's input box reads "the other way through the modes".
+    BackTab,
     Backspace,
     Esc,
     Left,
@@ -178,6 +183,7 @@ impl Key {
             Key::MetaBackspace => "M-<bs>".into(),
             Key::Enter => "<ret>".into(),
             Key::Tab => "<tab>".into(),
+            Key::BackTab => "<backtab>".into(),
             Key::Backspace => "<bs>".into(),
             Key::Esc => "<esc>".into(),
             Key::Left => "<left>".into(),
@@ -213,6 +219,7 @@ impl Key {
             "SPC" | "<spc>" => Key::Char(' '),
             "<ret>" | "RET" | "<cr>" => Key::Enter,
             "<tab>" | "TAB" => Key::Tab,
+            "<backtab>" | "S-<tab>" => Key::BackTab,
             "<bs>" | "<backspace>" => Key::Backspace,
             "<esc>" | "ESC" => Key::Esc,
             "<left>" => Key::Left,
@@ -245,9 +252,11 @@ impl Key {
 pub enum LineOverflow {
     /// Cut the line at the pane edge and mark it, so a hidden tail is visible
     /// as a fact rather than as silence.
-    #[default]
     Truncate,
-    /// Continue the line on the next row.
+    /// Continue the line on the next row. The default: text you cannot read is
+    /// worse than text that took two rows to show you, and the `→` marking the
+    /// tail tells you a line is long without telling you what is on it.
+    #[default]
     Wrap,
 }
 
@@ -285,16 +294,20 @@ pub enum HlKind {
     Modeline,
     ModelineInactive,
     ModelineText,
-    /// Markup faces, used by org mode. These carry *colour* and nothing else,
-    /// which is all a highlight span can carry: a span is a fact about the text
-    /// the parser found, and it is recomputed from scratch on every keystroke.
+    /// Markup faces, used by org mode. What a span carries is a *name*, and
+    /// nothing more: a span is a fact about the text the parser found, and it is
+    /// recomputed from scratch on every keystroke. Everything the name resolves
+    /// to — a colour, and since [`FaceStyle`] a weight and a slant — is the
+    /// theme's answer rather than the parser's, so a theme change repaints
+    /// without re-parsing.
     ///
-    /// Emphasis used to be colour-only for a second reason — the renderer opened
-    /// exactly one font face — and that one is gone. Real weight, slant and type
-    /// size live on [`Overlay`](crate::Overlay) instead of here, where they can
-    /// be *put* by a mode rather than derived by a parser, and where clearing
-    /// one does not mean re-parsing the buffer. `org-modern.lisp` sets both: the
-    /// face for the hue, `weight`/`slant` for the shape.
+    /// Type *size* is the one attribute that stays off this list, and it stays
+    /// off for a metric reason rather than a stylistic one: weight and slant
+    /// pick a font handle and change no advance, while a size changes how many
+    /// rows a line claims. So size lives on [`Overlay`](crate::Overlay), where
+    /// it can be *put* by a mode and cleared without re-parsing the buffer.
+    /// `org-modern.lisp` sets both: the face for the hue, `weight`/`slant` and
+    /// `scale` for the shape.
     Heading1,
     Heading2,
     Heading3,
@@ -374,15 +387,42 @@ pub struct Span {
     pub kind: HlKind,
 }
 
-/// Syntax colors, one per [`HlKind`]. Every entry is settable from Lisp.
+/// The half of a face that picks a *font handle* rather than a colour.
+///
+/// `FaceStyle` and not `Style`, which is the name it wants: `zemacs_gui::Style`
+/// already exists and the renderer already imports it, and a third same-named
+/// type in one namespace is how a blit ends up in the wrong coordinate space —
+/// the comment on `Rect` over in `crates/render` tells that story at length.
+///
+/// Both bits false is the default and is the whole of backward compatibility: a
+/// theme that never mentions weight gets exactly the faces it got before this
+/// type existed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FaceStyle {
+    pub bold: bool,
+    pub italic: bool,
+}
+
+/// The faces: a colour and a [`FaceStyle`] per [`HlKind`], both settable from
+/// Lisp — `set-syntax-color` for the one, `set-face-style` for the other, and
+/// `set-face` in `init.lisp` for both at once.
 #[derive(Clone, Debug)]
 pub struct Theme {
     map: HashMap<HlKind, [f32; 3]>,
+    /// Weight and slant, for the faces that have asked for one. A second map
+    /// rather than a wider value in the first, because the two halves are set by
+    /// two primitives and consumed at two different moments — a colour picks the
+    /// `set_color_mod`, a style picks the font handle — and because absence has
+    /// to keep meaning "the default": a face with a colour and no style is the
+    /// overwhelmingly common case and must not have to name one.
+    styles: HashMap<HlKind, FaceStyle>,
 }
 
 impl Default for Theme {
     fn default() -> Self {
-        // A calm, slightly cool palette to match the default background.
+        // A calm, slightly cool palette to match the default background. No
+        // entry in `styles`: the default theme is upright body weight
+        // throughout, and a theme has to ask before anything else happens.
         let mut map = HashMap::new();
         map.insert(HlKind::Keyword, [0.78, 0.57, 0.94]);
         map.insert(HlKind::Function, [0.51, 0.75, 1.00]);
@@ -395,7 +435,10 @@ impl Default for Theme {
         map.insert(HlKind::Operator, [0.70, 0.78, 0.92]);
         map.insert(HlKind::Punctuation, [0.55, 0.60, 0.72]);
         map.insert(HlKind::Default, [0.86, 0.90, 1.00]);
-        Self { map }
+        Self {
+            map,
+            styles: HashMap::new(),
+        }
     }
 }
 
@@ -406,6 +449,18 @@ impl Theme {
 
     pub fn set(&mut self, kind: HlKind, rgb: [f32; 3]) {
         self.map.insert(kind, clamp3(rgb));
+    }
+
+    /// No fallback argument, unlike [`Theme::color`]: there is a right answer
+    /// for a face nobody styled — upright body weight — where there is no right
+    /// answer for a colour, which is why that one has to be told the pane's
+    /// foreground and this one does not.
+    pub fn style(&self, kind: HlKind) -> FaceStyle {
+        self.styles.get(&kind).copied().unwrap_or_default()
+    }
+
+    pub fn set_style(&mut self, kind: HlKind, style: FaceStyle) {
+        self.styles.insert(kind, style);
     }
 }
 
@@ -456,6 +511,11 @@ pub enum EditorCommand {
     SetBackground([f32; 3]),
     SetForeground([f32; 3]),
     SetSyntaxColor(String, [f32; 3]),
+    /// The face's weight and slant, by name: bold then italic. Separate from
+    /// [`EditorCommand::SetSyntaxColor`] rather than folded into it because a
+    /// theme overwhelmingly wants to set a colour and say nothing about weight,
+    /// and one command carrying both would make every such line say `nil nil`.
+    SetFaceStyle(String, bool, bool),
     SetLineNumbers(bool),
     SetTabWidth(usize),
     /// Columns of text to centre in the pane; 0 turns it off. See
@@ -490,6 +550,15 @@ pub enum EditorCommand {
     SetMinorMode(String, bool),
 
     // --- windows and frames ---
+    /// Magnify the focused window by `n` steps of [`frame::ZOOM_STEPS`]; `0`
+    /// puts it back to 100%.
+    ///
+    /// The window and not the frame, and not `SetFontSize`: `font_size` is the
+    /// size of text everywhere and stays exactly that, while this is one pane
+    /// asking to be larger than its neighbour. Reading a paper beside the code
+    /// you are writing about it is the case, and it is the case a per-frame
+    /// zoom cannot serve at all.
+    ZoomWindow(i32),
     /// Split the focused window; the new one shows the same buffer.
     SplitWindow(frame::Split),
     CloseWindow,
@@ -536,6 +605,9 @@ pub enum EditorCommand {
         key: char,
         label: String,
         action: String,
+        /// The global key sequence for the same command, drawn flush right.
+        /// Empty for none — see [`dashboard::Item::hint`].
+        hint: String,
     },
 
     // --- keymap, configured from Lisp ---
@@ -670,7 +742,90 @@ pub enum EditorCommand {
     /// panel describing the keyboard is not about the document at all.
     WhichKey(Option<String>),
 
+    /// corfu: the in-buffer completion popup, which is which-key's sibling and
+    /// is filled the same way — see [`CompletionEdit`] and [`Completion`].
+    Completion(CompletionEdit),
+
     // --- end of the lisp-api block -------------------------------------------
+}
+
+/// One change to the in-buffer completion popup.
+///
+/// Two verbs rather than four, and the split is between *where the popup is*
+/// and *what is in it*, because those two facts change at different rates: the
+/// candidate list is fetched once per word and the selection moves once per
+/// `C-n`. Folding them together would mean resending the whole list — one
+/// command per candidate, since the write envelope carries a single string — on
+/// every press of the key whose entire job is to be cheap.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CompletionEdit {
+    /// Put the popup under the text starting at the first field with the
+    /// second's row highlighted, or — with `None` — take it down.
+    ///
+    /// The rows survive a re-`Show` *at the same anchor* and are dropped when
+    /// the anchor moves, because a row list is a claim about the word starting
+    /// there. So moving the selection is one command, and starting a new
+    /// completion cannot inherit the last one's candidates even if the caller
+    /// forgets to clear them.
+    Show(Option<(usize, usize)>),
+    /// Append one candidate, or — with `None` — empty the list without taking
+    /// the popup down. Exactly [`EditorCommand::WhichKey`]'s idiom, and for
+    /// exactly its reason: one string per call is what the envelope carries.
+    Row(Option<String>),
+}
+
+/// The in-buffer completion popup: candidates for the word being typed, drawn
+/// at point rather than in the minibuffer.
+///
+/// **Not overlays**, and this is the third time that answer has been the wrong
+/// one (see [`EditorCommand::WhichKey`] and `which-key.lisp`). An overlay is
+/// anchored to a *range of buffer text* and slides when you type in front of
+/// it — which sounds right here, since the popup is about the word under point,
+/// and is not: an overlay's payload is drawn *in the cell grid, in the flow of
+/// the line*, so a ten-candidate list would have to be ten lines of the
+/// document that are not in the file. The popup floats over lines it is not
+/// about. That is a frame-level surface, which is what `ace` and `which_key`
+/// already are, so this is filed beside them.
+///
+/// **Not a prompt** either, for which-key's reason turned inside out: a prompt
+/// owns the keyboard, and here the keyboard has to keep reaching the *buffer* —
+/// the whole feature is that you go on typing and the list narrows.
+///
+/// The one thing it has that which-key does not is a position, since it is
+/// anchored to the document rather than to the frame. `at` is a buffer offset
+/// and the renderer turns it into pixels, because where a character is on
+/// screen depends on wrapping, folds, a window's zoom and an overlay's type
+/// scale — none of which core knows and all of which the renderer has just
+/// finished computing in order to draw the caret.
+#[derive(Clone, Debug, Default)]
+pub struct Completion {
+    /// Where the text being completed starts. Both the popup's anchor and the
+    /// start of the range a candidate replaces, which is deliberately one
+    /// number: a popup that pointed at one word while accepting over another
+    /// is the failure mode worth designing out.
+    pub at: usize,
+    pub rows: Vec<String>,
+    /// Index into `rows`. Kept clamped by [`Editor::apply`] rather than trusted,
+    /// since it arrives from the image and the renderer indexes with it.
+    pub selected: usize,
+}
+
+impl Completion {
+    /// The rows to draw, and where in `rows` they start — scrolled to keep the
+    /// selection visible, as [`minibuffer::Prompt::visible`] does for the other
+    /// popup. Separate from that one because a `Prompt` row carries an index
+    /// into `items` for the highlighter and a `selected` flag per row; here
+    /// there is one list and one integer, so the caller subtracts.
+    pub fn visible(&self, max: usize) -> (usize, &[String]) {
+        if max == 0 || self.rows.is_empty() {
+            return (0, &[]);
+        }
+        let first = self
+            .selected
+            .saturating_sub(max - 1)
+            .min(self.rows.len().saturating_sub(max));
+        (first, &self.rows[first..(first + max).min(self.rows.len())])
+    }
 }
 
 impl EditorCommand {
@@ -848,6 +1003,111 @@ pub enum ReadOnly {
     Claimed,
 }
 
+/// One edit to a document, in **character** offsets: `start..old_end` of the
+/// text before it became `start..new_end` of the text after it.
+///
+/// Three numbers rather than two, and the shape is not invented here — it is
+/// the intersection of the two consumers that were already asking for it.
+/// tree-sitter's `InputEdit` is this triple restated in bytes and row/columns,
+/// both of which are recoverable from the text and neither of which core has
+/// any business holding an opinion about; LSP's incremental `didChange` is the
+/// same triple wearing line/character clothes, plus the replacement text.
+/// Neither wanted a number the other did not, which is why there is one record
+/// and not two.
+///
+/// Offsets are characters because *every* offset in this editor is — `point`,
+/// `region`, markers, overlays, spans. A record in bytes would be the one place
+/// arithmetic against the rest of the API silently lied on a buffer containing
+/// an accent.
+///
+/// **The inserted text is deliberately absent.** It is exactly `start..new_end`
+/// of the buffer, for as long as no later edit has moved those offsets, so
+/// whoever needs it takes it at the moment it reads the record — see
+/// `crates/app`, which slices it under the same lock that read the record and
+/// hands the image a self-contained pair. Keeping it here would mean the log of
+/// a `replace-region` over a 10 MB buffer weighed 10 MB, for a copy most
+/// readers throw away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Change {
+    pub start: usize,
+    pub old_end: usize,
+    pub new_end: usize,
+}
+
+impl Change {
+    /// The single record that covers a run of consecutive edits — the text
+    /// before the first became the text after the last.
+    ///
+    /// Conservative rather than minimal: the answer is the smallest record
+    /// derivable *from the records alone*, which can be wider than a diff of
+    /// the two texts would give (typing `a` then deleting it reports a
+    /// one-character change rather than none). Narrowing it would mean holding
+    /// both texts and comparing them, which is the diffing this whole mechanism
+    /// exists to avoid, and every consumer treats a too-wide record as correct
+    /// and merely slower.
+    ///
+    /// `None` for an empty run, which is the honest answer to "what changed?"
+    /// when nothing did — a revision can move without the text moving.
+    pub fn coalesce(changes: &[Change]) -> Option<Change> {
+        let (first, rest) = changes.split_first()?;
+        let mut acc = *first;
+        for c in rest {
+            // How far the accumulated record has already shifted everything
+            // after it: later records are in *current* coordinates, `old_end`
+            // is in the coordinates of the text before the run began, and this
+            // is the only quantity that translates between them.
+            let shift = acc.new_end as i64 - acc.old_end as i64;
+            acc = Change {
+                start: acc.start.min(c.start),
+                old_end: acc.old_end.max((c.old_end as i64 - shift).max(0) as usize),
+                new_end: (acc.new_end as i64 + c.new_end as i64 - c.old_end as i64)
+                    .max(c.new_end as i64) as usize,
+            };
+        }
+        Some(acc)
+    }
+}
+
+/// Every edit made to one buffer, oldest first, and a count of how many there
+/// have ever been.
+///
+/// **A list, and not one running coalesced record.** A coalesced record has to
+/// be coalesced relative to somebody's last look, and there is more than one
+/// somebody: the syntax thread, the after-change hook, and — next — an LSP
+/// client, each reading at its own rate and each entitled to a different
+/// answer. Core would have to know all of them to keep one record; it needs to
+/// know none of them to keep a list. So core appends, a reader names the count
+/// it last acted on, and folds what it gets back with [`Change::coalesce`] if
+/// one record is what it wanted.
+///
+/// The log is capped and the count is not. A reader further behind than
+/// [`CHANGE_LIMIT`] gets `None` — "reread the whole text" — which is the same
+/// answer it gets for a buffer it has never seen, so there is one recovery path
+/// to write and one to test rather than two.
+#[derive(Default)]
+struct Changes {
+    count: u64,
+    log: Vec<Change>,
+}
+
+impl Changes {
+    fn record(&mut self, change: Change) {
+        self.count += 1;
+        self.log.push(change);
+        if self.log.len() > CHANGE_LIMIT {
+            self.log.remove(0);
+        }
+    }
+
+    fn since(&self, seen: u64) -> Option<&[Change]> {
+        // `seen > count` is a reader holding a number from another buffer's
+        // life. Not an error — buffers are switched constantly — but it is
+        // never a slice of this log, so it takes the same road as an overflow.
+        let behind = self.count.checked_sub(seen)? as usize;
+        (behind <= self.log.len()).then(|| &self.log[self.log.len() - behind..])
+    }
+}
+
 /// A text document plus a cursor expressed as a character index into the rope.
 pub struct Buffer {
     /// Stable handle. Windows refer to buffers by this, never by index.
@@ -928,6 +1188,14 @@ pub struct Buffer {
     /// Only the live buffer can be edited, so a parked buffer's spans stay
     /// valid for as long as it is parked.
     pub highlights: Vec<Span>,
+    /// What has happened to this text, for anything that has to keep a copy of
+    /// it in step — the syntax thread's tree, the image, a language server.
+    ///
+    /// Per buffer and travelling with it, for the same reason the undo history
+    /// and the markers do: a change log is a fact about a *document*, and a
+    /// reader that had one buffer's edits applied to another's copy would be
+    /// worse off than a reader with no log at all.
+    changes: Changes,
     /// Undo history lives with the buffer, not the editor: switching files
     /// must not let one buffer's `u` restore another's text.
     undo: Vec<Snapshot>,
@@ -990,6 +1258,7 @@ impl Buffer {
             file_mode: None,
             visited: None,
             highlights: Vec::new(),
+            changes: Changes::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             markers: marker::Markers::default(),
@@ -1123,7 +1392,21 @@ impl Buffer {
             text: self.text.clone(),
             cursor: self.cursor,
         });
-        self.text = snap.text;
+        // Recorded as a whole-document replacement, and that is the whole of
+        // what undo can honestly say. A snapshot is a rope, not a diff: there
+        // is no edit here to report, only two documents, and the record that
+        // describes "this one became that one" without lying is
+        // `0..old_len -> 0..new_len`. Every reader already handles it — the
+        // parser reparses, a language server takes one full-range change, the
+        // image reads the buffer back — because it is the same record `load`
+        // and `revert-buffer` produce.
+        //
+        // ponytail: a `u` on a one-character typo therefore costs a full
+        // reparse. The ceiling is the file size at which that is felt, the same
+        // few hundred KB the parser's own ceiling sits at. The upgrade is an
+        // undo history of *edits* rather than snapshots, which is a different
+        // undo system and would retire the clamping two lines below with it.
+        self.replace_text(snap.text);
         self.cursor = snap.cursor.min(self.text.len_chars());
         // A snapshot is a whole rope, not a diff, so there is no edit to run the
         // markers through: they keep the positions they had and are pulled back
@@ -1147,6 +1430,93 @@ impl Buffer {
 
     pub fn len_lines(&self) -> usize {
         self.text.len_lines()
+    }
+
+    /// The last line the cursor may sit on — vim's count, not the rope's.
+    ///
+    /// A rope counts the empty string after a trailing newline as a line, and
+    /// very nearly every file ends in one. So `len_lines() - 1` names a line
+    /// that is not there, and everything reaching for "the last line" landed on
+    /// it: `G` put the cursor on a row with no text, `j` walked onto it, `}`
+    /// stopped short of the real last paragraph, and `dd` on the actual last
+    /// line computed its range against a phantom.
+    ///
+    /// `"one\ntwo\n"` is two lines here, as it is in vim and in `wc -l`.
+    /// `"one\ntwo"` is also two, and the second one is real — which is the
+    /// distinction this has to make and the reason it is not simply a subtract.
+    pub fn last_line(&self) -> usize {
+        let last = self.len_lines().saturating_sub(1);
+        let trailing_newline = self.char_at(self.len_chars().saturating_sub(1)) == Some('\n');
+        if last > 0 && trailing_newline && self.line_len(last) == 0 {
+            last - 1
+        } else {
+            last
+        }
+    }
+
+    /// `line`'s leading whitespace, as the string to repeat.
+    ///
+    /// What `o` and `O` open the new line with: vim's `autoindent`, which evil
+    /// leaves on, and without which every `o` in indented code is followed by
+    /// retyping the indent you were already at.
+    pub fn line_indent(&self, line: usize) -> String {
+        let start = self.line_start(line);
+        (0..self.line_len(line))
+            .map(|i| self.text.char(start + i))
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect()
+    }
+
+    /// The bracket matching the one at `pos`, or the one just before it.
+    ///
+    /// Both directions from one function because both callers want both: `%`
+    /// jumps from either end of a pair, and the paren highlight has to light up
+    /// the partner whether point is on the opener or just past the closer —
+    /// which is where point sits the instant you finish typing one.
+    ///
+    /// ponytail: brackets in strings and comments count. Skipping them needs the
+    /// syntax spans, which arrive on a different thread and a frame late, so a
+    /// matcher that consulted them would answer differently depending on when it
+    /// was asked. Nesting is honoured, which is what makes it useful at all;
+    /// `"("` in a string is the known wrong answer.
+    pub fn matching_bracket(&self, pos: usize) -> Option<usize> {
+        const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+        // On a bracket, or — for the closer only — just past one. Point after a
+        // freshly typed `)` is the case the highlight exists for.
+        let at = |i: usize| self.char_at(i);
+        let (from, c) = match at(pos).filter(|c| PAIRS.iter().any(|(o, k)| c == o || c == k)) {
+            Some(c) => (pos, c),
+            None => {
+                let back = pos.checked_sub(1)?;
+                let c = at(back).filter(|c| PAIRS.iter().any(|(_, k)| c == k))?;
+                (back, c)
+            }
+        };
+        let (open, close, forward) = match PAIRS.iter().find(|(o, _)| *o == c) {
+            Some(&(o, k)) => (o, k, true),
+            None => {
+                let &(o, k) = PAIRS.iter().find(|(_, k)| *k == c)?;
+                (o, k, false)
+            }
+        };
+        let mut depth = 0i32;
+        let n = self.len_chars();
+        let mut i = from;
+        loop {
+            match at(i) {
+                Some(ch) if ch == open => depth += 1,
+                Some(ch) if ch == close => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                return Some(i);
+            }
+            i = match forward {
+                true if i + 1 < n => i + 1,
+                false if i > 0 => i - 1,
+                _ => return None,
+            };
+        }
     }
 
     /// (line, column) of the cursor, both zero-based.
@@ -1213,7 +1583,58 @@ impl Buffer {
         let inserted = text.chars().count();
         self.markers.adjust(start, removed, inserted);
         self.overlays.adjust(start, removed, inserted);
+        // Recorded here for exactly the reason the markers are adjusted here:
+        // this is the only place the rope moves under an edit, so it is the
+        // only place a record can be produced that cannot be forgotten. A
+        // no-op splice is still recorded — `(insert "")` moves the revision,
+        // and a log that disagreed with the revision counter would be a second
+        // thing to reason about.
+        self.changes.record(Change {
+            start,
+            old_end: start + removed,
+            new_end: start + inserted,
+        });
         self.modified = true;
+    }
+
+    /// Swap the whole text out, recording the whole-document replacement it is.
+    ///
+    /// The four callers — undo/redo, `load`, `create-buffer`, and the generated
+    /// buffers' refresh — are not *edits*: each throws the undo history, the
+    /// markers and the overlays away and starts a document over, so there is
+    /// nothing for `splice` to adjust and no reason to pay for its rope
+    /// surgery. The change log has to hear about it all the same. A reader that
+    /// missed it would go on adjusting offsets into a document that is gone,
+    /// which is worse than being told to start again.
+    fn replace_text(&mut self, text: Rope) {
+        self.changes.record(Change {
+            start: 0,
+            old_end: self.text.len_chars(),
+            new_end: text.len_chars(),
+        });
+        self.text = text;
+    }
+
+    /// How many edits this buffer has ever seen.
+    ///
+    /// A reader keeps the number it last acted on and hands it back to
+    /// [`Buffer::changes_since`]. A counter rather than a cursor the reader
+    /// holds *in* the buffer, because there is more than one reader and core
+    /// has no business knowing how many.
+    pub fn change_count(&self) -> u64 {
+        self.changes.count
+    }
+
+    /// Every edit since `seen`, oldest first — or `None`, meaning the log no
+    /// longer reaches back that far and the reader should reread the text.
+    ///
+    /// An empty slice and `None` are different answers and the difference
+    /// matters: empty is "the revision moved but the text did not", which
+    /// `set-language` and a mode change both produce, and a reader that
+    /// resynced on those would reparse the file every time a minor mode was
+    /// toggled.
+    pub fn changes_since(&self, seen: u64) -> Option<&[Change]> {
+        self.changes.since(seen)
     }
 
     fn insert_char(&mut self, c: char) {
@@ -1444,6 +1865,15 @@ pub struct Editor {
     /// is pending any more. Filling it is the image's job, because what a prefix
     /// means is Lisp's opinion and not core's.
     pub which_key: Vec<String>,
+    /// corfu: candidates for the word being typed, filed here for
+    /// [`Completion`]'s reasons and read through [`Editor::completion`] rather
+    /// than directly.
+    ///
+    /// Private, unlike `which_key`, because "is there a popup" and "is there a
+    /// popup that still describes where you are typing" are different questions
+    /// and only the second one is ever the right one to ask. See
+    /// [`Editor::completion`].
+    completion: Option<Completion>,
     /// Column a run of `j`/`k` is trying to hold.
     ///
     /// Without it, passing through a short line permanently forgets how far
@@ -1458,6 +1888,10 @@ pub struct Editor {
     /// integer compare rather than by diffing the text once a frame.
     register_revision: u64,
     last_search: String,
+    /// Which way `n` goes. Set by `/` and `?` and by `*` and `#`: a search
+    /// started backwards has to *repeat* backwards, or `?` is not a backward
+    /// search at all, only a one-shot jump.
+    search_backward: bool,
     /// vim-agent: named registers, macros and marks. One field rather than
     /// five, and the struct lives in [`evil`] with everything else that reads
     /// it — none of this is the document, so none of it belongs to `apply`.
@@ -1471,6 +1905,16 @@ impl Default for Editor {
 }
 
 const UNDO_LIMIT: usize = 500;
+/// How many edits [`Changes`] keeps per buffer before the oldest fall off and a
+/// reader that far behind is told to reread the text instead.
+///
+/// Sized for the gap between a reader and the keyboard, not for a session: the
+/// app looks once a frame and the image is a queue turn behind that, so a
+/// hundred is already two seconds of very fast typing. Every reader has a
+/// resync path — it is the same path a buffer switch takes — so overflowing is
+/// slow rather than wrong, and the alternative, an unbounded log, is a leak in
+/// a long editing session with nothing draining it.
+const CHANGE_LIMIT: usize = 256;
 /// How many messages [`Editor::messages`] keeps before dropping the oldest.
 pub const MESSAGE_LIMIT: usize = 500;
 
@@ -1519,11 +1963,13 @@ impl Editor {
             visual_anchor: None,
             ace: None,
             which_key: Vec::new(), // which-key panel
+            completion: None,      // corfu
             desired_col: None,
             register: String::new(),
             register_linewise: false,
             register_revision: 0,
             last_search: String::new(),
+            search_backward: false,
             vim: evil::Vim::default(), // vim-agent
         }
     }
@@ -1575,6 +2021,14 @@ impl Editor {
                     self.next_buffer_id += 1;
                     let previous = std::mem::replace(&mut self.buffer, fresh);
                     self.others.insert(0, previous);
+                    // A new, empty buffer starts at the top. `switch_buffer` in
+                    // the arm above restores the incoming buffer's own scroll;
+                    // this arm had no incoming buffer and so kept the *outgoing*
+                    // one's, which is how a terminal opened from line 400 of a
+                    // file got a window scrolled 400 lines into a blank grid.
+                    // `create_buffer` has always said this; this is the same
+                    // line.
+                    self.scroll = 0;
                 }
             }
         }
@@ -1585,7 +2039,7 @@ impl Editor {
             self.buffer.given_name = Some(name.to_string());
         }
         self.buffer.kind = kind;
-        self.buffer.text = Rope::from_str(text);
+        self.buffer.replace_text(Rope::from_str(text));
         self.buffer.modified = false;
         self.buffer.undo.clear();
         self.buffer.redo.clear();
@@ -1599,10 +2053,14 @@ impl Editor {
         self.buffer.highlights.clear();
         self.revision += 1;
 
-        let (id, cursor) = (self.buffer.id, self.buffer.cursor);
+        // Scroll too, and not only the buffer and the cursor: `sync_window`
+        // above parked the *outgoing* buffer's scroll on this window, and the
+        // window is what the renderer draws every pane from.
+        let (id, cursor, scroll) = (self.buffer.id, self.buffer.cursor, self.scroll);
         let w = self.frame_mut().current_window_mut();
         w.buffer = id;
         w.cursor = cursor;
+        w.scroll = scroll;
         id
     }
 
@@ -1850,7 +2308,7 @@ impl Editor {
         self.buffer.given_name = Some(name);
         self.buffer.kind = BufferKind::Text;
         self.buffer.path = None;
-        self.buffer.text = Rope::from_str("");
+        self.buffer.replace_text(Rope::from_str(""));
         self.buffer.cursor = 0;
         self.buffer.modified = false;
         self.buffer.undo.clear();
@@ -2024,6 +2482,13 @@ impl Editor {
                 Some(k) => self.theme.set(k, rgb),
                 None => self.status = format!("unknown syntax face: {name}"),
             },
+            // The same complaint, word for word, as the colour setter's: a
+            // misspelled face is one mistake, and which of the two primitives
+            // happened to catch it is not the reader's problem.
+            EditorCommand::SetFaceStyle(name, bold, italic) => match HlKind::from_name(&name) {
+                Some(k) => self.theme.set_style(k, FaceStyle { bold, italic }),
+                None => self.status = format!("unknown syntax face: {name}"),
+            },
             EditorCommand::SetLineNumbers(on) => self.settings.line_numbers = on,
             EditorCommand::SetTabWidth(n) => self.settings.tab_width = n.clamp(1, 16),
             // Not clamped at the low end past zero, which is the "off" value:
@@ -2080,6 +2545,15 @@ impl Editor {
                 }
                 self.pending_hooks
                     .push(format!("{name}-{}-hook", if on { "on" } else { "off" }));
+            }
+            EditorCommand::ZoomWindow(by) => {
+                let w = self.frame_mut().current_window_mut();
+                w.zoom = match by {
+                    0 => 100,
+                    by => frame::zoom_step(w.zoom, by),
+                };
+                let at = w.zoom;
+                self.status = format!("window zoom {at}%");
             }
             EditorCommand::SplitWindow(dir) => {
                 self.sync_window();
@@ -2142,10 +2616,18 @@ impl Editor {
                 self.dashboard.items.clear();
                 self.dashboard.clamp_selection();
             }
-            EditorCommand::AddDashboardItem { key, label, action } => {
-                self.dashboard
-                    .items
-                    .push(dashboard::Item { key, label, action });
+            EditorCommand::AddDashboardItem {
+                key,
+                label,
+                action,
+                hint,
+            } => {
+                self.dashboard.items.push(dashboard::Item {
+                    key,
+                    label,
+                    action,
+                    hint,
+                });
                 self.dashboard.clamp_selection();
             }
 
@@ -2230,6 +2712,35 @@ impl Editor {
                 Some(r) => self.which_key.push(r),
                 None => self.which_key.clear(),
             },
+            EditorCommand::Completion(edit) => match edit {
+                CompletionEdit::Show(None) => self.completion = None,
+                CompletionEdit::Show(Some((at, selected))) => {
+                    // Kept only if the anchor is the same one: see
+                    // [`CompletionEdit::Show`]. Clamped to the document because
+                    // the number came out of the image, and an anchor past the
+                    // end would be a range `accept` could not replace.
+                    let at = at.min(self.buffer.len_chars());
+                    let mut c = self
+                        .completion
+                        .take()
+                        .filter(|c| c.at == at)
+                        .unwrap_or_default();
+                    c.at = at;
+                    c.selected = selected.min(c.rows.len().saturating_sub(1));
+                    self.completion = Some(c);
+                }
+                CompletionEdit::Row(row) => {
+                    if let Some(c) = self.completion.as_mut() {
+                        match row {
+                            Some(r) => c.rows.push(r),
+                            None => {
+                                c.rows.clear();
+                                c.selected = 0;
+                            }
+                        }
+                    }
+                }
+            },
             // --- end of the lisp-api block ------------------------------------
 
             // The app intercepts these; reaching `apply` means nothing is listening.
@@ -2287,7 +2798,7 @@ impl Editor {
         // A new document gets a new history — and note the outgoing buffer took
         // its own undo stack with it, so one `u` here can never restore the
         // file you were looking at a moment ago.
-        self.buffer.text = Rope::from_str(text);
+        self.buffer.replace_text(Rope::from_str(text));
         self.buffer.cursor = 0;
         self.buffer.path = path;
         self.buffer.language = language;
@@ -2329,7 +2840,15 @@ impl Editor {
             m if m.is_visual() && !self.mode.is_visual() => {
                 self.visual_anchor = Some(self.buffer.cursor);
             }
-            Mode::Normal | Mode::Insert | Mode::Dashboard => self.visual_anchor = None,
+            // Leaving visual: keep what was selected, so `gv` can put it back.
+            // Remembered on the way out rather than as it is dragged, because
+            // "the last selection" means the one you finished with.
+            Mode::Normal | Mode::Insert | Mode::Dashboard => {
+                if self.mode.is_visual() {
+                    self.vim.last_selection = self.selection();
+                }
+                self.visual_anchor = None;
+            }
             _ => {}
         }
         if m == Mode::Normal && self.mode == Mode::Insert {
@@ -2417,6 +2936,56 @@ impl Editor {
         let pos = pos.min(self.buffer.len_chars());
         self.buffer.markers.add(id, pos, insertion);
         id
+    }
+
+    // --- corfu ------------------------------------------------------------
+
+    /// The in-buffer completion popup, but only while it still describes where
+    /// you are typing: Insert mode, and point at or after the anchor on the
+    /// anchor's own line.
+    ///
+    /// **A predicate rather than a `clear` somewhere, and the difference is
+    /// timing.** which-key is retired by a question asked in `handle_key` —
+    /// "is anything still pending?" — because what makes it stale is core's own
+    /// [`evil::Pending`], which `dispatch_key` has already updated by then. What
+    /// makes *this* stale is the mode and the cursor, and those live in
+    /// [`EditorCommand`]s that `handle_key` has produced and nobody has applied
+    /// yet. A check there would be a frame behind on every key that matters —
+    /// the `Esc` leaving Insert, the backspace off the front of the word — and
+    /// a popup that outlives the word it is about by one keystroke is a popup
+    /// you accept the wrong candidate from.
+    ///
+    /// Asked where the editor is *read*, it is exact: everything has landed by
+    /// then. It is also one site, which is the property `handle_key` was
+    /// protecting — there is no list of "commands that retire the popup" to keep
+    /// in step with the grammar.
+    ///
+    /// [`Editor::retire_completion`] is the other half, and only the other half:
+    /// it stops a hidden popup coming *back*.
+    pub fn completion(&self) -> Option<&Completion> {
+        let c = self.completion.as_ref()?;
+        let cursor = self.buffer.cursor;
+        let live = self.mode == Mode::Insert
+            && cursor >= c.at
+            // Same line. A prefix cannot span one, so this is both "point is
+            // still in the word" and "the popup is beside the word" at once —
+            // and it is what makes `j` take the popup down without core having
+            // to know that `j` moves the cursor.
+            && line_col_of(&self.buffer, c.at).0 == line_col_of(&self.buffer, cursor).0;
+        live.then_some(c)
+    }
+
+    /// Forget a popup that [`Editor::completion`] is already hiding.
+    ///
+    /// Without this, hidden is not gone: `Esc` then `i` puts you back in Insert
+    /// with the cursor where it was, and the popup — never emptied, only
+    /// invisible — would come back holding the candidates for a word you have
+    /// stopped typing. Run *before* the key is interpreted, so it sees the
+    /// previous key's outcome and fires ahead of the key that would resurrect it.
+    fn retire_completion(&mut self) {
+        if self.completion.is_some() && self.completion().is_none() {
+            self.completion = None;
+        }
     }
 
     /// Where a marker is now, or `None` if it was deleted, never existed, or
@@ -2862,6 +3431,106 @@ mod tests {
         ed
     }
 
+    // --- corfu -----------------------------------------------------------
+
+    /// A buffer mid-word in Insert mode with a popup up, which is the only
+    /// state any of this is about.
+    fn completing(text: &str, at: usize, cursor: usize, rows: &[&str]) -> Editor {
+        let mut ed = fresh(text);
+        ed.mode = Mode::Insert;
+        ed.buffer.cursor = cursor;
+        ed.apply(EditorCommand::Completion(CompletionEdit::Show(Some((at, 0)))));
+        for r in rows {
+            ed.apply(EditorCommand::Completion(CompletionEdit::Row(Some(
+                r.to_string(),
+            ))));
+        }
+        ed
+    }
+
+    #[test]
+    fn a_completion_popup_is_only_shown_while_point_is_still_in_the_word_it_describes() {
+        let mut ed = completing("let foo\nbar", 4, 7, &["format!", "foo_bar"]);
+        assert_eq!(ed.completion().map(|c| c.rows.len()), Some(2));
+
+        // Typing further into the word keeps it: that is the feature.
+        ed.buffer.cursor = 7;
+        assert!(ed.completion().is_some());
+
+        // Backspacing off the front of the word does not.
+        ed.buffer.cursor = 3;
+        assert!(ed.completion().is_none(), "point is before the anchor");
+
+        // Nor does landing on another line, which is how `j` retires the popup
+        // without core knowing anything about `j`.
+        ed.buffer.cursor = 9;
+        assert!(ed.completion().is_none(), "point is on another line");
+
+        // Nor does leaving Insert.
+        ed.buffer.cursor = 7;
+        ed.mode = Mode::Normal;
+        assert!(ed.completion().is_none(), "a popup is an Insert-mode thing");
+    }
+
+    #[test]
+    fn a_hidden_completion_popup_does_not_come_back_when_insert_does() {
+        let mut ed = completing("let foo", 4, 7, &["format!"]);
+        // Esc, then `i`: the mode is what hid it and the mode is coming back, so
+        // without `retire_completion` the candidates for a word you stopped
+        // typing would reappear.
+        feed(&mut ed, &[Key::Esc]);
+        assert!(ed.completion().is_none());
+        feed(&mut ed, &[Key::Char('i')]);
+        assert!(
+            ed.completion().is_none(),
+            "hidden has to mean gone, not merely invisible"
+        );
+    }
+
+    #[test]
+    fn showing_at_the_same_anchor_keeps_the_rows_and_moving_it_drops_them() {
+        let mut ed = completing("let foo", 4, 7, &["format!", "foo_bar"]);
+        // A selection change is one command and must not cost the list.
+        ed.apply(EditorCommand::Completion(CompletionEdit::Show(Some((4, 1)))));
+        assert_eq!(ed.completion().map(|c| c.selected), Some(1));
+        assert_eq!(ed.completion().map(|c| c.rows.len()), Some(2));
+
+        // A new word cannot inherit the last one's candidates, even if whoever
+        // filled it in forgot to clear them.
+        ed.apply(EditorCommand::Completion(CompletionEdit::Show(Some((5, 0)))));
+        assert_eq!(ed.completion().map(|c| c.rows.len()), Some(0));
+    }
+
+    #[test]
+    fn a_selection_out_of_the_image_is_clamped_rather_than_indexed_with() {
+        let mut ed = completing("let foo", 4, 7, &["format!"]);
+        ed.apply(EditorCommand::Completion(CompletionEdit::Show(Some((4, 99)))));
+        assert_eq!(ed.completion().map(|c| c.selected), Some(0));
+    }
+
+    #[test]
+    fn the_visible_rows_scroll_to_hold_the_selection() {
+        let mut c = Completion {
+            at: 0,
+            rows: (0..8).map(|i| i.to_string()).collect(),
+            selected: 0,
+        };
+        assert_eq!(c.visible(3), (0, &c.rows[0..3]));
+        // Still in the first window.
+        c.selected = 2;
+        assert_eq!(c.visible(3).0, 0);
+        // Past it, so the window follows rather than the selection leaving.
+        c.selected = 5;
+        let (first, rows) = c.visible(3);
+        assert_eq!(first, 3);
+        assert_eq!(rows, ["3", "4", "5"]);
+        // The last row never scrolls past the end of the list.
+        c.selected = 7;
+        assert_eq!(c.visible(3), (5, &c.rows[5..8]));
+        // A box with no room draws nothing rather than panicking on a slice.
+        assert_eq!(c.visible(0), (0, &[] as &[String]));
+    }
+
     #[test]
     fn insert_mode_types_text() {
         let mut ed = fresh("");
@@ -2894,16 +3563,60 @@ mod tests {
     }
 
     #[test]
+    fn a_face_remembers_the_weight_and_slant_it_was_given() {
+        let mut ed = fresh("");
+        ed.apply(EditorCommand::SetFaceStyle("keyword".into(), true, false));
+        ed.apply(EditorCommand::SetFaceStyle("comment".into(), false, true));
+        assert_eq!(
+            ed.theme.style(HlKind::Keyword),
+            FaceStyle { bold: true, italic: false }
+        );
+        assert_eq!(
+            ed.theme.style(HlKind::Comment),
+            FaceStyle { bold: false, italic: true }
+        );
+        // Setting one face says nothing about any other, and a style set back to
+        // plain really goes back to plain — a theme reloaded over another one
+        // has to be able to undo what the first said.
+        assert_eq!(ed.theme.style(HlKind::String), FaceStyle::default());
+        ed.apply(EditorCommand::SetFaceStyle("keyword".into(), false, false));
+        assert_eq!(ed.theme.style(HlKind::Keyword), FaceStyle::default());
+    }
+
+    #[test]
+    fn styling_a_face_that_does_not_exist_complains_and_changes_nothing() {
+        let mut ed = fresh("");
+        ed.apply(EditorCommand::SetFaceStyle("keywrod".into(), true, true));
+        assert_eq!(ed.status, "unknown syntax face: keywrod");
+        assert!(HlKind::ALL.iter().all(|&k| ed.theme.style(k) == FaceStyle::default()));
+    }
+
+    #[test]
+    fn the_default_theme_is_upright_body_weight_throughout() {
+        // The guarantee that this feature is invisible until a theme asks for
+        // it: nothing renders bold or italic on a face until something sets one.
+        let ed = fresh("");
+        for k in HlKind::ALL {
+            assert_eq!(ed.theme.style(k), FaceStyle::default(), "{}", k.name());
+        }
+    }
+
+    #[test]
     fn normalize_keys_handles_both_forms() {
         assert_eq!(normalize_keys("gd"), "g d");
         assert_eq!(normalize_keys("SPC f f"), "SPC f f");
         assert_eq!(normalize_keys("C-x C-f"), "C-x C-f");
         // Named keys are one token, not five characters.
-        for named in ["<tab>", "<ret>", "<esc>", "<bs>", "<left>"] {
+        for named in ["<tab>", "<backtab>", "<ret>", "<esc>", "<bs>", "<left>"] {
             assert_eq!(normalize_keys(named), named);
         }
         // ...and each still matches what the key actually produces.
         assert_eq!(normalize_keys(&Key::Tab.token()), Key::Tab.token());
+        // `<backtab>` is a key of its own, so a config can bind it and it can
+        // never be mistaken for the `<tab>` it used to arrive as.
+        assert_eq!(Key::from_token("<backtab>"), Some(Key::BackTab));
+        assert_eq!(Key::from_token("S-<tab>"), Some(Key::BackTab));
+        assert_ne!(Key::BackTab.token(), Key::Tab.token());
         assert_eq!(normalize_keys("C-M-j"), "C-M-j");
         assert_eq!(normalize_keys("M-+"), "M-+");
         assert_eq!(normalize_keys("SPC"), "SPC");
@@ -2970,6 +3683,34 @@ mod tests {
         ed.apply(EditorCommand::DeleteRange(0, 10));
         assert_eq!(ed.marker_position(m), Some(0));
         assert_eq!(ed.buffer.len_chars(), 0);
+    }
+
+    /// The command sequence a mouse drag emits, without a mouse.
+    ///
+    /// The pointer arithmetic lives in the renderer and the event plumbing in
+    /// the app, but what those two agree to send is this — press, then Visual,
+    /// then a `MoveTo` per motion — and it is the part that has to keep meaning
+    /// "a selection anchored where the press landed".
+    #[test]
+    fn a_drag_is_a_visual_selection_anchored_at_the_press() {
+        let (mut ed, _) = marked("alpha beta gamma", 0);
+        ed.apply(EditorCommand::MoveTo(6)); // the press, on `b`
+        ed.apply(EditorCommand::SetMode(Mode::Visual));
+        ed.apply(EditorCommand::MoveTo(9)); // dragged three characters right
+        // Inclusive of the character under the cursor, as vim's visual is —
+        // so `beta` is four characters and the range ends at 10.
+        assert_eq!(ed.selection(), Some((6, 10)));
+        // Every motion after the first moves only the far end: the anchor is
+        // set once, on entering Visual, and `v` then `C-v` keeping it is the
+        // same rule.
+        ed.apply(EditorCommand::MoveTo(2)); // dragged back past the start
+        assert_eq!(ed.selection(), Some((2, 7)));
+
+        // A fresh press collapses it, which is what stops the next click from
+        // dragging the far end of the selection you just made.
+        ed.apply(EditorCommand::SetMode(Mode::Normal));
+        ed.apply(EditorCommand::MoveTo(11));
+        assert_eq!(ed.selection(), None);
     }
 
     #[test]
@@ -3114,6 +3855,7 @@ mod tests {
             Key::MetaBackspace,
             Key::Enter,
             Key::Tab,
+            Key::BackTab,
             Key::Backspace,
             Key::Esc,
             Key::Left,
@@ -3605,4 +4347,229 @@ mod tests {
     }
 
     // --- end of the lisp-api block -------------------------------------------
+
+    // --- the change log ------------------------------------------------------
+
+    /// The only thing a record actually promises: the text before `start` and
+    /// the text after the two ends are the same in both documents.
+    ///
+    /// Asserted rather than a literal offset triple, because that is the
+    /// property every reader depends on and a literal would only say that the
+    /// arithmetic had not changed. A record that is *wider* than it had to be
+    /// passes — see [`Change::coalesce`], which is deliberately conservative.
+    fn record_describes(before: &str, after: &str, c: Change) {
+        let b: Vec<char> = before.chars().collect();
+        let a: Vec<char> = after.chars().collect();
+        assert!(c.start <= c.old_end && c.start <= c.new_end, "inverted {c:?}");
+        assert!(c.old_end <= b.len() && c.new_end <= a.len(), "past the end {c:?}");
+        assert_eq!(b[..c.start], a[..c.start], "prefix moved under {c:?}");
+        assert_eq!(b[c.old_end..], a[c.new_end..], "suffix moved under {c:?}");
+    }
+
+    /// Run `keys` and check that what the log says happened is what happened.
+    fn edits_are_described_by_their_record(text: &str, keys: &[Key]) {
+        let mut ed = fresh(text);
+        let seen = ed.buffer.change_count();
+        let before = ed.buffer.text.to_string();
+        feed(&mut ed, keys);
+        let after = ed.buffer.text.to_string();
+        let log = ed.buffer.changes_since(seen).expect("nothing has overflowed");
+        match Change::coalesce(log) {
+            Some(c) => record_describes(&before, &after, c),
+            None => assert_eq!(before, after, "no record, but the text moved: {keys:?}"),
+        }
+    }
+
+    /// Every keystroke that edits, put through the invariant. The scripts are
+    /// chosen for the shapes that break the coalescing arithmetic: an insert
+    /// followed by a delete *behind* it, a delete that swallows a previous
+    /// insert whole, and a paste that lands before everything already recorded.
+    #[test]
+    fn a_record_names_exactly_the_text_that_moved() {
+        let text = "one two three\nfour five six\nseven eight\n";
+        for keys in [
+            &[Key::Char('x')][..],
+            &[Key::Char('d'), Key::Char('d')],
+            &[Key::Char('i'), Key::Char('a'), Key::Char('b'), Key::Esc],
+            &[Key::Char('o'), Key::Char('z'), Key::Esc],
+            &[Key::Char('A'), Key::Char('!'), Key::Esc],
+            // insert, then delete from *before* where the insert landed
+            &[
+                Key::Char('j'),
+                Key::Char('i'),
+                Key::Char('q'),
+                Key::Esc,
+                Key::Char('k'),
+                Key::Char('d'),
+                Key::Char('d'),
+            ],
+            // yank a line and paste it above everything typed so far
+            &[
+                Key::Char('y'),
+                Key::Char('y'),
+                Key::Char('G'),
+                Key::Char('o'),
+                Key::Char('w'),
+                Key::Esc,
+                Key::Char('g'),
+                Key::Char('g'),
+                Key::Char('P'),
+            ],
+            &[Key::Char('x'), Key::Char('x'), Key::Char('u')],
+            &[Key::Char('d'), Key::Char('d'), Key::Char('u'), Key::Ctrl('r')],
+        ] {
+            edits_are_described_by_their_record(text, keys);
+        }
+    }
+
+    /// The same invariant where it is hardest to get right: text that is not
+    /// one byte per character, so a record in bytes would slice mid-codepoint.
+    #[test]
+    fn a_record_is_in_characters_not_bytes() {
+        edits_are_described_by_their_record(
+            "café ▸ Übung\nmañana\n",
+            &[
+                Key::Char('l'),
+                Key::Char('l'),
+                Key::Char('i'),
+                Key::Char('é'),
+                Key::Esc,
+                Key::Char('x'),
+            ],
+        );
+    }
+
+    /// One splice, one record — the property that lets a reader trust the log
+    /// instead of diffing. Checked against the offsets a caller can predict,
+    /// which is the one place a literal triple is worth asserting on.
+    #[test]
+    fn one_splice_is_one_record() {
+        let mut ed = fresh("hello world");
+        let seen = ed.buffer.change_count();
+        ed.apply(EditorCommand::DeleteRange(0, 6));
+        ed.apply(EditorCommand::MoveTo(2));
+        ed.apply(EditorCommand::InsertText("!!".into()));
+        assert_eq!(
+            ed.buffer.changes_since(seen).unwrap(),
+            [
+                Change { start: 0, old_end: 6, new_end: 0 },
+                Change { start: 2, old_end: 2, new_end: 4 },
+            ]
+        );
+        assert_eq!(ed.buffer.text.to_string(), "wo!!rld");
+    }
+
+    /// Undo restores a snapshot rather than replaying an edit, so the honest
+    /// record is the whole document — and it has to *be* recorded, because a
+    /// reader told only that the revision moved would keep a stale copy.
+    #[test]
+    fn undo_and_redo_report_a_whole_document_because_a_snapshot_is_not_a_diff() {
+        let mut ed = fresh("abcdef");
+        feed(&mut ed, &[Key::Char('x')]);
+        let seen = ed.buffer.change_count();
+        feed(&mut ed, &[Key::Char('u')]);
+        assert_eq!(
+            ed.buffer.changes_since(seen).unwrap(),
+            [Change { start: 0, old_end: 5, new_end: 6 }]
+        );
+        let seen = ed.buffer.change_count();
+        feed(&mut ed, &[Key::Ctrl('r')]);
+        assert_eq!(
+            ed.buffer.changes_since(seen).unwrap(),
+            [Change { start: 0, old_end: 6, new_end: 5 }]
+        );
+    }
+
+    /// A revision can move without the text moving. Those two answers must not
+    /// collapse, or every minor-mode toggle would cost a reparse and a full
+    /// `didChange`.
+    #[test]
+    fn a_revision_that_moved_without_the_text_records_nothing() {
+        let mut ed = fresh("(defun f () 1)");
+        let seen = ed.buffer.change_count();
+        let revision = ed.revision;
+        ed.apply(EditorCommand::SetLanguage(Some("lisp".into())));
+        assert_ne!(ed.revision, revision, "the app re-highlights off this");
+        assert_eq!(ed.buffer.changes_since(seen), Some(&[][..]));
+    }
+
+    /// Falling behind is answered with "reread the text", never with a slice
+    /// that starts in the middle of what the reader missed.
+    #[test]
+    fn a_reader_that_fell_behind_is_told_to_reread_rather_than_handed_a_hole() {
+        let mut ed = fresh("");
+        let seen = ed.buffer.change_count();
+        for _ in 0..CHANGE_LIMIT + 1 {
+            ed.apply(EditorCommand::InsertChar('x'));
+        }
+        assert_eq!(ed.buffer.changes_since(seen), None);
+        // ...and the reader that kept up is still served.
+        let caught_up = ed.buffer.change_count();
+        ed.apply(EditorCommand::InsertChar('y'));
+        assert_eq!(ed.buffer.changes_since(caught_up).map(<[_]>::len), Some(1));
+    }
+
+    /// A count from another buffer's life is not a slice of this log. Buffers
+    /// are switched constantly, so this is the ordinary case rather than an
+    /// error, and it takes the same road as an overflow.
+    #[test]
+    fn a_count_from_a_different_buffer_reads_as_reread() {
+        let mut ed = fresh("abc");
+        ed.apply(EditorCommand::InsertChar('z'));
+        assert_eq!(ed.buffer.changes_since(ed.buffer.change_count() + 5), None);
+    }
+
+    /// Loading a file is a whole new document, and the reader has to be told —
+    /// silently reusing a pristine buffer would otherwise leave a parser
+    /// adjusting offsets into text that was never there.
+    #[test]
+    fn opening_a_file_records_the_document_it_replaced() {
+        let mut ed = Editor::new();
+        let seen = ed.buffer.change_count();
+        ed.load("fn main() {}\n", Some(PathBuf::from("/tmp/x.rs")), Some("rust".into()));
+        let log = ed.buffer.changes_since(seen).unwrap_or_default();
+        assert_eq!(Change::coalesce(log).map(|c| c.new_end), Some(13));
+    }
+
+    /// The arithmetic in `coalesce`, on the cases that are not simply "widen
+    /// the range": a later edit whose offsets are in coordinates the earlier
+    /// one created, and one that deletes text the earlier one inserted.
+    #[test]
+    fn coalescing_translates_later_edits_back_into_the_original_coordinates() {
+        // "abc": insert X at 1, then insert Y at 3 => "aXbYc". The unchanged
+        // "a" and "c" must stay outside the record.
+        let run = [
+            Change { start: 1, old_end: 1, new_end: 2 },
+            Change { start: 3, old_end: 3, new_end: 4 },
+        ];
+        assert_eq!(
+            Change::coalesce(&run),
+            Some(Change { start: 1, old_end: 2, new_end: 4 })
+        );
+        record_describes("abc", "aXbYc", Change::coalesce(&run).unwrap());
+
+        // "abcdef": delete 1..3, then insert two chars at 0 => "ZZadef".
+        let run = [
+            Change { start: 1, old_end: 3, new_end: 1 },
+            Change { start: 0, old_end: 0, new_end: 2 },
+        ];
+        assert_eq!(
+            Change::coalesce(&run),
+            Some(Change { start: 0, old_end: 3, new_end: 3 })
+        );
+        record_describes("abcdef", "ZZadef", Change::coalesce(&run).unwrap());
+
+        // An insert entirely swallowed by a later delete: the record may not
+        // reach back further than the text ever did.
+        let run = [
+            Change { start: 5, old_end: 5, new_end: 6 },
+            Change { start: 0, old_end: 10, new_end: 0 },
+        ];
+        assert_eq!(
+            Change::coalesce(&run),
+            Some(Change { start: 0, old_end: 9, new_end: 0 })
+        );
+
+        assert_eq!(Change::coalesce(&[]), None);
+    }
 }

@@ -50,7 +50,6 @@ $V$ has the same number of elements.
 State clearly where you use the *exchange* step — the point at which a vector of
 one basis is swapped for a vector of the other — since that is the only place
 the finiteness hypothesis does any work.
-
 *** Response
 
 ** Problem

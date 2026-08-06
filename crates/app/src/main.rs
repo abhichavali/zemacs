@@ -336,28 +336,6 @@ fn focus_after_close(focus: usize, closed: usize, before: usize) -> usize {
     if focus > closed { focus - 1 } else { focus }.min(last)
 }
 
-// --- every open buffer ------------------------------------------------------
-//
-// Core keeps the live buffer out of `others`, so "all of them" is a two-part
-// walk rather than a field. Four places here wanted it and each spelled it
-// slightly differently, which is how `autosave_all` came to visit the live
-// buffer by hand and the revert sweep by iterator. Two helpers rather than one
-// because the mutable half also wants to find *one* buffer, which is the shape
-// core answers read-only as `Editor::buffer_by_id` and has no writer for.
-
-/// Every open buffer, live and parked.
-fn buffers(editor: &Editor) -> impl Iterator<Item = &zemacs_core::Buffer> {
-    std::iter::once(&editor.buffer).chain(editor.others.iter())
-}
-
-/// Buffer `id`, live or parked, to write to. The mutable twin core does not
-/// have — see the note above.
-fn buffer_mut(editor: &mut Editor, id: BufferId) -> Option<&mut zemacs_core::Buffer> {
-    std::iter::once(&mut editor.buffer)
-        .chain(editor.others.iter_mut())
-        .find(|b| b.id == id)
-}
-
 /// The `after-edit-hook` call for whatever has happened to the live buffer
 /// since the image was last told, or `None` when the answer is "nothing".
 ///
@@ -2052,7 +2030,7 @@ fn autosave_all(editor: &Editor) {
     // `sync_focused_window` has not run yet this iteration, but auto-save only
     // reads text and path, and neither is window state — which is why this
     // takes the editor by reference at all.
-    for buffer in buffers(editor) {
+    for buffer in editor.buffers() {
         autosave_one(buffer);
     }
 }
@@ -2306,7 +2284,7 @@ impl Revert {
         // rendered view. Neither has a file behind it that could be newer, and
         // both already refresh on their own verbs. Collected first because the
         // revert below needs `editor` mutably.
-        let watched: Vec<(zemacs_core::BufferId, PathBuf)> = buffers(editor)
+        let watched: Vec<(zemacs_core::BufferId, PathBuf)> = editor.buffers()
             .filter(|b| !b.kind.is_generated())
             .filter_map(|b| b.path.clone().map(|p| (b.id, p)))
             .collect();
@@ -2319,7 +2297,7 @@ impl Revert {
         // not grow by every file ever visited. Cheap: it is the same length as
         // the sweep that just ran.
         self.seen.retain(|path, _| {
-            buffers(editor).any(|b| b.path.as_deref() == Some(path.as_path()))
+            editor.buffers().any(|b| b.path.as_deref() == Some(path.as_path()))
         });
     }
 
@@ -2370,7 +2348,7 @@ impl Revert {
             // left stale would ask "changed on disk — save anyway?" about a
             // change that did not alter a byte.
             let stamp = disk_stamp(path);
-            if let Some(buffer) = buffer_mut(editor, id) {
+            if let Some(buffer) = editor.buffer_by_id_mut(id) {
                 buffer.visited = stamp;
             }
             return;
@@ -2398,7 +2376,7 @@ fn revert(editor: &mut Editor, id: zemacs_core::BufferId, path: &Path, text: &st
     // it is back in sync and a later `:w` has nothing to ask about. Without
     // this, every auto-revert would arm the save prompt for the next save.
     let stamp = disk_stamp(path);
-    if let Some(buffer) = buffer_mut(editor, id) {
+    if let Some(buffer) = editor.buffer_by_id_mut(id) {
         buffer.file_mode = mode;
         buffer.visited = stamp;
     }

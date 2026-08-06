@@ -199,28 +199,33 @@ This one is now half-closed: every setting has a reader (=(font-size)=,
 =(tab-width)=, =(line-overflow)= …), so the baseline could be read rather than
 assumed. That change belongs in =modes.lisp=.
 
-** A change notification carries no delta
+** A change notification carries no delta — *closed*
 
-=crates/app/src/main.rs=. The editor now reports =after-change-hook= when the
-document's revision moves, but it reports only *that* it moved — core keeps no
-edit log a reader could walk, so Lisp has to read the buffer back to find out
-what happened.
+Was: the editor reported =after-change-hook= when the document's revision moved
+and only *that* it moved, so Lisp had to read the buffer back to find out what
+happened. The upgrade path written here was "core recording =(start, old-end,
+new-end)= per edit and handing it to the hook".
 
-The visible cost is in =runtime/lsp.lisp=: =textDocument/didChange= sends the
-**whole buffer** on every keystroke rather than a range. That is one buffer copy
-per revision, which is what Emacs paid for years and is not felt below a few
-hundred KB.
+That is what landed. =Change= is the record, =Buffer::changes_since= is the
+reader, and =after_edit_form= in =crates/app/src/main.rs= delivers
+=(after-edit-hook START OLD-END NEW-END TEXT)=. The text is sliced under the same
+lock that produced the record, which is the load-bearing part: the image
+evaluates the form a turn or more later, and offsets alone would name a document
+that has since moved on.
 
-Upgrade path: core recording =(start, old-end, new-end)= per edit and handing it
-to the hook. It is the same record overlays want, so it should be built once for
-both rather than approximated by diffing two copies of a buffer here.
+What is left is one consumer's work rather than a hole in the boundary.
+=runtime/lsp.lisp= still sends the **whole buffer** in =textDocument/didChange=,
+and its own header says so; turning the delta into a =contentChanges= range needs
+the shadow copy per open file, which is Lisp's to keep and needs nothing from
+Rust.
 
-=point-moved-hook=, added beside it, has the smaller version of the same ceiling:
-it says point moved and not where it moved *from*. A config that wants to act on
-the range you just left — re-typesetting the equation you stepped out of — keeps
-the old position in a variable. Both close together, and for the same reason: a
-hook here carries a name and no arguments, so giving either one a payload means
-teaching =pending_hooks= to carry data.
+=point-moved-hook=, added beside it, still has the smaller version of the
+original ceiling: it says point moved and not where it moved *from*. A config
+that wants to act on the range you just left — re-typesetting the equation you
+stepped out of — keeps the old position in a variable. It did not close with the
+other half because the two travel differently: =pending_hooks= carries a name and
+no arguments, where =after-edit-hook= gets its payload by being *formatted into
+the form the app queues*. That route is open to any hook willing to pay for it.
 
 ** LSP columns are characters, not UTF-16 code units
 
@@ -411,15 +416,16 @@ session, and the session verbs in =runtime/modes/ai.lisp= are bound in the
 shell too; the fix, when one does not, is the same major/minor lookup
 =normal_key= already does, moved into =terminal_key=.
 
-** One terminal grid reaches the renderer
+** One terminal grid reaches the renderer — *closed*
 
-=crates/app/src/term.rs=, =Term::screen=, and =crates/render/src/lib.rs=, which
-takes a single =Option<&Screen>= for the whole frame and draws it in every pane
-whose buffer is a terminal. Sessions are plural and grids are not, so a *split
-showing two terminal buffers at once* paints the live session's grid in both.
-Everything else about a background session is correct — its buffer text, its
-name, its size, and its own pane the moment you focus it. The upgrade is the
-renderer taking a grid per =BufferId=.
+Was: =Term::screen= answered one grid and =crates/render/src/lib.rs= took a
+single =Option<&Screen>= for the whole frame, so a *split showing two terminal
+buffers at once* painted the live session's grid in both panes. The upgrade
+written here was "the renderer taking a grid per =BufferId=".
+
+That is what landed. =Term::screens= answers =Vec<(BufferId, Screen)>= and
+=Renderer::render= takes =terminals: &[(BufferId, Screen)]=, so a pane finds its
+own session's grid or draws none.
 
 ** A parked buffer is reverted but not re-highlighted
 
@@ -472,11 +478,11 @@ that show up as behaviour rather than as API.
 | ● | =runtime/modes/modes.lisp=     | The settings baseline starts at the factory default.                 |
 |   | =core/evil.rs=                 | No sticky desired column through a short line for some motions; with an operator pending =j=/=k= are buffer lines, not visual ones. |
 |   | =core/lib.rs= (=line_cells=)     | Core lays a line out without overlays, so a =display= substitution moves the renderer's columns and not =j='s. |
-|   | =app/main.rs=                  | Frame focus is a bare assignment, so the live buffer follows the pointer. |
+|   | =app/main.rs= (=MouseWheel=)     | Frame focus is a bare assignment in *this one arm*, so scrolling an unfocused pane moves the live buffer without adopting the window. Every other path — =FocusGained=, both mouse buttons — goes through =EditorCommand::FocusFrame=. |
 |   | =app/main.rs= (the loop)       | An idle editor still redraws every display frame and throws the result away when the digest says it was identical; only the *present* is skipped. Skipping the draw too needs a signal core does not have — a generation stamped on every mutation, including the ones a Lisp primitive makes through the shared mutex. |
 |   | =app/main.rs=, =syntax/lib.rs=   | Full reparse per revision; ceiling is a few hundred KB.              |
 |   | =syntax/org.rs=                | Single-line emphasis; only the two built-in todo keywords; rescan per keystroke for LaTeX. |
-|   | =render/lib.rs=                | One =Renderer= per process (leaked TTF context); no horizontal scrolling; a wrapped line at the foot of a pane is cut; prompt lands on the focused modeline; input and path text truncate at the tail; a which-key column past the right edge is dropped rather than wrapped; highlight, shadow and divider colours hardcoded; an overlay image grows its line's row count but reflows nothing sideways, and its textures are never evicted; core is not told about the rows it took; a fold at the very bottom of the row budget is not counted, and =scroll= is still a buffer line; a wide character straddling the wrap point is cut in half rather than moved down; a control character draws as nothing rather than as =^G=. |
+|   | =render/lib.rs=                | A closed frame leaves its =TextureCreator= behind — leaked for ='static= textures, and *because* nothing drops it, =Drop= takes the SDL renderer and window down by hand; no horizontal scrolling; a wrapped line at the foot of a pane is cut; prompt lands on the focused modeline; input and path text truncate at the tail; a which-key column past the right edge is dropped rather than wrapped; highlight, shadow and divider colours hardcoded; an overlay image grows its line's row count but reflows nothing sideways, and its textures are never evicted; core is not told about the rows it took; a fold at the very bottom of the row budget is not counted, and =scroll= is still a buffer line; a wide character straddling the wrap point is cut in half rather than moved down; a control character draws as nothing rather than as =^G=. |
 |   | =dired/lib.rs=, =dired/render.rs= | No watcher or caching; per-comparison allocation in the sort; no cross-device rename; no ACLs; one face for both marks; UTC timestamps. |
 |   | =git/lib.rs=, =git/rebase.rs=    | No =--set-upstream=; a cherry-pick conflict is reported as git's own words; rebase shells out to =sh= and =cp= (unix only) and skips =--rebase-merges= steps. |
 |   | =latex/lib.rs=                 | =\begin{equation}= typesets at the article =\textwidth=; =DefaultHasher= for the preview cache key. |

@@ -9,3 +9,6 @@ Cargo.lock
 .zemacs-setup.log
 .zemacs-run-*.sh
 .zemacs-setup.sh
+
+# Agent worktrees — transient, and each is its own checkout of this repo.
+.claude/worktrees/

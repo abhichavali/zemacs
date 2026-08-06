@@ -366,13 +366,12 @@ still opens, at lesson one."
 ;;; ---------------------------------------------------------------------------
 ;;; Stage 1: the child process
 ;;;
-;;; `ext:run-program' with `:wait nil' hands back a stream and a process handle,
-;;; and the loop below does three things at once with them: drains the pipe so a
-;;; chatty answer cannot fill it and deadlock, asks whether the child has
-;;; finished, and gives up after `*tutor-timeout*'. ECL has no timeout of its
-;;; own, and this is the whole of adding one — `external-process-wait' with a
-;;; NIL second argument polls rather than blocks, and `terminate-process' with
-;;; a true second argument is SIGKILL.
+;;; `run-process' in `modes.lisp' does the running: it drains the pipe so a
+;;; chatty answer cannot fill it and deadlock, polls for the exit, and gives up
+;;; at a deadline — which here is `*tutor-timeout*', because a student's `(loop)'
+;;; is a case this file expects rather than an accident. The loop was written out
+;;; in this file first and `math-written.lisp' then wrote it again for `curl';
+;;; one copy of something this fiddly is the most that should exist.
 
 (defun %tutor-form-string (form)
   "FORM printed so that reading it back gives FORM again.
@@ -433,38 +432,6 @@ first and would fail on every macro lesson in the file."
               *tutor-verdict-mark*
               *tutor-verdict-mark*))))
 
-(defun %tutor-spawn (program args)
-  "Run PROGRAM with ARGS, no stdin, stderr merged into stdout. Answers a status
-— :EXITED, :TIMEOUT or :BROKEN — and everything the child said before then."
-  (handler-case
-      (multiple-value-bind (stream code process)
-          (ext:run-program program args
-                           :input nil :output :stream :error :output :wait nil)
-        (declare (ignore code))
-        (unwind-protect
-             (let ((text (make-string-output-stream))
-                   (deadline (+ (get-internal-real-time)
-                                (* *tutor-timeout*
-                                   internal-time-units-per-second))))
-               (loop
-                 ;; Drain first, always. A child that fills the pipe blocks in
-                 ;; `write' and would then never reach the exit we are polling
-                 ;; for, which is a hang built out of two things that are each
-                 ;; individually correct.
-                 (loop while (listen stream)
-                       do (let ((c (read-char stream nil nil)))
-                            (if c (write-char c text) (return))))
-                 (unless (eq (ext:external-process-wait process nil) :running)
-                   (loop for c = (read-char stream nil nil)
-                         while c do (write-char c text))
-                   (return (values :exited (get-output-stream-string text))))
-                 (when (> (get-internal-real-time) deadline)
-                   (ext:terminate-process process t)
-                   (return (values :timeout (get-output-stream-string text))))
-                 (sleep 0.02)))
-          (ignore-errors (close stream))))
-    (serious-condition (e) (values :broken (%condition-string e)))))
-
 (defun %tutor-detail (text)
   "TEXT trimmed, or NIL when there is nothing in it. A bare `FAIL' means `that
 is not the answer', and `FAIL <condition>' means `the test itself could not
@@ -493,12 +460,10 @@ none — which means the child died before it could decide."
 a real limitation and worth saying, and worth saying only once.")
 
 (defun %tutor-ecl-p ()
-  "Whether the system `ecl' can be found. `executable-find' comes from
-`ai.lisp', which loads from the same list this file does; without it we assume
-yes and let the failed exec below tell us otherwise."
-  (if (fboundp 'executable-find)
-      (and (executable-find *tutor-ecl*) t)
-      t))
+  "Whether the system `ecl' can be found. `executable-find' is `modes.lisp''s,
+which is loaded before anything in this directory — it used to be `ai.lisp''s,
+and this function used to have to work without it."
+  (and (executable-find *tutor-ecl*) t))
 
 (defun %tutor-check-child (source check)
   "Mark SOURCE against CHECK in a child `ecl'. Answers (STATUS . DETAIL) where
@@ -512,10 +477,11 @@ STATUS is one of :PASS :FAIL :ERROR :TIMEOUT :BROKEN."
                              :if-does-not-exist :create
                              :external-format :utf-8)
           (write-string (%tutor-child-program source check) out))
-        (multiple-value-bind (status output)
-            (%tutor-spawn *tutor-ecl*
-                          (list "--norc" "--shell"
-                                (namestring *tutor-check-file*)))
+        (multiple-value-bind (output status)
+            (run-process *tutor-ecl*
+                         (list "--norc" "--shell"
+                               (namestring *tutor-check-file*))
+                         :timeout *tutor-timeout*)
           (let ((verdict (%tutor-verdict output)))
             (cond (verdict verdict)
                   ((eq status :timeout)
@@ -844,7 +810,7 @@ rather than a frame later."
   (replace-region 0 (point-max) (%tutor-org-text))
   (goto-char 0)
   (set-major-mode "org-mode")
-  (unless (minor-mode-p 'tutor-lesson) (set-minor-mode "tutor-lesson" t))
+  (enable-minor-mode 'tutor-lesson)
   (set-evil-state "normal")
   *tutor-buffer*)
 
@@ -855,7 +821,7 @@ it. `C-c C-c' is the one key the tutor takes from it — minor modes are
 consulted before the major mode, so here it checks rather than evaluating."
   (create-buffer *tutor-lisp-buffer* "lisp")
   (set-major-mode "lisp-mode")
-  (unless (minor-mode-p 'tutor-answer) (set-minor-mode "tutor-answer" t))
+  (enable-minor-mode 'tutor-answer)
   *tutor-lisp-buffer*)
 
 (defun %tutor-layout ()
@@ -1295,17 +1261,13 @@ checking or stepping does not mean moving to the other window first.")
   "Turn `tutor-lesson' on in a buffer that declares itself the tutor.
 
 On `*org-mode-functions*', so the mode survives re-entering org-mode — which
-`%tutor-instruction-buffer' causes on every render. Guarded by `minor-mode-p'
-because the org-mode body runs on every entry and the mode command is a toggle:
-without the guard, re-rendering would switch the motions off."
-  (when (and (%tutor-buffer-p) (not (minor-mode-p 'tutor-lesson)))
-    (tutor-lesson)))
+`%tutor-instruction-buffer' causes on every render. `enable-minor-mode' and not
+the `tutor-lesson' command: the org-mode body runs on every entry and the
+command is a toggle, so re-rendering would switch the motions off."
+  (when (%tutor-buffer-p)
+    (enable-minor-mode 'tutor-lesson)))
 
-;;; DEFVAR before the PUSHNEW, exactly as `org-modern.lisp' and `math.lisp' do:
-;;; a build whose `*runtime-dir*' never found that file must get an empty list
-;;; here rather than an unbound variable.
-(defvar *org-mode-functions* nil)
-(pushnew 'tutor-lesson-maybe *org-mode-functions*)
+(add-hook '*org-mode-functions* 'tutor-lesson-maybe)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys

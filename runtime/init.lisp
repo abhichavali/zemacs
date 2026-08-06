@@ -828,11 +828,13 @@ moment you do something. Costs one read of a special variable per movement."
             (message (format nil "clone failed: ~a" (getf clone :url)))))))
   nil)
 
-;;; DEFVAR before the PUSHNEW, for the reason spelled out where org's two hooks
-;;; are installed further down: this is the first thing in the file to mention
-;;; the list, and a bare PUSHNEW on an unbound special is an error.
-(defvar *point-moved-functions* nil)
-(pushnew 'project-clone-poll *point-moved-functions*)
+;;; `add-hook' and not a PUSHNEW, and this is the site that makes the difference
+;;; visible: `modes.lisp' — where `*point-moved-functions*' is declared — is not
+;;; loaded until much further down this file, so a bare PUSHNEW here would be a
+;;; PUSHNEW on an unbound special, which is an error. `add-hook' comes up with
+;;; the image, below every `load', and binds the list if it is the first to
+;;; mention it.
+(add-hook '*point-moved-functions* 'project-clone-poll)
 
 (defun project-clone ()
   "Clone a git repository into `*project-directory*' and open it.
@@ -1074,6 +1076,14 @@ this exists — see `%dashboard-item'."
 ;;;   (define-mode-key MODE KEYS COMMAND)   inherited by derived modes
 ;;;   (add-auto-mode SUFFIX MODE)           pick a mode from the file name
 ;;;   (derived-mode-p MODE &optional OF) (minor-mode-p MODE)
+;;;   (enable-minor-mode MODE)              on if off; what a mode hook calls,
+;;;                                         since the mode's own command toggles
+;;;
+;;; ...and the two hooks the editor reports about a buffer, both declared there
+;;; and both joined with `add-hook', which binds the list if nothing has yet:
+;;;
+;;;   (add-hook '*after-change-functions* 'my-function)   the document moved
+;;;   (add-hook '*point-moved-functions*  'my-function)   point moved
 ;;;
 ;;; Loaded before any mode hook is *defined*, because `define-derived-mode'
 ;;; generates `<mode>-hook' — a hand-written one after this point would replace
@@ -1379,14 +1389,8 @@ has edited costs one comparison per keystroke and nothing else."
     (org-latex-preview-new))
   nil)
 
-;;; DEFVAR before each PUSHNEW, exactly as `org-modern.lisp' does it: this file
-;;; is read before `lsp.lisp' installs `after-change-hook' and before
-;;; `modes.lisp' would have been reached in a build with no `*runtime-dir*', so
-;;; both lists have to be safe to be the first to mention.
-(defvar *after-change-functions* nil)
-(defvar *point-moved-functions* nil)
-(pushnew 'org-latex-note-change *after-change-functions*)
-(pushnew 'org-latex-maybe-preview *point-moved-functions*)
+(add-hook '*after-change-functions* 'org-latex-note-change)
+(add-hook '*point-moved-functions* 'org-latex-maybe-preview)
 
 ;;; `C-c r', which is what the TODO asked for and what Emacs muscle memory
 ;;; wants. It could not work when this was written: `C-c' is bound whole, to

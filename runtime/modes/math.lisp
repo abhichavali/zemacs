@@ -754,21 +754,14 @@ to the Contents and `SPC m s' says how far in you are.")
   "Turn `math-curriculum' on in a buffer that declares itself one.
 
 On `*org-mode-functions*', so opening a curriculum *is* the whole installation.
-Guarded by `minor-mode-p' because the org-mode body runs on every entry into the
-mode and the mode command is a toggle — without it, re-entering org-mode would
-switch the curriculum motions off."
-  (when (and (math-curriculum-p) (not (minor-mode-p 'math-curriculum)))
-    (math-curriculum)
-    ;; Last, so its line is the one left on screen: `%toggle-minor-mode' ends by
-    ;; announcing the mode, and the progress line is what is actually worth
-    ;; reading.
+`enable-minor-mode' rather than the `math-curriculum' command because the
+org-mode body runs on every entry and the command is a toggle; it answers T only
+on the entry that actually switched it on, which is the one worth reporting
+progress for."
+  (when (and (math-curriculum-p) (enable-minor-mode 'math-curriculum))
     (math-progress)))
 
-;;; DEFVAR before the PUSHNEW, exactly as `org-modern.lisp' does for the other
-;;; two hook lists: a build whose `*runtime-dir*' never found that file must get
-;;; an empty list here rather than an unbound variable.
-(defvar *org-mode-functions* nil)
-(pushnew 'math-curriculum-maybe *org-mode-functions*)
+(add-hook '*org-mode-functions* 'math-curriculum-maybe)
 
 (define-key "math-curriculum" "SPC m n" "math-next-problem")
 (define-key "math-curriculum" "SPC m p" "math-previous-problem")
@@ -1191,8 +1184,4 @@ draws exactly what it drew before."
           (%math-page-unit-nodes
            (find at (getf *math-page* :units) :key (lambda (u) (getf u :begin))))))))
 
-;;; DEFVAR before the PUSHNEW, exactly as the two hook lists above: a build whose
-;;; `*runtime-dir*' never found `org-frozen.lisp' must get an empty list here
-;;; rather than an unbound variable, and a config reload must not double it.
-(defvar *org-frozen-node-functions* nil)
-(pushnew 'math-page-decorate *org-frozen-node-functions*)
+(add-hook '*org-frozen-node-functions* 'math-page-decorate)

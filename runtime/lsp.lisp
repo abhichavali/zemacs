@@ -49,25 +49,12 @@
 ;;; ---------------------------------------------------------------------------
 ;;; After-change
 ;;;
-;;; The application calls `after-change-hook' the way it calls `X-hook': by name,
-;;; guarded with `fboundp'. A list rather than a single function so that this
-;;; file and your config can both hang something off it — the one hook the
-;;; editor now reports about the *document* should not be first-come-first-served.
-;;;
-;;; ponytail: this belongs in the standard library next to `define-derived-mode'
-;;; rather than in the LSP client, and should move there the day something else
-;;; wants it. It is here because the LSP client is the only thing that does.
-
-(defvar *after-change-functions* nil
-  "Functions called with no arguments after any change to the live buffer.")
-
-(defun after-change-hook ()
-  "Called by the editor whenever the document's revision moves.
-
-Errors are swallowed per function: this fires on every keystroke, and a broken
-hook must cost you that hook rather than the ability to type."
-  (dolist (f *after-change-functions*)
-    (ignore-errors (funcall f))))
+;;; `*after-change-functions*' and the `after-change-hook' the application calls
+;;; by name used to be declared here, because the LSP client was the only thing
+;;; that wanted them. They are in `modes.lisp' now, beside `point-moved-hook'
+;;; and for the reason the note there gives — five other files wanted them too,
+;;; and a hook is not the property of whichever feature asked first. Nothing
+;;; about this client changed: it registers with `add-hook' like everybody else.
 
 ;;; ---------------------------------------------------------------------------
 ;;; Paths and URIs
@@ -393,7 +380,7 @@ and a mode with no server registered all fall out on the first test."
   ;; time you pressed the key.
   nil)
 
-(pushnew 'lsp-ensure *after-change-functions*)
+(add-hook '*after-change-functions* 'lsp-ensure)
 
 (defun lsp-did-save ()
   "Tell the server the live buffer was saved."
@@ -607,7 +594,7 @@ look at it — which is `%lsp-redraw-on-switch', below."
       (when (and path (lsp-diagnostics path))
         (%lsp-draw-diagnostics path)))))
 
-(pushnew '%lsp-redraw-on-switch *after-change-functions*)
+(add-hook '*after-change-functions* '%lsp-redraw-on-switch)
 
 (defparameter *lsp-diagnostics-file*
   (zemacs-file "diagnostics.txt")
@@ -1005,15 +992,11 @@ renderer — wrapping wider only means the box truncates what this already fitte
   "Most lines of documentation shown. Matches `POPUP_ROWS': past this the panel
 is a manual page hanging off your cursor.")
 
-;;; Spelled out here rather than borrowed from `ai.lisp', for the reason
-;;; `%lsp-mode-name' is: this file is loadable on its own and that is worth two
-;;; lines.
-(defun %lsp-split (string char)
-  "STRING split on CHAR. Empty fields are kept; the caller drops them."
-  (loop with start = 0
-        for i = (position char string :start start)
-        collect (subseq string start i)
-        while i do (setf start (1+ i))))
+;;; `split-string' is `modes.lisp''s. It used to be spelled out here *and* in
+;;; `ai.lisp', identical down to the docstring, under a comment saying this file
+;;; was loadable on its own and that was worth two lines. Two lines was the
+;;; wrong price to compare against: what it actually bought was a second copy of
+;;; a function, and the standard library is loaded above this one either way.
 
 (defun %lsp-first-n (list n)
   "The first N elements of LIST, or all of them if it is shorter."
@@ -1027,9 +1010,9 @@ structure it has — and a word longer than COLUMNS is left long rather than
 split, since the one thing in a docstring that is too wide to break is usually
 a type or a path."
   (let ((out nil))
-    (dolist (para (%lsp-split text #\Newline) (nreverse out))
+    (dolist (para (split-string text #\Newline) (nreverse out))
       (let ((line ""))
-        (dolist (word (remove "" (%lsp-split para #\Space) :test #'string=))
+        (dolist (word (remove "" (split-string para #\Space) :test #'string=))
           (cond ((zerop (length line)) (setf line word))
                 ((<= (+ (length line) 1 (length word)) columns)
                  (setf line (concatenate 'string line " " word)))
@@ -1182,7 +1165,7 @@ Upgrade path is one `jget' and a flag on the plist that forces the re-ask."
         (t (%lsp-completion-request (car where))))))
   nil)
 
-(pushnew 'lsp-complete-maybe *after-change-functions*)
+(add-hook '*after-change-functions* 'lsp-complete-maybe)
 
 ;;; ---------------------------------------------------------------------------
 ;;; The keys

@@ -1054,6 +1054,27 @@ static const char *LIBRARY_FORM =
     "             (zemacs::goto-char (min was (zemacs::point-max))))"
     "           hits))))"
 
+    /* --- hooks ------------------------------------------------------------ */
+    /* Emacs' `add-hook', with Emacs' argument order: the hook variable named as
+     * a symbol, then the function to run.
+     *
+     * It is here, below every Lisp file, rather than in `modes.lisp' with the
+     * two hooks the editor actually reports, and the one line that binds an
+     * unbound HOOK is the whole reason. Every file that wanted a hook used to
+     * open with `(defvar *point-moved-functions* nil)' before its PUSHNEW, not
+     * because it declared the list but because it could not be sure it was not
+     * the first file to mention it: `modes.lisp' may not have loaded, or may
+     * not exist in this image at all. Six copies of that line, each with a
+     * comment explaining it, and the comment was right every time. A helper
+     * that predates every `load' turns all of it into one call.
+     *
+     * PUSHNEW and not PUSH, so re-reading a config does not stack a second copy
+     * of the same function on a list that is walked per keystroke. */
+    " (defun zemacs::add-hook (hook function)"
+    "   (unless (boundp hook) (set hook nil))"
+    "   (pushnew function (symbol-value hook))"
+    "   function)"
+
     /* --- introspection --------------------------------------------------- */
     " (defun zemacs::where-is (command)"
     "   (let ((name (string-downcase (string command))))"
@@ -1070,7 +1091,7 @@ static const char *LIBRARY_FORM =
     "              \"SWITCH-TO-BUFFER\" \"WITH-CURRENT-BUFFER\" \"SAVE-EXCURSION\""
     "              \"GOTO-LINE\" \"BEGINNING-OF-LINE\" \"END-OF-LINE\" \"INSERT-AT\""
     "              \"DELETE-LINE\" \"SEARCH-FORWARD\" \"SEARCH-BACKWARD\""
-    "              \"REPLACE-ALL\" \"WHERE-IS\" \"BUFFER-LINES\""
+    "              \"REPLACE-ALL\" \"WHERE-IS\" \"ADD-HOOK\" \"BUFFER-LINES\""
     "              \"LINE-START\" \"LINE-END\""
     "              \"LINE-STRING\" \"MESSAGES\" \"SYNTAX-COLOR\""
     /* lisp-api */

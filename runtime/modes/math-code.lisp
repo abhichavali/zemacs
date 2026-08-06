@@ -897,25 +897,20 @@ the template back.")
 (defun math-code-maybe ()
   "Turn `math-code' on in a buffer that is a curriculum's program.
 
-Guarded by `minor-mode-p' because the mode command is a toggle and the hook runs
-on every entry into python-mode — without it, re-entering would switch the keys
-back off. The message is last so that it is the line left on screen: the toggle
-ends by announcing itself, and `math-code on' is not what a learner needs to
-read."
-  (when (and (not (minor-mode-p 'math-code))
-             (%math-code-curriculum-of (buffer-file-name)))
-    (math-code)
+`enable-minor-mode' rather than the `math-code' command, because the command is
+a toggle and this hook runs on every entry into python-mode — calling it would
+switch the keys back off the second time. It is also silent, which is the half
+that matters here: `math-code on' is not what a learner needs to read, and the
+line below is."
+  (when (and (%math-code-curriculum-of (buffer-file-name))
+             (enable-minor-mode 'math-code))
     (message (format nil "~a — SPC m x runs it, SPC m g goes back"
                      (buffer-name)))))
 
-(pushnew 'math-code-maybe *python-mode-functions*)
+(add-hook '*python-mode-functions* 'math-code-maybe)
 
 ;;; The build poller, on the hook `modes.lisp' runs after every cursor movement.
-;;; DEFVAR before the PUSHNEW as everywhere else that joins a hook list: a build
-;;; whose `*runtime-dir*' never found that file must get an empty list here
-;;; rather than an unbound variable.
-(defvar *point-moved-functions* nil)
-(pushnew 'math-code-build-poll *point-moved-functions*)
+(add-hook '*point-moved-functions* 'math-code-build-poll)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys

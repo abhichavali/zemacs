@@ -966,23 +966,6 @@ Turning it off removes exactly the overlays it made."
   (:on (org-modern-refresh))
   (:off (%org-modern-remove)))
 
-;;; `after-change-hook' is defined in `lsp.lisp', which `init.lisp' loads first
-;;; and inside a `handler-case' — so a machine with no `rpc.lisp' would leave
-;;; this file with nowhere to hang. Both forms are no-ops when that file did
-;;; load: DEFVAR does not overwrite a bound variable, and the function is only
-;;; defined when there is not one already.
-;;;
-;;; ponytail: this hook, and `*after-change-functions*' with it, belongs in the
-;;; standard library beside `define-derived-mode'. It is in the LSP client
-;;; because the LSP client was the only thing that wanted it, and this file is
-;;; the second — which is the day it should move.
-(defvar *after-change-functions* nil
-  "Functions called with no arguments after any change to the live buffer.")
-
-(unless (fboundp 'after-change-hook)
-  (defun after-change-hook ()
-    (dolist (f *after-change-functions*) (ignore-errors (funcall f)))))
-
 ;;; Hanging org-appear off both events the editor reports about a buffer.
 ;;;
 ;;; The *cursor* one is what makes this feel live, and it used to be the ceiling
@@ -992,8 +975,8 @@ Turning it off removes exactly the overlays it made."
 ;;; just moved onto only appeared once you pressed `i' and typed a character.
 ;;; `point-moved-hook' — queued by the application from the same place, taking
 ;;; the same route through `pending_hooks' and the same `fboundp' guard, and
-;;; declared in `modes.lisp' — closes it, and closing it cost exactly the second
-;;; PUSHNEW below.
+;;; declared in `modes.lisp' beside its twin — closes it, and closing it cost
+;;; exactly the second `add-hook' below.
 ;;;
 ;;; Rebinding the motion keys to Lisp wrappers was the other way, and it was the
 ;;; wrong one: it would have reimplemented counts, operators and the desired
@@ -1013,13 +996,8 @@ Turning it off removes exactly the overlays it made."
 ;;; re-entering the mode. Closing that properly wants the change *delta*
 ;;; `boundary.org' lists as missing, which would let this rescan the two lines
 ;;; that moved instead of all of them.
-(pushnew 'org-modern-appear *after-change-functions*)
-
-;;; DEFVAR before the PUSHNEW for the same reason as above: `modes.lisp' is
-;;; where this list is declared, and a build whose `*runtime-dir*' never found
-;;; that file must get an empty list here rather than an unbound variable.
-(defvar *point-moved-functions* nil)
-(pushnew 'org-modern-appear *point-moved-functions*)
+(add-hook '*after-change-functions* 'org-modern-appear)
+(add-hook '*point-moved-functions* 'org-modern-appear)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys, and turning it on
@@ -1031,8 +1009,10 @@ Turning it off removes exactly the overlays it made."
 ;;; and survives untouched. Re-declaring rather than wrapping is what makes a
 ;;; config reload idempotent instead of stacking a wrapper per reload.
 ;;;
-;;; Guarded by `minor-mode-p' because the body runs on every entry into the
-;;; mode, and `org-modern' is a toggle.
+;;; `enable-minor-mode' rather than the `org-modern' command, because the body
+;;; runs on every entry into the mode and the command is a toggle — the second
+;;; entry would switch the glyphs back off. That guard is the mode system's job
+;;; and `modes.lisp' does it; the docstring there is the long version.
 
 ;;; `org-latex-preview-new' comes from `init.lisp', which is read before this
 ;;; file — so the FBOUNDP is about a *config* that never loaded it rather than
@@ -1070,7 +1050,7 @@ Turning it off removes exactly the overlays it made."
   "Functions called with no arguments on entry into `org-mode'.")
 
 (define-derived-mode org-mode text-mode
-  (unless (minor-mode-p 'org-modern) (org-modern))
+  (enable-minor-mode 'org-modern)
   (when (fboundp 'org-latex-preview-new) (org-latex-preview-new))
   (org-inline-images-new)
   (dolist (f *org-mode-functions*) (ignore-errors (funcall f))))

@@ -379,60 +379,13 @@ whatever a vendor punctuates it with, meet in the middle."
 ;;; ---------------------------------------------------------------------------
 ;;; Subprocesses
 ;;;
-;;; The same shape `tutor.lisp' arrived at for running a child `ecl': drain the
-;;; pipe as you go so a chatty child cannot fill it and deadlock, poll for the
-;;; exit rather than blocking on it, and give up after a deadline, because ECL
-;;; has no timeout of its own.
-
-(defun %mw-run (program args &key stdin (timeout 30))
-  "Run PROGRAM with ARGS. Answers (values OUTPUT STATUS), where STATUS is
-:EXITED, :TIMEOUT or :BROKEN and OUTPUT is everything the child said.
-
-STDIN, when given, is written to the child and the pipe is then *closed* — which
-is the whole point of it here, because `curl --config -' reads until end of file
-and would otherwise wait for one forever.
-
-stderr is merged into stdout. That would corrupt a JSON reply if curl ever wrote
-to both, and it does not: `--silent' takes the progress meter away and
-`--show-error' leaves only the failures, which arrive *instead of* a body and are
-worth far more in the status line than `no reply' would be."
-  (handler-case
-      (multiple-value-bind (stream code process)
-          (ext:run-program program args
-                           :input (if stdin :stream nil)
-                           :output :stream :error :output :wait nil
-                           :external-format :utf-8)
-        (declare (ignore code))
-        (unwind-protect
-             (progn
-               (when stdin
-                 ;; With both directions streamed ECL answers a TWO-WAY-STREAM,
-                 ;; and closing *that* would take the reply away with the
-                 ;; request. Only the half the child reads is closed.
-                 (let ((to-child (if (typep stream 'two-way-stream)
-                                     (two-way-stream-output-stream stream)
-                                     stream)))
-                   (write-string stdin to-child)
-                   (finish-output to-child)
-                   (close to-child)))
-               (let ((text (make-string-output-stream))
-                     (deadline (+ (get-internal-real-time)
-                                  (* timeout internal-time-units-per-second))))
-                 (loop
-                   (loop while (listen stream)
-                         do (let ((c (read-char stream nil nil)))
-                              (if c (write-char c text) (return))))
-                   (unless (eq (ext:external-process-wait process nil) :running)
-                     (loop for c = (read-char stream nil nil)
-                           while c do (write-char c text))
-                     (return (values (get-output-stream-string text) :exited)))
-                   (when (> (get-internal-real-time) deadline)
-                     (ext:terminate-process process t)
-                     (return (values (get-output-stream-string text) :timeout)))
-                   (sleep 0.02))))
-          (ignore-errors (close stream))))
-    (serious-condition (e)
-      (values (ignore-errors (princ-to-string e)) :broken))))
+;;; `run-process' in `modes.lisp' — drain the pipe as you go so a chatty child
+;;; cannot fill it and deadlock, poll for the exit rather than blocking on it,
+;;; and give up after a deadline, because ECL has no timeout of its own. This
+;;; file used to carry its own copy of that loop, under a comment saying it was
+;;; the same shape `tutor.lisp' had arrived at; the two are one now, and the
+;;; superset was this one, since `curl' is the caller that needs to write to the
+;;; child's stdin and to pick its own deadline.
 
 ;;; ---------------------------------------------------------------------------
 ;;; The key
@@ -455,7 +408,7 @@ worth far more in the status line than `no reply' would be."
 and the first field of `ls -l' is specified by POSIX and identical on macOS and
 Linux. The trailing `@' or `+' an extended attribute adds is dropped by taking
 ten characters."
-  (multiple-value-bind (out status) (%mw-run "ls" (list "-l" (namestring path)) :timeout 5)
+  (multiple-value-bind (out status) (run-process "ls" (list "-l" (namestring path)) :timeout 5)
     (when (and (eq status :exited) out)
       (let* ((line (subseq out 0 (or (position #\Newline out) (length out))))
              (field (subseq line 0 (or (position #\Space line) (length line)))))
@@ -702,7 +655,7 @@ key appears in this program's memory outside the variable holding it."
 is the HTTP status as an integer or NIL when there was not one.
 
 With BODY-FILE it is a POST of that file as JSON; without, a GET."
-  (unless (or (not (fboundp 'executable-find)) (executable-find "curl"))
+  (unless (executable-find "curl")
     (return-from %mw-curl (values (%mw-say "math: no curl on $PATH") nil)))
   (let ((args (append (list "--silent" "--show-error" "--location"
                             "--max-time" (princ-to-string *math-written-timeout*)
@@ -716,12 +669,12 @@ With BODY-FILE it is a POST of that file as JSON; without, a GET."
                               (concatenate 'string "@" (namestring body-file))))
                       (list url))))
     (multiple-value-bind (out status)
-        (%mw-run "curl" args
-                 :stdin (%mw-curl-config key)
-                 ;; Ten seconds past curl's own deadline: curl is meant to be the
-                 ;; one that gives up, and this is only here for the case where
-                 ;; it does not.
-                 :timeout (+ *math-written-timeout* 10))
+        (run-process "curl" args
+                     :stdin (%mw-curl-config key)
+                     ;; Ten seconds past curl's own deadline: curl is meant to
+                     ;; be the one that gives up, and this is only here for the
+                     ;; case where it does not.
+                     :timeout (+ *math-written-timeout* 10))
       (case status
         (:timeout (values (%mw-say "math: the model did not answer in time") nil))
         (:broken (values (%mw-say (format nil "math: cannot run curl — ~a" out)) nil))
@@ -1310,10 +1263,7 @@ had given up on: asking by hand is how you say you have fixed it."
 ;;; occasional verb is for.
 
 ;;; Autostart, off by default, on the same hook `math.lisp' uses to switch the
-;;; minor mode on. PUSHNEW and a DEFVAR first for the same reason it does: a
-;;; config reload must not double the list, and a build that never loaded
-;;; `math.lisp' must get an empty list rather than an unbound variable.
-(defvar *org-mode-functions* nil)
+;;; minor mode on.
 
 (defun math-written-maybe-watch ()
   "Start the watcher when a curriculum opens, if the config asked for that."
@@ -1322,7 +1272,7 @@ had given up on: asking by hand is how you say you have fixed it."
              (ignore-errors (math-curriculum-p)))
     (math-watch-start)))
 
-(pushnew 'math-written-maybe-watch *org-mode-functions*)
+(add-hook '*org-mode-functions* 'math-written-maybe-watch)
 
 ;;; A hook, not a verb: running it from `M-x' does nothing you can see, and
 ;;; `*hidden-commands*' is `init.lisp''s existing answer for exactly that. The

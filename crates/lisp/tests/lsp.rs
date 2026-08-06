@@ -126,13 +126,20 @@ fn the_lsp_client_talks_to_a_server() {
     std::fs::write(
         &init,
         format!(
+            // `modes/modes.lisp` first, because it is where
+            // `*after-change-functions*` and the `after-change-hook` the
+            // application calls by name are declared — the client only
+            // registers on them. The shipped config loads it above `lsp.lisp`
+            // for the same reason, so this is what the editor actually does.
             "(in-package :zemacs)\n\
+             (load {:?} :verbose nil :print nil)\n\
              (load {:?} :verbose nil :print nil)\n\
              (load {:?} :verbose nil :print nil)\n\
              ;; Replaces the shipped pylsp entry — the point of the registry is\n\
              ;; that a server is a one-line change in Lisp and nothing else.\n\
              (lsp-register-server 'python-mode {:?} {LOG:?})\n\
              (message \"lsp test init loaded\")\n",
+            runtime("modes/modes.lisp"),
             runtime("rpc.lisp"),
             runtime("lsp.lisp"),
             server.to_string_lossy(),

@@ -142,15 +142,20 @@ const PROSE_CANDIDATES: &[&str] = &[
 pub struct Renderer {
     canvas: WindowCanvas,
 
-    // ponytail: the TTF context and the TextureCreator are leaked so `Font` and
-    // `Texture` get `'static` lifetimes instead of forcing a self-referential
-    // struct (both normally borrow from something we'd have to store next to
-    // them). Ceiling: one `Renderer` per process, and the SDL renderer + TTF
-    // subsystem live until exit. Upgrade path: `self_cell`/`ouroboros`, or the
-    // sdl2 `unsafe_textures` feature (which would also leak into the app crate).
-    ttf: &'static Sdl2TtfContext,
+    // ponytail: the `TextureCreator` is leaked so `Texture` gets a `'static`
+    // lifetime instead of forcing a self-referential struct (it normally borrows
+    // from the canvas we would have to store beside it). Ceiling: a closed frame
+    // leaves its creator — one `Rc` and a pointer — behind for good, and it is
+    // *because* nothing will ever drop that `Rc` that [`Drop`] has to take the
+    // SDL renderer and window down by hand. Upgrade path: `self_cell`/
+    // `ouroboros`, or the sdl2 `unsafe_textures` feature (which would also leak
+    // into the app crate).
+    //
+    // The TTF context was leaked the same way and per renderer, which is what
+    // made "one `Renderer` per process" a ceiling of a C library that is global
+    // whatever we do. It is one [`ttf`] for the whole process now, so a second
+    // frame costs a refcount rather than a documented restriction.
     textures: &'static TextureCreator<WindowContext>,
-    font: Font<'static, 'static>,
 
     font_path: PathBuf,
     /// The proportional face a scene's prose is set in, or `None` on a box that
@@ -166,15 +171,20 @@ pub struct Renderer {
     /// display scale, so it is *not* `settings.font_size`.
     point_size: u16,
 
-    glyphs: HashMap<char, Option<Texture<'static>>>,
-    /// The same font emboldened, with its own cache. SDL_ttf's bold is a style
+    /// The body face, and the same file emboldened. SDL_ttf's bold is a style
     /// on the `Font`, so real and bold text cannot come from one handle — and
     /// the rasterised glyphs differ, so they cannot share a cache either.
-    bold: Font<'static, 'static>,
-    bold_glyphs: HashMap<char, Option<Texture<'static>>>,
+    ///
+    /// Two [`Face`]s rather than two fonts standing beside two `HashMap`s, which
+    /// is what these were. A font and the textures rasterised out of it die
+    /// together — that is the invariant [`Face`] exists to state — so the pair is
+    /// one value in all three places it occurs: here, in [`Renderer::faces`], and
+    /// in the single blit [`Renderer::draw_glyph_in`] serves all of them with.
+    body: Face,
+    bold: Face,
     /// Every *other* face: any size an overlay's `scale` asked for, italic at
     /// any size, and every cut of the prose family a scene names. See [`Face`]
-    /// for what one is and [`Renderer::draw_glyph`] for the three-way split.
+    /// for what one is and [`Renderer::body_face`] for the split.
     ///
     /// The two fields above are not folded in here, deliberately. They are the
     /// faces the editor draws essentially all of its text in — every buffer,
@@ -182,6 +192,12 @@ pub struct Renderer {
     /// rather than of anyone's config. This map's is the opposite: it exists
     /// only because a config asked for typesetting, and every dimension of it is
     /// therefore something policy can be held to a bound on.
+    ///
+    /// Which is also why [`MAX_FACE_GLYPHS`] applies here and not to them: the
+    /// body face's repertoire is *the document's*, and a page of CJK holds more
+    /// distinct characters than any cap sized for a heading. Capping it would
+    /// empty and re-rasterise the whole screen every frame — the eviction below
+    /// is a bound on speculation, not on what you are looking at.
     ///
     /// **The bound.** The key space is closed by [`SCALE_STEPS`] × two weights ×
     /// two slants × two families = 32, of which the mono body's plain and bold
@@ -296,8 +312,8 @@ struct Caret {
 /// it, and the caches below outlive this call by one field-drop each.
 impl Drop for Renderer {
     fn drop(&mut self) {
-        self.glyphs.clear();
-        self.bold_glyphs.clear();
+        self.body.glyphs.clear();
+        self.bold.glyphs.clear();
         self.faces.clear();
         self.images.clear();
         // Read before the renderer goes: `window()` walks through the context we
@@ -336,37 +352,28 @@ impl Renderer {
 
         let textures: &'static TextureCreator<WindowContext> =
             Box::leak(Box::new(canvas.texture_creator()));
-        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(
-            sdl2::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?,
-        ));
 
         let font_path = find_font()?;
         let prose_path = find_prose_font()?;
         // Matches `Settings::default().font_size`; `sync` fixes it up on frame one.
         let point_size = scale_point_size(18.0, dpi_scale(&canvas));
-        let mut font = ttf
-            .load_font(&font_path, point_size)
-            .map_err(|e| anyhow::anyhow!("cannot open font {}: {e}", font_path.display()))?;
-        set_hinting(&mut font);
-        let bold = open_bold(ttf, &font_path, point_size)?;
-        let (cell_w, line_h) = metrics(&font);
+        let body = open_face(&font_path, FaceKey::body(point_size, false))?;
+        let bold = open_face(&font_path, FaceKey::body(point_size, true))?;
+        let (cell_w, line_h) = metrics(&body.font);
 
-        let ascent = font.ascent();
+        let ascent = body.font.ascent();
 
         Ok(Self {
             canvas,
-            ttf,
             textures,
-            font,
+            body,
             bold,
-            bold_glyphs: HashMap::new(),
             faces: HashMap::new(),
             images: HashMap::new(),
             scenes: None,
             font_path,
             prose_path,
             point_size,
-            glyphs: HashMap::new(),
             drawn: FNV_SEED,
             shown: None, // nothing on screen yet, so frame one always presents
             draws: 0,
@@ -385,23 +392,21 @@ impl Renderer {
         if want == self.point_size {
             return Ok(());
         }
-        let ttf = self.ttf;
         let path = self.font_path.clone();
-        self.font = ttf
-            .load_font(&path, want)
-            .map_err(|e| anyhow::anyhow!("cannot re-open font {}: {e}", path.display()))?;
-        set_hinting(&mut self.font);
-        self.bold = open_bold(ttf, &path, want)?;
+        // Replaced whole rather than re-opened and then emptied: a `Face` is a
+        // font *and* the textures rasterised out of it, so handing the field a
+        // new one is what throws the stale glyphs away. That is the invariant
+        // written on [`Face`], spent here.
+        self.body = open_face(&path, FaceKey::body(want, false))?;
+        self.bold = open_face(&path, FaceKey::body(want, true))?;
         self.point_size = want;
-        self.glyphs.clear(); // rasterised at the old size, all of it is stale
-        self.bold_glyphs.clear();
-        // ...and the scaled faces doubly so: their *point sizes* were derived
+        // The scaled faces are stale doubly: their *point sizes* were derived
         // from the old one, so both the fonts and their glyphs are wrong.
         self.faces.clear();
-        let (cell_w, line_h) = metrics(&self.font);
+        let (cell_w, line_h) = metrics(&self.body.font);
         self.cell_w = cell_w;
         self.line_h = line_h;
-        self.ascent = self.font.ascent();
+        self.ascent = self.body.font.ascent();
         // Images are rasterised to match the *text*, so a font-size change makes
         // every one of them the wrong size — but they are core's, produced by
         // whoever asked for them, so this only drops the uploads. The next
@@ -763,28 +768,6 @@ impl Renderer {
     /// `None` when the click was on a divider, or in a pane showing something
     /// that is not buffer text — the dashboard and a terminal both draw rows
     /// that no rope position corresponds to.
-    /// The grid a terminal pane can actually show, in cells, for a child that
-    /// has to be told how big its window is.
-    ///
-    /// Here for the same reason [`Renderer::click_target`] is: the draw loop
-    /// lays the child's rows out inside [`doc_rect`] and stops at the first one
-    /// that would cross an edge, so a second opinion about how many fit is not
-    /// a rounding difference — it is invisible. The child believes in rows that
-    /// are never drawn, and whatever it puts on the last one, which is the
-    /// prompt and the line you just typed, is simply not on the screen.
-    ///
-    /// What this replaces was `pane.h / line_h - 1`: one text row for the
-    /// modeline, and nothing for anything else. It was short by two insets that
-    /// have always been there — [`modeline_h`] is a row *plus* its padding and
-    /// two reliefs, and `doc_rect` insets by `PAD` besides — and both are
-    /// settings, so the error grew whenever the modeline did. The same was true
-    /// across: columns were measured on the pane's full width while the glyphs
-    /// were drawn inside a `PAD` on either side, so the last column went the
-    /// same way as the last row.
-    pub fn terminal_grid(&self, set: &Settings, pane: zemacs_core::Rect) -> (usize, usize) {
-        terminal_grid(self.cell_w, self.line_h, set, area_of(pane))
-    }
-
     pub fn click_target(
         &self,
         editor: &Editor,
@@ -820,6 +803,28 @@ impl Renderer {
             y,
         );
         Some((p.window, at))
+    }
+
+    /// The grid a terminal pane can actually show, in cells, for a child that
+    /// has to be told how big its window is.
+    ///
+    /// Here for the same reason [`Renderer::click_target`] is: the draw loop
+    /// lays the child's rows out inside [`doc_rect`] and stops at the first one
+    /// that would cross an edge, so a second opinion about how many fit is not
+    /// a rounding difference — it is invisible. The child believes in rows that
+    /// are never drawn, and whatever it puts on the last one, which is the
+    /// prompt and the line you just typed, is simply not on the screen.
+    ///
+    /// What this replaces was `pane.h / line_h - 1`: one text row for the
+    /// modeline, and nothing for anything else. It was short by two insets that
+    /// have always been there — [`modeline_h`] is a row *plus* its padding and
+    /// two reliefs, and `doc_rect` insets by `PAD` besides — and both are
+    /// settings, so the error grew whenever the modeline did. The same was true
+    /// across: columns were measured on the pane's full width while the glyphs
+    /// were drawn inside a `PAD` on either side, so the last column went the
+    /// same way as the last row.
+    pub fn terminal_grid(&self, set: &Settings, pane: zemacs_core::Rect) -> (usize, usize) {
+        terminal_grid(self.cell_w, self.line_h, set, area_of(pane))
     }
 
     // --- document ---------------------------------------------------------
@@ -1433,23 +1438,7 @@ impl Renderer {
     /// through that arithmetic would put the logo wherever a baseline would
     /// have been. Same cache, same texture lifetime; only the placement differs.
     fn draw_image_at(&mut self, id: ImageId, image: &Image, x: i32, y: i32) {
-        let (w, h) = (image.width, image.height);
-        // Split borrows, as `draw_image` does: the cache needs `&mut images`
-        // while uploading needs the texture creator, and blitting needs the
-        // canvas.
-        let Renderer {
-            images,
-            textures,
-            canvas,
-            ..
-        } = self;
-        let slot = images
-            .entry(id)
-            .or_insert_with(|| image_texture(textures, image));
-        let Some(tex) = slot else { return };
-        let _ = canvas.copy(tex, None, Rect::new(x, y, w, h));
-        self.mark([id, pack(x, y), pack(w as i32, h as i32), 0]);
-        self.draws += 1;
+        self.blit_image(id, image, x, y, image.width, image.height);
     }
 
     // --- modeline ---------------------------------------------------------
@@ -1505,6 +1494,11 @@ impl Renderer {
             return;
         }
 
+        // What a pane's modeline says. The active pane gets the editor's status
+        // line — mode, position, messages, and the prompt while one is open. The
+        // others get only their own buffer, because every other field in that
+        // line describes the focused window and would be the same lie repeated
+        // in every pane.
         let (left, right) = modeline::segments(editor, buf, is_active);
         // The right group is placed from the edge inwards, so the position and
         // the mode stay put as the file name and the status message change
@@ -1880,7 +1874,7 @@ impl Renderer {
 
         self.drop_shadow(b.x, b.y, b.w, b.h);
         self.fill(b.x, b.y, b.w, b.h, panel_c);
-        self.frame(b.x, b.y, b.w, b.h, border_c);
+        self.stroke(b.x, b.y, b.w, b.h, border_c);
 
         let x0 = b.x + PAD;
         let cols = ((b.w - 2 * PAD).max(0) / self.cell_w.max(1)) as usize;
@@ -1989,7 +1983,7 @@ impl Renderer {
 
         self.drop_shadow(x, list.y, box_w, box_h);
         self.fill(x, list.y, box_w, box_h, rgb(mix(bg, fg, 0.09)));
-        self.frame(x, list.y, box_w, box_h, rgb(mix(bg, accent, 0.30)));
+        self.stroke(x, list.y, box_w, box_h, rgb(mix(bg, accent, 0.30)));
 
         // `doc_spans` are offsets into the doc joined by newlines, which is the
         // form the parser was handed — so the running total is what turns a
@@ -2038,7 +2032,7 @@ impl Renderer {
 
         self.drop_shadow(b.x, b.y, b.w, b.h);
         self.fill(b.x, b.y, b.w, b.h, rgb(mix(bg, fg, 0.13)));
-        self.frame(b.x, b.y, b.w, b.h, rgb(mix(bg, accent, 0.45)));
+        self.stroke(b.x, b.y, b.w, b.h, rgb(mix(bg, accent, 0.45)));
 
         for (i, (label, _)) in menu.items.iter().enumerate() {
             let ry = b.y + PADV + i as i32 * self.line_h;
@@ -2063,15 +2057,6 @@ impl Renderer {
         }
         let i = ((y - b.y - PADV) / self.line_h.max(1)) as usize;
         (i < menu.items.len()).then_some(i)
-    }
-
-    /// A 1px rectangle outline. Four fills, and the only reason it is a method
-    /// is that three popups drew the same four lines.
-    fn frame(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color) {
-        self.fill(x, y, w, 1, color);
-        self.fill(x, y + h - 1, w, 1, color);
-        self.fill(x, y, 1, h, color);
-        self.fill(x + w - 1, y, 1, h, color);
     }
 
     /// A translucent smear under a floating box, so it reads as being *over* the
@@ -2140,10 +2125,6 @@ impl Renderer {
         self.mark([TAG_CLIP, 0, 0, 1]);
     }
 
-    /// A cursor rect, trimmed to `pane`. The cursor legitimately sits one cell
-    /// *past* the last column — end of line in insert mode, see [`cursor_pos`] —
-    /// and a whole cell there overhangs the neighbouring pane. The clip rect
-    /// would hide it; trimming means we never ask SDL to draw it at all.
     /// Draw a terminal's cell grid.
     ///
     /// Deliberately not the text path. A terminal carries a colour per cell and
@@ -2210,6 +2191,11 @@ impl Renderer {
         (self.cell_w, self.line_h)
     }
 
+    /// A cursor rect, trimmed to `pane`. The cursor legitimately sits one cell
+    /// *past* the last column — end of line in insert mode, see [`cursor_pos`] —
+    /// and a whole cell there overhangs the neighbouring pane. The clip rect
+    /// would hide it; trimming means we never ask SDL to draw it at all.
+    ///
     /// `h` rather than [`Renderer::line_h`] because a line an overlay has scaled
     /// owns several rows, and a cursor one row tall on a heading looks like a
     /// cursor on the line above it.
@@ -2300,43 +2286,12 @@ impl Renderer {
     /// A wide character advances two cells and a combining mark none, exactly as
     /// in the document: a buffer named `日本語.txt` has to measure the same on the
     /// modeline as it does in the switcher, or one of them wraps early.
+    ///
+    /// The body cut of [`Renderer::draw_run`] and nothing else. `scaled(cw, 100)`
+    /// is `cw`, so the chrome steps by exactly the cells it always did; what it
+    /// buys is that chrome and document text reach the glyph cache by one road.
     fn draw_weighted(&mut self, s: &str, x: i32, y: i32, color: Color, bold: bool) -> i32 {
-        let mut x = x;
-        for c in s.chars() {
-            if bold {
-                self.draw_bold_char(c, x, y, color);
-            } else {
-                self.draw_char(c, x, y, color);
-            }
-            x += char_cells(c) as i32 * self.cell_w;
-        }
-        x
-    }
-
-    fn draw_bold_char(&mut self, c: char, x: i32, y: i32, color: Color) {
-        if c == ' ' || c == '\t' {
-            return;
-        }
-        let Renderer {
-            bold_glyphs,
-            bold,
-            textures,
-            canvas,
-            ..
-        } = self;
-        let slot = bold_glyphs
-            .entry(c)
-            .or_insert_with(|| glyph_texture(textures, bold, c));
-        if let Some(tex) = slot {
-            tex.set_color_mod(color.r, color.g, color.b);
-            let q = tex.query();
-            let _ = canvas.copy(tex, None, Rect::new(x, y, q.width, q.height));
-            // The glyph's size is a function of the face and the point size, and
-            // the point size is already in the frame seed, so the character and
-            // the weight identify the blit.
-            self.mark([TAG_BOLD ^ u64::from(c), pack(x, y), 0, bits(color)]);
-            self.draws += 1;
-        }
+        self.draw_run(s, x, y, color, Cut { bold, ..Cut::plain(100) })
     }
 
     /// `draw_str`, but `x` is where the text should *end*. Same glyph path.
@@ -2345,73 +2300,106 @@ impl Renderer {
         self.draw_str(s, x - w, y, color);
     }
 
+    /// One character of chrome in the body face — a terminal cell, a line of a
+    /// docstring. [`Renderer::draw_str`] for the callers that already own the
+    /// column.
     fn draw_char(&mut self, c: char, x: i32, y: i32, color: Color) {
-        if c == ' ' || c == '\t' {
-            return;
-        }
-        // Split borrows: the cache needs `&mut glyphs` while rasterising needs
-        // `&font`, and blitting needs `&mut canvas`.
-        let Renderer {
-            glyphs,
-            font,
-            textures,
-            canvas,
-            ..
-        } = self;
-        let slot = glyphs
-            .entry(c)
-            .or_insert_with(|| glyph_texture(textures, font, c));
-        if let Some(tex) = slot {
-            tex.set_color_mod(color.r, color.g, color.b);
-            let q = tex.query();
-            let _ = canvas.copy(tex, None, Rect::new(x, y, q.width, q.height));
-            self.mark([u64::from(c), pack(x, y), 0, bits(color)]);
-            self.draws += 1;
-        }
+        self.draw_glyph(c, x, y, color, Cut::plain(100));
     }
 
     // --- typeset text -----------------------------------------------------
 
     /// One glyph in whatever face `cut` names.
     ///
-    /// A three-way split rather than one lookup, and it is worth the extra arm:
-    /// body-weight and bold body text is nearly every character the editor ever
-    /// draws, and those two keep the direct field access and the flat
-    /// `HashMap<char, _>` they have always had. Only the rest — anything an
-    /// overlay's `scale` asked for, italic at any size, and every cut of the
-    /// prose family — pays a second hash to find its face first. The fast path
-    /// is unchanged, which also means the glyph cache with the interesting
-    /// lifetime is unchanged.
-    ///
-    /// **Which arm is taken is decided by [`Renderer::body_face`], the same
-    /// function [`Renderer::face_font`] asks when it is deciding which handle
-    /// *measures* the character.** That is not tidiness: this split was written
-    /// against `(pct, bold, italic)` and a family added underneath it went
-    /// unnoticed, so prose was measured in the proportional face and painted in
-    /// the monospace one — every glyph a Menlo glyph, stepped by a Charter
-    /// advance, with a hole after every `m` and no gap at all between some
-    /// words. Two copies of "which face is this" is exactly one copy too many.
-    ///
-    /// It costs the fast path an integer multiply and a clamp per glyph, where
-    /// it used to be three comparisons. That is a few thousand cycles across a
-    /// whole frame of text, against a `copy` per glyph on the line below it.
-    ///
     /// The cut names a face; [`Renderer::glyph_face`] says whether *this
     /// character* is really set in it, and is the same call the measure makes.
+    ///
+    /// Resolving a face costs an integer multiply and a clamp per glyph, and
+    /// every character of every frame comes through here now that the chrome does
+    /// too. That is a few thousand cycles across a whole screenful, against a
+    /// `copy` per glyph on the line below it — which is the trade that makes one
+    /// road to the cache affordable rather than merely tidy.
     fn draw_glyph(&mut self, c: char, x: i32, y: i32, color: Color, cut: Cut) {
         self.draw_glyph_in(c, x, y, color, self.glyph_face(self.cut_key(cut), c));
     }
 
-    /// [`Renderer::draw_glyph`] with the face already resolved, for the one
-    /// caller that has to know which face it got: `draw_text_frame` places the
-    /// blit against that face's own ascent, so it resolves first and passes the
-    /// answer down rather than asking twice.
+    /// [`Renderer::draw_glyph`] with the face already resolved, and the one
+    /// place a glyph reaches the canvas.
+    ///
+    /// Two callers need the split form. `draw_text_frame` places the blit against
+    /// the resolved face's *own* ascent, so it asks first and passes the answer
+    /// down rather than asking twice; everything else comes through `draw_glyph`.
+    ///
+    /// **Which face holds the cut is decided by [`Renderer::body_face`], the same
+    /// function [`Renderer::face_font`] asks when it is deciding which handle
+    /// *measures* the character.** That is not tidiness: the test was once
+    /// written out twice, against `(pct, bold, italic)`, and a family added
+    /// underneath one copy and not the other set prose in the monospace face
+    /// while spacing it in the proportional one — every glyph a Menlo glyph,
+    /// stepped by a Charter advance, with a hole after every `m` and no gap at
+    /// all between some words. Two copies of "which face is this" is exactly one
+    /// copy too many, and there is now one blit as well as one answer.
+    ///
+    /// The body cuts are fields and everything else is opened on demand, which is
+    /// the whole of the three-way shape this used to be spelled out as. The map's
+    /// two bounds are enforced here and in [`cached_face`]; see [`Renderer::faces`].
     fn draw_glyph_in(&mut self, c: char, x: i32, y: i32, color: Color, key: FaceKey) {
-        match self.body_face(key) {
-            Some(false) => self.draw_char(c, x, y, color),
-            Some(true) => self.draw_bold_char(c, x, y, color),
-            None => self.draw_styled_char(c, x, y, color, key),
+        if c == ' ' || c == '\t' {
+            return;
         }
+        // Asked before the destructure below, because it reads the renderer whole
+        // and that borrow has to be finished before the fields are split out.
+        let body = self.body_face(key);
+        // Split borrows: the cache needs `&mut` on a face while rasterising needs
+        // `&` on its font, and blitting needs `&mut canvas`.
+        let Renderer {
+            body: plain,
+            bold,
+            faces,
+            font_path,
+            prose_path,
+            textures,
+            canvas,
+            ..
+        } = self;
+        let face = match body {
+            Some(false) => plain,
+            Some(true) => bold,
+            None => {
+                let path = face_file(key, font_path, prose_path.as_deref());
+                let Some(face) = cached_face(faces, path, key) else {
+                    return;
+                };
+                // Emptied rather than evicted one by one: there is no access
+                // order to evict by without keeping one, and a face that has
+                // drawn this many distinct characters is a document whose
+                // repertoire is the whole cache anyway. Costs a re-rasterisation
+                // of what is on screen, once.
+                if face.glyphs.len() >= MAX_FACE_GLYPHS && !face.glyphs.contains_key(&c) {
+                    face.glyphs.clear();
+                }
+                face
+            }
+        };
+        let Some(tex) = face.glyph(textures, c) else {
+            return;
+        };
+        tex.set_color_mod(color.r, color.g, color.b);
+        let q = tex.query();
+        let _ = canvas.copy(tex, None, Rect::new(x, y, q.width, q.height));
+        // The key and not only the character, and that is what lets one word
+        // shape serve all three faces: a glyph's pixels are a function of the
+        // face it came out of, and only the *body* size is implied by the frame
+        // seed. Two frames differing only in a heading's scale, or in which
+        // family a substituted symbol landed in, would otherwise hash the same
+        // and the second would never be presented.
+        self.mark([
+            TAG_GLYPH ^ u64::from(c),
+            pack(x, y),
+            pack(i32::from(key.point_size), i32::from(key.style)),
+            bits(color),
+        ]);
+        self.draws += 1;
     }
 
     /// [`Renderer::draw_weighted`] for a typeset run: draws `s` at `pct` of body
@@ -2431,53 +2419,6 @@ impl Renderer {
             x += char_cells(c) as i32 * cw;
         }
         x
-    }
-
-    /// A glyph from the on-demand face map. See [`Renderer::faces`] for the
-    /// bound; this is where both halves of it are enforced.
-    fn draw_styled_char(&mut self, c: char, x: i32, y: i32, color: Color, key: FaceKey) {
-        if c == ' ' || c == '\t' {
-            return;
-        }
-        let Renderer {
-            faces,
-            ttf,
-            font_path,
-            prose_path,
-            textures,
-            canvas,
-            ..
-        } = self;
-        let path = face_file(key, font_path, prose_path.as_deref());
-        let Some(face) = cached_face(faces, ttf, path, key) else {
-            return;
-        };
-        // Emptied rather than evicted one by one: there is no access order to
-        // evict by without keeping one, and a face that has drawn this many
-        // distinct characters is a document whose repertoire is the whole cache
-        // anyway. Costs a re-rasterisation of what is on screen, once.
-        if face.glyphs.len() >= MAX_FACE_GLYPHS && !face.glyphs.contains_key(&c) {
-            face.glyphs.clear();
-        }
-        let slot = face
-            .glyphs
-            .entry(c)
-            .or_insert_with(|| glyph_texture(textures, &face.font, c));
-        if let Some(tex) = slot {
-            tex.set_color_mod(color.r, color.g, color.b);
-            let q = tex.query();
-            let _ = canvas.copy(tex, None, Rect::new(x, y, q.width, q.height));
-            // The size is *not* implied by the frame seed the way the body
-            // face's is, so it goes in: two frames differing only in a heading's
-            // scale would otherwise hash the same and never be presented.
-            self.mark([
-                TAG_STYLED ^ u64::from(c),
-                pack(x, y),
-                pack(i32::from(key.point_size), i32::from(key.style)),
-                bits(color),
-            ]);
-            self.draws += 1;
-        }
     }
 }
 
@@ -2522,6 +2463,26 @@ struct Face {
     glyphs: HashMap<char, Option<Texture<'static>>>,
 }
 
+impl Face {
+    /// The texture for `c`, rasterised on first sighting. `None` is a character
+    /// this face has no glyph for — cached as a failure by [`glyph_texture`], so
+    /// a missing symbol is not sent through FreeType sixty times a second.
+    ///
+    /// `&mut` on the way out because a blit recolours the texture it is about to
+    /// copy, which is the whole of why one white glyph serves every colour on
+    /// screen.
+    fn glyph(
+        &mut self,
+        textures: &'static TextureCreator<WindowContext>,
+        c: char,
+    ) -> Option<&mut Texture<'static>> {
+        self.glyphs
+            .entry(c)
+            .or_insert_with(|| glyph_texture(textures, &self.font, c))
+            .as_mut()
+    }
+}
+
 /// What identifies a [`Face`]: an absolute point size — already through the
 /// display's scale factor and the overlay's percentage — and the three style
 /// bits.
@@ -2531,9 +2492,9 @@ struct FaceKey {
     /// Bit 0 bold, bit 1 italic, bit 2 the proportional family.
     ///
     /// The family is a *bit in this byte* rather than a [`Family`] field beside
-    /// it, and the reason is the frame digest. `draw_styled_char` folds the key
-    /// into the digest as its two numbers, so anything that identifies a face
-    /// and is not in one of them is a change the digest cannot see — and the
+    /// it, and the reason is the frame digest. [`Renderer::draw_glyph_in`] folds
+    /// the key into the digest as its two numbers, so anything that identifies a
+    /// face and is not in one of them is a change the digest cannot see — and the
     /// symptom of that is not a wrong pixel but a frame that is never presented,
     /// because two pictures differing only in their typeface hashed the same.
     /// One byte carrying every bit of the decision is the shape that cannot go
@@ -2542,6 +2503,14 @@ struct FaceKey {
 }
 
 impl FaceKey {
+    /// The body cut: the monospace family at the size the grid itself is set in,
+    /// plain or bold. The two [`Renderer`] holds as fields rather than in
+    /// [`Renderer::faces`] — see [`Renderer::body_face`], which is the reader of
+    /// exactly these two keys.
+    fn body(point_size: u16, bold: bool) -> Self {
+        Self { point_size, style: u8::from(bold) }
+    }
+
     /// Whether this face is the proportional one — bit 2 of [`FaceKey::style`],
     /// read here rather than spelled out at each of the three call sites that
     /// want it.
@@ -2588,7 +2557,6 @@ fn face_key(body_point_size: u16, cut: Cut) -> FaceKey {
 /// the cache past what a glyph draw would have.
 fn cached_face<'a>(
     faces: &'a mut HashMap<FaceKey, Option<Face>>,
-    ttf: &'static Sdl2TtfContext,
     path: &std::path::Path,
     key: FaceKey,
 ) -> Option<&'a mut Face> {
@@ -2600,7 +2568,7 @@ fn cached_face<'a>(
     }
     faces
         .entry(key)
-        .or_insert_with(|| open_face(ttf, path, key))
+        .or_insert_with(|| open_face(path, key).ok())
         .as_mut()
 }
 
@@ -2661,11 +2629,14 @@ fn on_this_box(key: FaceKey, prose: Option<&std::path::Path>) -> FaceKey {
 /// # The frame digest
 ///
 /// A substitution changes the *key*, and the key is what the painter folds into
-/// the digest: `draw_styled_char` marks `(point_size, style)`, and clearing the
-/// family bit changes `style`. A substituted character that lands on the body
-/// face goes through `draw_char` instead, which marks a differently shaped word
-/// entirely. Either way the digest moves with the picture, which is the property
+/// the digest: [`Renderer::draw_glyph_in`] marks `(point_size, style)` for every
+/// glyph it blits, whichever face held it, and clearing the family bit changes
+/// `style`. So the digest moves with the picture, which is the property
 /// [`Renderer::drawn`] needs and the one a face swapped silently would break.
+/// It is also why one blit for all three faces is the safer shape and not merely
+/// the shorter one: when the body cuts marked a word of their own, a character
+/// substituted *onto* one of them changed the digest by changing which word was
+/// folded, which is true by luck rather than by construction.
 ///
 /// # The ASCII gate
 ///
@@ -2741,20 +2712,33 @@ const MAX_FACES: usize = SCALE_STEPS.len() * 8;
 /// three of them holding a few dozen glyphs apiece.
 const MAX_FACE_GLYPHS: usize = 256;
 
-/// A font at one size and style, or `None` if it will not open — cached as a
-/// failure so a missing file is not re-`stat`ed sixty times a second.
-fn open_face(
-    ttf: &'static Sdl2TtfContext,
-    path: &std::path::Path,
-    key: FaceKey,
-) -> Option<Face> {
-    let mut font = ttf.load_font(path, key.point_size).ok()?;
-    set_hinting(&mut font);
+/// A font at one size and style, with an empty glyph cache in front of it.
+///
+/// Fallible rather than optional, and that is what lets the *body* face come out
+/// of here too: [`Renderer::new`] and [`Renderer::sync`] have to report a coding
+/// font that will not open — there is nothing to fall back to and every cell of
+/// every buffer is set in one — while [`cached_face`] throws the reason away and
+/// caches the `None`, so a missing file is not re-`stat`ed sixty times a second.
+/// One opener for all of them; the two callers differ only in what they do with a
+/// refusal.
+fn open_face(path: &std::path::Path, key: FaceKey) -> anyhow::Result<Face> {
+    let mut font = ttf()?.load_font(path, key.point_size).map_err(|e| {
+        anyhow::anyhow!("cannot open font {} at {}pt: {e}", path.display(), key.point_size)
+    })?;
+    // macOS does not hint at all — CoreText positions glyphs on the real outline
+    // and lets the resolution carry it. FreeType's default is full hinting, which
+    // snaps stems to the pixel grid and is why the same font looks subtly wrong
+    // here next to a native application. Light hints vertically only, which keeps
+    // the baseline crisp without distorting letterforms sideways.
+    font.set_hinting(Hinting::Light);
     // Synthetic, both of them: FreeType smears the outline for bold and shears
     // it for italic rather than loading designed faces, which is what keeps the
     // advance the grid's and not the font's. A designed italic would need a
     // second file, a second search path, and a per-family table — and would
-    // still be drawn on the same monospace grid.
+    // still be drawn on the same monospace grid. It is also exactly what the
+    // *body* bold wants: the advance is unchanged, so a bold run occupies the
+    // columns a plain one would and the modeline's segments do not shift when a
+    // mode name changes.
     let mut style = sdl2::ttf::FontStyle::NORMAL;
     if key.style & 1 != 0 {
         style |= sdl2::ttf::FontStyle::BOLD;
@@ -2763,23 +2747,49 @@ fn open_face(
         style |= sdl2::ttf::FontStyle::ITALIC;
     }
     font.set_style(style);
-    Some(Face {
+    Ok(Face {
         font,
         glyphs: HashMap::new(),
     })
 }
 
+/// The process's SDL_ttf context.
+///
+/// One for the whole process rather than one leaked per [`Renderer`], which is
+/// what it was and what made "one `Renderer` per process" a documented ceiling.
+/// It never needed to be: `Sdl2TtfContext` is a zero-sized handle onto a C
+/// library that counts its own initialisations, so a second frame's `init` was
+/// only ever bumping that count — and leaking the handle so the `Font`s it hands
+/// out can be `'static` is a decision about the *process*, not about a window.
+///
+/// Never quit, deliberately and now honestly: every open face borrows from this
+/// for `'static`, and the moment none of them is alive is the moment the process
+/// exits. A `OnceLock` is the shape that says so.
+///
+/// Fallible on the first call and infallible after. [`Renderer::new`] is where
+/// the first font is opened, so a broken FreeType is still an error the app can
+/// print rather than a panic in the middle of a frame.
+fn ttf() -> anyhow::Result<&'static Sdl2TtfContext> {
+    static TTF: OnceLock<Sdl2TtfContext> = OnceLock::new();
+    match TTF.get() {
+        Some(ctx) => Ok(ctx),
+        None => {
+            let ctx = sdl2::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
+            Ok(TTF.get_or_init(move || ctx))
+        }
+    }
+}
+
 /// FNV-1a's constants, and tags that keep one kind of draw call from colliding
-/// with another. The character tags are the code points themselves — every
-/// scalar value is below `TAG_BOLD`, so nothing overlaps.
+/// with another. A glyph's tag carries the code point in its low bits — every
+/// scalar value is below `TAG_GLYPH`, so the xor cannot reach the tag above it.
 const FNV_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-const TAG_BOLD: u64 = 1 << 24;
+const TAG_GLYPH: u64 = 1 << 24;
 const TAG_FRAME: u64 = 1 << 25;
 const TAG_CLEAR: u64 = 1 << 26;
 const TAG_FILL: u64 = 1 << 27;
 const TAG_CLIP: u64 = 1 << 28;
-const TAG_STYLED: u64 = 1 << 29;
 const TAG_SCENE: u64 = 1 << 30;
 
 /// Two coordinates in one word, so a draw call is four folds rather than six.
@@ -2793,7 +2803,6 @@ fn bits(c: Color) -> u64 {
     u64::from(u32::from_be_bytes([c.r, c.g, c.b, c.a]))
 }
 
-/// `None` when the font has no glyph for `c` — cached so we don't retry it.
 /// How much to darken glyph stems. 1.0 is off; higher is heavier.
 ///
 /// FreeType hands back linear coverage, and blending that straight onto a dark
@@ -2803,6 +2812,7 @@ fn bits(c: Color) -> u64 {
 /// text here did not look like text in Emacs.
 const STEM_GAMMA: f32 = 1.45;
 
+/// `None` when the font has no glyph for `c` — cached so we don't retry it.
 fn glyph_texture(
     textures: &'static TextureCreator<WindowContext>,
     font: &Font,
@@ -2875,34 +2885,6 @@ fn darken_stems(surface: &mut Surface) {
             pixel[3] = curve[pixel[3] as usize];
         }
     });
-}
-
-/// macOS does not hint at all — CoreText positions glyphs on the real outline
-/// and lets the resolution carry it. FreeType's default is full hinting, which
-/// snaps stems to the pixel grid and is why the same font looks subtly wrong
-/// here next to a native application. Light hints vertically only, which keeps
-/// the baseline crisp without distorting letterforms sideways.
-/// The same file, emboldened.
-///
-/// SDL_ttf's `BOLD` is synthetic — FreeType smears the outline rather than
-/// loading a designed bold — which is exactly what is wanted here: the advance
-/// is unchanged, so a bold run occupies the same cells as a plain one and the
-/// modeline's columns do not move when the mode name changes.
-fn open_bold(
-    ttf: &'static Sdl2TtfContext,
-    path: &std::path::Path,
-    point_size: u16,
-) -> anyhow::Result<Font<'static, 'static>> {
-    let mut bold = ttf
-        .load_font(path, point_size)
-        .map_err(|e| anyhow::anyhow!("cannot open font {}: {e}", path.display()))?;
-    set_hinting(&mut bold);
-    bold.set_style(sdl2::ttf::FontStyle::BOLD);
-    Ok(bold)
-}
-
-fn set_hinting(font: &mut Font) {
-    font.set_hinting(Hinting::Light);
 }
 
 fn metrics(font: &Font) -> (i32, i32) {
@@ -3297,12 +3279,6 @@ fn line_col(buf: &Buffer, cursor: usize) -> (usize, usize) {
     (line, c - buf.line_start(line))
 }
 
-/// What a pane's modeline says.
-///
-/// The active pane gets the editor's status line — mode, position, messages,
-/// and the prompt while one is open. The others get only their own buffer,
-/// because every other field in that line describes the focused window and
-/// would be the same lie repeated in every pane.
 // --- modeline appearance ---------------------------------------------------
 //
 // Every knob Emacs exposes on `mode-line` lives behind one of the functions
@@ -4436,7 +4412,7 @@ fn line_in(font: Option<&Font>, line_h: i32, ascent: i32, pct: u16) -> (i32, i32
 /// the scene's runs name *before* handing itself to the layout engine, so
 /// measuring is a pure read of a map that is already populated. The alternatives
 /// were a `RefCell` around `faces` — which would put a runtime borrow on
-/// `draw_styled_char`, the hottest typeset path there is, to serve a call that
+/// [`Renderer::draw_glyph_in`], the hottest path there is, to serve a call that
 /// happens once per relayout — and a separate struct borrowing the fonts, which
 /// would have to be `pub` and would therefore put `sdl2::ttf::Font` in this
 /// crate's public API. The pre-pass costs one walk of the arena and changes
@@ -4506,15 +4482,15 @@ impl Renderer {
     ///
     /// **The one place that question is answered**, and it has two callers that
     /// must never disagree: [`Renderer::face_font`], which decides what
-    /// *measures* a character, and [`Renderer::draw_glyph`], which decides what
-    /// *draws* it. They were two copies of this test once, and a family added to
-    /// one and not the other is what set a whole page in the wrong font while
-    /// spacing it in the right one.
+    /// *measures* a character, and [`Renderer::draw_glyph_in`], which decides
+    /// what *draws* it. They were two copies of this test once, and a family
+    /// added to one and not the other is what set a whole page in the wrong font
+    /// while spacing it in the right one.
     ///
     /// Both fields are the *monospace* family at the body size, so a prose key
-    /// never lands here: `style` 0 and 1 are mono plain and mono bold, and bit 2
-    /// being set puts the key past both and into the map, which is where every
-    /// prose face lives.
+    /// never lands here: `style` 0 and 1 are mono plain and mono bold — which is
+    /// exactly [`FaceKey::body`] — and bit 2 being set puts the key past both and
+    /// into the map, which is where every prose face lives.
     fn body_face(&self, key: FaceKey) -> Option<bool> {
         match key.style {
             0 if key.point_size == self.point_size => Some(false),
@@ -4526,8 +4502,8 @@ impl Renderer {
     /// The font handle behind `key`, without opening anything.
     fn face_font(&self, key: FaceKey) -> Option<&Font<'static, 'static>> {
         match self.body_face(key) {
-            Some(false) => Some(&self.font),
-            Some(true) => Some(&self.bold),
+            Some(false) => Some(&self.body.font),
+            Some(true) => Some(&self.bold.font),
             None => self.faces.get(&key)?.as_ref().map(|f| &f.font),
         }
     }
@@ -4591,7 +4567,6 @@ impl Renderer {
                 }
             }
         }
-        let ttf = self.ttf;
         // Cloned once for the whole pre-pass, not per face: `cached_face` wants
         // the path while it holds `&mut self.faces`, and those are two fields of
         // one struct. Both families, because a document is prose with listings
@@ -4601,7 +4576,7 @@ impl Renderer {
         let prose = self.prose_path.clone();
         for key in want {
             let file = face_file(key, &path, prose.as_deref());
-            cached_face(&mut self.faces, ttf, file, key);
+            cached_face(&mut self.faces, file, key);
         }
     }
 
@@ -4960,7 +4935,8 @@ impl Renderer {
         }
     }
 
-    /// A hairline around `(x, y, w, h)`, as four fills.
+    /// A hairline around `(x, y, w, h)`, as four fills — the outline three
+    /// popups and a scene's `Block::border` all wanted, drawn once.
     ///
     /// Inside the rect rather than around it, so a border on a block flush with
     /// the pane's edge is visible rather than clipped away. It takes no part in
@@ -7000,25 +6976,25 @@ mod tests {
     ///
     /// Everything else about typesetting in this file is arithmetic and is
     /// tested as arithmetic. This is the one step that talks to FreeType, and it
-    /// is the step whose failure mode is silent: `open_face` answering `None`,
-    /// or the point size not moving, would draw a heading at body size and no
-    /// amount of layout testing would notice.
+    /// is the step whose failure mode is silent: `open_face` refusing, or the
+    /// point size not moving, would draw a heading at body size and no amount of
+    /// layout testing would notice.
     ///
     /// No window — `Sdl2TtfContext` needs no video subsystem — so this runs on a
-    /// headless box like every other test here. The `Box::leak` is the same
-    /// trade `Renderer::new` makes and is documented there.
+    /// headless box like every other test here. It is the process's own [`ttf`],
+    /// initialised by whichever of these tests runs first, which is exactly the
+    /// sharing the editor does between two frames.
     #[test]
     fn a_scaled_face_opens_and_is_bigger_than_the_body() {
         let Ok(path) = find_font() else {
             return; // no font on this box; the test above already said so
         };
-        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
         let advance = |pct: u16, style: u8| {
             let key = FaceKey {
                 point_size: scaled(18, pct).clamp(4, 400) as u16,
                 style,
             };
-            let face = open_face(ttf, &path, key).expect("the body font opens at every step");
+            let face = open_face(&path, key).expect("the body font opens at every step");
             metrics(&face.font)
         };
         let (body_w, body_h) = advance(100, 0);
@@ -7238,16 +7214,15 @@ mod scenes {
     }
 
     /// The real path, with a real font and no window — `Sdl2TtfContext` needs no
-    /// video subsystem, which is what lets this run on a headless box. The
-    /// `Box::leak` is the trade `Renderer::new` makes and documents.
+    /// video subsystem, which is what lets this run on a headless box, and
+    /// [`ttf`] is one for the whole test binary the way it is one per editor.
     #[test]
     fn a_real_face_measures_a_string_wider_than_nothing_and_larger_sizes_wider_still() {
         let Ok(path) = find_font() else {
             return; // no font on this box; `a_monospace_font_is_findable` says so
         };
-        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
         let open = |pct: u16| {
-            open_face(ttf, &path, face_key(18, scene_cut(style(pct, false, false))))
+            open_face(&path, face_key(18, scene_cut(style(pct, false, false))))
                 .expect("the body font opens at every step")
         };
         let (body, big) = (open(100), open(200));
@@ -7320,10 +7295,9 @@ mod scenes {
         let (Ok(mono_path), Ok(Some(prose_path))) = (find_font(), find_prose_font()) else {
             return; // the two tests above have already said which is missing
         };
-        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
         let open = |path: &PathBuf, family| {
-            open_face(ttf, path, face_key(18, scene_cut(in_family(100, family))))
-                .unwrap_or_else(|| panic!("{} would not open at the body size", path.display()))
+            open_face(path, face_key(18, scene_cut(in_family(100, family))))
+                .unwrap_or_else(|e| panic!("{} at the body size: {e}", path.display()))
         };
         let mono = open(&mono_path, Family::Mono);
         let prose = open(&prose_path, Family::Prose);
@@ -7378,12 +7352,11 @@ mod scenes {
         let Ok(Some(path)) = find_prose_font() else {
             return; // no proportional font on this box
         };
-        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
         // Every cut a document actually uses, since a sheared italic is where
         // the bearings are worst.
         for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
             let cut = scene_cut(Style { bold, italic, ..in_family(100, Family::Prose) });
-            let face = open_face(ttf, &path, face_key(18, cut)).expect("the prose face opens");
+            let face = open_face(&path, face_key(18, cut)).expect("the prose face opens");
             let font = &face.font;
             // Pairs a designer would have kerned, an ascender-descender clash,
             // and text with punctuation and accents in it.
@@ -7457,13 +7430,12 @@ mod scenes {
         let (Ok(mono_path), Ok(Some(prose_path))) = (find_font(), find_prose_font()) else {
             return; // the two font tests have already said which is missing
         };
-        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
         // Every cut, because a substitution changes the family and must change
         // nothing else: a 200% bold heading's star is still 200% and still bold.
         for (pct, bold, italic) in [(100, false, false), (200, true, false), (100, false, true)] {
             let cut = scene_cut(Style { bold, italic, ..in_family(pct, Family::Prose) });
             let key = face_key(18, cut);
-            let prose = open_face(ttf, &prose_path, key).expect("the prose face opens");
+            let prose = open_face(&prose_path, key).expect("the prose face opens");
             let at = |c| substituted(key, |_| Some(&prose.font), c);
 
             // Nothing anywhere maps the private use area, so this is the leg that
@@ -7477,7 +7449,7 @@ mod scenes {
             // And the characters that actually produced the screenshot. A prose
             // face carrying one of these is not the face that produced the bug,
             // and there is nothing for this to say about it.
-            let mono = open_face(ttf, &mono_path, key.mono()).expect("the coding face opens");
+            let mono = open_face(&mono_path, key.mono()).expect("the coding face opens");
             let mut ever_substituted = false;
             for &c in PAGE_FURNITURE {
                 if prose.font.find_glyph(c).is_none() {
@@ -7520,10 +7492,9 @@ mod scenes {
         let (Ok(mono_path), Ok(Some(prose_path))) = (find_font(), find_prose_font()) else {
             return;
         };
-        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
         let key = face_key(18, scene_cut(in_family(100, Family::Prose)));
-        let prose = open_face(ttf, &prose_path, key).expect("the prose face opens");
-        let mono = open_face(ttf, &mono_path, key.mono()).expect("the coding face opens");
+        let prose = open_face(&prose_path, key).expect("the prose face opens");
+        let mono = open_face(&mono_path, key.mono()).expect("the coding face opens");
 
         let every: Vec<char> = ['a', 'é', '—', '\u{e123}']
             .into_iter()
@@ -7599,9 +7570,8 @@ mod scenes {
         let Ok(Some(path)) = find_prose_font() else {
             return;
         };
-        let ttf: &'static Sdl2TtfContext = Box::leak(Box::new(sdl2::ttf::init().unwrap()));
         let key = face_key(18, scene_cut(in_family(100, Family::Prose)));
-        let face = open_face(ttf, &path, key).expect("the prose face opens");
+        let face = open_face(&path, key).expect("the prose face opens");
         for c in (0x20u8..=0x7e).map(char::from) {
             assert!(
                 face.font.find_glyph(c).is_some(),

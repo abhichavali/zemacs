@@ -4,10 +4,10 @@
 //! frame; spawns the Common Lisp image and drains its commands each frame.
 //!
 //! Command flow, in one place: the keyboard, the mouse and Lisp all produce
-//! [`EditorCommand`]s, and every one of them goes through [`dispatch`]. Most
-//! land in `Editor::apply` (the single document writer); three are *effects*
-//! the pure core cannot perform — evaluating Lisp, reading a file, writing a
-//! file — and this layer performs them.
+//! [`EditorCommand`]s, and every one of them goes through [`App::dispatch`].
+//! Most land in `Editor::apply` (the single document writer); three are
+//! *effects* the pure core cannot perform — evaluating Lisp, reading a file,
+//! writing a file — and this layer performs them.
 //!
 //! The invariant worth stating out loud: **`renderers[i]` draws
 //! `editor.frames[i]`**. Frames appear from the core (`M-x new-frame`) and the
@@ -16,6 +16,7 @@
 //! the same breath. Everything else — event routing, focus — is an index into
 //! both vectors at once, so nothing may remove from one alone.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -335,6 +336,28 @@ fn focus_after_close(focus: usize, closed: usize, before: usize) -> usize {
     if focus > closed { focus - 1 } else { focus }.min(last)
 }
 
+// --- every open buffer ------------------------------------------------------
+//
+// Core keeps the live buffer out of `others`, so "all of them" is a two-part
+// walk rather than a field. Four places here wanted it and each spelled it
+// slightly differently, which is how `autosave_all` came to visit the live
+// buffer by hand and the revert sweep by iterator. Two helpers rather than one
+// because the mutable half also wants to find *one* buffer, which is the shape
+// core answers read-only as `Editor::buffer_by_id` and has no writer for.
+
+/// Every open buffer, live and parked.
+fn buffers(editor: &Editor) -> impl Iterator<Item = &zemacs_core::Buffer> {
+    std::iter::once(&editor.buffer).chain(editor.others.iter())
+}
+
+/// Buffer `id`, live or parked, to write to. The mutable twin core does not
+/// have — see the note above.
+fn buffer_mut(editor: &mut Editor, id: BufferId) -> Option<&mut zemacs_core::Buffer> {
+    std::iter::once(&mut editor.buffer)
+        .chain(editor.others.iter_mut())
+        .find(|b| b.id == id)
+}
+
 /// The `after-edit-hook` call for whatever has happened to the live buffer
 /// since the image was last told, or `None` when the answer is "nothing".
 ///
@@ -392,13 +415,35 @@ fn after_edit_form(editor: &Editor, told: &mut Option<(BufferId, u64)>) -> Optio
         ),
     };
     let text = editor.buffer.slice_string(change.start, change.new_end);
-    Some(format!(
-        "(let ((h (find-symbol \"AFTER-EDIT-HOOK\" :zemacs))) \
-           (when (and h (fboundp h)) (funcall h {} {old_end} {} {})))",
-        change.start,
-        change.new_end,
-        zemacs_rpc::lisp::string(&text),
+    Some(lisp_call(
+        "AFTER-EDIT-HOOK",
+        &format!(
+            "{} {old_end} {} {}",
+            change.start,
+            change.new_end,
+            zemacs_rpc::lisp::string(&text),
+        ),
     ))
+}
+
+/// The one shape every signal this layer sends the image takes: look the symbol
+/// up in `ZEMACS`, and call it only if a config actually defined it.
+///
+/// Five call sites wrote this out by hand, which is five chances to drop the
+/// `fboundp` — and dropping it turns a config that never loaded `runtime/rpc.lisp`
+/// into an "undefined function" per message rather than into silence, which is
+/// the behaviour every one of the five wanted and none of them stated. `args` is
+/// already spelled as Lisp, because the only thing that varies between the five
+/// is how their arguments are spelled and two of them have none.
+///
+/// A `String` rather than a send, because [`after_edit_form`] has to build its
+/// call under the lock and hand it over — the delta is only meaningful sliced
+/// from the document that produced it. [`App::call_lisp`] is the other four.
+fn lisp_call(name: &str, args: &str) -> String {
+    format!(
+        "(let ((h (find-symbol {} :zemacs))) (when (and h (fboundp h)) (funcall h {args})))",
+        zemacs_rpc::lisp::string(name)
+    )
 }
 
 fn main() -> anyhow::Result<()> {
@@ -425,13 +470,7 @@ fn main() -> anyhow::Result<()> {
     // event's timestamp is in it, and the interesting part of a keystroke's life
     // is over before this loop ever sees the event.
     let timer = sdl.timer().map_err(|e| anyhow::anyhow!("SDL timer: {e}"))?;
-
-    // Text input is toggled per mode — see `wants_text_input`. It is off to
-    // begin with because the editor opens on the dashboard.
     let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL video: {e}"))?;
-    let text_input = video.text_input();
-    text_input.stop();
-    let mut text_input_on = false;
 
     let init_path = resolve_init_path();
     let (tx, rx): (Sender<EditorCommand>, Receiver<EditorCommand>) =
@@ -455,39 +494,12 @@ fn main() -> anyhow::Result<()> {
     // Lisp thread owns the image, and neither ever waits on a parse.
     let highlighter = zemacs_syntax::spawn_worker();
 
-    let mut last_revision = u64::MAX;
-    // How much of the live buffer's change log each reader has already acted
-    // on, as `(buffer, count)`. Two watermarks and not one, because the two
-    // readers are fed on different conditions — the parser only for a buffer
-    // with a language — and a shared one would hand whichever of them had been
-    // skipped a list of edits starting after text it never saw. `None`, and a
-    // buffer that does not match, both mean "start again".
-    let mut told_lisp: Option<(BufferId, u64)> = None;
-    let mut told_syntax: Option<(BufferId, u64)> = None;
-    // Where point was when the image was last told. `usize::MAX` cannot be a
-    // real offset, so the first pass through the loop always reports — which is
-    // what makes a config see the cursor it started next to.
-    let mut last_point = usize::MAX;
-    let mut last_file_query: Option<String> = None;
-    let mut last_grep: Option<String> = None;
-    let mut keys: Vec<Key> = Vec::new();
-    // There used to be a `swallow_text` flag here: an Alt keydown armed it and
-    // the `TextInput` macOS composed from the combo (⌥- is –, ⌥= is ≠) was
-    // dropped, because Option was a Meta fallback and `M--` had already been
-    // dispatched. The config sets `mac-option-modifier 'none`, so that was
-    // backwards — the composed character *is* the thing being asked for. Option
-    // is no longer a modifier here (see `key_from_keydown`) and the text it
-    // produces is now inserted like any other.
-    let mut mouse = Mouse::default();
-    let mut cursors = Cursors::new();
-    let mut magit = Magit::default();
-    let mut dired = Dired::default();
-    let mut term = Term::default();
-    let mut project = Project::default();
-    let mut last_autosave = Instant::now();
-    let mut last_revert = Instant::now();
-    let mut revert_watch = Revert::default();
-    let mut clipboard = Clipboard::new(&video);
+    // Everything else the loop needs, in one place — see [`App`]. The `sdl`
+    // handle goes in with it, because `pump`, `timer` and `video` above are all
+    // it was wanted for out here and the one remaining caller — opening a window
+    // for a frame core pushed — belongs to the app rather than to this function.
+    let mut app = App::new(sdl, &video, renderers, lisp, init_path);
+    let mut batch = Batch::default();
     let mut perf = Perf::new();
     // Whether the last iteration put anything on screen, which is the same
     // question as "has this one already been paced": a present blocks until the
@@ -515,7 +527,9 @@ fn main() -> anyhow::Result<()> {
         // happens.
         let idle = Instant::now();
         let waited = (!presented)
-            .then(|| pump.wait_event_timeout(renderers.first().map_or(16, Renderer::frame_ms)))
+            .then(|| {
+                pump.wait_event_timeout(app.renderers.first().map_or(16, Renderer::frame_ms))
+            })
             .flatten();
         let frame_start = Instant::now();
         perf.idle += frame_start - idle;
@@ -524,469 +538,25 @@ fn main() -> anyhow::Result<()> {
         // is where the frame's idle time actually is. A Lisp primitive waits at
         // most for one iteration's worth of input handling and drawing, never
         // for the display — that is what keeps a slow config from being felt.
+        //
+        // Every `app.` call below takes `&mut editor`, and that is the whole
+        // statement of the discipline: each one is a phase of *this* iteration,
+        // run under *this* lock, in this order. The only one that does not is
+        // `present`, below the `drop`.
         let mut editor = shared.lock().unwrap_or_else(|e| e.into_inner());
-        keys.clear();
-        // At most one window closes per iteration: a close shifts every later
-        // frame index down, and the rest of this batch was routed against the
-        // old ones. Deferring it keeps the whole batch consistent.
-        let mut closing: Option<usize> = None;
-        // When the earliest keystroke of this batch was stamped, for the perf
-        // report to subtract from the present at the bottom.
-        let mut typed: Option<u32> = None;
+        batch.start();
 
         // The event the wait above returned is the first of the batch — dropping
         // it would lose exactly the keystroke that woke us.
         for event in waited.into_iter().chain(pump.poll_iter()) {
-            match event {
-                Event::Quit { .. } => break 'main,
-                // Event-driven rather than polled: reading the clipboard is a
-                // trip through the window server, and SDL is already watching
-                // it for us. ponytail: if a platform turns out not to raise
-                // this, the fallback is a once-a-second pull beside the
-                // auto-save timer — same call, worse latency.
-                Event::ClipboardUpdate { .. } => clipboard.pull(&mut editor),
-                // How a file arrives from *outside* the process. Finder's "Open
-                // With" and a double-click on a file zemacs is the default for
-                // do not use argv — macOS sends an `odoc` Apple event, which SDL
-                // turns into this. Dragging a file onto the window is the same
-                // event, so both work off one arm.
-                Event::DropFile { filename, .. } => {
-                    open_file(&mut editor, &PathBuf::from(filename), &init_path)
-                }
-                Event::Window {
-                    window_id,
-                    win_event,
-                    ..
-                } => {
-                    let frame = frame_for_window(renderers.iter().map(Renderer::window_id), window_id);
-                    // Anything the *window system* says happened is a reason to
-                    // put the frame up again whether or not the editor moved:
-                    // exposed, resized, un-minimised, dragged to another
-                    // display. This is the one case where "the picture is
-                    // identical" is not the same as "the screen is right", and
-                    // it is what the skipped present below is safe *because* of.
-                    // Window events are rare, so the extra present costs nothing
-                    // anyone can measure.
-                    if let Some(i) = frame {
-                        renderers[i].invalidate();
-                    }
-                    match win_event {
-                        // The window manager decides which frame is current and
-                        // the editor follows it; there is no other source of
-                        // truth.
-                        //
-                        // ponytail: a bare assignment, so the *live* buffer and
-                        // cursor follow the pointer into the newly focused frame
-                        // instead of that frame's own window being adopted. Core
-                        // does the adopting (`Editor::adopt_window`) but only
-                        // from inside `apply`, and it has no command for "focus
-                        // frame N" — every window command works on
-                        // `focus_frame`. Fixing it properly means an
-                        // `EditorCommand::FocusFrame(usize)` in core, next to
-                        // `NewFrame`; until then two frames showing different
-                        // buffers swap contents when you click between them.
-                        WindowEvent::FocusGained => {
-                            if let Some(i) = frame {
-                                // Through the command, not a bare assignment:
-                                // the live buffer belongs to the focused window,
-                                // so core has to park it and adopt the new
-                                // frame's.
-                                let cmd = EditorCommand::FocusFrame(i);
-                                dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
-                            }
-                        }
-                        WindowEvent::Close => {
-                            if let Some(i) = frame {
-                                closing.get_or_insert(i);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                // Keys are not routed by window: the editor is global and the
-                // focused frame is where they land.
-                Event::KeyDown {
-                    keycode: Some(kc),
-                    keymod,
-                    timestamp,
-                    ..
-                } => {
-                    typed = Some(typed.map_or(timestamp, |t: u32| t.min(timestamp)));
-                    keys.extend(key_from_keydown(kc, keymod, !text_input_on));
-                }
-                // The right button, whose one job is the menu. Deliberately not
-                // sent to a terminal child even in Terminal mode: a right-click
-                // is how you reach the *window manager* here, and there is no
-                // other gesture that opens a second frame with the mouse.
-                Event::MouseButtonDown {
-                    window_id,
-                    mouse_btn: MouseButton::Right,
-                    x,
-                    y,
-                    ..
-                } => {
-                    if let Some(i) =
-                        frame_for_window(renderers.iter().map(Renderer::window_id), window_id)
-                    {
-                        let (x, y) = renderers[i].to_pixels(x, y);
-                        // Focused first, for the left click's reason: the menu's
-                        // verbs act on the focused frame, and right-clicking an
-                        // unfocused window and getting a split in another one is
-                        // the one outcome nobody means.
-                        let cmd = EditorCommand::FocusFrame(i);
-                        dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
-                        editor.open_context_menu(x, y);
-                    }
-                }
-                Event::MouseButtonDown {
-                    window_id,
-                    mouse_btn: MouseButton::Left,
-                    x,
-                    y,
-                    ..
-                } => {
-                    if let Some(i) =
-                        frame_for_window(renderers.iter().map(Renderer::window_id), window_id)
-                    {
-                        let (x, y) = renderers[i].to_pixels(x, y);
-                        let area = renderers[i].content_area();
-                        // A menu is modal to the pointer: while one is up, the
-                        // left button belongs to it and to nothing else. Picking
-                        // takes it down, and so does a click that missed — which
-                        // is what a click outside a menu means everywhere.
-                        if editor.context_menu.is_some() {
-                            let row = renderers[i].context_menu_row(&editor, x, y);
-                            if let Some(verb) = editor.pick_context_menu(row) {
-                                // Through `run_action`, the door a keybinding
-                                // uses: a menu entry cannot do anything a key
-                                // could not.
-                                for cmd in editor.run_action(verb) {
-                                    dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
-                                }
-                            }
-                            continue;
-                        }
-                        // A click anywhere in a window focuses its frame. The
-                        // `FocusGained` above would do it a moment later anyway;
-                        // doing it here means the `FocusWindow` below addresses
-                        // the frame that was actually clicked.
-                        dispatch(
-                            &mut editor,
-                            &lisp,
-                            EditorCommand::FocusFrame(i),
-                            &init_path,
-                            &mut renderers,
-                            &mut magit,
-                            &mut dired,
-                            &mut term,
-                            &mut project,
-                        );
-                        if let Some(window) = mouse.press(&editor.frames[i], i, area, x, y) {
-                            let cmd = EditorCommand::FocusWindow(window);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
-                            // A pane showing a scene has no character to land
-                            // on: there is no point in a scene and no offset a
-                            // click could name, so the gesture is a hit test and
-                            // what it means is Lisp's — the same division of
-                            // labour an `OverlayId` has. Same guard as the
-                            // terminal's click and as a mode hook: a config that
-                            // never defined the handler is silence, not an
-                            // error. Nothing is escaped because a tag is an
-                            // integer, which is the reason a tag *is* an
-                            // integer.
-                            //
-                            // ponytail: `hit` also answers the node id, and this
-                            // drops it — so "you clicked a figure, which means
-                            // nothing" and "you clicked outside the page" both
-                            // arrive as NIL. Ceiling: a mode wanting to react to
-                            // an untagged node. The upgrade path is a second
-                            // argument, since the id is already in hand here.
-                            // Resolved before the match so the borrow of the
-                            // renderer ends with the statement: the other arm
-                            // dispatches, and dispatching wants every renderer.
-                            let on_a_page = renderers[i]
-                                .scene_layout(&editor, i)
-                                .map(|(layout, _)| {
-                                    zemacs_gui::hit(layout, x, y).and_then(|(_, tag)| tag)
-                                });
-                            match on_a_page {
-                                Some(tag) => {
-                                    let tag = tag.map_or("nil".into(), |t| t.to_string());
-                                    lisp.eval(format!(
-                                        "(let ((h (find-symbol \"%SCENE-CLICK\" :zemacs))) \
-                                           (when (and h (fboundp h)) (funcall h {tag})))"
-                                    ));
-                                }
-                                // ...and then land on the character that was
-                                // clicked. Focusing alone made the pointer a way
-                                // to pick a *pane* and nothing smaller, which is
-                                // the one thing everybody expects a mouse to do.
-                                // The arithmetic belongs to the renderer — see
-                                // `click_target` for why — and it comes back
-                                // after the focus so the window it names is live.
-                                None => {
-                                    if let Some((_, at)) =
-                                        renderers[i].click_target(&editor, i, x, y)
-                                    {
-                                        // A click collapses whatever was
-                                        // selected, the way it does everywhere
-                                        // else — without this, clicking during
-                                        // a selection drags its far end instead
-                                        // of starting again. Left to `MoveTo`
-                                        // alone the drag below would also find
-                                        // an anchor it never set.
-                                        if editor.mode.is_visual() {
-                                            let cmd = EditorCommand::SetMode(
-                                                zemacs_core::Mode::Normal,
-                                            );
-                                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
-                                        }
-                                        let cmd = EditorCommand::MoveTo(at);
-                                        dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
-                                    }
-                                }
-                            }
-                        }
-                        // A program that asked for mouse events gets the click:
-                        // that is what makes vim, htop and tmux usable in here.
-                        // Focusing the pane happened first, so clicking into an
-                        // unfocused terminal both focuses it and reaches the
-                        // program in one gesture.
-                        if editor.mode == zemacs_core::Mode::Terminal {
-                            let (col, row) = cell_at(&editor, &renderers, x, y);
-                            let taken = term.mouse(&editor, zemacs_term::Mouse {
-                                button: zemacs_term::Button::Left,
-                                kind: zemacs_term::MouseKind::Press,
-                                col,
-                                row,
-                            });
-                            // Nobody wanted it. A shell never turns mouse
-                            // reporting on, so this is the click that used to
-                            // do nothing at all — it goes to Lisp with the row
-                            // it landed on and whatever OSC 8 link the child
-                            // hung on that cell, and which of the two is a link
-                            // is decided there. Same guard as a mode hook: a
-                            // config that never defined it is silence.
-                            if !taken {
-                                if let Some((line, uri)) =
-                                    term.click_context(&editor, col, row)
-                                {
-                                    let uri = uri.map_or("nil".into(), |u| {
-                                        zemacs_rpc::lisp::string(&u)
-                                    });
-                                    lisp.eval(format!(
-                                        "(let ((h (find-symbol \"%TERMINAL-CLICK\" :zemacs))) \
-                                           (when (and h (fboundp h)) (funcall h {} {col} {uri})))",
-                                        zemacs_rpc::lisp::string(&line)
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                Event::MouseButtonUp {
-                    window_id,
-                    mouse_btn: MouseButton::Left,
-                    x,
-                    y,
-                    ..
-                } => {
-                    mouse.release();
-                    // A press with no release is half a gesture. SGR reporting
-                    // makes the two separate events, so a program that only
-                    // ever hears the press has a button held down forever —
-                    // which is why clicking in `vim` or `htop` in here did
-                    // nothing until the *next* click.
-                    if editor.mode == zemacs_core::Mode::Terminal {
-                        if let Some(i) =
-                            frame_for_window(renderers.iter().map(Renderer::window_id), window_id)
-                        {
-                            let (x, y) = renderers[i].to_pixels(x, y);
-                            let (col, row) = cell_at(&editor, &renderers, x, y);
-                            term.mouse(&editor, zemacs_term::Mouse {
-                                button: zemacs_term::Button::Left,
-                                kind: zemacs_term::MouseKind::Release,
-                                col,
-                                row,
-                            });
-                        }
-                    }
-                }
-                Event::MouseMotion {
-                    window_id,
-                    x,
-                    y,
-                    mousestate,
-                    ..
-                } => match mouse.dragging() {
-                    // A held divider keeps its own frame rather than the event's:
-                    // SDL captures the mouse for the press, so the coordinates
-                    // stay in that window's space even once the pointer has left
-                    // it, and letting go of the drag at the edge is exactly the
-                    // bug this avoids.
-                    Some(i) => {
-                        if let Some(renderer) = renderers.get(i) {
-                            let (x, y) = renderer.to_pixels(x, y);
-                            mouse.motion(&mut editor.frames, x, y);
-                        }
-                    }
-                    None => {
-                        if let Some(i) =
-                            frame_for_window(renderers.iter().map(Renderer::window_id), window_id)
-                        {
-                            let (x, y) = renderers[i].to_pixels(x, y);
-                            let area = renderers[i].content_area();
-                            if let Some(cursors) = &mut cursors {
-                                cursors
-                                    .hover(editor.frames[i].divider_at(area, x, y).map(|d| d.dir));
-                            }
-                            // A menu row lights up under the pointer, which is
-                            // the only thing that makes it read as clickable.
-                            if editor.context_menu.is_some() {
-                                let row = renderers[i].context_menu_row(&editor, x, y);
-                                if let Some(m) = editor.context_menu.as_mut() {
-                                    m.hover = row;
-                                }
-                            }
-                            // Held-button motion is a drag, which is how a
-                            // selection is made in `vim` or a pane resized in
-                            // `tmux`. The terminal drops it unless the child
-                            // asked for drag reporting, so this costs nothing
-                            // for a program that did not.
-                            if mousestate.left() && editor.mode == zemacs_core::Mode::Terminal {
-                                let (col, row) = cell_at(&editor, &renderers, x, y);
-                                term.mouse(&editor, zemacs_term::Mouse {
-                                    button: zemacs_term::Button::Left,
-                                    kind: zemacs_term::MouseKind::Drag,
-                                    col,
-                                    row,
-                                });
-                            }
-                            // ...and everywhere else a drag is a selection. The
-                            // press already put the cursor where the gesture
-                            // started, so entering Visual anchors it there and
-                            // every motion after it moves only the far end —
-                            // the machinery `v` uses, which is the whole reason
-                            // `y`, `d`, `gv` and the modeline all work on what
-                            // was dragged without knowing a mouse was involved.
-                            //
-                            // `click_target` answers `None` over a dashboard or
-                            // a terminal, so neither needs excluding here: one
-                            // is a menu and the other is a grid the child owns.
-                            if mousestate.left() && editor.mode != zemacs_core::Mode::Terminal {
-                                if let Some((window, at)) =
-                                    renderers[i].click_target(&editor, i, x, y)
-                                {
-                                    // Only over the pane the press landed in. A
-                                    // drag that wanders into the next split
-                                    // would otherwise read an offset out of
-                                    // *that* buffer and apply it to this one.
-                                    let same = window == editor.frames[i].current;
-                                    // A click that wobbles by a pixel is still a
-                                    // click. Measured in characters rather than
-                                    // pixels, because a character is the unit a
-                                    // selection is actually made of.
-                                    let moved = at != editor.buffer.cursor;
-                                    if same && (moved || editor.mode.is_visual()) {
-                                        if !editor.mode.is_visual() {
-                                            let cmd = EditorCommand::SetMode(
-                                                zemacs_core::Mode::Visual,
-                                            );
-                                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
-                                        }
-                                        let cmd = EditorCommand::MoveTo(at);
-                                        dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                // SDL reports natural-scroll wheels with `direction: Flipped`
-                // and the raw sign, so undo that first; then negate, because a
-                // wheel push (positive y) moves the view *up* the file.
-                //
-                // ponytail: and then negate *again*, below, because the wheel
-                // that reads right on this desk is the other one. Hard-coded
-                // rather than a setting — a `set-scroll-direction` primitive is
-                // a C shim, an extern, a defprim and an export for one bool.
-                // Add it when a second person disagrees about which way is up.
-                Event::MouseWheel {
-                    window_id,
-                    y,
-                    direction,
-                    mouse_x,
-                    mouse_y,
-                    ..
-                } => {
-                    let y = -match direction {
-                        MouseWheelDirection::Flipped => -y,
-                        _ => y,
-                    };
-                    let frame =
-                        frame_for_window(renderers.iter().map(Renderer::window_id), window_id);
-                    if let (true, Some(i)) = (y != 0, frame) {
-                        // Scroll the pane under the pointer — by focusing it
-                        // first. `ScrollLines` moves the *live* window, and
-                        // focusing is the only way to make a pane live without
-                        // duplicating core's scroll clamping out here. It also
-                        // matches the click: pointing at a pane and acting on it
-                        // is the same gesture either way.
-                        let (px, py) = renderers[i].to_pixels(mouse_x, mouse_y);
-                        let area = renderers[i].content_area();
-                        editor.focus_frame = i;
-                        if let Some(window) = editor.frames[i].window_at(area, px, py) {
-                            let cmd = EditorCommand::FocusWindow(window);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
-                        }
-                        // A terminal has its own scrollback, and while the shell
-                        // has the keyboard the buffer holds only the *visible*
-                        // grid — scrolling that would move through a screenful
-                        // that is already all there is. `wheel` also knows to
-                        // hand the notch to a program that asked for mouse
-                        // events, or to send arrow keys to `less`.
-                        if editor.mode == zemacs_core::Mode::Terminal {
-                            let (col, row) = cell_at(&editor, &renderers, px, py);
-                            term.wheel(&editor, -y * SCROLL_LINES, col, row);
-                        } else if let Some(at) = editor.buffer.scene.as_ref().map(|s| s.scroll) {
-                            // A scene scrolls in pixels and has no viewport of
-                            // lines for `ScrollLines` to move — the cursor does
-                            // not exist here, so there is nothing to keep on
-                            // screen and nothing for core to clamp against. The
-                            // notch is the same three lines the document gets,
-                            // in the pane's own line height.
-                            let step = -y * SCROLL_LINES * renderers[i].cell_size().1;
-                            scroll_scene(&mut editor, &mut renderers[i], i, at + step);
-                            // No `invalidate()` here. The offset reaches the
-                            // frame digest — `draw_scene` folds it in, and the
-                            // boxes it moved were folded in anyway — so a notch
-                            // that changed the picture presents and a notch
-                            // against the end of the document does not, which
-                            // is what an unconditional invalidate got wrong in
-                            // the second case.
-                        } else {
-                            let cmd = EditorCommand::ScrollLines(-y * SCROLL_LINES);
-                            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
-                        }
-                    }
-                }
-                // Every character macOS hands us, including the ones it composed
-                // from an Option combo and the second half of a dead-key pair.
-                Event::TextInput {
-                    text, timestamp, ..
-                } => {
-                    // Insert mode arrives here rather than as `KeyDown`, and it
-                    // is the most latency-sensitive thing anyone does.
-                    typed = Some(typed.map_or(timestamp, |t: u32| t.min(timestamp)));
-                    keys.extend(text.chars().map(Key::Char));
-                }
-                _ => {}
+            if app.route_event(&mut editor, event, &mut batch).is_break() {
+                break 'main;
             }
         }
 
-        if let Some(i) = closing {
-            mouse.release(); // whatever was being dragged may be going away
-            close_frame(&mut editor, &mut renderers, i);
+        if let Some(i) = batch.closing {
+            app.mouse.release(); // whatever was being dragged may be going away
+            close_frame(&mut editor, &mut app.renderers, i);
         }
 
         // The dock menu's **New Frame**. It cannot reach the editor from the
@@ -994,42 +564,769 @@ fn main() -> anyhow::Result<()> {
         // the flag is spent, on the same command `M-x new-frame` sends.
         #[cfg(target_os = "macos")]
         if dock::wanted() {
-            dispatch(&mut editor, &lisp, EditorCommand::NewFrame, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+            app.dispatch(&mut editor, EditorCommand::NewFrame);
         }
 
-        for key in keys.drain(..) {
+        for key in batch.keys.drain(..) {
             for cmd in editor.handle_key(key) {
-                dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                app.dispatch(&mut editor, cmd);
             }
         }
         while let Ok(cmd) = rx.try_recv() {
-            dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+            app.dispatch(&mut editor, cmd);
         }
 
-        // Toggle SDL text input to match the mode. This is what stops macOS
-        // press-and-hold: the accent panel is a text-input-client feature, so
-        // with text input off, holding `j` repeats the keystroke natively
-        // instead of offering ĵ. Insert mode and prompts keep it on, where
-        // layout-correct characters and dead keys are what you actually want.
-        let want_text = wants_text_input(&editor);
-        if want_text != text_input_on {
-            if want_text {
-                text_input.start();
-            } else {
-                text_input.stop();
-            }
-            text_input_on = want_text;
-        }
+        app.sync_text_input(&editor);
 
         // The last window going away is a quit even if core has not said so.
-        if editor.should_quit || renderers.is_empty() {
+        if editor.should_quit || app.renderers.is_empty() {
             break 'main;
         }
 
+        app.tell_readers(&mut editor, &highlighter);
+        app.housekeep(&mut editor, &highlighter)?;
+
+        // Park the live cursor and scroll on the focused window, once, so every
+        // pane in every frame can be drawn from its own `Window`.
+        editor.sync_focused_window();
+        // One grid per terminal buffer on screen, not one for "the" terminal:
+        // see `Term::screens`. Gathered after `sync_focused_window`, so a
+        // session that just became visible is measured against the window it is
+        // actually in.
+        let screens = app.term.screens(&editor);
+        perf.input += frame_start.elapsed();
+
+        let drawing = Instant::now();
+        let draws = app.draw(&mut editor, &screens)?;
+        perf.draw += drawing.elapsed();
+
+        // Drawing is done; the editor is nobody's until the next iteration.
+        // Presenting parks this thread until the next vertical blank, which is
+        // most of the frame, and holding the lock across it would put every
+        // Lisp primitive behind the display.
+        drop(editor);
+        let presenting = Instant::now();
+        let presents = app.present();
+        presented = presents > 0;
+        perf.present += presenting.elapsed();
+        // A keystroke that changed nothing on screen — `k` at the top of the
+        // buffer — has no latency to report, only a frame that decided not to
+        // happen.
+        if let Some(stamped) = batch.typed.filter(|_| presented) {
+            perf.key(timer.ticks().saturating_sub(stamped));
+        }
+        perf.frame(frame_start, presents, draws);
+    }
+    // Language servers are children of this process and outlive it otherwise —
+    // one stray `clangd` indexing a repository per session, which is the kind of
+    // thing you only notice when the fan starts.
+    zemacs_rpc::stop_all();
+    Ok(())
+}
+
+// --- the app ---------------------------------------------------------------
+
+/// Everything the loop carries from one turn to the next, and everything a
+/// command needs in order to be carried out.
+///
+/// These were nineteen locals in `main`, seven of which `dispatch` re-listed at
+/// every one of its fifteen call sites — the same bindings in the same order
+/// every time, wrapped across three lines because they did not fit on one. They
+/// share a lifetime (built before the loop, dropped when it ends) and they are
+/// the *app's* half of the editor, the half the pure core cannot reach: a Lisp
+/// image, a window per frame, a git working tree, a directory, a PTY, a project,
+/// the clipboard. So they are one struct — and with a name to hang them on,
+/// each phase of the loop becomes a method here rather than six hundred lines
+/// inline.
+///
+/// **Every method below is called with the editor lock held**, which is what the
+/// `&mut Editor` in each signature says out loud: `main` takes the lock once at
+/// the top of an iteration and drops it before presenting, so nothing in here
+/// has to think about where the lock is. [`App::present`] is the exception and
+/// takes no editor at all, because by the time it runs there is none to take.
+/// `docs/threading.org` is the contract; the comments in `main` are where the
+/// lock is taken and where it goes.
+struct App {
+    /// Kept for [`App::housekeep`] alone: a frame core pushed needs an OS
+    /// window, and opening one needs the video subsystem back.
+    sdl: sdl2::Sdl,
+    lisp: Lisp,
+    init_path: PathBuf,
+    /// One renderer per frame, in frame order. See the module docs.
+    renderers: Vec<Renderer>,
+    magit: Magit,
+    dired: Dired,
+    term: Term,
+    project: Project,
+    mouse: Mouse,
+    cursors: Option<Cursors>,
+    clipboard: Clipboard,
+    /// Text input is toggled per mode — see [`wants_text_input`]. It is off to
+    /// begin with because the editor opens on the dashboard.
+    text_input: sdl2::keyboard::TextInputUtil,
+    text_input_on: bool,
+    last_revision: u64,
+    /// How much of the live buffer's change log each reader has already acted
+    /// on, as `(buffer, count)`. Two watermarks and not one, because the two
+    /// readers are fed on different conditions — the parser only for a buffer
+    /// with a language — and a shared one would hand whichever of them had been
+    /// skipped a list of edits starting after text it never saw. `None`, and a
+    /// buffer that does not match, both mean "start again".
+    told_lisp: Option<(BufferId, u64)>,
+    told_syntax: Option<(BufferId, u64)>,
+    /// Where point was when the image was last told. `usize::MAX` cannot be a
+    /// real offset, so the first pass through the loop always reports — which is
+    /// what makes a config see the cursor it started next to.
+    last_point: usize,
+    last_file_query: Option<String>,
+    last_grep: Option<String>,
+    last_autosave: Instant,
+    last_revert: Instant,
+    revert_watch: Revert,
+}
+
+/// What one turn of the event pump produced.
+///
+/// Gathered rather than acted on event by event, because all three answers are
+/// about the batch as a whole: the keys reach core in order once routing is
+/// done, the close is deferred so the rest of the batch keeps addressing the
+/// frames it was routed against, and the timestamp is the earliest of them.
+#[derive(Default)]
+struct Batch {
+    /// There used to be a `swallow_text` flag beside this: an Alt keydown armed
+    /// it and the `TextInput` macOS composed from the combo (⌥- is –, ⌥= is ≠)
+    /// was dropped, because Option was a Meta fallback and `M--` had already
+    /// been dispatched. The config sets `mac-option-modifier 'none`, so that was
+    /// backwards — the composed character *is* the thing being asked for. Option
+    /// is no longer a modifier here (see `key_from_keydown`) and the text it
+    /// produces is now inserted like any other.
+    keys: Vec<Key>,
+    /// At most one window closes per iteration: a close shifts every later frame
+    /// index down, and the rest of this batch was routed against the old ones.
+    /// Deferring it keeps the whole batch consistent.
+    closing: Option<usize>,
+    /// When the earliest keystroke of this batch was stamped, for the perf
+    /// report to subtract from the present at the bottom.
+    typed: Option<u32>,
+}
+
+impl Batch {
+    /// Empty, for a new iteration. `keys` is cleared rather than replaced, so
+    /// the one allocation lasts the session.
+    fn start(&mut self) {
+        self.keys.clear();
+        self.closing = None;
+        self.typed = None;
+    }
+
+    /// A keystroke or a composed character arrived, stamped on SDL's own clock.
+    /// The earliest wins: what the perf report wants is how long the *first* key
+    /// of the batch waited, which is the one that waited longest.
+    fn stamp(&mut self, timestamp: u32) {
+        self.typed = Some(self.typed.map_or(timestamp, |t| t.min(timestamp)));
+    }
+}
+
+impl App {
+    fn new(
+        sdl: sdl2::Sdl,
+        video: &sdl2::VideoSubsystem,
+        renderers: Vec<Renderer>,
+        lisp: Lisp,
+        init_path: PathBuf,
+    ) -> Self {
+        let text_input = video.text_input();
+        text_input.stop();
+        Self {
+            sdl,
+            lisp,
+            init_path,
+            renderers,
+            magit: Magit::default(),
+            dired: Dired::default(),
+            term: Term::default(),
+            project: Project::default(),
+            mouse: Mouse::default(),
+            cursors: Cursors::new(),
+            clipboard: Clipboard::new(video),
+            text_input,
+            text_input_on: false,
+            last_revision: u64::MAX,
+            told_lisp: None,
+            told_syntax: None,
+            last_point: usize::MAX,
+            last_file_query: None,
+            last_grep: None,
+            last_autosave: Instant::now(),
+            last_revert: Instant::now(),
+            revert_watch: Revert::default(),
+        }
+    }
+
+    /// Which frame an SDL event belongs to. `None` for a window that has already
+    /// been closed but still has events queued behind it.
+    fn frame_for(&self, window_id: u32) -> Option<usize> {
+        frame_for_window(self.renderers.iter().map(Renderer::window_id), window_id)
+    }
+
+    /// The same, for an event that also carries a position: the frame, and where
+    /// in it *in pixels*. One call rather than two because every mouse arm below
+    /// wanted exactly this pair and none of them wanted one without the other —
+    /// SDL reports points, and everything past here counts pixels.
+    fn pointer(&self, window_id: u32, x: i32, y: i32) -> Option<(usize, i32, i32)> {
+        let i = self.frame_for(window_id)?;
+        let (x, y) = self.renderers[i].to_pixels(x, y);
+        Some((i, x, y))
+    }
+
+    /// [`lisp_call`], sent. Four of the five signals build and send in the same
+    /// breath; the fifth is `after-edit-hook`, whose payload has to be sliced
+    /// where the lock is.
+    fn call_lisp(&self, name: &str, args: &str) {
+        self.lisp.eval(lisp_call(name, args));
+    }
+
+    /// Tell the child what the left button did, at cell `(col, row)`. Answers
+    /// whether the program running in it wanted the report.
+    ///
+    /// Left only, and one function for all three of press, release and drag,
+    /// because the three differ in exactly one field and getting *fewer* than
+    /// three of them right is the bug: a program that only ever hears the press
+    /// has a button held down forever. The right button never arrives here at
+    /// all — it is the context menu's, in every mode.
+    fn term_mouse(
+        &self,
+        editor: &Editor,
+        kind: zemacs_term::MouseKind,
+        col: usize,
+        row: usize,
+    ) -> bool {
+        self.term.mouse(editor, zemacs_term::Mouse {
+            button: zemacs_term::Button::Left,
+            kind,
+            col,
+            row,
+        })
+    }
+
+    /// The one place a command becomes an action. Everything the pure core can do
+    /// goes to `apply`; the three effects it can't perform are handled here.
+    ///
+    /// `CloseFrame` is a fourth: core removes the frame, but only this layer can
+    /// take the window down with it, and `M-x delete-frame` reaches core through
+    /// here just like the window's close button does.
+    fn dispatch(&mut self, editor: &mut Editor, cmd: EditorCommand) {
+        match cmd {
+            EditorCommand::CallLisp(form) => self.lisp.eval(form),
+            EditorCommand::Term(verb) => self.term.run(editor, &verb),
+            EditorCommand::Project(verb) => {
+                self.project.run_verb(editor, &verb);
+                // `compile` and `test` ask for a shell command; running one belongs
+                // to the terminal, which is the only thing here that owns a process.
+                if let Some(command) = self.project.run.take() {
+                    self.term.run(editor, "open");
+                    let mut line = command.program.clone();
+                    for arg in &command.args {
+                        line.push(' ');
+                        line.push_str(arg);
+                    }
+                    line.push('\r');
+                    self.term.send(editor, line.into_bytes());
+                }
+            }
+            // Dropped when no shell is running: a keystroke aimed at something that
+            // is not there is nothing, not an error worth reporting on every key.
+            EditorCommand::TermKey(key) => {
+                self.term.key(editor, key);
+            }
+            // dired borrows the file prompt for rename/copy/mkdir, so an answer to
+            // one of those is a filename for *it* rather than a file to open.
+            EditorCommand::OpenFile(path) if self.dired.awaiting_input() => {
+                self.dired.supply(editor, &path.to_string_lossy())
+            }
+            // Opening a directory lists it, as `find-file` does in Emacs.
+            EditorCommand::OpenFile(path) if path.is_dir() => {
+                // Remembered *before* it is listed, so that browsing to a repository
+                // puts it in the project switcher's history. Without this the only
+                // way into that list was opening a file inside a project, which is
+                // the chicken-and-egg behind "there is no select project" — the
+                // switcher could only ever offer somewhere you had already been.
+                project_remember(&path);
+                editor.buffer.path = Some(path);
+                self.dired.run(editor, "open");
+            }
+            EditorCommand::OpenFile(path) => open_file(editor, &path, &self.init_path),
+            EditorCommand::OpenAt(hit) => {
+                let root = self.project.search_root(editor);
+                open_at(editor, &root, &hit, &self.init_path);
+            }
+            EditorCommand::SaveFile(path) => save_file(editor, path, Save::Guarded),
+            EditorCommand::Git(verb) => self.magit.run(editor, &verb),
+            // The far side of a `yes`. Each arm goes to the *same* worker its
+            // guarded twin does, with the guard spent — so the question is asked in
+            // exactly one place and answered in exactly one place.
+            EditorCommand::Confirmed(inner) => match *inner {
+                EditorCommand::SaveFile(path) => save_file(editor, path, Save::Forced),
+                EditorCommand::Git(verb) => self.magit.run_confirmed(editor, &verb),
+                // Nothing else parks a command, so this is a confirmation for
+                // something that never asked — a bug in the caller, not in the
+                // answer, and worth saying rather than running.
+                other => editor.apply(EditorCommand::Message(format!(
+                    "confirmed a command that is not guarded: {other:?}"
+                ))),
+            },
+            EditorCommand::Dired(verb) => {
+                self.dired.run(editor, &verb);
+                // `RET` on a file leaves dired; opening a buffer is this layer's
+                // job, so dired asks rather than doing it.
+                if let Some(path) = self.dired.open_file.take() {
+                    open_file(editor, &path, &self.init_path);
+                }
+            }
+            EditorCommand::CloseFrame => {
+                let focused = editor.focus_frame;
+                close_frame(editor, &mut self.renderers, focused);
+            }
+            other => editor.apply(other),
+        }
+    }
+
+    /// One SDL event, routed. `Break` is the window server saying quit — the one
+    /// answer that ends the loop rather than the iteration.
+    ///
+    /// Everything that has to survive the *rest* of the batch goes into `batch`
+    /// rather than being acted on here; see [`Batch`] for why each of the three
+    /// does.
+    fn route_event(
+        &mut self,
+        editor: &mut Editor,
+        event: Event,
+        batch: &mut Batch,
+    ) -> ControlFlow<()> {
+        match event {
+            Event::Quit { .. } => return ControlFlow::Break(()),
+            // Event-driven rather than polled: reading the clipboard is a
+            // trip through the window server, and SDL is already watching
+            // it for us. ponytail: if a platform turns out not to raise
+            // this, the fallback is a once-a-second pull beside the
+            // auto-save timer — same call, worse latency.
+            Event::ClipboardUpdate { .. } => self.clipboard.pull(editor),
+            // How a file arrives from *outside* the process. Finder's "Open
+            // With" and a double-click on a file zemacs is the default for
+            // do not use argv — macOS sends an `odoc` Apple event, which SDL
+            // turns into this. Dragging a file onto the window is the same
+            // event, so both work off one arm.
+            Event::DropFile { filename, .. } => {
+                open_file(editor, &PathBuf::from(filename), &self.init_path)
+            }
+            Event::Window {
+                window_id,
+                win_event,
+                ..
+            } => {
+                let frame = self.frame_for(window_id);
+                // Anything the *window system* says happened is a reason to
+                // put the frame up again whether or not the editor moved:
+                // exposed, resized, un-minimised, dragged to another
+                // display. This is the one case where "the picture is
+                // identical" is not the same as "the screen is right", and
+                // it is what the skipped present below is safe *because* of.
+                // Window events are rare, so the extra present costs nothing
+                // anyone can measure.
+                if let Some(i) = frame {
+                    self.renderers[i].invalidate();
+                }
+                match win_event {
+                    // The window manager decides which frame is current and
+                    // the editor follows it; there is no other source of
+                    // truth.
+                    //
+                    // ponytail: a bare assignment, so the *live* buffer and
+                    // cursor follow the pointer into the newly focused frame
+                    // instead of that frame's own window being adopted. Core
+                    // does the adopting (`Editor::adopt_window`) but only
+                    // from inside `apply`, and it has no command for "focus
+                    // frame N" — every window command works on
+                    // `focus_frame`. Fixing it properly means an
+                    // `EditorCommand::FocusFrame(usize)` in core, next to
+                    // `NewFrame`; until then two frames showing different
+                    // buffers swap contents when you click between them.
+                    WindowEvent::FocusGained => {
+                        if let Some(i) = frame {
+                            // Through the command, not a bare assignment:
+                            // the live buffer belongs to the focused window,
+                            // so core has to park it and adopt the new
+                            // frame's.
+                            self.dispatch(editor, EditorCommand::FocusFrame(i));
+                        }
+                    }
+                    WindowEvent::Close => {
+                        if let Some(i) = frame {
+                            batch.closing.get_or_insert(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Keys are not routed by window: the editor is global and the
+            // focused frame is where they land.
+            Event::KeyDown {
+                keycode: Some(kc),
+                keymod,
+                timestamp,
+                ..
+            } => {
+                batch.stamp(timestamp);
+                batch
+                    .keys
+                    .extend(key_from_keydown(kc, keymod, !self.text_input_on));
+            }
+            // The right button, whose one job is the menu. Deliberately not
+            // sent to a terminal child even in Terminal mode: a right-click
+            // is how you reach the *window manager* here, and there is no
+            // other gesture that opens a second frame with the mouse.
+            Event::MouseButtonDown {
+                window_id,
+                mouse_btn: MouseButton::Right,
+                x,
+                y,
+                ..
+            } => {
+                if let Some((i, x, y)) = self.pointer(window_id, x, y) {
+                    // Focused first, for the left click's reason: the menu's
+                    // verbs act on the focused frame, and right-clicking an
+                    // unfocused window and getting a split in another one is
+                    // the one outcome nobody means.
+                    self.dispatch(editor, EditorCommand::FocusFrame(i));
+                    editor.open_context_menu(x, y);
+                }
+            }
+            Event::MouseButtonDown {
+                window_id,
+                mouse_btn: MouseButton::Left,
+                x,
+                y,
+                ..
+            } => {
+                let Some((i, x, y)) = self.pointer(window_id, x, y) else {
+                    return ControlFlow::Continue(());
+                };
+                let area = self.renderers[i].content_area();
+                // A menu is modal to the pointer: while one is up, the
+                // left button belongs to it and to nothing else. Picking
+                // takes it down, and so does a click that missed — which
+                // is what a click outside a menu means everywhere.
+                if editor.context_menu.is_some() {
+                    let row = self.renderers[i].context_menu_row(editor, x, y);
+                    let picked = editor.pick_context_menu(row);
+                    if let Some(verb) = picked {
+                        // Through `run_action`, the door a keybinding
+                        // uses: a menu entry cannot do anything a key
+                        // could not.
+                        for cmd in editor.run_action(verb) {
+                            self.dispatch(editor, cmd);
+                        }
+                    }
+                    return ControlFlow::Continue(());
+                }
+                // A click anywhere in a window focuses its frame. The
+                // `FocusGained` above would do it a moment later anyway;
+                // doing it here means the `FocusWindow` below addresses
+                // the frame that was actually clicked.
+                self.dispatch(editor, EditorCommand::FocusFrame(i));
+                let pressed = self.mouse.press(&editor.frames[i], i, area, x, y);
+                if let Some(window) = pressed {
+                    self.dispatch(editor, EditorCommand::FocusWindow(window));
+                    // A pane showing a scene has no character to land
+                    // on: there is no point in a scene and no offset a
+                    // click could name, so the gesture is a hit test and
+                    // what it means is Lisp's — the same division of
+                    // labour an `OverlayId` has. Same guard as the
+                    // terminal's click and as a mode hook: a config that
+                    // never defined the handler is silence, not an
+                    // error. Nothing is escaped because a tag is an
+                    // integer, which is the reason a tag *is* an
+                    // integer.
+                    //
+                    // ponytail: `hit` also answers the node id, and this
+                    // drops it — so "you clicked a figure, which means
+                    // nothing" and "you clicked outside the page" both
+                    // arrive as NIL. Ceiling: a mode wanting to react to
+                    // an untagged node. The upgrade path is a second
+                    // argument, since the id is already in hand here.
+                    // Resolved before the match so the borrow of the
+                    // renderer ends with the statement: the other arm
+                    // dispatches, and dispatching wants every renderer.
+                    let on_a_page = self.renderers[i]
+                        .scene_layout(editor, i)
+                        .map(|(layout, _)| {
+                            zemacs_gui::hit(layout, x, y).and_then(|(_, tag)| tag)
+                        });
+                    match on_a_page {
+                        Some(tag) => {
+                            let tag = tag.map_or("nil".into(), |t| t.to_string());
+                            self.call_lisp("%SCENE-CLICK", &tag);
+                        }
+                        // ...and then land on the character that was
+                        // clicked. Focusing alone made the pointer a way
+                        // to pick a *pane* and nothing smaller, which is
+                        // the one thing everybody expects a mouse to do.
+                        // The arithmetic belongs to the renderer — see
+                        // `click_target` for why — and it comes back
+                        // after the focus so the window it names is live.
+                        None => {
+                            let target = self.renderers[i].click_target(editor, i, x, y);
+                            if let Some((_, at)) = target {
+                                // A click collapses whatever was
+                                // selected, the way it does everywhere
+                                // else — without this, clicking during
+                                // a selection drags its far end instead
+                                // of starting again. Left to `MoveTo`
+                                // alone the drag below would also find
+                                // an anchor it never set.
+                                if editor.mode.is_visual() {
+                                    let cmd = EditorCommand::SetMode(zemacs_core::Mode::Normal);
+                                    self.dispatch(editor, cmd);
+                                }
+                                self.dispatch(editor, EditorCommand::MoveTo(at));
+                            }
+                        }
+                    }
+                }
+                // A program that asked for mouse events gets the click:
+                // that is what makes vim, htop and tmux usable in here.
+                // Focusing the pane happened first, so clicking into an
+                // unfocused terminal both focuses it and reaches the
+                // program in one gesture.
+                if editor.mode == zemacs_core::Mode::Terminal {
+                    let (col, row) = cell_at(editor, &self.renderers, x, y);
+                    let taken = self.term_mouse(editor, zemacs_term::MouseKind::Press, col, row);
+                    // Nobody wanted it. A shell never turns mouse
+                    // reporting on, so this is the click that used to
+                    // do nothing at all — it goes to Lisp with the row
+                    // it landed on and whatever OSC 8 link the child
+                    // hung on that cell, and which of the two is a link
+                    // is decided there. Same guard as a mode hook: a
+                    // config that never defined it is silence.
+                    if !taken {
+                        if let Some((line, uri)) = self.term.click_context(editor, col, row) {
+                            let uri = uri.map_or("nil".into(), |u| zemacs_rpc::lisp::string(&u));
+                            self.call_lisp(
+                                "%TERMINAL-CLICK",
+                                &format!("{} {col} {uri}", zemacs_rpc::lisp::string(&line)),
+                            );
+                        }
+                    }
+                }
+            }
+            Event::MouseButtonUp {
+                window_id,
+                mouse_btn: MouseButton::Left,
+                x,
+                y,
+                ..
+            } => {
+                self.mouse.release();
+                // A press with no release is half a gesture. SGR reporting
+                // makes the two separate events, so a program that only
+                // ever hears the press has a button held down forever —
+                // which is why clicking in `vim` or `htop` in here did
+                // nothing until the *next* click.
+                if editor.mode == zemacs_core::Mode::Terminal {
+                    if let Some((_, x, y)) = self.pointer(window_id, x, y) {
+                        let (col, row) = cell_at(editor, &self.renderers, x, y);
+                        self.term_mouse(editor, zemacs_term::MouseKind::Release, col, row);
+                    }
+                }
+            }
+            Event::MouseMotion {
+                window_id,
+                x,
+                y,
+                mousestate,
+                ..
+            } => match self.mouse.dragging() {
+                // A held divider keeps its own frame rather than the event's:
+                // SDL captures the mouse for the press, so the coordinates
+                // stay in that window's space even once the pointer has left
+                // it, and letting go of the drag at the edge is exactly the
+                // bug this avoids.
+                Some(i) => {
+                    if let Some(renderer) = self.renderers.get(i) {
+                        let (x, y) = renderer.to_pixels(x, y);
+                        self.mouse.motion(&mut editor.frames, x, y);
+                    }
+                }
+                None => {
+                    if let Some((i, x, y)) = self.pointer(window_id, x, y) {
+                        let area = self.renderers[i].content_area();
+                        if let Some(cursors) = &mut self.cursors {
+                            cursors.hover(editor.frames[i].divider_at(area, x, y).map(|d| d.dir));
+                        }
+                        // A menu row lights up under the pointer, which is
+                        // the only thing that makes it read as clickable.
+                        if editor.context_menu.is_some() {
+                            let row = self.renderers[i].context_menu_row(editor, x, y);
+                            if let Some(m) = editor.context_menu.as_mut() {
+                                m.hover = row;
+                            }
+                        }
+                        // Held-button motion is a drag, which is how a
+                        // selection is made in `vim` or a pane resized in
+                        // `tmux`. The terminal drops it unless the child
+                        // asked for drag reporting, so this costs nothing
+                        // for a program that did not.
+                        if mousestate.left() && editor.mode == zemacs_core::Mode::Terminal {
+                            let (col, row) = cell_at(editor, &self.renderers, x, y);
+                            self.term_mouse(editor, zemacs_term::MouseKind::Drag, col, row);
+                        }
+                        // ...and everywhere else a drag is a selection. The
+                        // press already put the cursor where the gesture
+                        // started, so entering Visual anchors it there and
+                        // every motion after it moves only the far end —
+                        // the machinery `v` uses, which is the whole reason
+                        // `y`, `d`, `gv` and the modeline all work on what
+                        // was dragged without knowing a mouse was involved.
+                        //
+                        // `click_target` answers `None` over a dashboard or
+                        // a terminal, so neither needs excluding here: one
+                        // is a menu and the other is a grid the child owns.
+                        if mousestate.left() && editor.mode != zemacs_core::Mode::Terminal {
+                            let target = self.renderers[i].click_target(editor, i, x, y);
+                            if let Some((window, at)) = target {
+                                // Only over the pane the press landed in. A
+                                // drag that wanders into the next split
+                                // would otherwise read an offset out of
+                                // *that* buffer and apply it to this one.
+                                let same = window == editor.frames[i].current;
+                                // A click that wobbles by a pixel is still a
+                                // click. Measured in characters rather than
+                                // pixels, because a character is the unit a
+                                // selection is actually made of.
+                                let moved = at != editor.buffer.cursor;
+                                if same && (moved || editor.mode.is_visual()) {
+                                    if !editor.mode.is_visual() {
+                                        let cmd = EditorCommand::SetMode(zemacs_core::Mode::Visual);
+                                        self.dispatch(editor, cmd);
+                                    }
+                                    self.dispatch(editor, EditorCommand::MoveTo(at));
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            // SDL reports natural-scroll wheels with `direction: Flipped`
+            // and the raw sign, so undo that first; then negate, because a
+            // wheel push (positive y) moves the view *up* the file.
+            //
+            // ponytail: and then negate *again*, below, because the wheel
+            // that reads right on this desk is the other one. Hard-coded
+            // rather than a setting — a `set-scroll-direction` primitive is
+            // a C shim, an extern, a defprim and an export for one bool.
+            // Add it when a second person disagrees about which way is up.
+            Event::MouseWheel {
+                window_id,
+                y,
+                direction,
+                mouse_x,
+                mouse_y,
+                ..
+            } => {
+                let y = -match direction {
+                    MouseWheelDirection::Flipped => -y,
+                    _ => y,
+                };
+                let frame = self.pointer(window_id, mouse_x, mouse_y);
+                if let (true, Some((i, px, py))) = (y != 0, frame) {
+                    // Scroll the pane under the pointer — by focusing it
+                    // first. `ScrollLines` moves the *live* window, and
+                    // focusing is the only way to make a pane live without
+                    // duplicating core's scroll clamping out here. It also
+                    // matches the click: pointing at a pane and acting on it
+                    // is the same gesture either way.
+                    let area = self.renderers[i].content_area();
+                    editor.focus_frame = i;
+                    let window = editor.frames[i].window_at(area, px, py);
+                    if let Some(window) = window {
+                        self.dispatch(editor, EditorCommand::FocusWindow(window));
+                    }
+                    // A terminal has its own scrollback, and while the shell
+                    // has the keyboard the buffer holds only the *visible*
+                    // grid — scrolling that would move through a screenful
+                    // that is already all there is. `wheel` also knows to
+                    // hand the notch to a program that asked for mouse
+                    // events, or to send arrow keys to `less`.
+                    if editor.mode == zemacs_core::Mode::Terminal {
+                        let (col, row) = cell_at(editor, &self.renderers, px, py);
+                        self.term.wheel(editor, -y * SCROLL_LINES, col, row);
+                    } else if let Some(at) = editor.buffer.scene.as_ref().map(|s| s.scroll) {
+                        // A scene scrolls in pixels and has no viewport of
+                        // lines for `ScrollLines` to move — the cursor does
+                        // not exist here, so there is nothing to keep on
+                        // screen and nothing for core to clamp against. The
+                        // notch is the same three lines the document gets,
+                        // in the pane's own line height.
+                        let step = -y * SCROLL_LINES * self.renderers[i].cell_size().1;
+                        scroll_scene(editor, &mut self.renderers[i], i, at + step);
+                        // No `invalidate()` here. The offset reaches the
+                        // frame digest — `draw_scene` folds it in, and the
+                        // boxes it moved were folded in anyway — so a notch
+                        // that changed the picture presents and a notch
+                        // against the end of the document does not, which
+                        // is what an unconditional invalidate got wrong in
+                        // the second case.
+                    } else {
+                        self.dispatch(editor, EditorCommand::ScrollLines(-y * SCROLL_LINES));
+                    }
+                }
+            }
+            // Every character macOS hands us, including the ones it composed
+            // from an Option combo and the second half of a dead-key pair.
+            Event::TextInput {
+                text, timestamp, ..
+            } => {
+                // Insert mode arrives here rather than as `KeyDown`, and it
+                // is the most latency-sensitive thing anyone does.
+                batch.stamp(timestamp);
+                batch.keys.extend(text.chars().map(Key::Char));
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Toggle SDL text input to match the mode. This is what stops macOS
+    /// press-and-hold: the accent panel is a text-input-client feature, so
+    /// with text input off, holding `j` repeats the keystroke natively
+    /// instead of offering ĵ. Insert mode and prompts keep it on, where
+    /// layout-correct characters and dead keys are what you actually want.
+    fn sync_text_input(&mut self, editor: &Editor) {
+        let want_text = wants_text_input(editor);
+        if want_text == self.text_input_on {
+            return;
+        }
+        if want_text {
+            self.text_input.start();
+        } else {
+            self.text_input.stop();
+        }
+        self.text_input_on = want_text;
+    }
+
+    /// Everything the image and the parser are told about this frame.
+    ///
+    /// One phase because the two of them ask the same question — what has
+    /// happened since I last looked — and answer it from watermarks that have to
+    /// move in step with the thing they describe. Under the lock, necessarily:
+    /// the delta is *sliced* here so that whatever reads it a turn later is
+    /// reading a record rather than a document that has moved on. See
+    /// [`after_edit_form`], which is where that argument is written down.
+    fn tell_readers(&mut self, editor: &mut Editor, highlighter: &zemacs_syntax::Worker) {
         // Hand each new revision to the syntax thread and carry on drawing.
         let mut edit_form = None;
-        if editor.revision != last_revision {
-            last_revision = editor.revision;
+        if editor.revision != self.last_revision {
+            self.last_revision = editor.revision;
             // The image's one signal that the document moved. Core reports mode
             // *entry* and nothing else, so without this a language server could
             // never learn that a buffer changed — and neither could anything
@@ -1043,7 +1340,7 @@ fn main() -> anyhow::Result<()> {
             // every generated buffer is read-only.
             if !editor.buffer.kind.is_generated() {
                 editor.pending_hooks.push("after-change-hook".into());
-                edit_form = after_edit_form(&editor, &mut told_lisp);
+                edit_form = after_edit_form(editor, &mut self.told_lisp);
             }
             match &editor.buffer.language {
                 Some(lang) => highlighter.request(zemacs_syntax::Request {
@@ -1062,7 +1359,8 @@ fn main() -> anyhow::Result<()> {
                     // image's watermark would hand the parser, the moment a
                     // language was set, a list of edits starting after text it
                     // never saw.
-                    edits: told_syntax
+                    edits: self
+                        .told_syntax
                         .filter(|(b, _)| *b == editor.buffer.id)
                         .and_then(|(_, seen)| editor.buffer.changes_since(seen))
                         .map(<[_]>::to_vec),
@@ -1074,7 +1372,7 @@ fn main() -> anyhow::Result<()> {
                 None => {}
             }
             if editor.buffer.language.is_some() {
-                told_syntax = Some((editor.buffer.id, editor.buffer.change_count()));
+                self.told_syntax = Some((editor.buffer.id, editor.buffer.change_count()));
             }
         }
         // The other signal the image gets about a buffer, and the twin of the
@@ -1097,8 +1395,8 @@ fn main() -> anyhow::Result<()> {
         // stepped out of, say — has to remember it in the image. The upgrade
         // is what `after_edit_form` above already does for the document: build
         // the call here, where the lock is held, rather than queueing a name.
-        if editor.buffer.cursor != last_point && !editor.buffer.kind.is_generated() {
-            last_point = editor.buffer.cursor;
+        if editor.buffer.cursor != self.last_point && !editor.buffer.kind.is_generated() {
+            self.last_point = editor.buffer.cursor;
             editor.pending_hooks.push("point-moved-hook".into());
         }
 
@@ -1106,10 +1404,7 @@ fn main() -> anyhow::Result<()> {
         // with `fboundp` so a mode with no hook defined is silence rather than
         // an "undefined function" every time you open a file.
         for hook in std::mem::take(&mut editor.pending_hooks) {
-            lisp.eval(format!(
-                "(let ((h (find-symbol {:?} :zemacs))) (when (and h (fboundp h)) (funcall h)))",
-                hook.to_uppercase()
-            ));
+            self.call_lisp(&hook.to_uppercase(), "");
         }
         // ...and the one hook that carries arguments, queued after the
         // no-argument ones so that a config which uses both sees the order it
@@ -1118,7 +1413,7 @@ fn main() -> anyhow::Result<()> {
         // business holding a Lisp form, and this call is only meaningful with
         // the delta baked in.
         if let Some(form) = edit_form {
-            lisp.eval(form);
+            self.lisp.eval(form);
         }
 
         // Anything a JSON-RPC child said since the last frame. This is the whole
@@ -1137,14 +1432,26 @@ fn main() -> anyhow::Result<()> {
                 zemacs_rpc::Event::Protocol(e) => (":error", zemacs_rpc::lisp::string(&e)),
                 zemacs_rpc::Event::Exited(e) => (":exit", zemacs_rpc::lisp::string(&e)),
             };
-            lisp.eval(format!(
-                "(let ((h (find-symbol \"%RPC-EVENT\" :zemacs))) \
-                   (when (and h (fboundp h)) (funcall h {conn} {kind} '{form})))"
-            ));
+            self.call_lisp("%RPC-EVENT", &format!("{conn} {kind} '{form}"));
         }
+    }
 
-        refresh_file_completions(&mut editor, &mut last_file_query);
-        refresh_grep(&mut editor, &project, &mut last_grep);
+    /// The per-frame housekeeping: everything core holds but cannot fill in
+    /// itself.
+    ///
+    /// One phase and not eight because they are all the same shape and all have
+    /// the same reason — core does no IO, owns no window and has no parser, and
+    /// this is the one layer with all three. The order is the order they depend
+    /// on each other in, which is the only thing that stops them being eight
+    /// separate methods: a frame gets its window before a terminal inside it is
+    /// measured against the pane it now has.
+    fn housekeep(
+        &mut self,
+        editor: &mut Editor,
+        highlighter: &zemacs_syntax::Worker,
+    ) -> anyhow::Result<()> {
+        refresh_file_completions(editor, &mut self.last_file_query);
+        refresh_grep(editor, &self.project, &mut self.last_grep);
 
         // Adopt a result only if the buffer hasn't moved on; if it has, a newer
         // parse is already in flight and the current spans stay up meanwhile.
@@ -1154,22 +1461,22 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        highlight_completion_doc(&mut editor);
+        highlight_completion_doc(editor);
 
         // Where `M-x new-frame` becomes a window. Core pushes the frame, the
         // loop notices it has no renderer for it. Emacs spells extra frames
         // `<2>`, `<3>`; so do we, so they are tellable apart in the dock.
-        while renderers.len() < editor.frames.len() {
-            let title = format!("zemacs <{}>", renderers.len() + 1);
-            let mut renderer = Renderer::new(&sdl, &title, WINDOW_W, WINDOW_H)?;
+        while self.renderers.len() < editor.frames.len() {
+            let title = format!("zemacs <{}>", self.renderers.len() + 1);
+            let mut renderer = Renderer::new(&self.sdl, &title, WINDOW_W, WINDOW_H)?;
             // Keys are routed to `focus_frame`, not to whichever window the OS
             // considers frontmost, so a new frame has to claim it here. macOS
             // does not always send `FocusGained` for a window the application
             // opened itself, and without this every keystroke kept going to the
             // frame you opened the new one *from*.
             renderer.focus();
-            editor.focus_frame = renderers.len();
-            renderers.push(renderer);
+            editor.focus_frame = self.renderers.len();
+            self.renderers.push(renderer);
         }
 
         // Size each session to the pane it is actually shown in, then let them
@@ -1180,92 +1487,94 @@ fn main() -> anyhow::Result<()> {
         //
         // Measured out here because `Term` owns no renderer: it says which
         // buffers it has, this says how big each one's pane is.
-        if term.is_live() {
-            let sizes: Vec<(zemacs_core::BufferId, usize, usize)> = term
+        if self.term.is_live() {
+            let sizes: Vec<(zemacs_core::BufferId, usize, usize)> = self
+                .term
                 .buffers()
                 .into_iter()
                 .map(|id| {
-                    let (cols, rows) = terminal_size(&editor, &renderers, id);
+                    let (cols, rows) = terminal_size(editor, &self.renderers, id);
                     (id, cols, rows)
                 })
                 .collect();
-            term.sync(&mut editor, &sizes);
+            self.term.sync(editor, &sizes);
         }
 
         // Wall-clock rather than keystroke-counted: the loop already runs at
         // vsync, so an elapsed check is free, and a crash costs at most this
         // interval's worth of typing either way.
-        if last_autosave.elapsed() >= AUTOSAVE_EVERY {
-            autosave_all(&mut editor);
-            last_autosave = Instant::now();
+        if self.last_autosave.elapsed() >= AUTOSAVE_EVERY {
+            autosave_all(editor);
+            self.last_autosave = Instant::now();
         }
 
         // Same shape, same argument, one order of magnitude more often: this one
         // is a `stat` rather than a write, and five seconds is how long a file
         // is allowed to be stale on screen.
-        if last_revert.elapsed() >= REVERT_EVERY {
-            revert_watch.poll(&mut editor);
-            last_revert = Instant::now();
+        if self.last_revert.elapsed() >= REVERT_EVERY {
+            self.revert_watch.poll(editor);
+            self.last_revert = Instant::now();
         }
 
         // After the whole batch, so a yank and the delete before it push once
         // rather than twice — the register only has to be right by the time
         // anyone outside can ask.
-        clipboard.push(&editor);
+        self.clipboard.push(editor);
+        Ok(())
+    }
 
-        // Park the live cursor and scroll on the focused window, once, so every
-        // pane in every frame can be drawn from its own `Window`.
-        editor.sync_focused_window();
-        // One grid per terminal buffer on screen, not one for "the" terminal:
-        // see `Term::screens`. Gathered after `sync_focused_window`, so a
-        // session that just became visible is measured against the window it is
-        // actually in.
-        let screens = term.screens(&editor);
-        perf.input += frame_start.elapsed();
-
-        // Every window, every iteration, and `render` syncs the font itself.
-        // Drawing is the cheap half — measured at 2.4 ms for a full screen of
-        // text, against 14 ms of vertical blank below — so nothing here is
-        // conditional. What it produces besides pixels is a digest of every draw
-        // call it made, which is what lets the present be skipped.
-        //
-        // ponytail: an idle editor still redraws at the refresh rate, throwing
-        // the frame away when the digest says it was identical. That is a couple
-        // of milliseconds of CPU per display frame doing nothing, and it buys
-        // the one thing a cheaper test cannot: correctness without a list of
-        // "fields that mean a redraw" to keep in step with the renderer. The
-        // upgrade path is core stamping a generation on every mutation — the
-        // *only* signal that also catches a Lisp primitive editing the buffer
-        // through the shared mutex, which raises no event here — and then this
-        // loop can skip the draw as well as the present, and sleep properly.
-        // The third writer named on `scroll_scene`, and the one core cannot do
-        // for itself: a scene is swapped in whole and carries the outgoing
-        // page's offset across, so a page that re-rendered *shorter* is left
-        // scrolled past its own end — until here, because the height that says
-        // so belongs to a laid-out scene and laying one out needs a font. A
-        // no-op on every frame where the offset was already legal, and the
-        // layout it asks for is the one the pane loop is about to want anyway.
+    /// Draw every window, and answer how many draw calls it took.
+    ///
+    /// Every window, every iteration, and `render` syncs the font itself.
+    /// Drawing is the cheap half — measured at 2.4 ms for a full screen of
+    /// text, against 14 ms of vertical blank below — so nothing here is
+    /// conditional. What it produces besides pixels is a digest of every draw
+    /// call it made, which is what lets the present be skipped.
+    ///
+    /// ponytail: an idle editor still redraws at the refresh rate, throwing
+    /// the frame away when the digest says it was identical. That is a couple
+    /// of milliseconds of CPU per display frame doing nothing, and it buys
+    /// the one thing a cheaper test cannot: correctness without a list of
+    /// "fields that mean a redraw" to keep in step with the renderer. The
+    /// upgrade path is core stamping a generation on every mutation — the
+    /// *only* signal that also catches a Lisp primitive editing the buffer
+    /// through the shared mutex, which raises no event here — and then this
+    /// loop can skip the draw as well as the present, and sleep properly.
+    ///
+    /// The scroll fixup at the top is the third writer named on `scroll_scene`,
+    /// and the one core cannot do for itself: a scene is swapped in whole and
+    /// carries the outgoing page's offset across, so a page that re-rendered
+    /// *shorter* is left scrolled past its own end — until here, because the
+    /// height that says so belongs to a laid-out scene and laying one out needs
+    /// a font. A no-op on every frame where the offset was already legal, and
+    /// the layout it asks for is the one the pane loop below is about to want
+    /// anyway.
+    fn draw(
+        &mut self,
+        editor: &mut Editor,
+        screens: &[(BufferId, zemacs_term::Screen)],
+    ) -> anyhow::Result<u32> {
         let focus = editor.focus_frame;
         let at = editor.buffer.scene.as_ref().map(|s| s.scroll);
-        if let (Some(renderer), Some(at)) = (renderers.get_mut(focus), at) {
-            scroll_scene(&mut editor, renderer, focus, at);
+        if let (Some(renderer), Some(at)) = (self.renderers.get_mut(focus), at) {
+            scroll_scene(editor, renderer, focus, at);
         }
 
-        let drawing = Instant::now();
-        for (i, renderer) in renderers.iter_mut().enumerate() {
-            renderer.render(&mut editor, i, &screens)?;
+        for (i, renderer) in self.renderers.iter_mut().enumerate() {
+            renderer.render(editor, i, screens)?;
         }
-        perf.draw += drawing.elapsed();
-        let draws: u32 = renderers.iter().map(Renderer::draw_calls).sum();
+        Ok(self.renderers.iter().map(Renderer::draw_calls).sum())
+    }
 
-        // Drawing is done; the editor is nobody's until the next iteration.
-        // Presenting parks this thread until the next vertical blank, which is
-        // most of the frame, and holding the lock across it would put every
-        // Lisp primitive behind the display.
-        drop(editor);
-        let presenting = Instant::now();
+    /// Put on screen what changed, and answer how many windows that was.
+    ///
+    /// The one method here with no `Editor`, and deliberately: `main` drops the
+    /// lock immediately above the call, because presenting parks this thread
+    /// until the display's next vertical blank and holding the editor across
+    /// that would put every Lisp primitive behind the display.
+    fn present(&mut self) -> u32 {
         let mut presents = 0;
-        for renderer in renderers.iter_mut() {
+        for renderer in self.renderers.iter_mut() {
             // Only what changed. A present of an identical picture costs a whole
             // vertical blank and shows the user nothing, and it is the frame the
             // *next* keystroke would rather have been drawn in.
@@ -1288,112 +1597,7 @@ fn main() -> anyhow::Result<()> {
             renderer.present();
             presents += 1;
         }
-        presented = presents > 0;
-        perf.present += presenting.elapsed();
-        // A keystroke that changed nothing on screen — `k` at the top of the
-        // buffer — has no latency to report, only a frame that decided not to
-        // happen.
-        if let Some(stamped) = typed.filter(|_| presented) {
-            perf.key(timer.ticks().saturating_sub(stamped));
-        }
-        perf.frame(frame_start, presents, draws);
-    }
-    // Language servers are children of this process and outlive it otherwise —
-    // one stray `clangd` indexing a repository per session, which is the kind of
-    // thing you only notice when the fan starts.
-    zemacs_rpc::stop_all();
-    Ok(())
-}
-
-/// The one place a command becomes an action. Everything the pure core can do
-/// goes to `apply`; the three effects it can't perform are handled here.
-///
-/// `CloseFrame` is a fourth: core removes the frame, but only this layer can
-/// take the window down with it, and `M-x delete-frame` reaches core through
-/// here just like the window's close button does.
-fn dispatch(
-    editor: &mut Editor,
-    lisp: &Lisp,
-    cmd: EditorCommand,
-    init_path: &Path,
-    renderers: &mut Vec<Renderer>,
-    magit: &mut Magit,
-    dired: &mut Dired,
-    term: &mut Term,
-    project: &mut Project,
-) {
-    match cmd {
-        EditorCommand::CallLisp(form) => lisp.eval(form),
-        EditorCommand::Term(verb) => term.run(editor, &verb),
-        EditorCommand::Project(verb) => {
-            project.run_verb(editor, &verb);
-            // `compile` and `test` ask for a shell command; running one belongs
-            // to the terminal, which is the only thing here that owns a process.
-            if let Some(command) = project.run.take() {
-                term.run(editor, "open");
-                let mut line = command.program.clone();
-                for arg in &command.args {
-                    line.push(' ');
-                    line.push_str(arg);
-                }
-                line.push('\r');
-                term.send(editor, line.into_bytes());
-            }
-        }
-        // Dropped when no shell is running: a keystroke aimed at something that
-        // is not there is nothing, not an error worth reporting on every key.
-        EditorCommand::TermKey(key) => {
-            term.key(editor, key);
-        }
-        // dired borrows the file prompt for rename/copy/mkdir, so an answer to
-        // one of those is a filename for *it* rather than a file to open.
-        EditorCommand::OpenFile(path) if dired.awaiting_input() => {
-            dired.supply(editor, &path.to_string_lossy())
-        }
-        // Opening a directory lists it, as `find-file` does in Emacs.
-        EditorCommand::OpenFile(path) if path.is_dir() => {
-            // Remembered *before* it is listed, so that browsing to a repository
-            // puts it in the project switcher's history. Without this the only
-            // way into that list was opening a file inside a project, which is
-            // the chicken-and-egg behind "there is no select project" — the
-            // switcher could only ever offer somewhere you had already been.
-            project_remember(&path);
-            editor.buffer.path = Some(path);
-            dired.run(editor, "open");
-        }
-        EditorCommand::OpenFile(path) => open_file(editor, &path, init_path),
-        EditorCommand::OpenAt(hit) => {
-            let root = project.search_root(editor);
-            open_at(editor, &root, &hit, init_path);
-        }
-        EditorCommand::SaveFile(path) => save_file(editor, path, Save::Guarded),
-        EditorCommand::Git(verb) => magit.run(editor, &verb),
-        // The far side of a `yes`. Each arm goes to the *same* worker its
-        // guarded twin does, with the guard spent — so the question is asked in
-        // exactly one place and answered in exactly one place.
-        EditorCommand::Confirmed(inner) => match *inner {
-            EditorCommand::SaveFile(path) => save_file(editor, path, Save::Forced),
-            EditorCommand::Git(verb) => magit.run_confirmed(editor, &verb),
-            // Nothing else parks a command, so this is a confirmation for
-            // something that never asked — a bug in the caller, not in the
-            // answer, and worth saying rather than running.
-            other => editor.apply(EditorCommand::Message(format!(
-                "confirmed a command that is not guarded: {other:?}"
-            ))),
-        },
-        EditorCommand::Dired(verb) => {
-            dired.run(editor, &verb);
-            // `RET` on a file leaves dired; opening a buffer is this layer's
-            // job, so dired asks rather than doing it.
-            if let Some(path) = dired.open_file.take() {
-                open_file(editor, &path, init_path);
-            }
-        }
-        EditorCommand::CloseFrame => {
-            let focused = editor.focus_frame;
-            close_frame(editor, renderers, focused);
-        }
-        other => editor.apply(other),
+        presents
     }
 }
 
@@ -1844,11 +2048,11 @@ fn autosave_path(buffer: &zemacs_core::Buffer) -> Option<PathBuf> {
 
 /// Every modified buffer, not just the focused one — the whole point is the
 /// buffer you were *not* looking at when the editor died.
-fn autosave_all(editor: &mut Editor) {
+fn autosave_all(editor: &Editor) {
     // `sync_focused_window` has not run yet this iteration, but auto-save only
-    // reads text and path, and neither is window state.
-    autosave_one(&editor.buffer);
-    for buffer in &editor.others {
+    // reads text and path, and neither is window state — which is why this
+    // takes the editor by reference at all.
+    for buffer in buffers(editor) {
         autosave_one(buffer);
     }
 }
@@ -2102,8 +2306,7 @@ impl Revert {
         // rendered view. Neither has a file behind it that could be newer, and
         // both already refresh on their own verbs. Collected first because the
         // revert below needs `editor` mutably.
-        let watched: Vec<(zemacs_core::BufferId, PathBuf)> = std::iter::once(&editor.buffer)
-            .chain(editor.others.iter())
+        let watched: Vec<(zemacs_core::BufferId, PathBuf)> = buffers(editor)
             .filter(|b| !b.kind.is_generated())
             .filter_map(|b| b.path.clone().map(|p| (b.id, p)))
             .collect();
@@ -2116,9 +2319,7 @@ impl Revert {
         // not grow by every file ever visited. Cheap: it is the same length as
         // the sweep that just ran.
         self.seen.retain(|path, _| {
-            std::iter::once(&editor.buffer)
-                .chain(editor.others.iter())
-                .any(|b| b.path.as_deref() == Some(path.as_path()))
+            buffers(editor).any(|b| b.path.as_deref() == Some(path.as_path()))
         });
     }
 
@@ -2169,10 +2370,7 @@ impl Revert {
             // left stale would ask "changed on disk — save anyway?" about a
             // change that did not alter a byte.
             let stamp = disk_stamp(path);
-            if let Some(buffer) = std::iter::once(&mut editor.buffer)
-                .chain(editor.others.iter_mut())
-                .find(|b| b.id == id)
-            {
+            if let Some(buffer) = buffer_mut(editor, id) {
                 buffer.visited = stamp;
             }
             return;
@@ -2200,10 +2398,7 @@ fn revert(editor: &mut Editor, id: zemacs_core::BufferId, path: &Path, text: &st
     // it is back in sync and a later `:w` has nothing to ask about. Without
     // this, every auto-revert would arm the save prompt for the next save.
     let stamp = disk_stamp(path);
-    if let Some(buffer) = std::iter::once(&mut editor.buffer)
-        .chain(editor.others.iter_mut())
-        .find(|b| b.id == id)
-    {
+    if let Some(buffer) = buffer_mut(editor, id) {
         buffer.file_mode = mode;
         buffer.visited = stamp;
     }

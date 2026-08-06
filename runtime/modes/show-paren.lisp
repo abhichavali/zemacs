@@ -103,13 +103,11 @@ lands somewhere new, and it lands off a bracket nearly every time."
                   (remove nil (list (%show-paren-mark mine)
                                     (%show-paren-mark other))))))))))
 
-(defvar *point-moved-functions* nil)
-(pushnew 'show-paren-update *point-moved-functions*)
+(add-hook '*point-moved-functions* 'show-paren-update)
 
 ;;; A change can move the pair without moving point — typing `(` in front of an
 ;;; existing one, or an edit arriving from Lisp — so the change hook forces a
 ;;; rebuild by forgetting where the highlight was drawn. Not a second scan: it
 ;;; invalidates, and the mover does the work on the next report.
-(defvar *after-change-functions* nil)
 (defun %show-paren-invalidate () (setf *show-paren-at* nil))
-(pushnew '%show-paren-invalidate *after-change-functions*)
+(add-hook '*after-change-functions* '%show-paren-invalidate)

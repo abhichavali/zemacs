@@ -134,13 +134,18 @@ fn real_servers_answer() {
     std::fs::write(
         &init,
         format!(
+            // `modes/modes.lisp` first: it declares `*after-change-functions*`
+            // and the `after-change-hook` the application calls by name, which
+            // is the seam the client registers on. See `tests/lsp.rs`.
             "(in-package :zemacs)\n\
+             (load {:?} :verbose nil :print nil)\n\
              (load {:?} :verbose nil :print nil)\n\
              (load {:?} :verbose nil :print nil)\n\
              ;; No --background-index: this is one file, and indexing a whole\n\
              ;; tree is the slowest thing clangd can be asked to do.\n\
              (lsp-register-server 'c-mode \"clangd\")\n\
              (message \"live lsp init loaded\")\n",
+            runtime("modes/modes.lisp"),
             runtime("rpc.lisp"),
             runtime("lsp.lisp"),
         ),

@@ -1951,6 +1951,9 @@ data loss much later."
 ;;; onto from here — the shape `*org-mode-functions*', `*after-change-functions*'
 ;;; and `*org-frozen-node-functions*' all have. org-modern does not know this
 ;;; file exists, and a second mode wanting the same thing is one more PUSHNEW.
+;;; This one keeps its DEFVAR rather than going through `add-hook': the list
+;;; holds mode *names* and is compared with STRING=, and `add-hook' is EQL — a
+;;; list of functions, which is what every other list of this shape holds.
 (defvar *org-modern-appear-inhibit-modes* nil)
 (pushnew "org-frozen-mode" *org-modern-appear-inhibit-modes* :test #'string=)
 
@@ -1984,8 +1987,7 @@ data loss much later."
     (org-frozen-refresh))
   nil)
 
-(defvar *after-change-functions* nil)
-(pushnew 'org-frozen-after-change *after-change-functions*)
+(add-hook '*after-change-functions* 'org-frozen-after-change)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys

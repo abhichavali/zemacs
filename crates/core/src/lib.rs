@@ -2245,7 +2245,13 @@ impl Editor {
     /// 0 is the current buffer — and why `switch-to-buffer` can find one by
     /// name. Half a dozen readers used to spell the chain out for themselves;
     /// an invariant this many things depend on is worth exactly one statement.
-    pub(crate) fn buffers(&self) -> impl Iterator<Item = &Buffer> {
+    ///
+    /// `pub` rather than `pub(crate)` because the app wanted the same walk and,
+    /// being unable to reach this one, wrote it again — which is how its
+    /// `autosave_all` came to visit the live buffer by hand while the revert
+    /// sweep used an iterator. The live-first order is a promise made to Lisp;
+    /// it should not be re-derived by anyone.
+    pub fn buffers(&self) -> impl Iterator<Item = &Buffer> {
         std::iter::once(&self.buffer).chain(self.others.iter())
     }
 
@@ -2260,6 +2266,18 @@ impl Editor {
     /// windows, whose buffers are not `self.buffer`.
     pub fn buffer_by_id(&self, id: BufferId) -> Option<&Buffer> {
         self.buffers().find(|b| b.id == id)
+    }
+
+    /// The same buffer, to write to — what auto-revert and auto-save reach for,
+    /// since both act on a buffer that is not the one being typed into.
+    ///
+    /// Spelled out rather than built on a `buffers_mut`, because that iterator
+    /// has exactly this one caller and an iterator with one caller is a worse
+    /// abstraction than the chain it hides.
+    pub fn buffer_by_id_mut(&mut self, id: BufferId) -> Option<&mut Buffer> {
+        std::iter::once(&mut self.buffer)
+            .chain(self.others.iter_mut())
+            .find(|b| b.id == id)
     }
 
     /// Park the live cursor and scroll onto the focused window so every window

@@ -101,22 +101,18 @@ pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
         // right for a menu and wrong for anything that has to *match* a name.
         // This is the same buffers with their fields apart:
         // `(NAME FILE MODIFIED-P MAJOR-MODE)`, live buffer first.
-        "buffer-info" => list(
-            std::iter::once(buf)
-                .chain(ed.others.iter())
-                .map(|b| {
-                    format!(
-                        "({} {} {} {})",
-                        string(&b.name()),
-                        match &b.path {
-                            Some(p) => string(&p.to_string_lossy()),
-                            None => "nil".into(),
-                        },
-                        boolean(b.modified),
-                        string(&b.major_mode),
-                    )
-                }),
-        ),
+        "buffer-info" => list(ed.buffers().map(|b| {
+            format!(
+                "({} {} {} {})",
+                string(&b.name()),
+                match &b.path {
+                    Some(p) => string(&p.to_string_lossy()),
+                    None => "nil".into(),
+                },
+                boolean(b.modified),
+                string(&b.major_mode),
+            )
+        })),
 
         "major-mode" => string(&buf.major_mode),
         "minor-modes" => list(buf.minor_modes.iter().map(|m| string(m))),

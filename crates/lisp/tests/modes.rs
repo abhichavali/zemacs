@@ -325,6 +325,49 @@ fn modes_are_built_in_lisp() {
             .then_some(())
     });
 
+    // --- enable-minor-mode, the switch a mode hook can call ------------------
+    //
+    // The toggle above is what a *key* runs. This is what a mode hook runs, and
+    // the difference is the whole reason it exists: a hook fires on every entry
+    // into the mode, so calling the toggle from one would switch the minor mode
+    // back off the second time round. Four modes wrote the guard out by hand
+    // before this did it once.
+    //
+    // Idempotent, and it says which of the two it did: T on the call that
+    // switched it on, NIL on every call after that.
+    lisp.eval(
+        r#"(message (format nil "~a ~a ~a"
+                            (and (enable-minor-mode 'test-minor) t)
+                            (and (enable-minor-mode 'test-minor) t)
+                            (and (minor-mode-p 'test-minor) t)))"#
+            .into(),
+    );
+    wait_message(&shared, "enable-minor-mode", |m| m == "T NIL T");
+    // Counting `"test-minor on"` proves the other two things at once, because
+    // the `:on` body and the toggle's own announcement happen to print the same
+    // sentence. The toggle above logged it twice — once as the body, once as
+    // the announcement. `enable-minor-mode` has now added exactly one: it runs
+    // the `:on` body, which a bare `set-minor-mode` skips and which is why the
+    // two tutor call sites that used the primitive come here instead; and it is
+    // *silent*, so a mode that came on because you opened a file does not talk
+    // over the message its hook is about to print. Four would mean it announced
+    // itself, and the second call turning the mode off would have made it five.
+    assert_eq!(
+        shared
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| *m == "test-minor on")
+            .count(),
+        3,
+        "twice from the toggle, once more from enable-minor-mode's :on body"
+    );
+    lisp.eval("(test-minor)".into());
+    wait(&shared, "test-minor off again", |ed| {
+        (!ed.buffer.minor_modes.contains(&"test-minor".to_string())).then_some(())
+    });
+
     // --- choosing a mode from the filename ----------------------------------
     lisp.eval(
         r#"(message (format nil "~a ~a ~a"

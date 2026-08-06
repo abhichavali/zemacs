@@ -19,6 +19,7 @@
 ;;;;
 ;;;;   (define-derived-mode rust-mode prog-mode BODY...)   a major mode
 ;;;;   (define-minor-mode visual-line "doc" (:on ...) (:off ...))
+;;;;   (enable-minor-mode 'org-modern)      on if off; the hook-safe switch
 ;;;;   (set-mode-local 'org-mode 'line-overflow "wrap")    reverts on exit
 ;;;;   (define-mode-key "prog-mode" "SPC t w" "visual-line")  inherited
 ;;;;   (add-auto-mode ".md" 'text-mode)
@@ -128,6 +129,116 @@ that silently disagrees with the file behind it."
                                                          #x3F))))
                           (write-char (code-char code) out)
                           (incf i len))))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Splitting a string, and running a program
+;;;
+;;; Here for exactly the reason `utf8-text' is above, and worth spelling out
+;;; once rather than three times: these are not about modes, they are about
+;;; things several modes each need, and this is the earliest file every one of
+;;; them already loads.
+;;;
+;;; What they replace is the copy per file. `split-string' was written out twice
+;;; — `%lsp-split' and `%ai-split', identical down to the docstring.
+;;; `executable-find' lived in `ai.lisp' and was reached from `tutor.lisp' and
+;;; `math-written.lisp' through an `(fboundp 'executable-find)' guard, because
+;;; neither could be sure the AI file had loaded; a helper in the file everybody
+;;; loads first needs no guard, and the two are gone. And `run-process' was
+;;; written twice, in `tutor.lisp' to mark an exercise in a child `ecl' and in
+;;; `math-written.lisp' to hand a photograph to `curl' — the second with a
+;;; comment saying it is the same shape as the first, which is the moment to
+;;; merge rather than to note it. Two copies of a loop this fiddly is one copy
+;;; that gets fixed and one that does not.
+
+(defun split-string (string char)
+  "STRING split on CHAR. Empty fields are kept; the caller drops them."
+  (loop with start = 0
+        for i = (position char string :start start)
+        collect (subseq string start i)
+        while i do (setf start (1+ i))))
+
+(defun executable-find (program)
+  "Where PROGRAM is on $PATH, as a pathname, or NIL.
+A name containing a separator is a path and is taken as one, which is what
+every shell does."
+  (if (find #\/ program)
+      (probe-file program)
+      (dolist (dir (split-string (or (ext:getenv "PATH") "") #\:))
+        (when (plusp (length dir))
+          (let ((path (probe-file (concatenate 'string dir "/" program))))
+            ;; `probe-file' answers for a *directory* of that name too, and its
+            ;; truename has a NIL name component — which is how a directory
+            ;; called `claude' on $PATH would otherwise read as an installed
+            ;; harness.
+            (when (and path (pathname-name path))
+              (return path)))))))
+
+(defun run-process (program args &key stdin (timeout 30))
+  "Run PROGRAM with ARGS and wait for it. Answers (values OUTPUT STATUS), where
+STATUS is :EXITED, :TIMEOUT or :BROKEN and OUTPUT is everything the child said.
+
+The loop does three things at once, and each of them is a reason this is not
+`ext:run-program' with `:wait t'. It drains the pipe *as it fills*, because a
+chatty child that fills it blocks in `write' and then never reaches the exit
+being waited for — a hang built out of two things that are each individually
+correct. It polls for that exit rather than blocking on it, which is
+`external-process-wait' with a NIL second argument. And it gives up at a
+deadline, because ECL has no timeout of its own and this is the whole of adding
+one; `terminate-process' with a true second argument is SIGKILL.
+
+STDIN, when given, is written to the child and the pipe is then *closed* —
+which is the point of it: `curl --config -' reads until end of file and would
+otherwise wait for one forever.
+
+stderr is merged into stdout, so a child that explains itself on the wrong
+stream is still heard. That would corrupt a structured reply from a program
+that wrote to both, and each caller here knows its program does not: curl's
+`--silent --show-error' leaves only failures, which arrive *instead of* a body.
+
+**This parks the Lisp thread until the child is done**, which is what TIMEOUT
+is really bounding — nothing else in the image is evaluated meanwhile. A
+program that can take minutes wants `:wait nil' and a poll on
+`*point-moved-functions*' instead, which is why `project-clone-poll' in
+`init.lisp' and `math-code-build-poll' in `math-code.lisp' are deliberately
+*not* written in terms of this: a clone or a venv build would stall every
+keystroke's `after-change-hook' for its whole length."
+  (handler-case
+      (multiple-value-bind (stream code process)
+          (ext:run-program program args
+                           :input (if stdin :stream nil)
+                           :output :stream :error :output :wait nil
+                           :external-format :utf-8)
+        (declare (ignore code))
+        (unwind-protect
+             (progn
+               (when stdin
+                 ;; With both directions streamed ECL answers a TWO-WAY-STREAM,
+                 ;; and closing *that* would take the reply away with the
+                 ;; request. Only the half the child reads is closed.
+                 (let ((to-child (if (typep stream 'two-way-stream)
+                                     (two-way-stream-output-stream stream)
+                                     stream)))
+                   (write-string stdin to-child)
+                   (finish-output to-child)
+                   (close to-child)))
+               (let ((text (make-string-output-stream))
+                     (deadline (+ (get-internal-real-time)
+                                  (* timeout internal-time-units-per-second))))
+                 (loop
+                   (loop while (listen stream)
+                         do (let ((c (read-char stream nil nil)))
+                              (if c (write-char c text) (return))))
+                   (unless (eq (ext:external-process-wait process nil) :running)
+                     (loop for c = (read-char stream nil nil)
+                           while c do (write-char c text))
+                     (return (values (get-output-stream-string text) :exited)))
+                   (when (> (get-internal-real-time) deadline)
+                     (ext:terminate-process process t)
+                     (return (values (get-output-stream-string text) :timeout)))
+                   (sleep 0.02))))
+          (ignore-errors (close stream))))
+    (serious-condition (e)
+      (values (ignore-errors (princ-to-string e)) :broken))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Names
@@ -444,21 +555,49 @@ what you would have put in it in BODY. NAME-exit-hook is yours to define."
   "True when MODE is on in the live buffer."
   (member (%mode-name mode) (minor-modes) :test #'string=))
 
-(defun %toggle-minor-mode (name)
-  "Flip NAME in the live buffer and run whichever of its bodies applies.
+(defun %set-minor-mode (name on)
+  "Put NAME in state ON in the live buffer and run whichever of its bodies
+applies. Answers ON, so a caller can use it as its own value.
 
 The bodies run here rather than from the `NAME-on-hook' the editor pushes: that
-hook is delivered on the next turn of the *application* loop, and a minor mode
-is only ever switched by this command, so running it on the spot is both
+hook is delivered on the next turn of the *application* loop, and this function
+is the only thing that switches a minor mode, so running it on the spot is both
 immediate and true in a headless image. The cost is that a bare
-`(set-minor-mode \"visual-line\" t)' flips the mode without running its body —
-call the command instead."
-  (let ((on (not (minor-mode-p name))))
-    (set-minor-mode name on)
-    (let ((bodies (gethash name *minor-mode-bodies*)))
-      (when bodies (funcall (if on (car bodies) (cdr bodies)))))
-    (%refresh-settings)
+`(set-minor-mode \"visual-line\" t)' — the *primitive*, one word shorter than
+this — flips the mode without running its body or re-resolving the settings it
+claims. Call the mode's own command, or `enable-minor-mode'."
+  (set-minor-mode name on)
+  (let ((bodies (gethash name *minor-mode-bodies*)))
+    (when bodies (funcall (if on (car bodies) (cdr bodies)))))
+  (%refresh-settings)
+  on)
+
+(defun %toggle-minor-mode (name)
+  "Flip NAME in the live buffer. The body of every command `define-minor-mode'
+generates, and the only one of the two switches that announces itself: you
+pressed a key to get here."
+  (let ((on (%set-minor-mode name (not (minor-mode-p name)))))
     (message (format nil "~a ~:[off~;on~]" name on))))
+
+(defun enable-minor-mode (mode)
+  "Turn MODE on in the live buffer unless it is already on. T when this call is
+what turned it on, NIL when it was on already.
+
+The verb the mode system was missing, and four modes each wrote out in full
+before it existed. A minor mode that belongs to a kind of file switches itself
+on from a *mode hook* — `math-code' from `*python-mode-functions*',
+`math-curriculum', `tutor-lesson' and `org-modern' from `*org-mode-functions*'
+— and a mode hook runs on **every** entry into the mode, so a hook that called
+the mode's own command would switch it back off the second time round. Hence
+`(unless (minor-mode-p 'x) (x))' at four sites, each under its own paragraph
+explaining the same guard. One paragraph is enough, and this is it.
+
+Silent, unlike the toggle: a mode that came on because you opened the kind of
+file it is for has not answered a question you asked, and each of those four
+callers had a `message' of its own that the toggle's was overwriting anyway."
+  (let ((name (%mode-name mode)))
+    (unless (minor-mode-p name)
+      (%set-minor-mode name t))))
 
 (defmacro define-minor-mode (name doc &body clauses)
   "Define minor mode NAME, whose command toggles it in the live buffer.
@@ -482,39 +621,50 @@ binds in its buffers only, and minor modes are consulted before the major one."
        ,mode)))
 
 ;;; ---------------------------------------------------------------------------
-;;; The cursor moved
+;;; The two things the editor reports about a buffer
 ;;;
-;;; The editor reports two things about a buffer and this is the second of them.
-;;; `after-change-hook' says the *document* moved; this one says *point* did —
-;;; you pressed `j', or `w', or clicked, or switched buffers. The application
-;;; queues it exactly as it queues that one, through `pending_hooks' and behind
-;;; the same `fboundp' guard, so an image that never defines the function pays
-;;; nothing.
+;;; `after-change-hook' says the *document* moved — you typed, or Lisp wrote
+;;; into the buffer. `point-moved-hook' says *point* did — you pressed `j', or
+;;; `w', or clicked, or switched buffers. The application queues them the same
+;;; way, through `pending_hooks' and behind the same `fboundp' guard, so an
+;;; image that defines neither pays nothing for either.
 ;;;
-;;; It lives here because this is the standard library — the file a mode is
-;;; defined with — and a hook every mode may want does not belong in whichever
-;;; feature happened to want it first. (`*after-change-functions*' is still in
-;;; the LSP client for that historical reason, and the note beside it in
-;;; `org-modern.lisp' says so.)
+;;; Both live here, and the first of them only arrived on the second attempt.
+;;; `after-change-hook' was declared in `lsp.lisp' because the LSP client was
+;;; the only thing that wanted it, and by the time `org-modern.lisp',
+;;; `show-paren.lisp', `org-frozen.lisp', `math-code.lisp' and `init.lisp'
+;;; wanted it too there were *two* copies of the dispatcher — the second one
+;;; wrapped in `(unless (fboundp ...))' so that whichever file loaded first won
+;;; — and a defensive DEFVAR in every file that pushed onto either list. That is
+;;; what a hook living in whichever feature happened to want it first costs, and
+;;; it is why this is the file it belongs in: the standard library, beside
+;;; `define-derived-mode', where a mode looks for it anyway.
 ;;;
-;;; A function on this list runs on **every** cursor movement in every buffer,
-;;; which is once per keystroke at worst — the same budget `after-change-hook'
-;;; has while you type. So the rule for what goes on it is the rule org-appear
-;;; already follows: a constant amount of work, or a cheap test that decides
-;;; whether to do any. A buffer rescan here would be felt.
+;;; A function on either list runs on **every** keystroke at worst. So the rule
+;;; for what goes on one is the rule org-appear already follows: a constant
+;;; amount of work, or a cheap test that decides whether to do any. A buffer
+;;; rescan here would be felt.
 ;;;
-;;; DEFVAR and a guarded DEFUN, both on purpose: a config reload must not throw
-;;; away the functions already registered, and must not replace a `point-moved-hook'
-;;; a config wrote for itself.
+;;; DEFVAR and guarded DEFUNs, all on purpose: a config reload must not throw
+;;; away the functions already registered, and must not replace a hook a config
+;;; wrote for itself.
+
+(defvar *after-change-functions* nil
+  "Functions called with no arguments after any change to the live buffer.")
 
 (defvar *point-moved-functions* nil
   "Functions called with no arguments after point moves in the live buffer.")
 
+;;; IGNORE-ERRORS per function, in both: one config's broken hook must cost you
+;;; that hook rather than the next one in the list, and must not turn every
+;;; keystroke into a backtrace.
+
+(unless (fboundp 'after-change-hook)
+  (defun after-change-hook ()
+    (dolist (f *after-change-functions*) (ignore-errors (funcall f)))))
+
 (unless (fboundp 'point-moved-hook)
   (defun point-moved-hook ()
-    ;; IGNORE-ERRORS per function, as `after-change-hook' does: one config's
-    ;; broken mover must not stop the next one from running, and it must not
-    ;; turn every keystroke into a backtrace.
     (dolist (f *point-moved-functions*) (ignore-errors (funcall f)))))
 
 ;;; ---------------------------------------------------------------------------

@@ -87,29 +87,12 @@ not double the list.
 ;;; forks — this one exists so the *menu* can say so, which is the difference
 ;;; between picking a harness and finding out, and picking it and watching a
 ;;; buffer flash.
-
-(defun %ai-split (string char)
-  "STRING split on CHAR. Empty fields are kept; the caller drops them."
-  (loop with start = 0
-        for i = (position char string :start start)
-        collect (subseq string start i)
-        while i do (setf start (1+ i))))
-
-(defun executable-find (program)
-  "Where PROGRAM is on $PATH, as a pathname, or NIL.
-A name containing a separator is a path and is taken as one, which is what
-every shell does."
-  (if (find #\/ program)
-      (probe-file program)
-      (dolist (dir (%ai-split (or (ext:getenv "PATH") "") #\:))
-        (when (plusp (length dir))
-          (let ((path (probe-file (concatenate 'string dir "/" program))))
-            ;; `probe-file' answers for a *directory* of that name too, and its
-            ;; truename has a NIL name component — which is how a directory
-            ;; called `claude' on $PATH would otherwise read as an installed
-            ;; harness.
-            (when (and path (pathname-name path))
-              (return path)))))))
+;;;
+;;; `executable-find' itself was written here first, and lives in `modes.lisp'
+;;; now: `tutor.lisp' and `math-written.lisp' both wanted it and both reached it
+;;; through an `(fboundp 'executable-find)' guard, because neither could be sure
+;;; this file had loaded. A helper in the file every mode loads first needs no
+;;; such guard.
 
 (defun ai-installed-p (name)
   "Whether the harness called NAME has its binary on $PATH."

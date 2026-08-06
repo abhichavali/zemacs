@@ -1613,9 +1613,21 @@ impl Buffer {
         }
     }
 
+    /// The zero-based line `pos` falls on, clamped to the document.
+    ///
+    /// The clamp is the whole reason this is a method: `Rope::char_to_line`
+    /// *panics* one past the end, and the offsets asking come from arithmetic in
+    /// Lisp, from a motion target computed against a buffer an edit has since
+    /// shortened, and from a marker restored across an undo. A dozen callers
+    /// spelled the guard out for themselves, which is a dozen chances to be the
+    /// one that did not.
+    pub(crate) fn line_of(&self, pos: usize) -> usize {
+        self.text.char_to_line(pos.min(self.len_chars()))
+    }
+
     /// (line, column) of the cursor, both zero-based.
     pub fn cursor_line_col(&self) -> (usize, usize) {
-        let line = self.text.char_to_line(self.cursor.min(self.len_chars()));
+        let line = self.line_of(self.cursor);
         let line_start = self.text.line_to_char(line);
         (line, self.cursor - line_start)
     }
@@ -1693,13 +1705,13 @@ impl Buffer {
 
     /// Swap the whole text out, recording the whole-document replacement it is.
     ///
-    /// The four callers — undo/redo, `load`, `create-buffer`, and the generated
-    /// buffers' refresh — are not *edits*: each throws the undo history, the
-    /// markers and the overlays away and starts a document over, so there is
-    /// nothing for `splice` to adjust and no reason to pay for its rope
-    /// surgery. The change log has to hear about it all the same. A reader that
-    /// missed it would go on adjusting offsets into a document that is gone,
-    /// which is worse than being told to start again.
+    /// The callers — undo/redo, and [`Buffer::adopt`] for everything else — are
+    /// not *edits*: each throws the undo history, the markers and the overlays
+    /// away and starts a document over, so there is nothing for `splice` to
+    /// adjust and no reason to pay for its rope surgery. The change log has to
+    /// hear about it all the same. A reader that missed it would go on
+    /// adjusting offsets into a document that is gone, which is worse than
+    /// being told to start again.
     fn replace_text(&mut self, text: Rope) {
         self.changes.record(Change {
             start: 0,
@@ -1707,6 +1719,32 @@ impl Buffer {
             new_end: text.len_chars(),
         });
         self.text = text;
+    }
+
+    /// Take `text` as a **different document**, dropping everything that
+    /// described the old one.
+    ///
+    /// The shared half of the three routes to a buffer holding something else —
+    /// `load` reading a file, `create_buffer` making one from Lisp, and
+    /// `show_named` re-rendering a generated listing — which had three copies
+    /// of this list and were one forgotten `markers.clear()` away from a marker
+    /// naming an offset in text that no longer exists. The undo history goes
+    /// for the same reason: one `u` must never restore a document you are not
+    /// looking at.
+    ///
+    /// What stays with the caller is what genuinely differs between the three:
+    /// where point lands afterwards, and whether a *scene* went with the
+    /// document — a page is only stale where a buffer was reused rather than
+    /// stacked, so the two callers that reuse one say so themselves.
+    fn adopt(&mut self, text: &str) {
+        self.replace_text(Rope::from_str(text));
+        self.cursor = 0;
+        self.modified = false;
+        self.undo.clear();
+        self.redo.clear();
+        self.markers.clear();
+        self.overlays.clear();
+        self.highlights.clear();
     }
 
     /// How many edits this buffer has ever seen.
@@ -2111,13 +2149,7 @@ impl Editor {
                 Some(i) => self.switch_buffer(i + 1),
                 None => {
                     self.sync_window();
-                    self.buffer.saved_scroll = self.scroll;
-                    let mut fresh = Buffer::from_str("");
-                    fresh.id = self.next_buffer_id;
-                    fresh.kind = kind;
-                    self.next_buffer_id += 1;
-                    let previous = std::mem::replace(&mut self.buffer, fresh);
-                    self.others.insert(0, previous);
+                    self.stack_buffer();
                     // A new, empty buffer starts at the top. `switch_buffer` in
                     // the arm above restores the incoming buffer's own scroll;
                     // this arm had no incoming buffer and so kept the *outgoing*
@@ -2136,29 +2168,20 @@ impl Editor {
             self.buffer.given_name = Some(name.to_string());
         }
         self.buffer.kind = kind;
-        self.buffer.replace_text(Rope::from_str(text));
-        self.buffer.modified = false;
-        self.buffer.undo.clear();
-        self.buffer.redo.clear();
         // Regenerated text, so every marker into the old listing names a line
         // that may not even be there any more. Overlays go the same way: dired
-        // and magit put their faces back on every refresh anyway.
-        self.buffer.markers.clear();
-        self.buffer.overlays.clear();
+        // and magit put their faces back on every refresh anyway — see
+        // [`Buffer::adopt`], which is where the rest of that list lives.
+        self.buffer.adopt(text);
         self.buffer.move_to_line_col(line, 0);
         self.mode = kind.mode();
-        self.buffer.highlights.clear();
         self.revision += 1;
-
-        // Scroll too, and not only the buffer and the cursor: `sync_window`
-        // above parked the *outgoing* buffer's scroll on this window, and the
-        // window is what the renderer draws every pane from.
-        let (id, cursor, scroll) = (self.buffer.id, self.buffer.cursor, self.scroll);
-        let w = self.frame_mut().current_window_mut();
-        w.buffer = id;
-        w.cursor = cursor;
-        w.scroll = scroll;
-        id
+        // The scroll goes back onto the window too, and not only the buffer and
+        // the cursor: the sync at the top of this function parked the *outgoing*
+        // buffer's scroll there, and the window is what the renderer draws every
+        // pane from.
+        self.sync_window();
+        self.buffer.id
     }
 
     /// Replace buffer `id`'s text with `text`, keeping point on the line it was
@@ -2215,9 +2238,19 @@ impl Editor {
         &mut self.frames[i]
     }
 
+    /// Every open buffer, **live one first**.
+    ///
+    /// That order is not an implementation detail: it is what `(buffer-list)`
+    /// and `(buffer-info)` promise, what the switcher's indices are into — index
+    /// 0 is the current buffer — and why `switch-to-buffer` can find one by
+    /// name. Half a dozen readers used to spell the chain out for themselves;
+    /// an invariant this many things depend on is worth exactly one statement.
+    pub(crate) fn buffers(&self) -> impl Iterator<Item = &Buffer> {
+        std::iter::once(&self.buffer).chain(self.others.iter())
+    }
+
     fn dashboard_buffer_id(&self) -> BufferId {
-        std::iter::once(&self.buffer)
-            .chain(self.others.iter())
+        self.buffers()
             .find(|b| b.kind == BufferKind::Dashboard)
             .map(|b| b.id)
             .unwrap_or(0)
@@ -2226,9 +2259,7 @@ impl Editor {
     /// Any buffer by handle — the renderer needs this to draw the *inactive*
     /// windows, whose buffers are not `self.buffer`.
     pub fn buffer_by_id(&self, id: BufferId) -> Option<&Buffer> {
-        std::iter::once(&self.buffer)
-            .chain(self.others.iter())
-            .find(|b| b.id == id)
+        self.buffers().find(|b| b.id == id)
     }
 
     /// Park the live cursor and scroll onto the focused window so every window
@@ -2242,8 +2273,11 @@ impl Editor {
         self.sync_window();
     }
 
-    /// Park the live cursor and scroll on the focused window. Must run before
-    /// anything changes which window is focused.
+    /// Park the live buffer, cursor and scroll on the focused window. Must run
+    /// before anything changes which window is focused — and again after
+    /// anything changes which *buffer* is live, since the window is what the
+    /// renderer draws every pane from and one still naming the buffer that left
+    /// would swap it straight back in on the next focus change.
     fn sync_window(&mut self) {
         let (cursor, scroll, lines, cols, id) = (
             self.buffer.cursor,
@@ -2258,6 +2292,26 @@ impl Editor {
         w.viewport_lines = lines;
         w.wrap_cols = cols;
         w.buffer = id;
+    }
+
+    /// Park the live buffer on the stack and make a fresh, empty one live.
+    ///
+    /// The first half of every route to "a different document is on screen" —
+    /// `load`, `create_buffer`, `show_named` — which had three copies of it and
+    /// were the three places a forgotten `saved_scroll` or a reused
+    /// `next_buffer_id` would show up as one buffer wearing another's identity.
+    ///
+    /// *Whether* to stack stays with the caller, because that is where the three
+    /// genuinely differ: `load` and `create_buffer` reuse a pristine buffer
+    /// rather than leaving an untitled husk in the switcher, and a generated
+    /// buffer always gets its own.
+    fn stack_buffer(&mut self) {
+        self.buffer.saved_scroll = self.scroll;
+        let mut fresh = Buffer::from_str("");
+        fresh.id = self.next_buffer_id;
+        self.next_buffer_id += 1;
+        let previous = std::mem::replace(&mut self.buffer, fresh);
+        self.others.insert(0, previous);
     }
 
     /// Make the focused window's buffer and position the live ones. The
@@ -2291,10 +2345,7 @@ impl Editor {
     /// and *reorders the list as it goes* — so an index is only good until the
     /// next switch, which is exactly one keystroke when the switcher previews.
     pub fn buffer_ids(&self) -> Vec<BufferId> {
-        std::iter::once(&self.buffer)
-            .chain(self.others.iter())
-            .map(|b| b.id)
-            .collect()
+        self.buffers().map(|b| b.id).collect()
     }
 
     /// Switch to the buffer with `id`, wherever it has drifted to. A no-op when
@@ -2310,8 +2361,7 @@ impl Editor {
     }
 
     pub fn buffer_names(&self) -> Vec<String> {
-        std::iter::once(&self.buffer)
-            .chain(self.others.iter())
+        self.buffers()
             .map(|b| {
                 let mark = if b.modified { " [+]" } else { "" };
                 format!("{}{mark}", b.name())
@@ -2330,8 +2380,7 @@ impl Editor {
     pub fn buffer_candidates(&self) -> Vec<String> {
         let names = self.buffer_names();
         let width = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
-        std::iter::once(&self.buffer)
-            .chain(self.others.iter())
+        self.buffers()
             .zip(&names)
             .map(|(b, name)| {
                 let pad = width - name.chars().count();
@@ -2362,11 +2411,7 @@ impl Editor {
         self.mode = self.buffer.kind.mode();
         // The window now shows this buffer — otherwise the next focus change
         // would swap the old one straight back in.
-        let (id, cursor, scroll) = (self.buffer.id, self.buffer.cursor, self.scroll);
-        let w = self.frame_mut().current_window_mut();
-        w.buffer = id;
-        w.cursor = cursor;
-        w.scroll = scroll;
+        self.sync_window();
     }
 
     // --- lisp-api: buffers with no file behind them --------------------------
@@ -2395,29 +2440,17 @@ impl Editor {
         // leave an untitled husk in the switcher.
         self.sync_window();
         if !self.buffer.is_pristine() {
-            self.buffer.saved_scroll = self.scroll;
-            let mut fresh = Buffer::from_str("");
-            fresh.id = self.next_buffer_id;
-            self.next_buffer_id += 1;
-            let previous = std::mem::replace(&mut self.buffer, fresh);
-            self.others.insert(0, previous);
+            self.stack_buffer();
         }
         self.buffer.given_name = Some(name);
         self.buffer.kind = BufferKind::Text;
         self.buffer.path = None;
-        self.buffer.replace_text(Rope::from_str(""));
-        self.buffer.cursor = 0;
-        self.buffer.modified = false;
-        self.buffer.undo.clear();
-        self.buffer.redo.clear();
-        self.buffer.markers.clear();
-        self.buffer.overlays.clear();
+        self.buffer.adopt("");
         // A scene is about a document too, and this path *reuses* the live
         // buffer when it was pristine — so a page left over from the buffer
         // that was here would be drawn over a scratchpad that has nothing to do
         // with it, and would keep the read-only claim that came with it.
         self.buffer.set_scene(None);
-        self.buffer.highlights.clear();
         // No hook: `fundamental-mode-hook` firing on every scratchpad would be a
         // surprise, and Lisp that wants one calls `set-major-mode` itself — it
         // is one line, and it is the line that says which mode it meant.
@@ -2426,11 +2459,7 @@ impl Editor {
         self.scroll = 0;
         self.revision += 1;
         self.mode = Mode::Normal;
-        let id = self.buffer.id;
-        let w = self.frame_mut().current_window_mut();
-        w.buffer = id;
-        w.cursor = 0;
-        w.scroll = 0;
+        self.sync_window();
     }
 
     /// Kill the buffer at `index` in [`Editor::buffer_names`]; 0 is the live one.
@@ -2475,6 +2504,18 @@ impl Editor {
 
     // --- end of the lisp-api block -------------------------------------------
 
+    /// One edit to the live document, and the revision it owes.
+    ///
+    /// The six mutating arms of [`Editor::apply`] each used to bump the counter
+    /// for themselves, which is six chances to add a seventh and forget — and a
+    /// mutation the revision does not see is a buffer the syntax thread never
+    /// re-parses and an `after-change-hook` that never fires. The bump belongs
+    /// to *being* an edit, so it is stated where that is decided.
+    fn edit(&mut self, f: impl FnOnce(&mut Buffer)) {
+        f(&mut self.buffer);
+        self.revision += 1;
+    }
+
     /// The one and only document mutator.
     pub fn apply(&mut self, cmd: EditorCommand) {
         // Generated buffers are views, not documents: *dashboard* and *magit*
@@ -2494,30 +2535,12 @@ impl Editor {
         let history = matches!(cmd, EditorCommand::Undo | EditorCommand::Redo);
         match cmd {
             EditorCommand::Checkpoint => self.checkpoint(),
-            EditorCommand::InsertChar(c) => {
-                self.buffer.insert_char(c);
-                self.revision += 1;
-            }
-            EditorCommand::InsertText(s) => {
-                self.buffer.insert_text(&s);
-                self.revision += 1;
-            }
-            EditorCommand::InsertNewline => {
-                self.buffer.insert_char('\n');
-                self.revision += 1;
-            }
-            EditorCommand::DeleteBackward => {
-                self.buffer.delete_backward();
-                self.revision += 1;
-            }
-            EditorCommand::DeleteForward => {
-                self.buffer.delete_forward();
-                self.revision += 1;
-            }
-            EditorCommand::DeleteRange(a, b) => {
-                self.buffer.delete_range(a, b);
-                self.revision += 1;
-            }
+            EditorCommand::InsertChar(c) => self.edit(|b| b.insert_char(c)),
+            EditorCommand::InsertText(s) => self.edit(|b| b.insert_text(&s)),
+            EditorCommand::InsertNewline => self.edit(|b| b.insert_char('\n')),
+            EditorCommand::DeleteBackward => self.edit(Buffer::delete_backward),
+            EditorCommand::DeleteForward => self.edit(Buffer::delete_forward),
+            EditorCommand::DeleteRange(a, b) => self.edit(|buf| buf.delete_range(a, b)),
             EditorCommand::Yank {
                 start,
                 end,
@@ -2896,28 +2919,15 @@ impl Editor {
         }
         // Stack the outgoing buffer, unless it is a throwaway.
         if !self.buffer.is_pristine() {
-            self.buffer.saved_scroll = self.scroll;
-            let mut fresh = Buffer::from_str("");
-            fresh.id = self.next_buffer_id;
-            self.next_buffer_id += 1;
-            let previous = std::mem::replace(&mut self.buffer, fresh);
-            self.others.insert(0, previous);
+            self.stack_buffer();
         }
         // A new document gets a new history — and note the outgoing buffer took
         // its own undo stack with it, so one `u` here can never restore the
-        // file you were looking at a moment ago.
-        self.buffer.replace_text(Rope::from_str(text));
-        self.buffer.cursor = 0;
+        // file you were looking at a moment ago. Its markers went the same way,
+        // and any left are stale by the same argument. See [`Buffer::adopt`].
+        self.buffer.adopt(text);
         self.buffer.path = path;
         self.buffer.language = language;
-        self.buffer.modified = false;
-        self.buffer.undo.clear();
-        self.buffer.redo.clear();
-        // A different document: the markers of the buffer that was here went
-        // with it onto the stack, and any left are stale by the same argument
-        // that clears the undo history.
-        self.buffer.markers.clear();
-        self.buffer.overlays.clear();
         // ...and the scene, for the reason `create_buffer` clears it: a
         // pristine buffer is reused rather than stacked, and the page that was
         // on it is about the document that just left.
@@ -2930,15 +2940,10 @@ impl Editor {
         self.buffer.major_mode = major.clone();
         self.buffer.minor_modes.clear();
         self.pending_hooks.push(format!("{major}-hook"));
-        self.buffer.highlights.clear();
         self.revision += 1;
         self.scroll = 0;
         self.mode = Mode::Normal;
-        let id = self.buffer.id;
-        let w = self.frame_mut().current_window_mut();
-        w.buffer = id;
-        w.cursor = 0;
-        w.scroll = 0;
+        self.sync_window();
     }
 
     fn set_mode(&mut self, m: Mode) {
@@ -3024,8 +3029,8 @@ impl Editor {
             (self.buffer.cursor, anchor)
         };
         if self.mode == Mode::VisualLine {
-            let first = self.buffer.text.char_to_line(a.min(self.buffer.len_chars()));
-            let last = self.buffer.text.char_to_line(b.min(self.buffer.len_chars()));
+            let first = self.buffer.line_of(a);
+            let last = self.buffer.line_of(b);
             let end = (self.buffer.line_end(last) + 1).min(self.buffer.len_chars());
             Some((self.buffer.line_start(first), end))
         } else {

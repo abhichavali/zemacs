@@ -4,10 +4,11 @@
 //! targets but never mutates it. Everything it decides comes back as
 //! [`EditorCommand`]s for [`Editor::apply`].
 //!
-//! With exactly one exception, and it earns its keep: replaying a macro applies
-//! each key's commands before feeding the next, because a macro is a recording
-//! of *decisions* and every decision after the first has to see what the one
-//! before it did. `apply` is still the only writer — see [`Editor::replay`].
+//! With exactly one exception, and it earns its keep: a *replay* — `@` or `.` —
+//! applies each key's commands before feeding the next, because both are
+//! recordings of *decisions* and every decision after the first has to see what
+//! the one before it did. `apply` is still the only writer — see
+//! [`Editor::run_keys`], which is that exception in one place for both.
 //!
 //! Lookup order for every key, which is what makes the Lisp config authoritative:
 //! prompt line → pending literal (`r`, `f`, `"`, `m`, `` ` ``, `q`, `@`) →
@@ -420,6 +421,39 @@ impl Editor {
         }
     }
 
+    /// Feed `keys` back through [`Editor::handle_key`], `n` times over,
+    /// applying what each one produced before the next arrives.
+    ///
+    /// The one place in this file that mutates the document, and it is the
+    /// engine of *both* `.` and `@` — one function rather than the two copies
+    /// it was, because they are the same mechanism twice: a macro and a repeat
+    /// are recordings of **decisions**, so every key after the first has to see
+    /// what the one before it did. The second `dw` of a replay deletes the word
+    /// under the cursor *now*. Handing the whole batch back to the caller
+    /// instead would compute every offset against the text as it stood before
+    /// the replay started, and a two-line macro would delete the same word
+    /// twice.
+    ///
+    /// Still not a crack in "`apply` is the only writer": it is `apply` doing
+    /// the writing, with the replay driving the loop instead of the app.
+    /// Commands core cannot carry out itself travel back up as usual, so a
+    /// macro can still open a file or call Lisp.
+    fn run_keys(&mut self, keys: &[Key], n: usize) -> Vec<EditorCommand> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            for key in keys.iter().copied() {
+                for cmd in self.handle_key(key) {
+                    if cmd.needs_app() {
+                        out.push(cmd);
+                    } else {
+                        self.apply(cmd);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// `.` — the last change, again, `n` times.
     fn repeat_change(&mut self, n: usize) -> Vec<EditorCommand> {
         let keys = self.vim.change.clone();
@@ -434,21 +468,8 @@ impl Editor {
         // Replaying on top of that made the first key of the change read as
         // `. d` rather than `d`, and matched nothing at all.
         self.pending.clear();
-        // Applied here rather than returned, for the reason `replay` gives:
-        // every key after the first has to see what the one before it did.
         self.vim.repeating = true;
-        let mut out = Vec::new();
-        for _ in 0..n {
-            for key in keys.iter().copied() {
-                for cmd in self.handle_key(key) {
-                    if cmd.needs_app() {
-                        out.push(cmd);
-                    } else {
-                        self.apply(cmd);
-                    }
-                }
-            }
-        }
+        let out = self.run_keys(&keys, n);
         self.vim.repeating = false;
         self.vim.just_repeated = true;
         out
@@ -521,7 +542,7 @@ impl Editor {
     /// being able to interrupt a running program.
     fn terminal_key(&mut self, key: Key) -> Vec<EditorCommand> {
         let token = key.token();
-        if let Some(action) = self.keymap.get(&(Mode::Terminal, token.clone())).cloned() {
+        if let Some(action) = self.keymap_lookup(&token) {
             return self.run_action(&action);
         }
         if key.is_editor_key() {
@@ -565,16 +586,15 @@ impl Editor {
         if !self.pending.keys.is_empty() || !matches!(key, Key::Char(_)) {
             self.pending.keys.push(key.token());
             let seq = self.pending.keys.join(" ");
-            if let Some(cmd) = self.keymap.get(&(Mode::Insert, seq.clone())).cloned() {
+            // The same two questions Normal mode asks, through the same two
+            // readers: [`Editor::keymaps`] is the only statement anywhere of
+            // which maps a key is looked up in, and Insert layers over nothing,
+            // so it answers this one with Insert alone.
+            if let Some(cmd) = self.keymap_lookup(&seq) {
                 self.pending.clear();
                 return self.run_action(&cmd);
             }
-            let prefix = format!("{seq} ");
-            if self
-                .keymap
-                .keys()
-                .any(|(m, k)| *m == Mode::Insert && k.starts_with(&prefix))
-            {
+            if self.keymap_prefix(&seq) {
                 return vec![]; // more of the sequence to come
             }
             // Not a binding and not a prefix. A sequence that got somewhere and
@@ -1341,36 +1361,33 @@ impl Editor {
         }
     }
 
+    /// Every motion in the grammar, as the table it is: a key sequence in, a
+    /// destination and the span an operator would cover, out.
+    ///
+    /// The arms answer `(target, span)` rather than building a [`Motion`] each,
+    /// because a motion *is* that pair and twenty repetitions of the struct
+    /// literal hid which arms differ in more than their arithmetic. Two do, and
+    /// now say so by returning early: `j` and `k` hand the whole decision to
+    /// [`Editor::vertical`], which is the one motion whose *unit* — buffer line
+    /// or visual row — depends on the window rather than on the key.
     fn motion(&self, seq: &str, n: usize) -> Option<Motion> {
         let buf = &self.buffer;
         let (line, col) = buf.cursor_line_col();
         let cur = buf.cursor;
-        let m = match seq {
-            "h" | "<left>" => Motion {
-                target: buf.line_start(line) + col.saturating_sub(n),
-                span: Span::Exclusive,
-            },
-            "l" | "<right>" | "SPC" => Motion {
-                target: (cur + n).min(buf.line_end(line)),
-                span: Span::Exclusive,
-            },
+        let (target, span) = match seq {
+            "h" | "<left>" => (buf.line_start(line) + col.saturating_sub(n), Span::Exclusive),
+            "l" | "<right>" | "SPC" => ((cur + n).min(buf.line_end(line)), Span::Exclusive),
             // Vertical motions hold the column. Targeting the line start would
             // send `j` to column 0, which is wrong for the cursor and invisible
             // to an operator (a linewise span only reads the *line*).
-            "j" | "<down>" => self.vertical(true, n),
-            "k" | "<up>" => self.vertical(false, n),
-            "0" => Motion {
-                target: buf.line_start(line),
-                span: Span::Exclusive,
-            },
-            "^" => Motion {
-                target: buf.first_non_blank(line),
-                span: Span::Exclusive,
-            },
-            "$" => Motion {
-                target: buf.line_end((line + n - 1).min(buf.last_line())),
-                span: Span::Inclusive,
-            },
+            "j" | "<down>" => return Some(self.vertical(true, n)),
+            "k" | "<up>" => return Some(self.vertical(false, n)),
+            "0" => (buf.line_start(line), Span::Exclusive),
+            "^" => (buf.first_non_blank(line), Span::Exclusive),
+            "$" => (
+                buf.line_end((line + n - 1).min(buf.last_line())),
+                Span::Inclusive,
+            ),
             // `w`/`W`, and the one deliberate irregularity in vim's grammar
             // that everybody relies on without noticing: with an operator
             // pending, a `w` that would carry the range onto the next line
@@ -1390,48 +1407,42 @@ impl Editor {
                 }
                 let mut target = pos;
                 if self.pending.op.is_some() {
-                    let eol = buf.line_end(buf.text.char_to_line(prev.min(buf.len_chars())));
+                    let eol = buf.line_end(buf.line_of(prev));
                     target = target.min(eol.max(cur));
                 }
-                Motion {
-                    target,
-                    span: Span::Exclusive,
-                }
+                (target, Span::Exclusive)
             }
-            "b" | "B" => Motion {
-                target: (0..n).fold(cur, |p, _| word_backward(buf, p, seq == "B")),
-                span: Span::Exclusive,
-            },
-            "e" | "E" => Motion {
-                target: (0..n).fold(cur, |p, _| word_end(buf, p, seq == "E")),
-                span: Span::Inclusive,
-            },
+            "b" | "B" => (
+                (0..n).fold(cur, |p, _| word_backward(buf, p, seq == "B")),
+                Span::Exclusive,
+            ),
+            "e" | "E" => (
+                (0..n).fold(cur, |p, _| word_end(buf, p, seq == "E")),
+                Span::Inclusive,
+            ),
             // Backward to the end of the previous word. `g e` used to mean "the
             // end of the buffer", which is `G`'s job and is not what any vim
             // user pressing `ge` is asking for.
-            "g e" | "g E" => Motion {
-                target: (0..n).fold(cur, |p, _| word_end_backward(buf, p, seq == "g E")),
-                span: Span::Inclusive,
-            },
+            "g e" | "g E" => (
+                (0..n).fold(cur, |p, _| word_end_backward(buf, p, seq == "g E")),
+                Span::Inclusive,
+            ),
             // Linewise line motions. `_` is "this line", so `d_` is `dd` and
             // `3_` reaches two lines down — the off-by-one is vim's, not a slip.
-            "_" => Motion {
-                target: buf.first_non_blank((line + n - 1).min(buf.last_line())),
-                span: Span::Linewise,
-            },
-            "+" | "<ret>" => Motion {
-                target: buf.first_non_blank((line + n).min(buf.last_line())),
-                span: Span::Linewise,
-            },
-            "-" => Motion {
-                target: buf.first_non_blank(line.saturating_sub(n)),
-                span: Span::Linewise,
-            },
+            "_" => (
+                buf.first_non_blank((line + n - 1).min(buf.last_line())),
+                Span::Linewise,
+            ),
+            "+" | "<ret>" => (
+                buf.first_non_blank((line + n).min(buf.last_line())),
+                Span::Linewise,
+            ),
+            "-" => (buf.first_non_blank(line.saturating_sub(n)), Span::Linewise),
             // `|` — go to a column, counting from 1.
-            "|" => Motion {
-                target: (buf.line_start(line) + n.saturating_sub(1)).min(buf.line_end(line)),
-                span: Span::Exclusive,
-            },
+            "|" => (
+                (buf.line_start(line) + n.saturating_sub(1)).min(buf.line_end(line)),
+                Span::Exclusive,
+            ),
             // The window's top, middle and bottom line. The only motions that
             // ask what is *drawn* rather than what is in the buffer, which is
             // why they read `scroll` and `viewport_lines`.
@@ -1444,53 +1455,38 @@ impl Editor {
                     "L" => bottom.saturating_sub(n - 1).max(top),
                     _ => top + (bottom - top) / 2,
                 };
-                Motion {
-                    target: buf.first_non_blank(target),
-                    span: Span::Linewise,
-                }
+                (buf.first_non_blank(target), Span::Linewise)
             }
             // `%` — the other end of the bracket at or just before point.
             // Inclusive, so `d%` takes the pair and everything between it,
             // which is the whole reason anyone uses it with an operator.
-            "%" => Motion {
-                target: buf.matching_bracket(cur)?,
-                span: Span::Inclusive,
-            },
+            "%" => (buf.matching_bracket(cur)?, Span::Inclusive),
             // `j`/`k` by *visual* row, explicitly, whatever the window is
             // doing — vim's `gj`/`gk`.
-            "g j" | "g k" => Motion {
-                target: self.visual_target(seq == "g j", n, self.held_col(self.cursor_vcol())),
-                span: Span::Exclusive,
-            },
-            "{" => Motion {
-                target: buf.line_start(paragraph(buf, line, false)),
-                span: Span::Linewise,
-            },
-            "}" => Motion {
-                target: buf.line_start(paragraph(buf, line, true)),
-                span: Span::Linewise,
-            },
+            "g j" | "g k" => (
+                self.visual_target(seq == "g j", n, self.held_col(self.cursor_vcol())),
+                Span::Exclusive,
+            ),
+            "{" => (buf.line_start(paragraph(buf, line, false)), Span::Linewise),
+            "}" => (buf.line_start(paragraph(buf, line, true)), Span::Linewise),
+            // A count on `G` is the line to go to rather than a repetition, and
+            // its absence is the last line — which is why this reads `count`
+            // itself instead of the `n` every other arm takes.
             "G" => {
                 let last = buf.last_line();
                 let target = match self.pending.count {
-                    Some(c) => buf.first_non_blank((c - 1).min(last)),
-                    None => buf.first_non_blank(last),
+                    Some(c) => (c - 1).min(last),
+                    None => last,
                 };
-                Motion {
-                    target,
-                    span: Span::Linewise,
-                }
+                (buf.first_non_blank(target), Span::Linewise)
             }
-            "g g" => {
-                let target = buf.first_non_blank(self.pending.count.unwrap_or(1).saturating_sub(1));
-                Motion {
-                    target,
-                    span: Span::Linewise,
-                }
-            }
+            "g g" => (
+                buf.first_non_blank(self.pending.count.unwrap_or(1).saturating_sub(1)),
+                Span::Linewise,
+            ),
             _ => return None,
         };
-        Some(m)
+        Some(Motion { target, span })
     }
 
     /// The word under the cursor, for `*` and `#`.
@@ -1500,7 +1496,7 @@ impl Editor {
     /// the line, which is nearly always what was meant.
     fn word_at_point(&self) -> Option<String> {
         let buf = &self.buffer;
-        let line = buf.text.char_to_line(buf.cursor.min(buf.len_chars()));
+        let line = buf.line_of(buf.cursor);
         let eol = buf.line_end(line);
         let mut i = buf.cursor;
         while i < eol && class_at(buf, i, false) != Some(1) {
@@ -1569,11 +1565,8 @@ impl Editor {
                 (cur.max(m.target) + 1).min(self.buffer.len_chars()),
             ),
             Span::Linewise => {
-                let a = self.buffer.text.char_to_line(cur.min(self.buffer.len_chars()));
-                let b = self
-                    .buffer
-                    .text
-                    .char_to_line(m.target.min(self.buffer.len_chars()));
+                let a = self.buffer.line_of(cur);
+                let b = self.buffer.line_of(m.target);
                 let (first, last) = (a.min(b), a.max(b));
                 (
                     self.buffer.line_start(first),
@@ -1740,9 +1733,8 @@ impl Editor {
     fn shift_lines(&mut self, right: bool, start: usize, end: usize) -> Vec<EditorCommand> {
         let buf = &self.buffer;
         let width = self.settings.tab_width.max(1);
-        let n = buf.len_chars();
-        let first = buf.text.char_to_line(start.min(n));
-        let last = buf.text.char_to_line(end.saturating_sub(1).min(n));
+        let first = buf.line_of(start);
+        let last = buf.line_of(end.saturating_sub(1));
         let mut cmds = vec![EditorCommand::Checkpoint];
         let mut landing = buf.line_start(first);
         for line in (first..=last).rev() {
@@ -1843,7 +1835,7 @@ impl Editor {
             // A paragraph: the run of non-blank lines around point, or the run
             // of blank ones if that is where point is. Linewise, like `dap`.
             'p' => {
-                let line = buf.text.char_to_line(cur);
+                let line = buf.line_of(cur);
                 let blank = |l: usize| buf.line_len(l) == 0;
                 let here = blank(line);
                 let mut first = line;
@@ -1931,7 +1923,7 @@ impl Editor {
     /// decided the way you read it rather than by whichever is nearest.
     fn quoted(&self, q: char, pos: usize) -> Option<(usize, usize)> {
         let buf = &self.buffer;
-        let line = buf.text.char_to_line(pos.min(buf.len_chars()));
+        let line = buf.line_of(pos);
         let (ls, le) = (buf.line_start(line), buf.line_end(line));
         let mut open: Option<usize> = None;
         let mut i = ls;
@@ -1975,7 +1967,7 @@ impl Editor {
         if from < start {
             // The last-line case: the range and the newline in front of it both
             // go, so point ends up on the line *before* — which did not move.
-            let line = self.buffer.text.char_to_line(from.min(self.buffer.len_chars()));
+            let line = self.buffer.line_of(from);
             return self.buffer.first_non_blank(line);
         }
         // Everything else: the line beginning at `end` is about to begin at
@@ -2104,20 +2096,8 @@ impl Editor {
         vec![EditorCommand::Message(format!("recorded {n} keys into @{name}"))]
     }
 
-    /// `@a`, and `@@` for whatever ran last.
-    ///
-    /// The keys go back through `handle_key`, and the commands are applied
-    /// **here** rather than handed to the caller: every motion is computed
-    /// against the document as it is *now*, so the second `dw` of a replay has
-    /// to see what the first one did. Returning them all in one batch would
-    /// compute every key against the text as it stood before the macro started,
-    /// and a two-line macro would delete the same word twice.
-    ///
-    /// This is the one place `handle_key` mutates the document, and it is not a
-    /// crack in the rule — it is still `Editor::apply` doing the writing, just
-    /// with the replay driving the loop instead of the app. Commands core
-    /// cannot carry out itself travel back up as usual, so a macro can still
-    /// open a file or call Lisp.
+    /// `@a`, and `@@` for whatever ran last. The keys go back through
+    /// [`Editor::run_keys`], which is where the replay is explained.
     fn replay(&mut self, name: char, count: usize) -> Vec<EditorCommand> {
         let name = match name {
             '@' => match self.vim.last_macro {
@@ -2134,18 +2114,7 @@ impl Editor {
         }
         self.vim.last_macro = Some(name);
         self.vim.depth += 1;
-        let mut out = Vec::new();
-        for _ in 0..count {
-            for key in keys.iter().copied() {
-                for cmd in self.handle_key(key) {
-                    if cmd.needs_app() {
-                        out.push(cmd);
-                    } else {
-                        self.apply(cmd);
-                    }
-                }
-            }
-        }
+        let out = self.run_keys(&keys, count);
         self.vim.depth -= 1;
         out
     }
@@ -2181,7 +2150,7 @@ impl Editor {
             .and_then(|id| self.marker_position(id))?;
         Some(match linewise {
             true => {
-                let line = self.buffer.text.char_to_line(at.min(self.buffer.len_chars()));
+                let line = self.buffer.line_of(at);
                 Motion {
                     target: self.buffer.first_non_blank(line),
                     span: Span::Linewise,
@@ -2367,20 +2336,7 @@ impl Editor {
                     vec![EditorCommand::OpenFile(PathBuf::from(expand_tilde(&path)))]
                 }
             }
-            // By id, like the preview: the index this candidate had when the
-            // prompt opened stopped being true the first time the preview
-            // switched, and accepting has to land on the buffer you were
-            // looking at rather than on whatever now sits at that position.
-            PromptKind::Buffer => match p.matches.get(p.selected).and_then(|&i| p.ids.get(i)) {
-                Some(&id) => vec![EditorCommand::SwitchBufferId(id)],
-                None => vec![],
-            },
-            // Items are one per line, in order, so the item index *is* the
-            // line number — no parsing back out of the rendered text.
-            PromptKind::Line => match p.matches.get(p.selected) {
-                Some(&line) => vec![EditorCommand::MoveTo(self.buffer.first_non_blank(line))],
-                None => vec![],
-            },
+            PromptKind::Buffer | PromptKind::Line => self.candidate_target(&p),
             // A project file, or a project root — which opens as a directory,
             // and a directory is dired. One prompt, both gestures.
             PromptKind::ProjectFile => match p.current() {
@@ -2478,19 +2434,33 @@ impl Editor {
                 .flatten();
             return vec![EditorCommand::MoveTo(at.unwrap_or(origin))];
         }
-        // The switcher shows you the buffer you are pointing at. Nothing else
-        // in the prompt changes: the candidate list was built when it opened and
-        // is not rebuilt, so the names stay where they are even though switching
-        // has quietly reordered the editor's own list underneath.
-        if p.kind == PromptKind::Buffer {
-            return match p.matches.get(p.selected).and_then(|&i| p.ids.get(i)) {
+        self.candidate_target(p)
+    }
+
+    /// Where the highlighted candidate takes you: the buffer it names, or the
+    /// line it is.
+    ///
+    /// One function because `preview` and `accept_prompt` have to agree about
+    /// it — the whole promise of a preview is that Enter lands where you are
+    /// already looking, and two copies of "which candidate is that, and what
+    /// does it mean" is two chances for them not to.
+    fn candidate_target(&self, p: &Prompt) -> Vec<EditorCommand> {
+        let Some(&i) = p.matches.get(p.selected) else {
+            return vec![];
+        };
+        match p.kind {
+            // By id and never by index: switching *reorders* the editor's list,
+            // so the position this candidate had when the prompt opened stopped
+            // being true the first time the preview moved. Nothing else in the
+            // prompt changes — the candidate list is not rebuilt, so the names
+            // stay where they are underneath.
+            PromptKind::Buffer => match p.ids.get(i) {
                 Some(&id) => vec![EditorCommand::SwitchBufferId(id)],
                 None => vec![],
-            };
-        }
-        match p.matches.get(p.selected) {
-            Some(&line) => vec![EditorCommand::MoveTo(self.buffer.first_non_blank(line))],
-            None => vec![],
+            },
+            // Items are one per line, in order, so the item index *is* the line
+            // number — no parsing back out of the rendered text.
+            _ => vec![EditorCommand::MoveTo(self.buffer.first_non_blank(i))],
         }
     }
 
@@ -2724,8 +2694,7 @@ impl Editor {
     /// The inclusive line range of the visual selection, if there is one.
     fn selection_lines(&self) -> Option<(usize, usize)> {
         let (a, b) = self.selection()?;
-        let to_line = |c: usize| self.buffer.text.char_to_line(c.min(self.buffer.len_chars()));
-        Some((to_line(a), to_line(b.saturating_sub(1))))
+        Some((self.buffer.line_of(a), self.buffer.line_of(b.saturating_sub(1))))
     }
 
     fn ex_command(&mut self, line: &str) -> Vec<EditorCommand> {
@@ -3779,6 +3748,31 @@ mod tests {
         );
     }
 
+    /// The comment over `BUILTIN_COMMANDS` asks a human to keep the list in
+    /// step with the match in `run_action`. This is that same request, made of
+    /// something that will actually notice: an offered name with no arm behind
+    /// it falls through to the Lisp fallback above, so `M-x` lists it and
+    /// running it reports an undefined function.
+    ///
+    /// Only this direction is checkable and only this direction is a bug. The
+    /// match deliberately has arms the list leaves out — `M-x`, `consult-line`,
+    /// `goto-line`, `grep`, `term` and `shell` are second spellings of verbs
+    /// already offered, and `open:` takes an argument.
+    ///
+    /// A fresh editor per name because these are real verbs: several open a
+    /// prompt, and one leaves ace labels up.
+    #[test]
+    fn every_offered_verb_has_an_arm_behind_it() {
+        for name in crate::evil::BUILTIN_COMMANDS {
+            let mut ed = fresh("hello\n");
+            assert_ne!(
+                ed.run_action(name),
+                vec![EditorCommand::CallLisp(format!("({name})"))],
+                "{name} is offered by M-x and `run_action` has no arm for it"
+            );
+        }
+    }
+
     #[test]
     fn prompt_navigation_accepts_both_spellings() {
         let mut ed = fresh("");
@@ -4362,7 +4356,10 @@ mod tests {
             ed.apply(cmd);
         }
         assert_eq!(ed.buffer.cursor, origin);
-        assert_ne!(ed.buffer.cursor, start.max(1).min(0)); // sanity: it moved and came back
+        // Sanity: it came back to where *this* prompt opened, which is not where
+        // the buffer started — otherwise the assertion above would pass on a
+        // preview that never moved at all.
+        assert_ne!(ed.buffer.cursor, start);
     }
 
     #[test]

@@ -32,6 +32,8 @@ use zemacs_lisp::Lisp;
 use zemacs_render::Renderer;
 
 mod dired;
+#[cfg(target_os = "macos")]
+mod dock;
 mod magit;
 mod project;
 mod term;
@@ -400,11 +402,16 @@ fn after_edit_form(editor: &Editor, told: &mut Option<(BufferId, u64)>) -> Optio
 }
 
 fn main() -> anyhow::Result<()> {
+    start_in_home();
     inherit_login_path();
     mac_window_hints();
     let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL init: {e}"))?;
     // One renderer per frame, in frame order. See the module docs.
     let mut renderers = vec![Renderer::new(&sdl, "zemacs", WINDOW_W, WINDOW_H)?];
+    // After the first renderer, because that is what brings the video subsystem
+    // up, and the delegate the dock menu attaches to does not exist before it.
+    #[cfg(target_os = "macos")]
+    dock::install();
     // Ask for the keyboard, exactly as a new frame does. macOS hands focus to a
     // window the application opened itself only when the application is already
     // the active one — so `zemacs` typed at a shell put a window on screen and
@@ -607,6 +614,30 @@ fn main() -> anyhow::Result<()> {
                     typed = Some(typed.map_or(timestamp, |t: u32| t.min(timestamp)));
                     keys.extend(key_from_keydown(kc, keymod, !text_input_on));
                 }
+                // The right button, whose one job is the menu. Deliberately not
+                // sent to a terminal child even in Terminal mode: a right-click
+                // is how you reach the *window manager* here, and there is no
+                // other gesture that opens a second frame with the mouse.
+                Event::MouseButtonDown {
+                    window_id,
+                    mouse_btn: MouseButton::Right,
+                    x,
+                    y,
+                    ..
+                } => {
+                    if let Some(i) =
+                        frame_for_window(renderers.iter().map(Renderer::window_id), window_id)
+                    {
+                        let (x, y) = renderers[i].to_pixels(x, y);
+                        // Focused first, for the left click's reason: the menu's
+                        // verbs act on the focused frame, and right-clicking an
+                        // unfocused window and getting a split in another one is
+                        // the one outcome nobody means.
+                        let cmd = EditorCommand::FocusFrame(i);
+                        dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                        editor.open_context_menu(x, y);
+                    }
+                }
                 Event::MouseButtonDown {
                     window_id,
                     mouse_btn: MouseButton::Left,
@@ -619,6 +650,22 @@ fn main() -> anyhow::Result<()> {
                     {
                         let (x, y) = renderers[i].to_pixels(x, y);
                         let area = renderers[i].content_area();
+                        // A menu is modal to the pointer: while one is up, the
+                        // left button belongs to it and to nothing else. Picking
+                        // takes it down, and so does a click that missed — which
+                        // is what a click outside a menu means everywhere.
+                        if editor.context_menu.is_some() {
+                            let row = renderers[i].context_menu_row(&editor, x, y);
+                            if let Some(verb) = editor.pick_context_menu(row) {
+                                // Through `run_action`, the door a keybinding
+                                // uses: a menu entry cannot do anything a key
+                                // could not.
+                                for cmd in editor.run_action(verb) {
+                                    dispatch(&mut editor, &lisp, cmd, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
+                                }
+                            }
+                            continue;
+                        }
                         // A click anywhere in a window focuses its frame. The
                         // `FocusGained` above would do it a moment later anyway;
                         // doing it here means the `FocusWindow` below addresses
@@ -793,6 +840,14 @@ fn main() -> anyhow::Result<()> {
                                 cursors
                                     .hover(editor.frames[i].divider_at(area, x, y).map(|d| d.dir));
                             }
+                            // A menu row lights up under the pointer, which is
+                            // the only thing that makes it read as clickable.
+                            if editor.context_menu.is_some() {
+                                let row = renderers[i].context_menu_row(&editor, x, y);
+                                if let Some(m) = editor.context_menu.as_mut() {
+                                    m.hover = row;
+                                }
+                            }
                             // Held-button motion is a drag, which is how a
                             // selection is made in `vim` or a pane resized in
                             // `tmux`. The terminal drops it unless the child
@@ -932,6 +987,14 @@ fn main() -> anyhow::Result<()> {
         if let Some(i) = closing {
             mouse.release(); // whatever was being dragged may be going away
             close_frame(&mut editor, &mut renderers, i);
+        }
+
+        // The dock menu's **New Frame**. It cannot reach the editor from the
+        // AppKit callback — see `dock` — so it raises a flag and this is where
+        // the flag is spent, on the same command `M-x new-frame` sends.
+        #[cfg(target_os = "macos")]
+        if dock::wanted() {
+            dispatch(&mut editor, &lisp, EditorCommand::NewFrame, &init_path, &mut renderers, &mut magit, &mut dired, &mut term, &mut project);
         }
 
         for key in keys.drain(..) {
@@ -1090,6 +1153,8 @@ fn main() -> anyhow::Result<()> {
                 editor.buffer.highlights = spans;
             }
         }
+
+        highlight_completion_doc(&mut editor);
 
         // Where `M-x new-frame` becomes a window. Core pushes the frame, the
         // loop notices it has no renderer for it. Emacs spells extra frames
@@ -1519,6 +1584,40 @@ fn save_file(editor: &mut Editor, path: Option<PathBuf>, guard: Save) {
             display_path(&target)
         ))),
     }
+}
+
+/// Colour the documentation panel beside the completion popup.
+///
+/// Mirrors [`refresh_file_completions`] exactly: core holds the state and
+/// cannot fill this field in, because `zemacs-syntax` depends on core rather
+/// than the other way round, and the renderer has no parser either. So the app
+/// — the one layer that has both — does it, the same way it does the IO.
+///
+/// Highlighted as the *buffer's* language, which is right for the thing being
+/// documented: a docstring for a Rust function is a Rust signature and some
+/// prose, and the prose falls out of the parse uncoloured, which the renderer
+/// draws in the comment face. A buffer with no language leaves the spans empty
+/// and gets plain text.
+///
+/// Runs once per doc change and not per frame: `CompletionEdit::Doc` clears the
+/// spans, and a non-empty list is the flag that says this has already been
+/// done. ponytail: on the main thread rather than through the highlighter's
+/// worker, because a docstring is a dozen lines against a buffer's thousands.
+/// The upgrade path is the same `request`/`poll` pair, if a server ever sends a
+/// page of prose.
+fn highlight_completion_doc(editor: &mut Editor) {
+    let Some(doc) = editor.completion_doc_to_colour() else {
+        return;
+    };
+    let text = doc.join("\n");
+    // No language means nothing to parse *with*, and the empty span list is
+    // still recorded: it says "parsed, nothing to colour", which is what stops
+    // this running again on the next frame.
+    let spans = match &editor.buffer.language {
+        Some(lang) => zemacs_syntax::highlight(lang, &text),
+        None => Vec::new(),
+    };
+    editor.set_completion_doc_spans(spans);
 }
 
 // --- file completion -----------------------------------------------------
@@ -2322,17 +2421,31 @@ fn key_from_keydown(kc: Keycode, keymod: Mod, raw: bool) -> Option<Key> {
     // from Lisp and read here, next to the existing `Set*` commands.
     let meta = keymod.intersects(Mod::LGUIMOD | Mod::RGUIMOD);
     // Enter has a multi-character key name, so `combo_char` cannot spell it —
-    // but `C-<ret>` and `C-M-<ret>` are the window splits.
+    // but `C-<ret>` and `C-M-<ret>` are the window splits and `M-<ret>` is org's
+    // "another one of these". Without the third arm `⌘⏎` fell through to the
+    // `Meta(char)` case below, which has no character to make and answered
+    // `None`, so the keystroke reached nothing at all.
     if matches!(kc, Keycode::Return | Keycode::KpEnter) {
         match (ctrl, meta) {
             (true, true) => return Some(Key::CtrlMetaEnter),
             (true, false) => return Some(Key::CtrlEnter),
+            (false, true) => return Some(Key::MetaEnter),
             _ => {}
         }
     }
     // Same reason, for `⌘⌫` — kill the word before point.
     if kc == Keycode::Backspace && meta {
         return Some(Key::MetaBackspace);
+    }
+    // ...and for the two arrows Meta makes word-wise. Named keys, so
+    // `combo_char` below cannot spell them and they would otherwise be dropped
+    // on the floor — which is exactly what `⌘←` used to do.
+    if meta && !ctrl {
+        match kc {
+            Keycode::Left => return Some(Key::MetaLeft),
+            Keycode::Right => return Some(Key::MetaRight),
+            _ => {}
+        }
     }
     match (ctrl, meta) {
         // Shift is not consulted for Ctrl combos: `C-a` and `C-A` are one key,
@@ -2454,6 +2567,25 @@ const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// blocks forever hangs startup. `$SHELL -l -c` is what every editor on this
 /// platform already does and a wedged profile hangs those too; the upgrade is a
 /// thread and a channel, on the day someone's `.zprofile` actually does it.
+/// Start in `$HOME` rather than wherever the launcher happened to leave us.
+///
+/// `inherit_login_path`'s sibling, and the same bug from the other end: an
+/// application bundle opened from the Dock or from Finder inherits `/` as its
+/// working directory, so `SPC f f` opened on the root of the disk and a
+/// terminal session started there. Nobody keeps their code in `/`.
+///
+/// Only from `/`, for the reason the `PATH` fix is conditional: a `zemacs`
+/// typed at a shell is *in* a directory on purpose, and moving out of it would
+/// be worse than the bug. `/` is the one cwd nothing chooses.
+fn start_in_home() {
+    if std::env::current_dir().is_ok_and(|d| d != Path::new("/")) {
+        return;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let _ = std::env::set_current_dir(home);
+    }
+}
+
 fn inherit_login_path() {
     if std::env::var("PATH").unwrap_or_default() != LAUNCHD_PATH {
         return;

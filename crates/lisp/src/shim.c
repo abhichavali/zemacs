@@ -928,6 +928,13 @@ static const char *LIBRARY_FORM =
     "   (zemacs::%do \"completion-show\" nil (if at at -1) index))"
     " (defun zemacs::completion-row (&optional row)"
     "   (zemacs::%do \"completion-row\" (and row (string row)) 0 0))"
+    /* The documentation panel beside the list, one line per call and NIL to
+     * empty it. About the *selected* candidate rather than about the list, so
+     * it is resent on every move — a docstring is a dozen short lines and the
+     * candidates are a hundred, which is the whole reason these are two verbs
+     * with two lifetimes rather than one payload. */
+    " (defun zemacs::completion-doc (&optional line)"
+    "   (zemacs::%do \"completion-doc\" (and line (string line)) 0 0))"
     " (defun zemacs::completion-at () (zemacs::%query \"completion-at\" 0 0))"
     " (pushnew \"completion-at\" zemacs::*readers* :test #'string=)"
     /* The one verb a scene needs. PAGE is a *printed* node — `(block :pad 48
@@ -1087,9 +1094,9 @@ static const char *LIBRARY_FORM =
  * The drawn ones, in the order the CASE below takes them: `face', `background'
  * and `display' replace or recolour the cells a range covers; `image' puts a
  * bitmap over them; `scale', `weight' and `slant' say what *type* they are set
- * in; `line-background', `line-prefix' and `fold' are about the lines the range
- * touches rather than about its cells. Everything else a config puts on an
- * overlay stops here.
+ * in; `line-background', `line-prefix', `gutter' and `fold' are about the lines
+ * the range touches rather than about its cells. Everything else a config puts on
+ * an overlay stops here.
  *
  * ponytail: an overlay the editor deletes on its own — because an edit swallowed
  * the text it was about — leaves its plist behind, a few conses per stale entry.
@@ -1165,6 +1172,14 @@ static const char *OVERLAY_FORM =
     "        (zemacs::%do \"overlay-line-background\" (zemacs::%overlay-face value) ov 0))"
     "       (:line-prefix"
     "        (zemacs::%do \"overlay-line-prefix\" (and value (string value)) ov 0))"
+    /* Emacs' fringe, in the spare column the line numbers already reserve. The
+     * distinction from `line-prefix' is the one worth reading: a prefix moves
+     * the line right by its own width, which is right for a quote bar over a
+     * whole passage and wrong for a mark on one line in fifty — that line then
+     * sits a column out from the code around it and its indentation reads as
+     * broken. `gutter' draws in the margin and moves nothing. */
+    "       (:gutter"
+    "        (zemacs::%do \"overlay-gutter\" (and value (string value)) ov 0))"
     /* The line property that changes how many rows there are: the lines after
      * the overlay's first one stop occupying rows at all. The renderer does
      * not draw them and `j' steps over them, which is code folding — and
@@ -1196,9 +1211,19 @@ static const char *OVERLAY_FORM =
     /* `(START END DISPLAY-P)' per fragment, in order. The one reader answered
      * outside `query.rs' — org's scanner is downstream of core. */
     " (defun zemacs::latex-fragments () (zemacs::%query \"latex-fragments\" 0 0))"
+    /* The other one: `(FIRST-LINE LAST-LINE)' per structural range in the live
+     * buffer, outermost first, from the same tree-sitter parse that colours it.
+     * *Lines*, because a fold hides whole lines and the caller was going to
+     * convert an offset back to one anyway.
+     *
+     * Every range, not a chosen one — which of the nested ranges to fold is
+     * policy, and policy is `org-fold.lisp''s. A buffer with no grammar answers
+     * `()', which is the honest structure of plain text. */
+    " (defun zemacs::fold-ranges () (zemacs::%query \"fold-ranges\" 0 0))"
     /* A reader is a noun, not a command: keep it out of the M-x list the same
      * way every other reader is kept out. */
     " (pushnew \"latex-fragments\" zemacs::*readers* :test #'string=)"
+    " (pushnew \"fold-ranges\" zemacs::*readers* :test #'string=)"
     /* The other producer of an `image' id: a *file*, rather than a LaTeX run.
      * WIDTH is in ems and may be fractional, which is why the primitive
      * underneath takes hundredths — the same percentage `overlay-scale' sends

@@ -225,6 +225,25 @@ fn ai_mode_is_data_in_lisp() {
         assert_eq!(got, want, "{name} resume={resume}");
     }
 
+    // The one-shot question, whose whole point is an argument with spaces in
+    // it. What `%ai-quote` produces is what `words` in `crates/app/src/term.rs`
+    // reads back, so this string and that splitter are two halves of one
+    // contract — and neither of them is a shell, which is why the last case is
+    // punctuation rather than a command.
+    for (prompt, want) in [
+        (r#""hello""#, r#""hello""#),
+        (r#""fix the failing test""#, r#""fix the failing test""#),
+        (r#""say \"hi\"""#, r#""say \"hi\"""#),
+        (r#""a\\b""#, r#""a\\b""#),
+        (r#""rm -rf / ; echo $HOME""#, r#""rm -rf / ; echo $HOME""#),
+    ] {
+        assert_eq!(
+            probe(&lisp, &shared, "quote", &format!("(%ai-quote {prompt})")),
+            want,
+            "quoting {prompt}"
+        );
+    }
+
     // --- and end to end, down the channel the app drains ---------------------
     //
     // `Term` needs the app, so the command travels rather than being applied,

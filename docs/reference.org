@@ -246,7 +246,15 @@ range covers, and three are about the *lines* it touches, whole.
 | =scale=            | a number, =1.0= being body     | Type size — *for the whole line*. See below. |
 | =line-background=  | a name from =(face-list)=      | A band across the whole pane, behind every line the range touches. |
 | =line-prefix=      | a string                     | Drawn in the left margin of every row of those lines, text pushed right by its width. |
+| =gutter=           | a string                     | One cell in the gutter, beside the line number. The text does *not* move. |
 | =fold=             | =T= or =NIL=                     | The lines *after* the first stop occupying rows at all. |
+
+=line-prefix= and =gutter= look alike and are opposites, which is worth stating
+once: a prefix reserves columns and so moves its line right, which is what a
+quote bar over a whole passage wants; =gutter= draws in the margin the line
+numbers already reserve and moves nothing, which is what a *sparse* mark — one
+line in fifty wearing an error dot — needs, or that line reads as misindented. A
+buffer with no gutter has no margin and draws no mark.
 
 =NIL= clears any of them. A colour is a *face name*, not an =(R G B)= — the theme
 already owns that vocabulary, so an overlay recolours itself when a theme is
@@ -335,11 +343,38 @@ is*. That is the policy, and it lives in =runtime/modes/org-fold.lisp=:
 | =(fold-dwim)=                 | H | Toggle the selection, or the mode's subtree under point. =z a= |
 | =(fold-all)=                  | H | Fold every foldable range in the buffer. =z M=        |
 | =(fold-open-all)=             | H | Open them all. =z R=                                  |
+| =(fold-ranges)=               | R | =(FIRST-LINE LAST-LINE)= per structural range, outermost first. |
 | =*fold-subtree-functions*=    |   | Major mode -> a function answering =(BEG . END)= under point. |
 | =*fold-all-functions*=        |   | Major mode -> a function answering every =(BEG . END)=. |
 
-Teaching another mode to fold is one entry in each alist and one function; there
-is nothing to add in Rust, because Rust has no opinion about what a subtree is.
+*Every language with a grammar already folds, and neither alist mentions one.* A
+mode with no entry falls through to =tree-sitter-subtree-at-point= and
+=tree-sitter-subtrees=, which read =fold-ranges= — the same tree-sitter parse that
+colours the buffer, asked which line ranges are structural. So =z a= folds a
+function, a class, a brace block or a JSON object with no per-language work, and
+a grammar added to the build brings its folding with it. org is in the alists
+because org has no grammar here and a headline is not a syntax node.
+
+=fold-ranges= answers *every* named node spanning more than one line, in **lines**
+rather than offsets — a fold hides whole lines, and asking in those units is what
+saves anyone converting bytes to characters. Picking among the nested ranges is
+the policy half: the innermost one covering point for "fold what I am in", the
+outermost ones for "show me the shape of the file". A buffer with no grammar
+answers =()=.
+
+ponytail: no =folds.scm=. A fold query per grammar is more precise — it is how
+Neovim does it — and it is a file per language to write and keep in step with
+upstream. The imprecision costs a =z a= landing on something smaller than you
+meant (a multi-line argument list is a node too) and never costs a wrong fold.
+
+ponytail: =fold-ranges= re-parses the buffer on each call. It runs on the Lisp
+thread, so nothing waits on it, and the press that asks is a press you made
+deliberately — but it is a full parse where the highlighter next door is doing an
+incremental one. The upgrade is reaching that =Session='s tree, which today lives
+on the worker thread with no way to ask it a second question.
+
+Teaching a mode something *other* than the parser's answer is one entry in each
+alist and one function; there is still nothing to add in Rust.
 
 #+begin_src lisp
 ;; Fold a `defun' in a Lisp buffer, over the sexp motion lisp-mode already has.
@@ -868,7 +903,7 @@ or a bracketed name:
 : a  A  1  SPC  -  +
 : C-x  M-o  C-M-j
 : <ret>  <tab>  <bs>  <esc>  <left>  <right>  <up>  <down>
-: C-<ret>  C-M-<ret>  M-<bs>
+: C-<ret>  C-M-<ret>  M-<ret>  M-<bs>  M-<left>  M-<right>
 
 Spacing is normalised, so ="gd"= and ="g d"= are the same sequence. A single
 unseparated token containing =-= or starting with =<= is left alone, which is why

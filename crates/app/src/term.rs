@@ -115,9 +115,14 @@ impl Term {
             // you run *again*: edit, run, read, edit, and a session per press
             // would pile up dead children in the switcher within a minute, all
             // but the last finished and none named distinguishably.
-            other => match (other.strip_prefix("run:"), other.strip_prefix("rerun:")) {
-                (Some(rest), _) => self.run_harness(editor, rest, false),
-                (_, Some(rest)) => self.run_harness(editor, rest, true),
+            other => match (
+                other.strip_prefix("run:"),
+                other.strip_prefix("rerun:"),
+                other.strip_prefix("shell:"),
+            ) {
+                (Some(rest), _, _) => self.run_harness(editor, rest, false),
+                (_, Some(rest), _) => self.run_harness(editor, rest, true),
+                (_, _, Some(line)) => self.shell(editor, line),
                 _ => editor.apply(EditorCommand::Message(format!(
                     "unknown terminal verb: {other}"
                 ))),
@@ -127,12 +132,12 @@ impl Term {
 
     /// `run:NAME:PROGRAM ARG…`.
     ///
-    /// Splitting the command line on whitespace is deliberate and is the
-    /// ceiling: resume flags are `-r`, `--resume`, `--continue`, and a session
-    /// id is a UUID. ponytail: an argument with a space in it needs the verb to
-    /// carry a *list* rather than a string, which means an `EditorCommand`
-    /// shaped like `Term { verb, args }` — worth doing the first time a harness
-    /// wants `--prompt "do the thing"`, and not before.
+    /// The command line is split the way a shell splits one — see [`words`] —
+    /// which is the ponytail note that used to be here coming due: `claude -p
+    /// "fix the failing test"` is a harness wanting an argument with spaces in
+    /// it, and quoting is a fifteen-line function against a new `EditorCommand`
+    /// variant and a new envelope. Nothing is *executed* by a shell; the quotes
+    /// only decide where one argument ends and the next begins.
     fn run_harness(&mut self, editor: &mut Editor, rest: &str, reuse: bool) {
         let Some((name, line)) = rest.split_once(':') else {
             editor.apply(EditorCommand::Message(format!(
@@ -140,7 +145,7 @@ impl Term {
             )));
             return;
         };
-        let mut words = line.split_whitespace().map(str::to_string);
+        let mut words = words(line).into_iter();
         let Some(program) = words.next() else {
             editor.apply(EditorCommand::Message(
                 "terminal: run needs a command to run".into(),
@@ -163,6 +168,17 @@ impl Term {
             }
         }
         self.spawn(editor, &buffer, Some(command), true);
+    }
+
+    /// `shell:COMMAND` — what evil's `:!cmd` becomes.
+    ///
+    /// Typed at the shell rather than spawned, which is the same trade the
+    /// project's `compile` verb makes and for the same reason: a [`Command`]
+    /// here is word-split by [`words`] and never runs a pipeline, while the
+    /// child already has a terminal to print into and a cwd you chose.
+    fn shell(&mut self, editor: &mut Editor, line: &str) {
+        self.open(editor);
+        self.send(editor, format!("{line}\r").into_bytes());
     }
 
     fn open(&mut self, editor: &mut Editor) {
@@ -365,10 +381,16 @@ impl Term {
             // — so `⌘⌫` deletes the last word in the shell exactly as it does
             // in a buffer.
             Key::MetaBackspace => Input::Alt('\u{7f}'),
+            // ...and `⌘←`/`⌘→` the same way: a word at a time in readline, in
+            // an agent's input box, and in the editor's own Insert mode.
+            Key::MetaLeft => Input::AltLeft,
+            Key::MetaRight => Input::AltRight,
             // `C-M-x` and the two split keys belong to the editor. Leaving them
             // unhandled is what lets `C-<ret>` still split a window while a
             // child has the keyboard.
-            Key::CtrlMeta(_) | Key::CtrlEnter | Key::CtrlMetaEnter => return false,
+            Key::CtrlMeta(_) | Key::CtrlEnter | Key::CtrlMetaEnter | Key::MetaEnter => {
+                return false
+            }
         };
         self.sessions[i].inner.input(input);
         true
@@ -632,9 +654,92 @@ fn to_bytes(c: [f32; 3]) -> [u8; 3] {
     c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
+/// A command line split into arguments, the way a shell splits one: runs of
+/// non-space, with `"…"` and `'…'` holding a run together and `\` escaping the
+/// next character outside single quotes.
+///
+/// **Splitting only.** No globbing, no `$VAR`, no `~`, no pipes, no `;` — and
+/// nothing here is handed to a shell, so a quote is punctuation and not a
+/// promise. The one thing it buys is `claude -p "fix the failing test"`, which
+/// is one argument and used to be four.
+///
+/// An unterminated quote takes everything to the end of the line, which is the
+/// forgiving reading and the right one for a prompt somebody typed: `-p "fix
+/// the "test"` should run, not report a syntax error at a quote nobody meant.
+fn words(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut open: Option<char> = None;
+    let mut started = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // Inside single quotes a backslash is a backslash — that is the
+            // whole difference between the two quote characters in every shell.
+            '\\' if open != Some('\'') => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                    started = true;
+                }
+            }
+            '"' | '\'' if open.is_none() => {
+                open = Some(c);
+                // An empty `""` is still an argument, and a program told to
+                // send an empty prompt should be told exactly that.
+                started = true;
+            }
+            c if open == Some(c) => open = None,
+            c if c.is_whitespace() && open.is_none() => {
+                if started {
+                    out.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            c => {
+                word.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(word);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_command_line_splits_the_way_a_shell_splits_one() {
+        let cases: [(&str, &[&str]); 7] = [
+            // What every resume flag has always been, and still is.
+            ("claude -r", &["claude", "-r"]),
+            ("cursor-agent   --resume", &["cursor-agent", "--resume"]),
+            // The case this function exists for.
+            (
+                r#"claude -p "fix the failing test""#,
+                &["claude", "-p", "fix the failing test"],
+            ),
+            (r#"claude -p 'it'"#, &["claude", "-p", "it"]),
+            // A quote inside a prompt, escaped, and an apostrophe protected by
+            // the other quote character.
+            (
+                r#"claude -p "say \"hi\"""#,
+                &["claude", "-p", r#"say "hi""#],
+            ),
+            (r#"claude -p "don't""#, &["claude", "-p", "don't"]),
+            // Forgiving, on purpose: an unterminated quote is not an error.
+            (r#"claude -p "half"#, &["claude", "-p", "half"]),
+        ];
+        for (line, want) in cases {
+            assert_eq!(words(line), want, "{line:?}");
+        }
+        // An empty argument survives, because "send nothing" is a thing to say.
+        assert_eq!(words(r#"x "" y"#), ["x", "", "y"]);
+        assert!(words("   ").is_empty());
+    }
 
     /// Everything below runs a real PTY, so it runs a program that is on every
     /// machine this builds on. None of the three harnesses is a build

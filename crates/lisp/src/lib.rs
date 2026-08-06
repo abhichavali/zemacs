@@ -127,25 +127,45 @@ fn ask(name: &str, a: i64, b: i64) -> String {
 /// The readers core cannot answer, because answering them needs a crate that
 /// depends *on* core.
 ///
-/// There is exactly one, and it is a real question about the live buffer rather
-/// than a special case waiting to become a family: org's LaTeX fragments live in
-/// `zemacs-syntax`, which is downstream of `zemacs-core`, so the arm cannot go
-/// in `query.rs` without a dependency cycle. It answers in the same shape as
-/// everything there and is spelled like every other reader from Lisp; only the
-/// file it lives in differs.
+/// Both live in `zemacs-syntax`, which is downstream of `zemacs-core`, so
+/// neither arm can go in `query.rs` without a dependency cycle. They answer in
+/// the same shape as everything there and are spelled like every other reader
+/// from Lisp; only the file they live in differs.
 ///
-/// The buffer text is copied under the lock and scanned outside it: the scan is
+/// The buffer text is copied under the lock and scanned outside it: each scan is
 /// a pass over the whole buffer, and no keystroke should wait behind one.
 fn ask_here(name: &str) -> Option<String> {
-    if name != "latex-fragments" {
-        return None;
+    match name {
+        "latex-fragments" => {
+            let text = with_editor(|ed| ed.buffer.text.to_string())?;
+            let rows: Vec<String> = zemacs_syntax::latex_fragments(&text)
+                .iter()
+                .map(|f| format!("({} {} {})", f.start, f.end, if f.display { "t" } else { "nil" }))
+                .collect();
+            Some(format!("({})", rows.join(" ")))
+        }
+        // Structural folding: the tree-sitter parse the buffer is already
+        // coloured by, asked a different question. The *language* comes from the
+        // buffer rather than from the caller, so a config never has to know which
+        // grammar its file is — and a buffer with no grammar answers `()`, which
+        // is what a plain-text buffer honestly has to say about its structure.
+        "fold-ranges" => {
+            let (lang, text) =
+                with_editor(|ed| (ed.buffer.language.clone(), ed.buffer.text.to_string()))?;
+            let rows: Vec<String> = match lang {
+                Some(lang) => zemacs_syntax::fold_ranges(&lang, &text)
+                    .iter()
+                    .map(|(a, b)| format!("({a} {b})"))
+                    .collect(),
+                // No grammar, so nothing structural to say. `()` rather than a
+                // failure: a plain-text buffer is a buffer with no folds in it,
+                // not a buffer the question is invalid for.
+                None => Vec::new(),
+            };
+            Some(format!("({})", rows.join(" ")))
+        }
+        _ => None,
     }
-    let text = with_editor(|ed| ed.buffer.text.to_string())?;
-    let rows: Vec<String> = zemacs_syntax::latex_fragments(&text)
-        .iter()
-        .map(|f| format!("({} {} {})", f.start, f.end, if f.display { "t" } else { "nil" }))
-        .collect();
-    Some(format!("({})", rows.join(" ")))
 }
 
 /// Owned copy of a shim string. `NULL` means the Lisp argument was `NIL`.
@@ -782,6 +802,14 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
             a.max(0) as u64,
             (!arg.is_empty()).then_some(arg),
         )),
+        // ...and the third: a mark in the gutter, which is the same string in the
+        // same face and the *opposite* answer to "does the text move" — see
+        // `Overlay::gutter`. A sparse mark cannot be a prefix without lying about
+        // the indentation of the line it marks.
+        "overlay-gutter" => EditorCommand::Overlay(OverlayEdit::Gutter(
+            a.max(0) as u64,
+            (!arg.is_empty()).then_some(arg),
+        )),
         // Code folding, and the only overlay property that is about *lines*:
         // the lines after the overlay's first stop occupying rows entirely.
         // `b` rather than `arg` because the value is a flag, so one overlay can
@@ -862,6 +890,12 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
         )),
         "completion-row" => {
             EditorCommand::Completion(CompletionEdit::Row((!arg.is_empty()).then_some(arg)))
+        }
+        // ...and the documentation for whichever row is lit, which is a fact
+        // about the *selection* rather than about the list — so unlike
+        // `completion-row` it is resent whenever the selection moves.
+        "completion-doc" => {
+            EditorCommand::Completion(CompletionEdit::Doc((!arg.is_empty()).then_some(arg)))
         }
 
         // A keystroke for the shell. `Key::from_token` is the inverse of the

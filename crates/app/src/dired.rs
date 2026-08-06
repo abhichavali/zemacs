@@ -37,6 +37,7 @@ enum Pending {
     Rename(PathBuf),
     Copy(PathBuf),
     Mkdir,
+    CreateFile,
 }
 
 impl Dired {
@@ -79,6 +80,9 @@ impl Dired {
             Pending::Copy(from) => dired::copy(&from, &resolve(&dir, answer))?,
             Pending::Mkdir => {
                 dired::create_dir(&dir, answer)?;
+            }
+            Pending::CreateFile => {
+                dired::create_file(&dir, answer)?;
             }
         }
         self.refresh(editor)
@@ -181,11 +185,19 @@ impl Dired {
                 }
                 Ok(())
             }
-            "mkdir" => {
-                self.pending = Some(Pending::Mkdir);
+            // `create-file` is Emacs' `dired-create-empty-file`: it makes the
+            // file and leaves you in the listing, rather than opening it. `RET`
+            // is one key, and a new file you did not want open is the more
+            // annoying half of the two.
+            "mkdir" | "create-file" => {
+                let (pending, label) = match verb {
+                    "mkdir" => (Pending::Mkdir, "New directory: "),
+                    _ => (Pending::CreateFile, "New file: "),
+                };
+                self.pending = Some(pending);
                 editor.open_prompt(PromptKind::File);
                 if let Some(p) = editor.prompt.as_mut() {
-                    p.label = "New directory: ".into();
+                    p.label = label.into();
                 }
                 Ok(())
             }

@@ -219,8 +219,14 @@ a screen where everything is heavy has no emphasis left to give.")
   (dolist (face *bold-constructs*)
     (set-face-style face t (gethash face *face-italic*))))
 
-(defun load-theme (name)
-  "Load theme NAME from the themes/ directory next to this config."
+(defun load-theme (&optional name)
+  "Load theme NAME from the themes/ directory next to this config.
+
+With no NAME, ask — which is what makes this an `M-x' command as well as the
+function a config calls. Emacs spells it the same way and for the same reason:
+there is one door in, and whether you came through it with the answer already
+in hand is not a second function's worth of difference."
+  (unless name (return-from load-theme (theme)))
   (let ((path (and *runtime-dir*
                    (merge-pathnames (format nil "themes/~a.lisp" name)
                                     *runtime-dir*))))
@@ -546,7 +552,9 @@ build without it still reads this file.")
 
 (defparameter *hidden-commands*
   (append (when (boundp '*readers*) (symbol-value '*readers*))
-          '("make-marker" "point-marker" "load-theme" "theme-names"
+          ;; `load-theme' is deliberately *not* here: with no argument it asks,
+          ;; so `M-x load-theme' is a real command and not a call that errors.
+          '("make-marker" "point-marker" "theme-names"
             "buffer-lines" "buffer-names" "beginning-of-line" "end-of-line"
             ;; ...and one that is worse than useless by hand: called with no
             ;; argument it means "plain text", so `M-x set-language' picked by a
@@ -751,6 +759,125 @@ here makes the binding work, `define-key' below does that."
 (define-key-everywhere "C-M-p" "project-find-file")
 (define-leader "SPC w w" "ace-window")
 
+;;; ---------------------------------------------------------------------------
+;;; A project you do not have yet
+;;;
+;;; The hole beside `SPC p o': that one browses for a project on the disk, and a
+;;; repository you have never cloned is not on the disk. So this is the third
+;;; door in — a URL — and it lands you in exactly the same place the other two
+;;; do, a directory that `project-switch' will remember from now on.
+;;;
+;;; In Lisp and not in `crates/project', because none of it is a fast primitive:
+;;; it is one `git clone', a name derived from a URL, and a `find-file'. The
+;;; Rust side already knows what a project *is*; it does not need to learn git.
+;;;
+;;; `:wait nil' and a poll, which is the shape `math-code.lisp' established and
+;;; for its reason: a clone is seconds to minutes, and the Lisp thread is where
+;;; every keystroke's `after-change-hook' runs. Waiting for git here would stall
+;;; completion and diagnostics for the length of the clone.
+
+(defparameter *project-directory* "~/Code"
+  "Where `project-clone' puts a repository. `~/' is expanded; the directory is
+created if it is not there. Set it in your init to keep your checkouts
+somewhere else.")
+
+(defun %expand-home (path)
+  "PATH with a leading `~/' replaced by the home directory."
+  (if (and (>= (length path) 2) (string= "~/" path :end2 2))
+      (namestring (merge-pathnames (subseq path 2) (user-homedir-pathname)))
+      path))
+
+(defun %project-repo-name (url)
+  "The directory a clone of URL lands in: the last path segment, `.git' off.
+
+Handles both spellings git accepts — `https://host/owner/repo.git' and
+`git@host:owner/repo.git' — because the second's separator is a colon and the
+first's is a slash, and taking the last of either is the whole difference."
+  (let* ((trimmed (string-right-trim "/" url))
+         (cut (position-if (lambda (c) (member c '(#\/ #\:))) trimmed :from-end t))
+         (name (if cut (subseq trimmed (1+ cut)) trimmed))
+         (dot (search ".git" name :from-end t)))
+    (if (and dot (= dot (- (length name) 4))) (subseq name 0 dot) name)))
+
+(defvar *project-clone* nil
+  "The clone in flight, as a plist of :PROCESS :TARGET :URL, or NIL.
+One at a time: two clones would want two messages and there is one echo area.")
+
+(defun project-clone-poll ()
+  "Notice that a clone has finished, and open what it produced.
+
+On `*point-moved-functions*', for `math-code-build-poll''s reason: there is no
+timer in this editor, and the moment the answer becomes interesting is the
+moment you do something. Costs one read of a special variable per movement."
+  (let ((clone *project-clone*))
+    (when (and clone
+               (handler-case
+                   (not (eq :running (ext:external-process-wait
+                                      (getf clone :process) nil)))
+                 ;; A handle we can no longer ask about is a clone we can no
+                 ;; longer follow. The directory test below is the real verdict.
+                 (serious-condition () t)))
+      (let ((target (getf clone :target)))
+        (setf *project-clone* nil)
+        ;; The filesystem and not the exit status, so a clone that half-failed
+        ;; is not announced as a project: git leaves nothing behind when it
+        ;; cannot fetch, and a directory that exists is one you can open.
+        (if (probe-file (merge-pathnames ".git/" target))
+            (progn (message (format nil "cloned into ~a" target))
+                   (find-file target))
+            (message (format nil "clone failed: ~a" (getf clone :url)))))))
+  nil)
+
+;;; DEFVAR before the PUSHNEW, for the reason spelled out where org's two hooks
+;;; are installed further down: this is the first thing in the file to mention
+;;; the list, and a bare PUSHNEW on an unbound special is an error.
+(defvar *point-moved-functions* nil)
+(pushnew 'project-clone-poll *point-moved-functions*)
+
+(defun project-clone ()
+  "Clone a git repository into `*project-directory*' and open it.
+
+The third way into a project, beside `SPC p p' (one you have visited) and
+`SPC p o' (one on the disk). Bound to `SPC p n'."
+  (read-string "Git URL: "
+    (lambda (url)
+      (let ((url (and url (string-trim " " url))))
+        (cond
+          ((or (null url) (zerop (length url))))
+          (*project-clone*
+           (message (format nil "already cloning ~a" (getf *project-clone* :url))))
+          (t
+           (let* ((dir (%expand-home *project-directory*))
+                  (target (merge-pathnames
+                           (format nil "~a/" (%project-repo-name url))
+                           (pathname (format nil "~a/" (string-right-trim "/" dir))))))
+             (cond
+               ((probe-file target)
+                ;; Already here, which is not a failure — it is the answer to
+                ;; the question you asked, one step early.
+                (message (format nil "already cloned: ~a" target))
+                (find-file target))
+               (t
+                (ensure-directories-exist target)
+                (handler-case
+                    ;; `:output nil' is the null device, so there is no pipe to
+                    ;; fill and deadlock on — the same trade `math-code.lisp'
+                    ;; makes, and it costs git's progress bar, which is not
+                    ;; something a one-line echo area could have shown anyway.
+                    (multiple-value-bind (stream code process)
+                        (ext:run-program
+                         "git" (list "clone" url (namestring target))
+                         :input nil :output nil :error nil :wait nil)
+                      (declare (ignore stream code))
+                      (setf *project-clone*
+                            (list :url url :target target :process process))
+                      (message (format nil "cloning ~a into ~a…" url target)))
+                  (serious-condition (e)
+                    (message (format nil "cannot run git: ~a" e))))))))))))
+  nil)
+
+(define-leader "SPC p n" "project-clone")
+
 ;;; The terminal. A real shell on a real PTY, in a buffer.
 ;;;
 ;;; In `terminal' mode the shell owns the keyboard: `d', `j', Esc and above all
@@ -878,6 +1005,10 @@ there is no such link does the row itself get read for one."
 (define-key "dired" "R" "dired-rename")
 (define-key "dired" "C" "dired-copy")
 (define-key "dired" "+" "dired-mkdir")
+;;; `C-c n' makes an empty file. Emacs has no single key for this at all — `+'
+;;; is the directory — and a chord works here only because `C-c' is a global
+;;; *prefix* rather than a whole binding; see the `C-c C-c' note further down.
+(define-key "dired" "C-c n" "dired-create-file")
 (define-key "dired" "H" "dired-toggle-hidden")
 ;;; `g r', not a bare `g': a single-key binding here would claim the `g' that
 ;;; starts `gg', and the second one would only refresh again — so the motion
@@ -981,6 +1112,66 @@ this exists — see `%dashboard-item'."
 (define-key "org-mode" "SPC m b" "org-bold")
 (define-key "org-mode" "SPC m i" "org-italic")
 (define-key "org-mode" "SPC m c" "org-code")
+
+;;; `M-RET' — another one of what this line is.
+;;;
+;;; Hand-parsed rather than matched: ECL ships no regexp engine, which is the
+;;; same reason `lsp.lisp' splits strings by hand. A list item is little enough
+;;; grammar that this is shorter than the regexp would have been anyway.
+
+(defun %org-list-prefix (line)
+  "The bullet a new item under LINE should start with, or NIL if LINE is not one.
+
+An ordered item counts on — `3.' is followed by `4.' — and nothing renumbers the
+items *below* the new one. That is org's own behaviour and not a shortcut: org
+renumbers on demand, and doing it here would rewrite lines you cannot see every
+time you pressed the key."
+  (let* ((n (length line))
+         (i (or (position-if-not (lambda (c) (member c '(#\Space #\Tab))) line) n))
+         (indent (subseq line 0 i))
+         (after (lambda (j) (and (< (1+ j) n) (char= (char line (1+ j)) #\Space)))))
+    (cond
+      ;; `-' and `+' anywhere; `*' only when indented, since a `*' in column 0
+      ;; is a heading and org reads it that way too.
+      ((and (< i n) (member (char line i) '(#\- #\+)) (funcall after i))
+       (format nil "~a~a " indent (char line i)))
+      ((and (< i n) (plusp i) (char= (char line i) #\*) (funcall after i))
+       (format nil "~a* " indent))
+      ;; `12.' or `12)', then a space.
+      (t (let ((j (position-if-not #'digit-char-p line :start i)))
+           (when (and j (> j i)
+                      (member (char line j) '(#\. #\)))
+                      (funcall after j))
+             (format nil "~a~d~a " indent
+                     (1+ (parse-integer (subseq line i j)))
+                     (char line j))))))))
+
+(defun org-meta-return ()
+  "A new list item below this one, carrying the same bullet or the next number.
+
+`goto-char' then `insert' rather than `insert-at': `insert' leaves point after
+what it wrote, which is where you are about to type. Then Insert mode, because
+the only reason to ask for a new item is to fill it in.
+
+ponytail: lists only. A heading (`M-RET' on `** foo' making another `** ') is
+one more `cond' arm and a checkbox item (`- [ ] ') is one more, and neither has
+been asked for."
+  (when (derived-mode-p "org-mode")
+    (let ((prefix (%org-list-prefix (line-string))))
+      (if prefix
+          (progn
+            (goto-char (line-end))
+            (insert (format nil "~%~a" prefix))
+            (set-evil-state "insert"))
+          (message "not on a list item")))))
+
+;;; Bound twice, and it has to be. `normal_key' consults a buffer's *major mode*
+;;; keymap; `insert_key' consults only the `insert' one — so a binding made for
+;;; `org-mode' alone would be dead while you were typing the list, which is the
+;;; whole time you want it. The command answers NIL outside an org buffer, so
+;;; the `insert' binding is a dead key everywhere else, exactly as it was before.
+(define-key "org-mode" "M-<ret>" "org-meta-return")
+(define-key "insert" "M-<ret>" "org-meta-return")
 
 ;;; ---------------------------------------------------------------------------
 ;;; org-latex-preview — begin overlay block
@@ -1410,10 +1601,13 @@ has edited costs one comparison per keystroke and nothing else."
 ;;; cycle, `C-y' takes the one that is lit, `C-e' gives up.
 ;;;
 ;;; Four keys that mean *nothing at all* in Insert mode today — core answers a
-;;; bare Ctrl with no command — so none of these takes anything away, and none
-;;; of them needs the fallback that makes `RET' and `TAB' unbindable from the
-;;; image (see the note in `lsp.lisp': a Lisp fallback lands a queue turn late,
-;;; which would put the newline *after* the character you typed next).
+;;; bare Ctrl with no command — so none of these takes anything away.
+;;;
+;;; `TAB', `S-TAB' and `RET' do the same three jobs and are deliberately absent
+;;; from this list: they are not bindable from the image at all, because a Lisp
+;;; fallback for "no popup was up" lands a queue turn late and would put the
+;;; newline *after* the character you typed next. Core asks the question itself
+;;; and calls the same three commands — see the note in `lsp.lisp'.
 ;;;
 ;;; `C-M-i' is Emacs' `completion-at-point' and asks explicitly, which is how you
 ;;; get the list one character into a word.

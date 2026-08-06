@@ -128,6 +128,11 @@ pub enum Input {
     Down,
     Left,
     Right,
+    /// `⌥←` / `⌥→` — a word at a time. Their own variants rather than an `Alt`
+    /// wrapping a `Left`, because a modified arrow is a *different escape
+    /// sequence* rather than an ESC glued to the front of one: see [`encode`].
+    AltLeft,
+    AltRight,
 }
 
 /// The bytes a real terminal would send for `input`.
@@ -179,6 +184,13 @@ pub fn encode(input: Input, app_cursor: bool) -> Vec<u8> {
         Input::Down => arrow(b'B'),
         Input::Right => arrow(b'C'),
         Input::Left => arrow(b'D'),
+        // `CSI 1 ; 3 C` — xterm's modifyOtherKeys form, where the `3` is
+        // "Alt". Always `CSI` and never `SS3`: DECCKM only ever governed the
+        // *unmodified* arrows, and a modified one has parameters, which `ESC O`
+        // has no room for. This is what readline reads as forward-word and what
+        // an agent's input box reads as a word jump.
+        Input::AltRight => vec![0x1b, b'[', b'1', b';', b'3', b'C'],
+        Input::AltLeft => vec![0x1b, b'[', b'1', b';', b'3', b'D'],
     }
 }
 

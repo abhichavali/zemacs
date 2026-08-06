@@ -55,11 +55,11 @@
 ;;;                        the TUI, so `-c' is the closest thing it has and
 ;;;                        `-s ID' is the exact form.
 ;;;
-;;; ponytail: arguments are split on whitespace on the way through the verb, so
-;;; a flag whose value contains a space cannot be expressed here. Nothing any
-;;; of the three needs for *resuming* has one. The upgrade is the verb carrying
-;;; a list instead of a string, and it is worth doing the first time a harness
-;;; wants `--prompt "do the thing"'.
+;;; Arguments are split the way a shell splits them on the way through the verb
+;;; — see `words' in `crates/app/src/term.rs' — so a flag whose value contains a
+;;; space is written the way you would write it at a prompt, in quotes. That is
+;;; what `ai-send-prompt' below relies on, and it is the note that used to stand
+;;; here coming due.
 
 (defvar *ai-harnesses*
   (list (list "claude"   "claude"       '()   '("-r"))
@@ -160,27 +160,102 @@ entire contribution is one line of text."
       (progn (split-window-right)
              (call-command (%ai-verb harness resume)))))
 
+;;; ---------------------------------------------------------------------------
+;;; One question, no session
+;;;
+;;; A harness on a PTY is the right shape for a conversation and the wrong one
+;;; for a *question*: starting a full-screen TUI, waiting for it to come up and
+;;; reading one paragraph out of it is a lot of ceremony for "what does this
+;;; flag do". `claude -p' is the one-shot form — it prints an answer and exits —
+;;; and it is still a session buffer, because that is where a subprocess's
+;;; output goes here and because you want to scroll it.
+;;;
+;;; `rerun:' rather than `run:', which is the whole of the difference between
+;;; this and picking `claude' from the menu: a question is a thing you ask
+;;; *again*, so the buffer is reused. Twenty one-shot answers would otherwise be
+;;; twenty dead sessions in the switcher inside a minute.
+
+(defparameter *ai-prompt-harness* "claude"
+  "Which harness `ai-send-prompt' asks. Its program is looked up in
+`*ai-harnesses*', so pointing this at another entry is all it takes.")
+
+(defparameter *ai-prompt-flag* "-p"
+  "The one-shot flag. `claude -p PROMPT' prints an answer and exits; the other
+two spell it differently, which is why this is a variable and not a literal.")
+
+(defun %ai-quote (string)
+  "STRING as one shell-style argument: wrapped in double quotes, with the two
+characters that would end it escaped.
+
+The verb's splitter (`words' in `crates/app/src/term.rs') understands exactly
+this, and nothing is handed to a shell — so a backtick, a `$' or a semicolon in
+a prompt is text, and quoting is only about where the argument ends."
+  (with-output-to-string (out)
+    (write-char #\" out)
+    (loop for ch across string
+          do (when (or (char= ch #\") (char= ch #\\)) (write-char #\\ out))
+             (write-char ch out))
+    (write-char #\" out)))
+
+(defun ai-send-prompt ()
+  "Ask the agent one question, typed in the minibuffer, and show the answer.
+
+For the things that are not worth a conversation: what a flag does, what a
+stack trace means, a one-line rewrite. `M-x ai-send-prompt', or `send prompt'
+in the `C-a' menu."
+  (let ((harness (assoc *ai-prompt-harness* *ai-harnesses* :test #'string=)))
+    (cond
+      ((null harness)
+       (message (format nil "no such agent: ~a" *ai-prompt-harness*)))
+      ((null (executable-find (second harness)))
+       (message (format nil "~a is not installed — no ~a on $PATH"
+                        (first harness) (second harness))))
+      (t
+       (read-string "Prompt: "
+         (lambda (prompt)
+           ;; Cancelled, or entered empty. Neither is an error and neither is a
+           ;; question, so neither forks anything.
+           (when (and prompt (plusp (length (string-trim " " prompt))))
+             (split-window-right)
+             (call-command
+              (format nil "terminal-rerun:~a-p:~a ~a ~a"
+                      (first harness) (second harness) *ai-prompt-flag*
+                      (%ai-quote prompt))))))))))
+
+(defparameter *ai-send-prompt-label* "send prompt"
+  "What `ai-send-prompt' is called in the menu. Not a harness, so it is matched
+by name before the harness list is searched.")
+
 (defun ai ()
   "Pick a coding agent, then start a new conversation or resume one.
+`send prompt' is the odd one out: one question, one answer, no session.
 Bound to `C-a'."
-  (completing-read "Agent: " (mapcar #'%ai-label *ai-harnesses*)
+  (completing-read "Agent: " (append (mapcar #'%ai-label *ai-harnesses*)
+                                     (list *ai-send-prompt-label*))
+    ;; A `cond' and not a `return-from': this callback runs on a *later* turn of
+    ;; the Lisp queue (threading.org), by which time the block `ai' established
+    ;; has long since exited and jumping to it would be a control error rather
+    ;; than an early return.
     (lambda (pick)
-      (when pick
-        ;; The label carries the "(not installed)" note, so the harness is
-        ;; found by prefix rather than by equality.
-        (let ((harness (find-if (lambda (h)
-                                  (let ((name (first h)))
-                                    (and (<= (length name) (length pick))
-                                         (string= name pick
-                                                  :end2 (length name)))))
-                                *ai-harnesses*)))
-          (if (null harness)
-              (message (format nil "no such agent: ~a" pick))
-              (completing-read (format nil "~a: " (first harness))
-                               '("new" "resume")
-                (lambda (what)
-                  (when what
-                    (%ai-start harness (string= what "resume")))))))))))
+      (cond
+        ((null pick))
+        ((equal pick *ai-send-prompt-label*) (ai-send-prompt))
+        (t
+         ;; The label carries the "(not installed)" note, so the harness is
+         ;; found by prefix rather than by equality.
+         (let ((harness (find-if (lambda (h)
+                                   (let ((name (first h)))
+                                     (and (<= (length name) (length pick))
+                                          (string= name pick
+                                                   :end2 (length name)))))
+                                 *ai-harnesses*)))
+           (if (null harness)
+               (message (format nil "no such agent: ~a" pick))
+               (completing-read (format nil "~a: " (first harness))
+                                '("new" "resume")
+                 (lambda (what)
+                   (when what
+                     (%ai-start harness (string= what "resume"))))))))))))
 
 ;;; A shorthand per harness, so a key can go straight to one without the menu.
 ;;; Generated rather than written out, because the list is the list.
@@ -307,6 +382,7 @@ line, and a bare path opens at the top."
 (define-leader "SPC a k" "terminal-close")
 (define-leader "SPC a t" "terminal-new")
 (define-leader "SPC a f" "ai-find-file-at-point")
+(define-leader "SPC a s" "ai-send-prompt")
 
 ;;; The session verbs are *editor* verbs, not Lisp functions, so introspection
 ;;; cannot find them for `M-x' the way it finds everything else in this file.

@@ -209,11 +209,15 @@ fn the_lsp_client_talks_to_a_server() {
     wait(&shared, &lisp, "a clean line", |m| m == "no diagnostic on this line");
 
     // The renderer hung off the seam has already drawn for the diagnostic the
-    // fake server published: one `line-prefix` overlay, on the line it named.
-    // Nothing in this test installed it — `lsp.lisp` pushes it onto the seam
-    // itself, which is the whole claim that the seam is usable.
+    // fake server published: one `gutter` overlay, on the line it named. Nothing
+    // in this test installed it — `lsp.lisp` pushes it onto the seam itself,
+    // which is the whole claim that the seam is usable.
+    //
+    // `gutter` and not `line-prefix`, and asserted untrimmed: a prefix moves the
+    // marked line right by its own width, which put every diagnostic a column
+    // out of alignment with the code around it.
     let one = "(overlays-in (point-min) (point-max))";
-    let mark = format!("(string-trim \" \" (overlay-get (first (first {one})) 'line-prefix))");
+    let mark = format!("(overlay-get (first (first {one})) 'gutter)");
     says(&shared, &lisp, &format!("(length {one})"), "1");
     says(&shared, &lisp, &mark, "●");
     says(&shared, &lisp, &format!("(= (second (first {one})) (line-start 5))"), "T");

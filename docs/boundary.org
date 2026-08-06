@@ -364,8 +364,10 @@ exit. Bounded by the distinct fragments a session previews, which is small.
 =crates/core/src/lib.rs=, =normalize_keys=. ="gg"= means the sequence =g g=, so an
 unseparated mix like ="g<tab>"= is not supported — write ="g <tab>"=.
 
-Also =Key=: three named keys carry modifiers (=C-<ret>=, =C-M-<ret>=, =M-<bs>=) and
-the enum will become a modifier bitset at four.
+Also =Key=: six named keys now carry modifiers (=C-<ret>=, =C-M-<ret>=, =M-<ret>=,
+=M-<bs>=, =M-<left>=, =M-<right>=), well past the four this note set as the
+threshold. The enum owes a modifier bitset over a =Named= enum, and the debt is a
+match arm in every crate that reads a =Key=.
 
 ** A type size scales the line, not the run
 

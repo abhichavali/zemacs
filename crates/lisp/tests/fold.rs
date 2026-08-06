@@ -203,14 +203,56 @@ fn an_org_subtree_folds_from_lisp_and_stops_occupying_rows() {
         (folds(ed) == 0).then_some(())
     });
 
-    // --- a buffer whose mode has no policy says so rather than guessing -------
+    // --- code, with nobody having taught this mode anything ------------------
     //
-    // Which is the boundary working: Rust has no opinion about what is foldable,
-    // so a mode nobody taught folds nothing, and teaching it is one entry in
-    // `*fold-subtree-functions*`.
+    // The default the whole tree-sitter half exists for: `rust-mode` has no entry
+    // in `*fold-subtree-functions*` and needs none. The ranges come out of the
+    // same parse that colours the buffer, so a grammar in the build is a language
+    // that folds.
+    //
+    //   0 "fn one() {"  1 "    let a = 1;"  2 "    let b = 2;"  3 "}"
+    //   4 ""            5 "fn two() {"      6 "    println!();" 7 "}"
+    const RUST: &str = "fn one() {\n    let a = 1;\n    let b = 2;\n}\n\nfn two() {\n    println!();\n}\n";
     {
         let mut ed = shared.lock().unwrap();
+        ed.buffer = Buffer::from_str(RUST);
         ed.buffer.major_mode = "rust-mode".into();
+        // What `open_file` sets from the extension, and what the reader asks the
+        // buffer for rather than making the caller name a grammar.
+        ed.buffer.language = Some("rust".into());
+        ed.buffer.cursor = 0;
+        ed.status.clear();
+    }
+    lisp.eval("(zemacs::fold-dwim)".into());
+    wait(&shared, "the function under point to fold", |ed| {
+        (folds(ed) == 1).then_some(())
+    });
+    {
+        let ed = shared.lock().unwrap();
+        // The signature line stays and the body goes — the same shape org's
+        // headline has, arrived at without a line of rust-specific policy.
+        assert_eq!(hidden(&ed), vec![1, 2, 3], "the first function, not the second");
+    }
+    lisp.eval("(zemacs::fold-dwim)".into());
+    wait(&shared, "the function to open", |ed| (folds(ed) == 0).then_some(()));
+
+    // `fold-all` takes the *outermost* ranges only. Both functions, and neither
+    // the `block` inside each — which is a node of its own with the same extent,
+    // so a nested range that was not dropped would double every fold here.
+    lisp.eval("(zemacs::fold-all)".into());
+    wait(&shared, "both functions to fold", |ed| (folds(ed) == 2).then_some(()));
+    assert_eq!(hidden(&shared.lock().unwrap()), vec![1, 2, 3, 6, 7]);
+    lisp.eval("(zemacs::fold-open-all)".into());
+    wait(&shared, "every fold to open", |ed| (folds(ed) == 0).then_some(()));
+
+    // --- and a buffer with no grammar says so rather than guessing ------------
+    //
+    // Which is the boundary working from the other side: plain text has no
+    // structure to read, so the reader answers with none and nothing is invented.
+    {
+        let mut ed = shared.lock().unwrap();
+        ed.buffer.language = None;
+        ed.buffer.major_mode = "text-mode".into();
         ed.status.clear();
     }
     lisp.eval("(zemacs::fold-dwim)".into());

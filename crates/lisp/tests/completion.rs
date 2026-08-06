@@ -72,11 +72,15 @@ fn rows(shared: &Shared) -> Vec<String> {
 }
 
 /// A decoded `CompletionList`, in the alist shape `rpc.lisp` hands `jget`.
-/// `format` carries a `detail` and the other two do not, so the row a server
-/// gets drawn for it is visibly not its `label`.
+///
+/// `format` carries a `detail`, a `kind` and a `documentation`; the other two
+/// carry less of each. So the row drawn for it is visibly not its `label`, the
+/// three columns are visibly filled in from three different fields, and a
+/// candidate with no kind at all still produces a well-formed row.
 const REPLY: &str = r#"'(("isIncomplete" . nil)
-    ("items" . ((("label" . "format") ("detail" . "fn(&str)"))
-                (("label" . "foo_bar"))
+    ("items" . ((("label" . "format") ("kind" . 3) ("detail" . "fn(&str)")
+                 ("documentation" . "Format a string."))
+                (("label" . "foo_bar") ("kind" . 6))
                 (("label" . "zzz")))))"#;
 
 #[test]
@@ -191,9 +195,21 @@ fn a_completion_reply_becomes_a_popup_and_a_keystroke_puts_one_in_the_buffer() {
     });
     assert_eq!(
         drawn,
-        vec!["format  fn(&str)".to_string(), "foo_bar".to_string()],
+        vec![
+            "function\tformat\tfn(&str)".to_string(),
+            "variable\tfoo_bar\t".to_string()
+        ],
         "the two candidates that still start with `fo', in the server's order, \
-         and `detail' drawn beside the label it belongs to"
+         each as KIND/LABEL/DETAIL — the kind mapped out of `CompletionItemKind' \
+         into a face name the theme already colours"
+    );
+    // ...and the documentation for whichever one is lit, in the panel beside
+    // the list. Wrapped in the image because the box is a fixed number of
+    // columns; short enough here to come back as one line.
+    assert_eq!(
+        shared.lock().unwrap().completion().map(|c| c.doc.clone()),
+        Some(vec!["Format a string.".to_string()]),
+        "the selected candidate's docstring, sent through `completion-doc'"
     );
     assert_eq!(
         shared.lock().unwrap().completion().map(|c| c.at),

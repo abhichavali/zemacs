@@ -286,6 +286,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "dired-rename",
     "dired-copy",
     "dired-mkdir",
+    "dired-create-file",
     "dired-toggle-hidden",
     "dired-refresh",
     "ace-window",
@@ -336,6 +337,11 @@ impl Editor {
         // what makes a completion popup stale is the mode and the cursor, and
         // this key's effect on those is still sitting in a command list.
         self.retire_completion();
+        // A menu opened by the pointer is dismissed by the keyboard, which is
+        // what every menu on every platform does. Unconditional and not a key
+        // test: there is no keystroke that means "keep the menu up", since the
+        // menu is not on the keyboard's path at all.
+        self.context_menu = None;
         let cmds = self.dispatch_key(key);
         self.note_change(key, &cmds);
         if self.pending.keys.is_empty() {
@@ -581,6 +587,30 @@ impl Editor {
                 return vec![];
             }
         }
+        // `TAB` and `RET` mean the popup while there is one, and mean themselves
+        // otherwise — which is corfu's binding and *not* something the image
+        // could have done for itself.
+        //
+        // The comment this replaces was right about why: a Lisp command bound to
+        // `RET` would have to insert the newline itself when no popup was up,
+        // and it would land a queue turn late — `a<RET>b` coming out as `ab`
+        // and a newline (`docs/threading.org`). Asked *here* the question has no
+        // fallback in it at all. Core knows synchronously whether a popup is on
+        // screen, because core is what decides; the branch that is not the popup
+        // falls through to the tab and the newline below, on the same keystroke.
+        if self.completion().is_some_and(|c| !c.accepting) {
+            match key {
+                Key::Tab => return self.run_action("lsp-complete-next"),
+                Key::BackTab => return self.run_action("lsp-complete-previous"),
+                Key::Enter => {
+                    // Latched before the round trip: see
+                    // [`Completion::accepting`].
+                    self.completion_accepting();
+                    return self.run_action("lsp-complete-accept");
+                }
+                _ => {}
+            }
+        }
         match key {
             Key::Esc | Key::Ctrl('c') => vec![EditorCommand::SetMode(Mode::Normal)],
             Key::Char(c) => vec![EditorCommand::InsertChar(c)],
@@ -592,6 +622,19 @@ impl Editor {
             Key::MetaBackspace => self.delete_word_backward(),
             Key::Left => vec![EditorCommand::MoveCursor(Direction::Left)],
             Key::Right => vec![EditorCommand::MoveCursor(Direction::Right)],
+            // A word at a time, which is what a Meta'd arrow means in readline,
+            // in every text field on this platform, and — via `Input::AltLeft` —
+            // inside a terminal session too.
+            Key::MetaLeft => vec![EditorCommand::MoveTo(word_backward(
+                &self.buffer,
+                self.buffer.cursor,
+                false,
+            ))],
+            Key::MetaRight => vec![EditorCommand::MoveTo(word_forward(
+                &self.buffer,
+                self.buffer.cursor,
+                false,
+            ))],
             Key::Up => vec![EditorCommand::MoveCursor(Direction::Up)],
             Key::Down => vec![EditorCommand::MoveCursor(Direction::Down)],
             // Nothing, rather than the tab it used to type by arriving here as
@@ -599,7 +642,9 @@ impl Editor {
             // has already had its say, so `(define-key "insert" "<backtab>" …)`
             // is what gives it a meaning in a file buffer.
             Key::BackTab => vec![],
-            Key::Ctrl(_) | Key::Meta(_) | Key::CtrlMeta(_) => vec![],
+            // `M-<ret>` among them: it is a binding or it is nothing, and the
+            // keymap above has already had its say. Typing a newline is `<ret>`.
+            Key::Ctrl(_) | Key::Meta(_) | Key::CtrlMeta(_) | Key::MetaEnter => vec![],
             Key::CtrlEnter => vec![EditorCommand::SplitWindow(frame::Split::Columns)],
             Key::CtrlMetaEnter => vec![EditorCommand::SplitWindow(frame::Split::Rows)],
         }
@@ -2221,6 +2266,10 @@ impl Editor {
     // --- prompt line -----------------------------------------------------
 
     fn prompt_key(&mut self, key: Key) -> Vec<EditorCommand> {
+        // Read before the prompt is borrowed, and only for the one key that
+        // wants it: a `String` clone per keystroke would be a copy of the
+        // clipboard on every letter typed into a prompt.
+        let paste = matches!(key, Key::Ctrl('y')).then(|| self.register.replace('\n', " "));
         let Some(p) = self.prompt.as_mut() else {
             return vec![];
         };
@@ -2252,6 +2301,20 @@ impl Editor {
             }
             Key::Char(c) => {
                 p.text.push(c);
+                p.refilter();
+            }
+            // Paste. The unnamed register *is* the system clipboard here (see
+            // `Editor::register`), so this is `C-v` as well without knowing it —
+            // which is the point: a URL to clone, a path to open, a pattern to
+            // search for all arrive from somewhere else, and retyping one was
+            // the only way to get it into a prompt.
+            //
+            // A prompt is one line, so a linewise register's newlines are
+            // dropped rather than truncating at the first: pasting three yanked
+            // lines into `:` should give you all three words, not the first one
+            // and a silent loss.
+            Key::Ctrl('y') => {
+                p.text.push_str(paste.unwrap_or_default().trim_end());
                 p.refilter();
             }
             // `C-j`/`C-k` alongside `C-n`/`C-p`: both spellings are muscle
@@ -2667,6 +2730,26 @@ impl Editor {
 
     fn ex_command(&mut self, line: &str) -> Vec<EditorCommand> {
         let line = line.trim();
+        // `:!cmd` — vim's shell escape, and like `:s` it has to be read before
+        // the split below, since `:!wc -l` is one command line and not a verb
+        // with an argument.
+        //
+        // Typed at the live shell rather than spawned: core owns no processes,
+        // the terminal is the only place output can be read and scrolled, and a
+        // `Command` built here would be word-split and so would never see a
+        // pipe, an alias, or the directory you had just `cd`-ed to.
+        //
+        // ponytail: no filter form. `:%!sort` in vim replaces the range with the
+        // command's output, which needs the range fed in as stdin and the result
+        // read back — a synchronous spawn plus a new `EditorCommand`, where this
+        // is one line. Worth building the first time someone reaches for it.
+        if let Some(cmd) = line.strip_prefix('!') {
+            let cmd = cmd.trim();
+            return match cmd.is_empty() {
+                true => vec![EditorCommand::Message("usage: :!<command>".into())],
+                false => vec![EditorCommand::Term(format!("shell:{cmd}"))],
+            };
+        }
         // Substitute before the split below: `s/a/b/g` has no whitespace in it,
         // so the generic parse would take the whole line for a command name.
         if let Some(cmds) = self.substitute(line) {
@@ -4704,6 +4787,22 @@ mod tests {
         feed(&mut ed, &keys("q"));
         feed(&mut ed, &[Key::Enter]);
         assert!(ed.should_quit);
+    }
+
+    /// `:!` is read before the verb split, or `:!wc -l` loses its argument —
+    /// and before `:s`, so a command line with slashes in it stays a command.
+    #[test]
+    fn a_bang_runs_a_shell_command_line_whole() {
+        let mut ed = fresh("");
+        assert_eq!(
+            ed.ex_command("!sed s/a/b/ < in | wc -l"),
+            vec![EditorCommand::Term("shell:sed s/a/b/ < in | wc -l".into())]
+        );
+        // A bare `:!` is a typo, not an empty command line typed at the shell.
+        assert!(matches!(
+            ed.ex_command("!  ").as_slice(),
+            [EditorCommand::Message(_)]
+        ));
     }
 
     // --- registers, macros, marks ----------------------------------------

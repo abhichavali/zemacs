@@ -120,6 +120,84 @@ pub fn highlight(lang: &str, text: &str) -> Vec<Span> {
     ANON.with(|s| s.borrow_mut().highlight(None, lang, text, None))
 }
 
+/// Every structural range in `text` worth folding, as **1-based inclusive line
+/// numbers**, outermost first.
+///
+/// Lines and not char offsets, deliberately: a fold hides whole lines, the
+/// caller turns a line into an offset with `line-start`/`line-end` anyway, and
+/// tree-sitter hands out a node's rows without anyone having to walk the text to
+/// convert bytes to characters. The one conversion this feature would otherwise
+/// have needed, avoided by asking the question in the units the answer is used
+/// in.
+///
+/// The rule is *every named node spanning more than one line*, and there is no
+/// `folds.scm` anywhere: a fold query per grammar is a file per language to
+/// write and keep in step with upstream, where this is one predicate that works
+/// on every grammar in the build and on the next one added. What it costs is
+/// precision — a multi-line argument list is a node too, so it is offered as a
+/// fold — and the caller picks which of the nested ranges it wants, which is the
+/// policy half and belongs in Lisp.
+///
+/// Unnamed nodes are skipped, so a bare `{ … }` delimiter pair is not a fold of
+/// its own beside the block it delimits.
+///
+/// Unknown language, no grammar, or a parse failure yields an empty `Vec` — the
+/// crate's "never fail loudly" rule, and the caller has one thing to check.
+pub fn fold_ranges(lang: &str, text: &str) -> Vec<(usize, usize)> {
+    thread_local! {
+        static ANON: RefCell<Parser> = RefCell::new(Parser::new());
+    }
+    let Some(config) = config(lang) else {
+        return Vec::new();
+    };
+    ANON.with(|p| {
+        let mut parser = p.borrow_mut();
+        if parser.set_language(&config.language).is_err() {
+            return Vec::new();
+        }
+        let Some(tree) = parser.parse(text, None) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        // Pre-order, which is what makes the list outermost-first: a caller
+        // wanting the innermost range containing a line takes the *last* match,
+        // and one wanting the top-level ones takes those no earlier range covers.
+        //
+        // Iterative rather than recursive because the depth here is the depth of
+        // the *parse tree*, and a file of nothing but nested brackets is a stack
+        // overflow in a crate whose rule is that bad input costs colour and never
+        // costs the process.
+        let mut cursor = tree.walk();
+        let mut depth = 0usize;
+        let mut down = true;
+        loop {
+            // `depth > 0` skips the root, which spans the file: folding it hides
+            // everything, and it would swallow every other range a caller
+            // filtered for the outermost ones.
+            if down && depth > 0 {
+                let node = cursor.node();
+                let (a, b) = (node.start_position().row, node.end_position().row);
+                if node.is_named() && b > a {
+                    out.push((a + 1, b + 1));
+                }
+            }
+            if down && cursor.goto_first_child() {
+                depth += 1;
+                continue;
+            }
+            if cursor.goto_next_sibling() {
+                down = true;
+                continue;
+            }
+            if !cursor.goto_parent() {
+                return out;
+            }
+            depth -= 1;
+            down = false;
+        }
+    })
+}
+
 /// Flatten a tree's captures into sorted, non-overlapping **byte** spans.
 ///
 /// The three rules, in order of appearance below:

@@ -132,17 +132,66 @@ pub fn char_at_cell(cells: &[Cell], col: usize, line_len: usize) -> usize {
     cells.get(col).map_or(line_len, |&(_, i)| i)
 }
 
-/// Display rows a line of `len` cells occupies in a pane `cols` wide.
+/// The cell each display row of `cells` starts at, in a pane `cols` wide.
 ///
-/// Always at least one, so an empty line still has a row for its gutter number
-/// and its cursor. `cols == 0` — a pane narrower than its own line numbers — is
-/// the infinite-loop case: it yields one row rather than dividing by zero, and
-/// every caller advances past the line either way.
-pub fn wrap_row_count(len: usize, cols: usize) -> usize {
-    match cols {
-        0 => 1,
-        c => len.div_ceil(c).max(1),
+/// **The one answer to "where does this line break", and every other question
+/// about wrapping is asked of the list it returns.** It used to be division —
+/// row `r` started at `r * cols` — and division is exactly what breaks a word
+/// in half. A break position depends on the *text*, so a number of columns is
+/// no longer enough to compute one, and the arithmetic has to become a lookup.
+///
+/// Greedy, and a word moves down whole: within each row, the break goes after
+/// the last space that fits. A word wider than the pane is broken at the edge
+/// rather than dropped, which is the one case where breaking mid-word is right
+/// — a 200-character URL in a 40-column pane has to go somewhere.
+///
+/// Spaces only, and no dictionary: a tab is already spaces by the time it gets
+/// here ([`expand_line`]), and hyphens, slashes and CJK are deliberately not
+/// break opportunities. ponytail: so `foo/bar/baz` and a Japanese sentence (no
+/// spaces at all) still break at the pane edge. Ceiling: a long path or a CJK
+/// paragraph wraps exactly as it used to. Upgrade path is UAX #14, which is a
+/// table and not a line of code, and is worth it the day this editor is used
+/// for prose in a language that does not space its words.
+///
+/// Always at least one row, so an empty line still has one for its gutter
+/// number and its cursor. `cols == 0` — a pane narrower than its own line
+/// numbers — is the infinite-loop case: it yields one row rather than dividing
+/// by zero, and every caller advances past the line either way.
+pub fn wrap_breaks(cells: &[Cell], cols: usize) -> Vec<usize> {
+    let mut rows = vec![0];
+    if cols == 0 {
+        return rows;
     }
+    let mut start = 0;
+    while start + cols < cells.len() {
+        let limit = start + cols;
+        // The last position in `(start, limit]` with a space in front of it —
+        // that is, the start of the last word that would still fit. Searched
+        // backwards from the edge because the greedy answer is the *latest*
+        // break, not the earliest.
+        let brk = (start + 1..=limit)
+            .rev()
+            .find(|&k| cells[k - 1].0 == ' ')
+            // No space anywhere in the row: one word, wider than the pane. Cut
+            // it at the edge, which is the only place left.
+            .unwrap_or(limit);
+        rows.push(brk);
+        start = brk;
+    }
+    rows
+}
+
+/// Which display row cell `cell` is drawn on, given a line's [`wrap_breaks`].
+pub fn wrap_row_of(breaks: &[usize], cell: usize) -> usize {
+    breaks.partition_point(|&s| s <= cell).saturating_sub(1)
+}
+
+/// The cell range `[start, end)` of display row `row`, for a line of `len`
+/// cells. A row past the end is empty at the end of the line, which is what a
+/// caller that clamped its own row count would want.
+pub fn wrap_row_range(breaks: &[usize], row: usize, len: usize) -> (usize, usize) {
+    let start = breaks.get(row).copied().unwrap_or(len);
+    (start, breaks.get(row + 1).copied().unwrap_or(len).max(start))
 }
 
 #[cfg(test)]
@@ -220,7 +269,52 @@ mod tests {
         assert_eq!(visual_col(&cells, 2), 4);
         // Wrapping counts cells, so this is two rows in a four-column pane where
         // a character count would have said one.
-        assert_eq!(wrap_row_count(cells.len(), 4), 2);
+        assert_eq!(wrap_breaks(&cells, 4).len(), 2);
+    }
+
+    /// The rule: a word moves down whole. Everything else here is what that
+    /// costs at the edges.
+    #[test]
+    fn a_line_wraps_between_words_and_only_breaks_one_it_has_to() {
+        let rows = |text: &str, cols| {
+            let cells = expand_line(text, 4);
+            let breaks = wrap_breaks(&cells, cols);
+            (0..breaks.len())
+                .map(|r| {
+                    let (s, e) = wrap_row_range(&breaks, r, cells.len());
+                    cells[s..e].iter().map(|&(c, _)| c).collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // The whole point: `hello world` in ten columns is two words, not
+        // `hello worl` and a stranded `d`.
+        assert_eq!(rows("hello world", 10), ["hello ", "world"]);
+        // The break is greedy — as many words as fit, and the space that ends
+        // the row stays on it rather than starting the next.
+        assert_eq!(rows("aaa bb cc ddddd", 10), ["aaa bb cc ", "ddddd"]);
+        // A word wider than the pane is cut at the edge. Anything else would
+        // mean a 200-character URL had nowhere to go.
+        assert_eq!(rows("aaa bbbbbbbbbb", 6), ["aaa ", "bbbbbb", "bbbb"]);
+        assert_eq!(rows("supercalifragilistic", 5), ["super", "calif", "ragil", "istic"]);
+        // A line that fits is one row, and an empty line is still a row.
+        assert_eq!(rows("short", 10), ["short"]);
+        assert_eq!(rows("", 10), [""]);
+        // Exactly the width: one row, and no phantom empty second one.
+        assert_eq!(rows("abcde", 5), ["abcde"]);
+        // A pane with no columns at all yields one row rather than looping.
+        assert_eq!(wrap_breaks(&expand_line("anything", 4), 0), [0]);
+
+        // ...and the lookups agree with the ranges, which is the invariant every
+        // caller depends on: `j` finds a row and the renderer draws it.
+        let cells = expand_line("aaa bb cc ddddd", 4);
+        let breaks = wrap_breaks(&cells, 10);
+        assert_eq!(breaks, [0, 10]);
+        assert_eq!(wrap_row_of(&breaks, 0), 0);
+        assert_eq!(wrap_row_of(&breaks, 9), 0);
+        assert_eq!(wrap_row_of(&breaks, 10), 1);
+        assert_eq!(wrap_row_of(&breaks, 99), 1, "past the end is the last row");
+        assert_eq!(wrap_row_range(&breaks, 1, cells.len()), (10, 15));
     }
 
     /// A combining mark decorates the character before it rather than occupying

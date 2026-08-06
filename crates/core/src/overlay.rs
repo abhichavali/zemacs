@@ -34,10 +34,11 @@
 //! The payloads split in two, and the split is the one thing to understand here.
 //! Most of them are about the *cells* a range covers: a face recolours them, a
 //! `display` string replaces them, `bold` and `italic` change which face
-//! rasterises them. Three are about the *lines* the range touches, whole:
+//! rasterises them. Four are about the *lines* the range touches, whole:
 //! [`Overlay::fold`] makes them stop occupying rows, [`Overlay::line_background`]
-//! paints a band the width of the pane behind them, and
-//! [`Overlay::line_prefix`] pushes their text in and draws something in the gap.
+//! paints a band the width of the pane behind them,
+//! [`Overlay::line_prefix`] pushes their text in and draws something in the gap,
+//! and [`Overlay::gutter`] marks them without moving anything.
 //! [`Overlay::scale`] is written as a cell payload and behaves as a line one —
 //! see its own note, which is the only surprising thing in this file.
 //!
@@ -158,6 +159,22 @@ pub struct Overlay {
     /// the continuation rows to line up too, and two properties that are always
     /// set together are one property.
     pub line_prefix: Option<String>,
+    /// Drawn in the **gutter**, beside the line number, and the text does not
+    /// move. Emacs' fringe, in the one spare column [`crate::Settings`] already
+    /// reserves between the numbers and the text.
+    ///
+    /// The difference from [`Overlay::line_prefix`] is the whole reason this
+    /// exists, and it is not cosmetic: a prefix pushes its line right by its own
+    /// width, so a *sparse* mark — one line in fifty wearing an error dot — takes
+    /// that line out of alignment with the code around it, and the indentation
+    /// you are reading is a lie. A quote bar wants the indent because it marks a
+    /// whole passage; a diagnostic marks one line and must not.
+    ///
+    /// One cell, on the line's first row only. A buffer with no gutter has
+    /// nowhere to put it and so does not draw it — there is no margin to draw in,
+    /// and stealing a column of text would be the bug this property was added to
+    /// fix.
+    pub gutter: Option<String>,
     /// **Hide the lines after this overlay's first one.** The one payload here
     /// that is about *lines* rather than about cells, and the whole of code
     /// folding: everything else an overlay carries replaces some characters with
@@ -185,6 +202,7 @@ impl Overlay {
             italic: None,
             line_background: None,
             line_prefix: None,
+            gutter: None,
             fold: false,
         }
     }
@@ -243,6 +261,9 @@ pub enum OverlayEdit {
     Italic(OverlayId, Option<bool>),
     LineBackground(OverlayId, Option<HlKind>),
     LinePrefix(OverlayId, Option<String>),
+    /// A mark in the gutter, which unlike [`OverlayEdit::LinePrefix`] leaves the
+    /// text where it is.
+    Gutter(OverlayId, Option<String>),
     /// Fold, or unfold, the lines after this overlay's first one.
     Fold(OverlayId, bool),
     Delete(OverlayId),
@@ -305,6 +326,7 @@ impl Overlays {
             | OverlayEdit::Italic(id, _)
             | OverlayEdit::LineBackground(id, _)
             | OverlayEdit::LinePrefix(id, _)
+            | OverlayEdit::Gutter(id, _)
             | OverlayEdit::Fold(id, _) => id,
         };
         let Some(o) = self.live.iter_mut().find(|o| o.id == id) else {
@@ -322,6 +344,7 @@ impl Overlays {
             OverlayEdit::Italic(_, i) => o.italic = i,
             OverlayEdit::LineBackground(_, k) => o.line_background = k,
             OverlayEdit::LinePrefix(_, s) => o.line_prefix = s,
+            OverlayEdit::Gutter(_, s) => o.gutter = s,
             OverlayEdit::Fold(_, f) => o.fold = f,
             OverlayEdit::Delete(_) | OverlayEdit::RemoveIn(..) => unreachable!("returned above"),
         }

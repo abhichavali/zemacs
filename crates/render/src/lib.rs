@@ -52,12 +52,14 @@ use sdl2::render::{BlendMode, Texture, TextureCreator, WindowCanvas};
 use sdl2::surface::Surface;
 use sdl2::ttf::{Font, Hinting, Sdl2TtfContext};
 use sdl2::video::WindowContext;
-use zemacs_core::display::{char_cells, expand_line, str_cells, visual_col, wrap_row_count};
+use zemacs_core::display::{
+    char_cells, expand_line, str_cells, visual_col, wrap_breaks, wrap_row_of, wrap_row_range,
+};
 use zemacs_core::modeline;
 use zemacs_core::{
     dashboard::Row as Dash, fold_hiding, fold_starts_in, Buffer, BufferId, BufferKind,
     CompletionStyle, Editor, FaceStyle, HlKind, Image, ImageId, LineOverflow, Mode, Overlay,
-    Settings, Span, Window,
+    Completion, ContextMenu, Settings, Span, Window,
 };
 // `zemacs_gui::Rect` is deliberately not imported: `Rect` in this file is
 // SDL's, and three rectangle types in one namespace is how a blit ends up in
@@ -277,6 +279,39 @@ struct Caret {
     /// beside its caret has to measure in the same ones.
     cw: i32,
     row_h: i32,
+}
+
+/// Take the window down by hand, because nothing else will.
+///
+/// [`Renderer::new`] leaks its `TextureCreator` to get `Texture<'static>`, and
+/// that handle holds an `Rc` on the renderer context, which holds one on the
+/// window context. So dropping this struct drops neither: `SDL_DestroyRenderer`
+/// and `SDL_DestroyWindow` never run, and a frame closed with the red button
+/// vanishes from `editor.frames` while its window sits on screen, drawn by
+/// nobody and routed to nothing. That is the whole of "close does nothing when a
+/// second frame is open" — with one frame the close is an `SDL_QUIT` and the
+/// process exits before anyone notices.
+///
+/// Textures first. Destroying a renderer invalidates every texture made from
+/// it, and the caches below outlive this call by one field-drop each.
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        self.glyphs.clear();
+        self.bold_glyphs.clear();
+        self.faces.clear();
+        self.images.clear();
+        // Read before the renderer goes: `window()` walks through the context we
+        // are about to free.
+        let window = self.canvas.window().raw();
+        let renderer = self.canvas.raw();
+        // Safe to do once, precisely *because* of the leak: the `Rc`s that would
+        // free these are in a `Box::leak` that never drops, so no destructor can
+        // run behind us and double-free.
+        unsafe {
+            sdl2::sys::SDL_DestroyRenderer(renderer);
+            sdl2::sys::SDL_DestroyWindow(window);
+        }
+    }
 }
 
 impl Renderer {
@@ -621,6 +656,9 @@ impl Renderer {
             // minibuffer's box (which is modal and dims everything anyway).
             self.draw_completion_at_point(editor, area.w, area.h, status_h);
             self.draw_completion(editor, area.w, area.h, status_h);
+            // Last, and therefore on top of all of them: a menu the pointer
+            // opened is the most recent thing you asked for.
+            self.draw_context_menu(editor, area.w, area.h);
         }
 
         Ok(())
@@ -1021,19 +1059,25 @@ impl Renderer {
             // core's ceiling as much as this file's — core lays a line out with
             // no overlays at all, see boundary.org — and closing it is handing
             // both of them the overlay list this loop is already walking.
-            let text_rows = if wrap {
-                wrap_row_count(cells.len(), lb.cols)
+            // Where this line breaks, once, for every question below: the row
+            // count, the cursor's row and column, and the range each row draws.
+            // Truncation is the degenerate list — one row holding everything —
+            // so the loop below needs no second shape for it.
+            let breaks = if wrap {
+                wrap_breaks(&cells, lb.cols)
             } else {
-                1
+                vec![0]
             };
+            let text_rows = breaks.len();
             let need = (text_rows * lb.tall).max(tall);
             let fits = need.min(rows - row);
             let shown_rows = drawn_rows(fits, lb.tall, text_rows);
 
             // Only the focused window of the focused frame gets a cursor: two
             // blocks on screen at once is two claims about where typing goes.
-            let cursor_at = (active && line == cur_line)
-                .then(|| cursor_pos(visual_col(&cells, cur_col), lb.cols, text_rows.max(1)));
+            let cursor_at = (active && line == cur_line).then(|| {
+                cursor_pos(visual_col(&cells, cur_col), &breaks, cells.len(), lb.cols)
+            });
 
             // ponytail: no horizontal scrolling. A truncated line gives up its
             // last column to the marker; the tail is simply not reachable.
@@ -1045,7 +1089,7 @@ impl Renderer {
             let folds_here = fold_starts_in(overlays, start, end);
 
             let mut ri = 0usize;
-            for (r, (rs, re)) in wrap_rows(cells.len(), lb.cols)
+            for (r, (rs, re)) in wrap_rows(&breaks, cells.len())
                 .take(shown_rows)
                 .enumerate()
             {
@@ -1085,8 +1129,14 @@ impl Renderer {
                         self.fill(x, y, lb.cw, row_h, c);
                     }
                 }
+                // Clipped to the pane's edge rather than to `re`, deliberately:
+                // a linewise selection runs one cell past the line's last
+                // character to swallow the newline, and on a row that word wrap
+                // ended early the highlight should still reach the margin — a
+                // selected paragraph with ragged right edges reads as several
+                // selections.
                 for &s in &sel_cells {
-                    if let Some((a, b)) = row_span(s, rs, lb.cols) {
+                    if let Some((a, b)) = row_span(s, rs, rs + lb.cols) {
                         let x = lx0 + a as i32 * lb.cw;
                         self.fill(x, y, (b - a) as i32 * lb.cw, row_h, sel_bg);
                     }
@@ -1109,6 +1159,37 @@ impl Renderer {
                 // screen lines, which is what `display-line-numbers-type
                 // 'visual` means — so every row gets one. After the stripe,
                 // which is painted across the gutter too.
+                // A mark in the margin — a diagnostic's severity dot, and the
+                // reason this is not a `line_prefix`: it takes no columns off the
+                // line, so a marked line stays in column with its neighbours.
+                //
+                // The spare column `gutter_w` reserves between the numbers and
+                // the text, which is exactly the one cell of air a mark wants and
+                // is why nothing had to grow to fit this. First row only: the
+                // mark is about the buffer line, the way an absolute number is.
+                //
+                // No gutter means no margin, so nothing is drawn rather than a
+                // column of text being taken — see `Overlay::gutter`.
+                if let (Some((g, face)), true) = (style.gutter, gutter > 0 && r == 0) {
+                    // Brighter than a line number and dimmer than the text: it is
+                    // chrome, but chrome you are meant to notice. A face on the
+                    // overlay overrides, the way `line_prefix` takes its colour.
+                    let c = match face {
+                        Some(k) => rgb(editor.theme.color(k, fg)),
+                        None => num_cur_c,
+                    };
+                    // Clamped to the one column there is. A longer mark would
+                    // paint over the first characters of the line, which is
+                    // precisely the bug this property exists to not have — and
+                    // `…` says "it did not fit" rather than corrupting the code.
+                    //
+                    // Pane-sized like the numbers beside it, not line-sized: the
+                    // gutter is chrome, and a mark next to a 1.5× heading is
+                    // still a mark in the same column as every other one.
+                    let x = doc.x + digits as i32 * cell_w;
+                    self.draw_run(&truncate(g, 1), x, y, c, Cut::plain(scale_step(zoom)));
+                }
+
                 if numbered && r == 0 {
                     let c = if line == cur_line { num_cur_c } else { num_c };
                     let n = gutter_number(line, cur_line, set.relative_line_numbers);
@@ -1770,7 +1851,13 @@ impl Renderer {
         if c.rows.is_empty() || editor.prompt.is_some() {
             return;
         }
-        let widest = c.rows.iter().map(|s| str_cells(s)).max().unwrap_or(0);
+        let parsed: Vec<Row<'_>> = c.rows.iter().map(|s| Row::parse(s)).collect();
+        // Every column is sized against the *whole* list rather than against the
+        // rows on screen, so scrolling with `C-n` does not shuffle the layout
+        // under the selection.
+        let name_w = parsed.iter().map(|r| str_cells(r.label)).max().unwrap_or(0);
+        let detail_w = parsed.iter().map(|r| str_cells(r.detail)).max().unwrap_or(0);
+        let widest = KIND_COLS + name_w + if detail_w > 0 { detail_w + 2 } else { 0 };
         let b = point_popup(caret, w, h, status_h, self.line_h, widest, c.rows.len());
         if b.rows == 0 {
             return;
@@ -1784,32 +1871,237 @@ impl Renderer {
         // it. The border does the rest.
         let panel_c = rgb(mix(bg, fg, 0.11));
         let border_c = rgb(mix(bg, accent, 0.45));
-        let sel_bg = rgb(mix(bg, accent, 0.22));
+        // Deeper than the old 0.22 and no longer the only mark of the selection:
+        // the accent bar down the left edge is what your eye actually lands on,
+        // and it survives a theme whose function colour is close to the panel.
+        let sel_bg = rgb(mix(bg, accent, 0.30));
         let row_c = rgb(mix(bg, fg, 0.78));
+        let dim_c = rgb(mix(bg, fg, 0.45));
 
+        self.drop_shadow(b.x, b.y, b.w, b.h);
         self.fill(b.x, b.y, b.w, b.h, panel_c);
-        self.fill(b.x, b.y, b.w, 1, border_c);
-        self.fill(b.x, b.y + b.h - 1, b.w, 1, border_c);
-        self.fill(b.x, b.y, 1, b.h, border_c);
-        self.fill(b.x + b.w - 1, b.y, 1, b.h, border_c);
+        self.frame(b.x, b.y, b.w, b.h, border_c);
 
         let x0 = b.x + PAD;
         let cols = ((b.w - 2 * PAD).max(0) / self.cell_w.max(1)) as usize;
         let (first, rows) = c.visible(b.rows);
         for (i, row) in rows.iter().enumerate() {
             let ry = b.y + PADV + i as i32 * self.line_h;
+            let row = Row::parse(row);
             let selected = first + i == c.selected;
-            let colour = if selected {
+            if selected {
                 // Inset by the border rather than over it: the frame is what
                 // separates the box from the code, and a selection that painted
                 // across it would put a hole in that on one row.
                 self.fill(b.x + 1, ry, b.w - 2, self.line_h, sel_bg);
-                rgb(accent)
-            } else {
-                row_c
-            };
-            self.draw_str(&truncate(row, cols), x0, ry, colour);
+                self.fill(b.x + 1, ry, SEL_BAR, self.line_h, rgb(accent));
+            }
+            // The kind badge: a tinted chip with a letter in it, which is the
+            // one part of a candidate you read without reading. Colour comes
+            // from the *theme's* face for that kind, so `function` in the list
+            // is the same hue as a function call in the buffer behind it — and a
+            // theme change recolours the popup for free.
+            let kind_c = editor.theme.color(row.kind, fg);
+            self.fill(
+                x0,
+                ry + 1,
+                KIND_COLS as i32 * self.cell_w - self.cell_w / 2,
+                self.line_h - 2,
+                rgb(mix(bg, kind_c, 0.28)),
+            );
+            self.draw_str(row.badge(), x0 + self.cell_w / 4, ry, rgb(kind_c));
+
+            // Name, then detail — and the detail is cut first when the box is
+            // narrow, because a truncated identifier is not a candidate you can
+            // recognise and a truncated type still is.
+            let nx = x0 + KIND_COLS as i32 * self.cell_w;
+            let room = cols.saturating_sub(KIND_COLS);
+            let name = truncate(row.label, room);
+            let end = self.draw_weighted(
+                &name,
+                nx,
+                ry,
+                if selected { rgb(fg) } else { row_c },
+                selected,
+            );
+            let left = room.saturating_sub(str_cells(&name) + 2);
+            if left > 0 && !row.detail.is_empty() {
+                self.draw_str(&truncate(row.detail, left), end + 2 * self.cell_w, ry, dim_c);
+            }
         }
+        // A thumb, only when the list is longer than the box — otherwise the
+        // popup would grow a permanent stripe that means nothing.
+        self.scrollbar(&b, first, rows.len(), c.rows.len(), rgb(mix(bg, fg, 0.35)));
+        self.draw_completion_doc(editor, c, &b, w, h, status_h);
+    }
+
+    /// The documentation for the highlighted candidate, in a second box beside
+    /// the first — vscode's shape, and the only surface in this editor that
+    /// answers "what *is* this thing" without leaving the word you are typing.
+    ///
+    /// To the right of the list when there is room and to its left otherwise,
+    /// which is the same rule [`point_popup`] uses vertically and for the same
+    /// reason: near the end of a long line the right side is where there is no
+    /// room at all. Never above or below — the two boxes have to read as one
+    /// object, and a stack of three would be taller than the pane.
+    ///
+    /// Its own height, and *not* the list's: two candidates with a paragraph of
+    /// documentation between them is the ordinary case, and clipping the
+    /// paragraph to two lines to keep the boxes level would throw away the
+    /// thing this panel exists to show. It shares the list's top edge and grows
+    /// down from there until it runs out of window.
+    ///
+    /// Syntax-highlighted through `doc_spans`, which the *app* fills in: see
+    /// [`Completion::doc_spans`]. No spans yet draws as plain text, which is
+    /// what the first frame after a selection move gets.
+    fn draw_completion_doc(
+        &mut self,
+        editor: &Editor,
+        c: &Completion,
+        list: &Popup,
+        w: i32,
+        h: i32,
+        status_h: i32,
+    ) {
+        if c.doc.is_empty() {
+            return;
+        }
+        let (bg, fg) = (editor.settings.background, editor.settings.foreground);
+        let accent = editor.theme.color(HlKind::Function, fg);
+        let widest = c.doc.iter().map(|s| str_cells(s)).max().unwrap_or(0);
+        let cols = widest.clamp(1, DOC_POPUP_COLS);
+        let box_w = cols as i32 * self.cell_w + 2 * PAD;
+        let right = list.x + list.w + DOC_GAP;
+        let x = if right + box_w <= w {
+            right
+        } else {
+            (list.x - DOC_GAP - box_w).max(0)
+        };
+        // Down to the status strip and no further, so the box never covers the
+        // modeline or the minibuffer — `POPUP_ROWS` is the taste and this is
+        // the hard limit.
+        let room = (((h - status_h) - list.y - 2 * PADV) / self.line_h.max(1)).max(0) as usize;
+        let rows = c.doc.len().min(POPUP_ROWS).min(room);
+        if rows == 0 {
+            return;
+        }
+        let box_h = 2 * PADV + rows as i32 * self.line_h;
+
+        self.drop_shadow(x, list.y, box_w, box_h);
+        self.fill(x, list.y, box_w, box_h, rgb(mix(bg, fg, 0.09)));
+        self.frame(x, list.y, box_w, box_h, rgb(mix(bg, accent, 0.30)));
+
+        // `doc_spans` are offsets into the doc joined by newlines, which is the
+        // form the parser was handed — so the running total is what turns a
+        // span back into a column on a row.
+        let mut at = 0usize;
+        let mut si = 0usize;
+        let spans = c.doc_spans.as_deref().unwrap_or(&[]);
+        for (i, line) in c.doc.iter().take(rows).enumerate() {
+            let ry = list.y + PADV + i as i32 * self.line_h;
+            let n = line.chars().count();
+            let (next, runs) = spans_for_line(spans, si, at, at + n);
+            si = next;
+            let lx = x + PAD;
+            for (col, ch) in truncate(line, cols).chars().enumerate() {
+                let kind = runs
+                    .iter()
+                    .find(|&&(s, e, _)| (s..e).contains(&col))
+                    .map_or(HlKind::Comment, |&(_, _, k)| k);
+                self.draw_char(
+                    ch,
+                    lx + col as i32 * self.cell_w,
+                    ry,
+                    rgb(editor.theme.color(kind, fg)),
+                );
+            }
+            at += n + 1; // the newline the parser saw
+        }
+    }
+
+    // --- the right-click menu -----------------------------------------------
+
+    /// The menu under the pointer, and the box [`Renderer::context_menu_row`]
+    /// hit-tests against.
+    ///
+    /// The two share [`Renderer::context_menu_box`] rather than each doing the
+    /// arithmetic, which is the whole reason the hit test lives on the renderer
+    /// at all: a menu you can see one row of and click a different one is the
+    /// bug this design rules out rather than tests for.
+    fn draw_context_menu(&mut self, editor: &Editor, w: i32, h: i32) {
+        let Some(menu) = &editor.context_menu else {
+            return;
+        };
+        let b = context_menu_box(menu, w, h, self.cell_w, self.line_h);
+        let (bg, fg) = (editor.settings.background, editor.settings.foreground);
+        let accent = editor.theme.color(HlKind::Function, fg);
+
+        self.drop_shadow(b.x, b.y, b.w, b.h);
+        self.fill(b.x, b.y, b.w, b.h, rgb(mix(bg, fg, 0.13)));
+        self.frame(b.x, b.y, b.w, b.h, rgb(mix(bg, accent, 0.45)));
+
+        for (i, (label, _)) in menu.items.iter().enumerate() {
+            let ry = b.y + PADV + i as i32 * self.line_h;
+            let hot = menu.hover == Some(i);
+            if hot {
+                self.fill(b.x + 1, ry, b.w - 2, self.line_h, rgb(mix(bg, accent, 0.30)));
+                self.fill(b.x + 1, ry, SEL_BAR, self.line_h, rgb(accent));
+            }
+            let colour = if hot { rgb(fg) } else { rgb(mix(bg, fg, 0.78)) };
+            self.draw_str(label, b.x + PAD, ry, colour);
+        }
+    }
+
+    /// Which row of the menu is under `(x, y)`, in pixels. `None` for a point
+    /// outside the box or in its padding.
+    pub fn context_menu_row(&self, editor: &Editor, x: i32, y: i32) -> Option<usize> {
+        let menu = editor.context_menu.as_ref()?;
+        let area = self.content_area();
+        let b = context_menu_box(menu, area.w, area.h, self.cell_w, self.line_h);
+        if x < b.x || x >= b.x + b.w || y < b.y + PADV || y >= b.y + b.h - PADV {
+            return None;
+        }
+        let i = ((y - b.y - PADV) / self.line_h.max(1)) as usize;
+        (i < menu.items.len()).then_some(i)
+    }
+
+    /// A 1px rectangle outline. Four fills, and the only reason it is a method
+    /// is that three popups drew the same four lines.
+    fn frame(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color) {
+        self.fill(x, y, w, 1, color);
+        self.fill(x, y + h - 1, w, 1, color);
+        self.fill(x, y, 1, h, color);
+        self.fill(x + w - 1, y, 1, h, color);
+    }
+
+    /// A translucent smear under a floating box, so it reads as being *over* the
+    /// code rather than cut into it.
+    ///
+    /// Three rings rather than a blur: the canvas is in [`BlendMode::Blend`], so
+    /// stacking three cheap rectangles at a low alpha gives a falloff for the
+    /// price of three fills, and a real blur would mean a texture.
+    fn drop_shadow(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        for (i, a) in [(1, 40u8), (2, 26), (3, 14)] {
+            self.fill(
+                x + i,
+                y + i,
+                w,
+                h,
+                Color::RGBA(0, 0, 0, a),
+            );
+        }
+    }
+
+    /// The thumb down the inside of a popup's right edge. Nothing at all when
+    /// every row is on screen.
+    fn scrollbar(&mut self, b: &Popup, first: usize, shown: usize, total: usize, color: Color) {
+        if shown == 0 || total <= shown {
+            return;
+        }
+        let track = b.h - 2 * PADV;
+        let thumb = (track * shown as i32 / total as i32).max(self.line_h / 2);
+        let top = b.y + PADV + (track - thumb) * first as i32 / (total - shown) as i32;
+        self.fill(b.x + b.w - 1 - SCROLLBAR_W, top, SCROLLBAR_W, thumb, color);
     }
 
     // --- primitives -------------------------------------------------------
@@ -2944,7 +3236,7 @@ fn offset_at(
         );
         let cells = line_cells(buf, line, set.tab_width);
         let visual = if wrap {
-            wrap_row_count(cells.len(), b.cols)
+            wrap_breaks(&cells, b.cols).len()
         } else {
             1
         };
@@ -3259,10 +3551,96 @@ fn point_popup(
     Popup { x, y, w: box_w, h: box_h, rows }
 }
 
+/// Where the right-click menu sits, clamped into the window.
+///
+/// Flipped rather than shoved when it would run off the bottom or the right: a
+/// menu whose top-left corner is the pointer is the convention, and near an edge
+/// every platform hangs it the other way rather than sliding it out from under
+/// your hand.
+///
+/// A free function, like [`point_popup`], so the geometry can be tested with no
+/// window open — and so the drawing and the hit test provably agree, which is
+/// the bug ("I clicked New Window and got a split") worth designing out.
+fn context_menu_box(menu: &ContextMenu, w: i32, h: i32, cell_w: i32, line_h: i32) -> Popup {
+    let cols = menu.items.iter().map(|(l, _)| str_cells(l)).max().unwrap_or(0);
+    let box_w = cols as i32 * cell_w + 2 * PAD;
+    let box_h = 2 * PADV + menu.items.len() as i32 * line_h;
+    let x = if menu.x + box_w <= w { menu.x } else { (menu.x - box_w).max(0) };
+    let y = if menu.y + box_h <= h { menu.y } else { (menu.y - box_h).max(0) };
+    Popup { x, y, w: box_w, h: box_h, rows: menu.items.len() }
+}
+
 /// Widest a completion popup gets, in cells. A candidate is an identifier;
 /// past this it is a signature, and a box wider than the code behind it has
 /// stopped floating over the buffer and started replacing it.
-const POINT_POPUP_COLS: usize = 42;
+const POINT_POPUP_COLS: usize = 48;
+
+/// Cells the kind badge claims at the front of a candidate row: a letter and
+/// the gap after it.
+const KIND_COLS: usize = 3;
+
+/// Width of the accent bar down the left of the selected row.
+const SEL_BAR: i32 = 2;
+
+/// Width of a popup's scroll thumb.
+const SCROLLBAR_W: i32 = 2;
+
+/// Widest the documentation box gets, in cells, and the gap between it and the
+/// candidate list. Wider than the list on purpose — a docstring is prose and a
+/// candidate is a word.
+const DOC_POPUP_COLS: usize = 56;
+const DOC_GAP: i32 = 6;
+
+/// One candidate, split into the three things drawn in three columns.
+///
+/// The wire form is `KIND \t LABEL \t DETAIL`, and every field after the first
+/// missing one is empty — so `"foo"` is a bare label with no badge and no type,
+/// which is what a caller that knows nothing about the columns produces. The
+/// split is here rather than in the image because the columns are *aligned*,
+/// and aligning them means measuring cells.
+///
+/// `KIND` is a face name ([`HlKind::from_name`]), not a colour and not a glyph:
+/// the image says what a candidate *is* and the theme says what that looks
+/// like, which is the same division as every span in the buffer.
+struct Row<'a> {
+    kind: HlKind,
+    label: &'a str,
+    detail: &'a str,
+}
+
+impl<'a> Row<'a> {
+    fn parse(s: &'a str) -> Row<'a> {
+        let mut f = s.split('\t');
+        let (a, b, c) = (f.next().unwrap_or(""), f.next(), f.next());
+        match b {
+            // Three fields: the first is the kind.
+            Some(label) => Row {
+                kind: HlKind::from_name(a).unwrap_or(HlKind::Default),
+                label,
+                detail: c.unwrap_or(""),
+            },
+            // One field: all label, no claim about what it is.
+            None => Row { kind: HlKind::Default, label: a, detail: "" },
+        }
+    }
+
+    /// The letter in the badge. Deliberately a letter and not an icon glyph: an
+    /// icon font is not something this editor ships or can assume, and a
+    /// missing glyph draws as a box, which is worse than dull.
+    fn badge(&self) -> &'static str {
+        match self.kind {
+            HlKind::Function => "ƒ",
+            HlKind::Type => "T",
+            HlKind::Keyword => "k",
+            HlKind::Constant => "c",
+            HlKind::Variable => "v",
+            HlKind::String => "\"",
+            HlKind::Number => "#",
+            HlKind::Comment => "-",
+            _ => "·",
+        }
+    }
+}
 
 /// Cells between one which-key column and the next.
 const WHICH_KEY_GUTTER: usize = 2;
@@ -3369,21 +3747,19 @@ fn menu_widths(rows: &[Dash]) -> (usize, usize, usize) {
 // a tab is several cells and a `→` is one, so wrapping on anything else puts
 // the break in the wrong place (or, for bytes, mid-codepoint).
 
-/// The cell range `[start, end)` shown on each display row of a line of `len`
-/// cells, in order. Truncation takes the first of these and nothing else.
+/// The cell range `[start, end)` shown on each display row of a line, in order.
+/// Truncation takes the first of these and nothing else.
 ///
-/// ponytail: the break is at exactly `cols`, so a wide character whose first
-/// cell is the last column is cut in half — its glyph is clipped at the pane
-/// edge and its continuation blank starts the next row. Emacs moves the whole
-/// character down. Ceiling: a CJK paragraph in a narrow pane, where every other
-/// row ends on a half glyph. Upgrade path: this takes the cell list rather than
-/// a length, and backs the break off by one when it lands on a continuation
-/// cell — which is also what a per-line table of advances would give it.
-fn wrap_rows(len: usize, cols: usize) -> impl Iterator<Item = (usize, usize)> {
-    (0..wrap_row_count(len, cols)).map(move |r| {
-        let s = (r * cols).min(len);
-        (s, (s + cols).min(len))
-    })
+/// Where the rows *are* is [`wrap_breaks`]'s answer and not this function's —
+/// core's `j` and `k` read the same list, and a renderer that broke lines
+/// somewhere else would draw the cursor where core does not think it is.
+///
+/// ponytail: a wide character whose first cell is the last column of a row is
+/// still cut in half, because a break opportunity is a space and `漢漢漢` has
+/// none. Ceiling: a CJK paragraph in a narrow pane. Upgrade path is the UAX #14
+/// note on `wrap_breaks`, which subsumes this.
+fn wrap_rows(breaks: &[usize], len: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    (0..breaks.len()).map(move |r| wrap_row_range(breaks, r, len))
 }
 
 /// Column of the truncation marker for a line of `len` cells in `cols`
@@ -3396,63 +3772,86 @@ fn truncation_marker(len: usize, cols: usize) -> Option<usize> {
     (cols > 0 && len > cols).then(|| cols - 1)
 }
 
-/// The part of display-cell range `sel` that lands on the row starting at cell
-/// `rs`, as columns within that row — `None` when it misses the row entirely.
+/// The part of display-cell range `sel` that lands on row `[rs, re)`, as
+/// columns within that row — `None` when it misses the row entirely.
 ///
-/// Clipped to `cols`, which is what stops a selection running off the pane: the
+/// Clipped to the row's own end and not to `cols`, which is what stops a
+/// selection running off the pane *and*, since the rows stopped being uniform,
+/// what stops it running past a short row into the whitespace beside it: the
 /// range may extend one cell past the line's last character (the newline a
-/// linewise selection swallows) and a wrapped row's range is unbounded to the
-/// right until it is cut here.
-fn row_span(sel: (usize, usize), rs: usize, cols: usize) -> Option<(usize, usize)> {
-    let (a, b) = (sel.0.max(rs), sel.1.min(rs + cols));
+/// linewise selection swallows) and a row's range is unbounded to the right
+/// until it is cut here.
+fn row_span(sel: (usize, usize), rs: usize, re: usize) -> Option<(usize, usize)> {
+    let (a, b) = (sel.0.max(rs), sel.1.min(re));
     (b > a).then(|| (a - rs, b - rs))
 }
 
-/// (row, column) of a cursor on display cell `vc` of a line occupying `rows`
-/// rows of `cols` columns.
+/// (row, column) of a cursor on display cell `vc` of a line whose rows start at
+/// `breaks`, in a pane `cols` wide.
 ///
 /// The cursor may sit one cell *past* the last character — insert mode at end
 /// of line — and on a line ending exactly at the pane's edge that cell is the
 /// first column of a row this line does not own. Emacs opens a continuation row
 /// for it; we park it on the trailing margin of the last row the line does own,
 /// one cell left of where Emacs draws it and, more importantly, inside the
-/// pane. Truncated lines (`rows == 1`) land there too: with no horizontal
-/// scrolling there is nowhere else to say "the cursor is off to the right".
-fn cursor_pos(vc: usize, cols: usize, rows: usize) -> (usize, usize) {
+/// pane. Truncated lines (one row) land there too: with no horizontal scrolling
+/// there is nowhere else to say "the cursor is off to the right".
+fn cursor_pos(vc: usize, breaks: &[usize], len: usize, cols: usize) -> (usize, usize) {
     if cols == 0 {
         return (0, 0);
     }
-    match vc / cols {
-        r if r < rows => (r, vc % cols),
-        _ => (rows.saturating_sub(1), cols),
+    // Past the line's last cell: the trailing margin of the last row, as above.
+    // Asked before the row lookup because `wrap_row_of` would answer the last
+    // row anyway and then subtract the wrong start.
+    if vc > len {
+        return (breaks.len().saturating_sub(1), cols);
     }
+    let r = wrap_row_of(breaks, vc);
+    let (start, _) = wrap_row_range(breaks, r, len);
+    ((r).min(breaks.len().saturating_sub(1)), (vc - start).min(cols))
 }
 
 /// Buffer lines that fit in `rows` display rows, given each line's row count in
 /// `heights` counting down from the first visible line — the window's
 /// `viewport_lines`.
 ///
-/// Rows left over once the buffer ends count as one line each. Core clamps
-/// `scroll` against this number, so a count that shrank at the end of the file
-/// would let the view scroll past it; topping up also makes truncation (every
-/// height 1) report the pane's full row capacity, exactly as before wrapping
-/// existed. A single line taller than the whole pane still reports 1, which is
-/// what keeps scrolling able to step over it.
+/// When the buffer ends with the pane not full, the slack is topped up from
+/// `above` — the lines *before* the first visible one, nearest first. Core
+/// clamps `scroll` against this number (`len_lines - viewport_lines` is the
+/// furthest it will scroll), so a count that simply shrank at the end of the
+/// file would let the view scroll past it.
+///
+/// Topping up **by line and not by row** is the whole of the correction here.
+/// The slack used to be charged one line per leftover row, which is exact while
+/// every line is one row tall and a lie the moment one is not: stepping back
+/// four lines to fill four rows adds *more* than four rows when one of them
+/// wraps, so the clamp dragged the view up past the end of the file and the last
+/// line went off the bottom — and stayed off, since a full window reports no
+/// slack to correct itself with. Counting the lines that actually fill those
+/// rows makes `len_lines - viewport_lines` the exact scroll at which the last
+/// line sits on the bottom row, which is what core has always believed it was.
+///
+/// A single line taller than the whole pane still reports 1, which is what keeps
+/// scrolling able to step over it.
 ///
 /// A height of **0** is a folded line, and is the reason this adds `h` rather
 /// than `h.max(1)`: such a line spans a buffer line and occupies no row, so it
 /// has to be counted as a line — or `scroll` could never step over a fold — and
 /// must not be charged a row.
-fn lines_in_rows(heights: impl IntoIterator<Item = usize>, rows: usize) -> usize {
+fn lines_in_rows(
+    heights: impl IntoIterator<Item = usize>,
+    above: impl IntoIterator<Item = usize>,
+    rows: usize,
+) -> usize {
     let (mut used, mut lines) = (0usize, 0usize);
-    for h in heights {
+    for h in heights.into_iter().chain(above) {
         if used >= rows {
             break;
         }
         used += h;
         lines += 1;
     }
-    lines + rows.saturating_sub(used)
+    lines
 }
 
 /// [`lines_in_rows`] for a real buffer. Only the visible lines are expanded —
@@ -3475,9 +3874,15 @@ fn visible_lines(
     if !wrap && !buf.overlays().iter().any(reshapes_lines) {
         return rows;
     }
-    let heights =
-        (scroll..buf.len_lines()).map(|l| line_rows(buf, l, text_w, cell_w, wrap, set.tab_width));
-    lines_in_rows(heights, rows)
+    let rows_of = |l| line_rows(buf, l, text_w, cell_w, wrap, set.tab_width);
+    // The second range is walked only when the file ends before the pane is
+    // full, and then only far enough to fill it — see [`lines_in_rows`], which is
+    // where the reason it counts lines rather than rows is written down.
+    lines_in_rows(
+        (scroll..buf.len_lines()).map(rows_of),
+        (0..scroll).rev().map(rows_of),
+        rows,
+    )
 }
 
 /// Whether an overlay can make a line occupy a different number of rows than its
@@ -3514,7 +3919,7 @@ fn line_rows(
         cell_w,
     );
     let visual = match wrap {
-        true => wrap_row_count(line_cells(buf, l, tab_width).len(), b.cols),
+        true => wrap_breaks(&line_cells(buf, l, tab_width), b.cols).len(),
         false => 1,
     };
     visual * b.tall
@@ -3736,6 +4141,11 @@ struct LineStyle<'a> {
     /// quote bar is `(overlay-put ov 'line-prefix "▎ ")` beside that overlay's
     /// own `face` rather than a second colour property nothing else would use.
     prefix: Option<(&'a str, Option<HlKind>)>,
+    /// A mark for the gutter, and its colour, the same way. Deliberately *not*
+    /// folded into `prefix`: this one is not part of [`LineBox`] at all, because
+    /// the whole point of it is that it takes no columns off the line — see
+    /// [`zemacs_core::Overlay::gutter`].
+    gutter: Option<(&'a str, Option<HlKind>)>,
 }
 
 /// The line attributes in force on `[start, end)`.
@@ -3754,6 +4164,9 @@ fn line_style<'a>(overlays: &'a [Overlay], start: usize, end: usize) -> LineStyl
         style.background = o.line_background.or(style.background);
         if let Some(p) = &o.line_prefix {
             style.prefix = Some((p.as_str(), o.face));
+        }
+        if let Some(g) = &o.gutter {
+            style.gutter = Some((g.as_str(), o.face));
         }
     }
     style
@@ -4668,8 +5081,12 @@ mod tests {
     fn the_cursor_follows_a_wide_character_across_a_wrap() {
         let cells = expand_line("😀😀😀😀", 4);
         assert_eq!(cells.len(), 8);
-        assert_eq!(wrap_row_count(cells.len(), 4), 2);
-        assert_eq!(cursor_pos(visual_col(&cells, 3), 4, 2), (1, 2));
+        let breaks = wrap_breaks(&cells, 4);
+        assert_eq!(breaks.len(), 2);
+        assert_eq!(
+            cursor_pos(visual_col(&cells, 3), &breaks, cells.len(), 4),
+            (1, 2)
+        );
     }
 
     /// Chrome measures in cells too — a CJK candidate that fit "by character
@@ -4701,6 +5118,7 @@ mod tests {
             italic: None,
             line_background: None,
             line_prefix: None,
+            gutter: None,
             fold: false,
         }
     }
@@ -4977,6 +5395,25 @@ mod tests {
         );
     }
 
+    /// The property this one exists *because of*: a gutter mark must be invisible
+    /// to layout. A diagnostic dot arrived as a `line-prefix` first, and that put
+    /// every marked line a column out from the code around it — so the whole
+    /// claim of `gutter` is that this box is the unmarked one, byte for byte.
+    #[test]
+    fn a_gutter_mark_takes_no_columns_off_the_line() {
+        let marked = LineStyle {
+            gutter: Some(("●", Some(HlKind::Constant))),
+            ..Default::default()
+        };
+        assert_eq!(
+            line_box(&marked, 100, 10),
+            line_box(&LineStyle::default(), 100, 10)
+        );
+        // And a line wearing both is indented by the prefix alone.
+        let both = LineStyle { prefix: Some(("| ", None)), ..marked };
+        assert_eq!(line_box(&both, 100, 10).indent, 20);
+    }
+
     /// The line attributes, resolved the way the draw loop resolves them.
     #[test]
     fn line_attributes_take_the_widest_scale_and_the_latest_of_the_rest() {
@@ -5203,6 +5640,46 @@ mod tests {
     }
 
     #[test]
+    fn the_right_click_menu_flips_at_an_edge_rather_than_sliding_out_from_the_pointer() {
+        let (w, h) = (80 * CW, 20 * LH);
+        let menu = |x, y| ContextMenu { x, y, ..Default::default() };
+
+        // Room for it: the pointer is the top-left corner, which is what every
+        // platform does.
+        let b = context_menu_box(&menu(4 * CW, 2 * LH), w, h, CW, LH);
+        assert_eq!((b.x, b.y), (4 * CW, 2 * LH));
+
+        // Against the bottom-right: flipped, so the box is still under the hand
+        // and entirely on screen.
+        let b = context_menu_box(&menu(w - CW, h - LH), w, h, CW, LH);
+        assert!(b.x + b.w <= w && b.y + b.h <= h, "off the edge: {b:?}");
+        assert!(b.x < w - CW && b.y < h - LH, "flipped, not shoved: {b:?}");
+
+        // And a window too small for either placement still yields a box on
+        // screen rather than a negative origin.
+        let b = context_menu_box(&menu(0, 0), 4 * CW, 2 * LH, CW, LH);
+        assert!(b.x >= 0 && b.y >= 0, "{b:?}");
+    }
+
+    #[test]
+    fn a_candidate_row_splits_into_three_columns_and_degrades_to_one() {
+        let r = Row::parse("function\tformat!\tmacro");
+        assert_eq!((r.kind, r.label, r.detail), (HlKind::Function, "format!", "macro"));
+        assert_eq!(r.badge(), "ƒ");
+
+        // A kind the face table does not know, and a candidate with no detail:
+        // both are well-formed rows, not errors.
+        let r = Row::parse("nonsense\tfoo\t");
+        assert_eq!((r.kind, r.label, r.detail), (HlKind::Default, "foo", ""));
+
+        // ...and a bare string, which is what a caller that knows nothing about
+        // the columns produces. All label — never a kind, or `foo` would draw
+        // as an unnamed face and lose its own name.
+        let r = Row::parse("foo_bar");
+        assert_eq!((r.kind, r.label, r.detail), (HlKind::Default, "foo_bar", ""));
+    }
+
+    #[test]
     fn a_completion_popup_with_no_room_either_side_asks_for_no_rows_at_all() {
         // A window two rows tall: nothing fits above or below without covering
         // the caret, and the caller draws nothing rather than a box over point.
@@ -5229,6 +5706,19 @@ mod tests {
         cells[s..e].iter().map(|&(c, _)| c).collect()
     }
 
+    /// The rows of a real cell list, which is what the draw loop walks.
+    fn rows_of(cells: &[(char, usize)], cols: usize) -> Vec<(usize, usize)> {
+        wrap_rows(&wrap_breaks(cells, cols), cells.len()).collect()
+    }
+
+    /// `n` cells with no break opportunity in them, for the tests below that
+    /// are about *cells* rather than about words — where a row breaks is
+    /// `wrap_breaks`' own test, in `crates/core/src/display.rs`, and every case
+    /// here would only be restating it.
+    fn unbroken(n: usize) -> Vec<(char, usize)> {
+        (0..n).map(|i| ('x', i)).collect()
+    }
+
     /// `visible_lines` for `text` wrapped in a `cols`-wide, `rows`-tall pane —
     /// the path the renderer actually takes, so a wrap measured in the wrong
     /// unit shows up here rather than only in the helper it was measured with.
@@ -5247,8 +5737,8 @@ mod tests {
     }
 
     #[test]
-    fn a_line_wraps_into_whole_rows_of_the_panes_width() {
-        let rows = |n: usize, w: usize| wrap_rows(n, w).collect::<Vec<_>>();
+    fn an_unbreakable_line_still_wraps_into_whole_rows_of_the_panes_width() {
+        let rows = |n: usize, w: usize| rows_of(&unbroken(n), w);
         // Narrower than the pane: one row, and it is the whole line.
         assert_eq!(rows(3, 4), vec![(0, 3)]);
         // Exactly the pane: still one row. A second, empty one would look like
@@ -5262,12 +5752,19 @@ mod tests {
         // Empty line: one row to hold the cursor and the gutter number.
         assert_eq!(rows(0, 4), vec![(0, 0)]);
         for (n, w) in [(3, 4), (4, 4), (5, 4), (12, 4), (0, 4), (7, 3)] {
-            assert_eq!(rows(n, w).len(), wrap_row_count(n, w), "{n}/{w}");
             // Every row is inside the line and they tile it end to end.
             assert_eq!(rows(n, w).last().unwrap().1, n, "{n}/{w}");
             assert!(rows(n, w).windows(2).all(|p| p[0].1 == p[1].0), "{n}/{w}");
             assert!(rows(n, w).iter().all(|&(s, e)| e - s <= w), "{n}/{w}");
         }
+        // ...and the invariant that survives word wrap: rows still tile the
+        // line end to end, they are just no longer all the pane's width.
+        let cells = expand_line("the quick brown fox jumps", 4);
+        let rows = rows_of(&cells, 10);
+        assert_eq!(rows.first().unwrap().0, 0);
+        assert_eq!(rows.last().unwrap().1, cells.len());
+        assert!(rows.windows(2).all(|p| p[0].1 == p[1].0));
+        assert!(rows.iter().all(|&(s, e)| e - s <= 10));
     }
 
     #[test]
@@ -5275,15 +5772,14 @@ mod tests {
         // Zero columns: a pane narrower than its own gutter. Dividing by it is
         // the infinite loop; one empty row is the answer that lets the caller
         // move on to the next line.
-        assert_eq!(wrap_row_count(500, 0), 1);
-        assert_eq!(wrap_rows(500, 0).collect::<Vec<_>>(), vec![(0, 0)]);
-        assert_eq!(wrap_rows(0, 0).collect::<Vec<_>>(), vec![(0, 0)]);
+        let long = unbroken(500);
+        assert_eq!(rows_of(&long, 0), vec![(0, 500)]);
+        assert_eq!(rows_of(&unbroken(0), 0), vec![(0, 0)]);
         assert_eq!(truncation_marker(500, 0), None); // nowhere to put it
-        assert_eq!(cursor_pos(7, 0, 1), (0, 0));
+        assert_eq!(cursor_pos(7, &[0], 500, 0), (0, 0));
         // One column: one row per character, and it does terminate.
-        assert_eq!(wrap_row_count(5, 1), 5);
         assert_eq!(
-            wrap_rows(5, 1).collect::<Vec<_>>(),
+            rows_of(&unbroken(5), 1),
             vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
         );
         assert_eq!(truncation_marker(5, 1), Some(0));
@@ -5295,7 +5791,7 @@ mod tests {
         // stop, 'b'. Wrapping the chars would fit it on one 4-column row.
         let cells = expand_line("a\tb", 4);
         assert_eq!(cells.len(), 5);
-        let rows = wrap_rows(cells.len(), 4).collect::<Vec<_>>();
+        let rows = rows_of(&cells, 4);
         assert_eq!(rows.len(), 2);
         assert_eq!(row_text(&cells, rows[0]), "a   ");
         assert_eq!(row_text(&cells, rows[1]), "b");
@@ -5303,10 +5799,11 @@ mod tests {
         assert_eq!(cells[rows[1].0].1, 2);
         // Same at the call site, which is what a source-char implementation
         // would actually get wrong: "a\tb" costs two of the pane's twenty rows
-        // where the three-character "abc" costs one. (Both files also have the
-        // empty line their trailing newline leaves behind.)
-        assert_eq!(wrapped_lines("a\tb\n", 20, 4), 2 + 17);
-        assert_eq!(wrapped_lines("abc\n", 20, 4), 2 + 18);
+        // where the three-character "abc" costs one, so half as many of them
+        // fit. Measured on a file that fills the pane, since a file that does
+        // not is answered by its own length whatever its lines cost.
+        assert_eq!(wrapped_lines(&"a\tb\n".repeat(20), 20, 4), 10);
+        assert_eq!(wrapped_lines(&"abc\n".repeat(20), 20, 4), 20);
     }
 
     #[test]
@@ -5315,22 +5812,23 @@ mod tests {
         // codepoint in half doing it.
         let cells = expand_line("ααααα", 4);
         assert_eq!(cells.len(), 5);
-        assert_eq!(wrap_row_count(cells.len(), 3), 2);
-        let rows = wrap_rows(cells.len(), 3).collect::<Vec<_>>();
+        let rows = rows_of(&cells, 3);
+        assert_eq!(rows.len(), 2);
         assert_eq!(row_text(&cells, rows[0]), "ααα");
         assert_eq!(row_text(&cells, rows[1]), "αα");
         // Box-drawing art from the dashboard banner, same story.
         let cells = expand_line("███████╗", 4);
         assert_eq!(cells.len(), 8);
-        assert_eq!(wrap_row_count(cells.len(), 8), 1);
-        assert_eq!(wrap_row_count(cells.len(), 4), 2);
-        // At the call site: ten Greek letters are ten cells and twenty bytes,
-        // so a byte-measured pane wraps them into five rows instead of three
-        // and reports 16 lines where the answer is 18.
-        assert_eq!(wrapped_lines("αααααααααα\n", 20, 4), 2 + 16);
-        assert_eq!(wrapped_lines("aaaaaaaaaa\n", 20, 4), 2 + 16);
+        assert_eq!(rows_of(&cells, 8).len(), 1);
+        assert_eq!(rows_of(&cells, 4).len(), 2);
+        // At the call site: ten Greek letters are ten cells and twenty bytes, so
+        // a byte-measured pane wraps them into five rows instead of three and
+        // fits four of them in twenty rows where seven belong — and answers the
+        // same as the ASCII line beside it, which is the property.
+        assert_eq!(wrapped_lines(&"αααααααααα\n".repeat(20), 20, 4), 7);
+        assert_eq!(wrapped_lines(&"aaaaaaaaaa\n".repeat(20), 20, 4), 7);
         // Three cells is one row; three bytes would be two.
-        assert_eq!(wrapped_lines("ααα\n", 20, 4), 2 + 18);
+        assert_eq!(wrapped_lines(&"ααα\n".repeat(20), 20, 4), 20);
     }
 
     #[test]
@@ -5355,21 +5853,19 @@ mod tests {
 
     #[test]
     fn a_wrapped_offset_round_trips_to_its_row_and_column() {
-        let cells = expand_line("abcdefghij", 4);
-        let rows = wrap_rows(cells.len(), 4).collect::<Vec<_>>();
-        for vc in 0..cells.len() {
-            let (r, c) = cursor_pos(vc, 4, rows.len());
-            assert!(c < 4, "{vc} -> {r},{c}");
-            assert_eq!(rows[r].0 + c, vc, "{vc} -> {r},{c}");
-            assert!(vc >= rows[r].0 && vc < rows[r].1, "{vc} -> {r},{c}");
-        }
-        // Same for a tab-expanded line, where cells and chars disagree.
-        let cells = expand_line("\tfn main() {", 4);
-        let rows = wrap_rows(cells.len(), 5).collect::<Vec<_>>();
-        for src in [0usize, 1, 5] {
-            let vc = visual_col(&cells, src);
-            let (r, c) = cursor_pos(vc, 5, rows.len());
-            assert_eq!(rows[r].0 + c, vc);
+        // Three lines, and the third is the one word wrap made interesting: its
+        // rows are not all the pane's width, so a `vc / cols` round trip would
+        // put the cursor on the wrong row.
+        for (text, cols) in [("abcdefghij", 4), ("\tfn main() {", 5), ("aaa bb cc dddd", 10)] {
+            let cells = expand_line(text, 4);
+            let breaks = wrap_breaks(&cells, cols);
+            let rows = rows_of(&cells, cols);
+            for vc in 0..cells.len() {
+                let (r, c) = cursor_pos(vc, &breaks, cells.len(), cols);
+                assert!(c < cols, "{text:?} {vc} -> {r},{c}");
+                assert_eq!(rows[r].0 + c, vc, "{text:?} {vc} -> {r},{c}");
+                assert!(vc >= rows[r].0 && vc < rows[r].1, "{text:?} {vc} -> {r},{c}");
+            }
         }
     }
 
@@ -5378,14 +5874,15 @@ mod tests {
         // End of a line that exactly fills its last row: cell 8 belongs to a
         // row this line does not own, so it comes back to the trailing margin
         // of row 1 rather than landing on the next buffer line.
-        assert_eq!(cursor_pos(8, 4, 2), (1, 4));
-        assert_eq!(cursor_pos(7, 4, 2), (1, 3)); // the last character itself
+        let two_rows = [0usize, 4];
+        assert_eq!(cursor_pos(8, &two_rows, 8, 4), (1, 4));
+        assert_eq!(cursor_pos(7, &two_rows, 8, 4), (1, 3)); // the last character
         // Truncated: the cursor is somewhere off to the right, and the margin
         // is the only place left to say so. Never past it.
-        for vc in [30, 31, 500] {
-            assert_eq!(cursor_pos(vc, 30, 1), (0, 30));
+        for vc in [31, 500] {
+            assert_eq!(cursor_pos(vc, &[0], 30, 30), (0, 30));
         }
-        assert_eq!(cursor_pos(0, 30, 1), (0, 0));
+        assert_eq!(cursor_pos(0, &[0], 30, 30), (0, 0));
         // A margin cursor is still inside its pane once trimmed — this is the
         // arithmetic `draw_cursor` protects.
         let cols = 30i32;
@@ -5398,20 +5895,23 @@ mod tests {
 
     #[test]
     fn a_selection_is_clipped_to_each_row_it_crosses() {
+        // The caller passes the row's *end*, which for the highlight is the
+        // pane's right edge — see the note at the call site.
+        let span = |sel, rs: usize, cols: usize| row_span(sel, rs, rs + cols);
         // Cells 2..9 of a line wrapped at 4: part of row 0, all of row 1, part
         // of row 2.
-        assert_eq!(row_span((2, 9), 0, 4), Some((2, 4)));
-        assert_eq!(row_span((2, 9), 4, 4), Some((0, 4)));
-        assert_eq!(row_span((2, 9), 8, 4), Some((0, 1)));
-        assert_eq!(row_span((2, 9), 12, 4), None); // past the selection
-        assert_eq!(row_span((2, 9), 0, 0), None); // zero-column pane
+        assert_eq!(span((2, 9), 0, 4), Some((2, 4)));
+        assert_eq!(span((2, 9), 4, 4), Some((0, 4)));
+        assert_eq!(span((2, 9), 8, 4), Some((0, 1)));
+        assert_eq!(span((2, 9), 12, 4), None); // past the selection
+        assert_eq!(span((2, 9), 0, 0), None); // zero-column pane
         // The trailing newline cell of a linewise selection: shown when the row
         // has a column spare, dropped when it would land past the pane edge.
-        assert_eq!(row_span((0, 5), 0, 8), Some((0, 5)));
-        assert_eq!(row_span((0, 5), 0, 4), Some((0, 4)));
+        assert_eq!(span((0, 5), 0, 8), Some((0, 5)));
+        assert_eq!(span((0, 5), 0, 4), Some((0, 4)));
         // Never wider than the pane, whatever it is handed.
         for &(s, e) in &[(0usize, 500usize), (0, 5), (7, 9), (100, 200)] {
-            if let Some((a, b)) = row_span((s, e), 0, 30) {
+            if let Some((a, b)) = span((s, e), 0, 30) {
                 assert!(b <= 30 && a < b, "{s}..{e} -> {a}..{b}");
             }
         }
@@ -5420,25 +5920,52 @@ mod tests {
     #[test]
     fn viewport_lines_counts_buffer_lines_not_rows() {
         const ROWS: usize = 40;
+        let none = || std::iter::empty::<usize>();
         // Truncation: one row each, so the pane's full capacity, file length
         // notwithstanding — unchanged from before wrapping existed.
-        assert_eq!(lines_in_rows(std::iter::repeat_n(1, 100), ROWS), ROWS);
-        // A short file leaves rows empty; they count one line each, or `scroll`
-        // would be clamped further down every frame near the end of the file.
-        assert_eq!(lines_in_rows([1, 1, 1], ROWS), ROWS);
+        assert_eq!(lines_in_rows(std::iter::repeat_n(1, 100), none(), ROWS), ROWS);
         // Wrapped: a line worth several rows crowds the others out.
-        assert_eq!(lines_in_rows([10, 10, 10, 10, 1, 1], ROWS), 4);
-        assert_eq!(lines_in_rows([2, 2, 2, 2], ROWS), 4 + 32);
+        assert_eq!(lines_in_rows([10, 10, 10, 10, 1, 1], none(), ROWS), 4);
         // One line taller than the whole pane still counts as one, so scrolling
         // can step over it instead of getting stuck on it.
-        assert_eq!(lines_in_rows([100, 1, 1], ROWS), 1);
-        assert_eq!(lines_in_rows([100], ROWS), 1);
+        assert_eq!(lines_in_rows([100, 1, 1], none(), ROWS), 1);
+        assert_eq!(lines_in_rows([100], none(), ROWS), 1);
         // A pane with no room for text advertises no lines: core reads that as
         // zero and clamps, where a lie about one row would scroll by it.
-        assert_eq!(lines_in_rows([1, 1], 0), 0);
-        assert_eq!(lines_in_rows(std::iter::empty(), 0), 0);
-        // Past the end of the buffer: still the pane's capacity, never zero.
-        assert_eq!(lines_in_rows(std::iter::empty(), ROWS), ROWS);
+        assert_eq!(lines_in_rows([1, 1], none(), 0), 0);
+        assert_eq!(lines_in_rows(none(), none(), 0), 0);
+        // Nothing below the view and nothing above it: an empty buffer is zero
+        // lines, and core's `len_lines - this` is then 0 either way.
+        assert_eq!(lines_in_rows(none(), none(), ROWS), 0);
+    }
+
+    /// The end of the file, which is the case core's scroll clamp is built on:
+    /// it will not scroll past `len_lines - viewport_lines`, so this number has
+    /// to be the count of lines that puts the *last* line on the bottom row.
+    #[test]
+    fn the_slack_at_the_end_of_a_file_is_filled_by_line_not_by_row() {
+        const ROWS: usize = 40;
+        // Four lines left below the view, 36 rows spare. Every line one row: the
+        // 36 above fill them exactly, so 40 — the pane's capacity, unchanged.
+        assert_eq!(
+            lines_in_rows([1, 1, 1, 1], std::iter::repeat_n(1, 100), ROWS),
+            40
+        );
+        // The same slack, but the lines above it are four rows each: nine of
+        // them fill 36 rows, so the answer is 4 + 9 and *not* 4 + 36.
+        //
+        // This is the bug. Charging one line per leftover row said 40, core read
+        // `len_lines - 40` and scrolled the view up 36 lines — far past the end
+        // of the file, taking the last line off the bottom of the window, where
+        // it stayed: a full pane reports no slack, so nothing corrected it.
+        assert_eq!(
+            lines_in_rows([1, 1, 1, 1], std::iter::repeat_n(4, 100), ROWS),
+            4 + 9
+        );
+        // A short file has nothing above to top up with, so it is its own
+        // length — and core's `len_lines - this` is 0, which pins it to the top.
+        assert_eq!(lines_in_rows([1, 1, 1], std::iter::empty(), ROWS), 3);
+        assert_eq!(lines_in_rows([2, 2, 2, 2], std::iter::empty(), ROWS), 4);
     }
 
     #[test]
@@ -5456,17 +5983,22 @@ mod tests {
         assert_eq!(visible_lines(&buf, 0, 20, 10, 1, &set), 20);
         set.line_overflow = LineOverflow::Wrap;
         // 100 cells in a 10-column pane is 10 rows for the first line alone,
-        // then three one-row lines, then seven rows of nothing.
-        assert_eq!(visible_lines(&buf, 0, 20, 10, 1, &set), 4 + 7);
-        // Scrolled past the long line, the wrapped and truncated counts agree
-        // again — nothing on screen is wider than the pane.
-        assert_eq!(visible_lines(&buf, 1, 20, 10, 1, &set), 20);
+        // then three one-row lines: 13 rows of content and nothing above the
+        // view to fill the rest of the pane with, so four lines is the whole
+        // answer. Core reads `len_lines - 4` and pins the view to the top,
+        // which is where a file shorter than its pane belongs.
+        assert_eq!(visible_lines(&buf, 0, 20, 10, 1, &set), 4);
+        // Scrolled off the top, the seventeen spare rows are filled by walking
+        // *back* over the long line — which costs ten rows and buys one line.
+        // The old count said 20 here, one line per empty row, and that is the
+        // arithmetic that sent the view up past the end of a taller file.
+        assert_eq!(visible_lines(&buf, 1, 20, 10, 1, &set), 4);
         // Tall enough to matter: the long line alone fills a 5-row pane, and
         // the count must not drop to zero or scrolling stops dead.
         assert_eq!(visible_lines(&buf, 0, 5, 10, 1, &set), 1);
         assert_eq!(visible_lines(&buf, 0, 0, 10, 1, &set), 0);
         // A pane with no columns must not hang: every line is one row.
-        assert_eq!(visible_lines(&buf, 0, 5, 0, 1, &set), 4 + 1);
+        assert_eq!(visible_lines(&buf, 0, 5, 0, 1, &set), 4);
     }
 
     // --- the gutter -------------------------------------------------------
@@ -5891,7 +6423,7 @@ mod tests {
 
         // ...and every row it does walk indexes inside the line. This is the
         // slice that panicked.
-        for (rs, re) in wrap_rows(cells.len(), cols).take(shown_rows) {
+        for (rs, re) in rows_of(&cells, cols).into_iter().take(shown_rows) {
             let shown = marker.unwrap_or(re - rs);
             assert!(
                 rs + shown <= cells.len(),
@@ -5910,7 +6442,7 @@ mod tests {
 
         // Wrapping is untouched: there the text really does own those rows, and
         // `take` was never the thing bounding them.
-        let wrapped = wrap_row_count(cells.len(), cols);
+        let wrapped = rows_of(&cells, cols).len();
         assert_eq!(wrapped, 2);
         assert_eq!(drawn_rows(wrapped * tall, tall, wrapped), 2);
         // A 2× line still claims two display rows per visual row, and the row
@@ -5930,9 +6462,10 @@ mod tests {
         let cells = expand_line(&"x".repeat(500), 4);
 
         for &(wrap, cols) in &[(false, 30usize), (true, 30)] {
-            let need = if wrap { wrap_row_count(cells.len(), cols) } else { 1 };
+            let breaks = if wrap { wrap_breaks(&cells, cols) } else { vec![0] };
+            let need = breaks.len();
             let marker = (!wrap).then(|| truncation_marker(cells.len(), cols)).flatten();
-            for (rs, re) in wrap_rows(cells.len(), cols).take(need) {
+            for (rs, re) in wrap_rows(&breaks, cells.len()).take(need) {
                 let shown = marker.unwrap_or(re - rs);
                 assert!(shown <= cols, "wrap={wrap}");
                 assert!(doc.x + shown as i32 * CW <= right, "wrap={wrap}");
@@ -5940,13 +6473,13 @@ mod tests {
                     assert!(doc.x + (mc as i32 + 1) * CW <= right, "marker spills");
                 }
                 // The selection of the entire line, clipped to this row.
-                let (a, b) = row_span((0, cells.len() + 1), rs, cols).unwrap();
+                let (a, b) = row_span((0, cells.len() + 1), rs, rs + cols).unwrap();
                 assert!(doc.x + b as i32 * CW <= right, "selection spills");
                 assert!(b > a);
             }
             // The cursor at end of line — the position that used to be drawn at
             // column 500 and left to the clip rect to hide.
-            let (_, cc) = cursor_pos(cells.len(), cols, need);
+            let (_, cc) = cursor_pos(cells.len(), &breaks, cells.len(), cols);
             let x = doc.x + cc as i32 * CW;
             assert!(x <= right, "cursor at {x} outside {pane:?}");
             // `draw_cursor` trims it; a whole cell here would overhang.

@@ -165,27 +165,94 @@ subtree here."
             (:children (unfold-region beg end)        (message "subtree")))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; tree-sitter — which is every language, and needs no entry anywhere
+;;;
+;;; org has a hand-written idea of a subtree above because org has no grammar in
+;;; this build. Everything that *does* have one already gets parsed on every
+;;; keystroke to be coloured, and `fold-ranges' asks that same tree a different
+;;; question: which line ranges are structural. So folding a `defun', a class, a
+;;; brace block or a JSON object costs no per-language work at all — the mode
+;;; list below this is empty on purpose, and adding a grammar to the build adds
+;;; its folding with it.
+;;;
+;;; The reader answers *every* named node spanning more than one line, outermost
+;;; first, and picking among them is the whole of the policy here: the innermost
+;;; range for "fold what I am in", the outermost ones for "show me the shape of
+;;; the file". Two `loop's, and Rust needed no opinion about either.
+;;;
+;;; ponytail: no `folds.scm'. A fold query per grammar is more precise — it is
+;;; how Neovim does it — and it is a file per language to write and keep in step
+;;; with upstream. The imprecision it buys is that a multi-line argument list is
+;;; offered as a fold too, which costs a press of `z a' landing on something
+;;; smaller than you meant and never costs a wrong fold.
+;;;
+;;; ponytail: `fold-ranges' re-parses the buffer on each call, where the
+;;; highlighter next door is doing an incremental parse of the same text. It runs
+;;; on this thread and nothing waits on it, and the press that asks is one you
+;;; made deliberately — so the ceiling is a big file and a held-down `z a'. The
+;;; upgrade is reaching the highlighter's `Session' tree, which today lives on
+;;; the worker thread with no way to ask it a second question.
+
+(defun tree-sitter-subtree-at-point ()
+  "(BEG . END) for the innermost structural range covering point, or NIL.
+
+Innermost, so pressing the key inside a method folds the method rather than the
+class it lives in — and `fold-ranges' answers outermost first, so the innermost
+match is simply the last one that covers this line."
+  (let ((line (line-number))
+        (best nil))
+    (loop for (a b) in (fold-ranges)
+          when (and (<= a line) (<= line b)) do (setf best (cons a b)))
+    (when best
+      (cons (line-start (car best)) (line-end (cdr best))))))
+
+(defun tree-sitter-subtrees ()
+  "Every *outermost* structural range in the buffer — `fold-all''s shape.
+
+Outermost and not all of them: `fold-all' means \"show me the shape of this
+file\", which is one fold per top-level definition. A nested range would be a
+fold inside a fold nobody can see, and `fold-open-all' would then need two
+passes to undo what one press did.
+
+The ranges arrive outermost first, so anything starting at or before the last
+range's end is inside it — one integer of state and no interval arithmetic."
+  (let ((end 0)
+        (out '()))
+    (loop for (a b) in (fold-ranges)
+          when (> a end)
+            do (setf end b)
+               (push (cons (line-start a) (line-end b)) out))
+    (nreverse out)))
+
+;;; ---------------------------------------------------------------------------
 ;;; the generic commands
 
 (defparameter *fold-subtree-functions*
   '(("org-mode" . org-subtree-at-point))
   "Major mode -> a function answering (BEG . END) for the foldable thing under
-point, or NIL. *This is the policy hook.* Teaching another mode to fold is one
-entry here and one function; there is nothing to add in Rust, because Rust has
-no opinion about what a subtree is.")
+point, or NIL. *This is the policy hook*, and it is an override rather than a
+requirement: a mode with no entry falls through to `tree-sitter-subtree-at-point',
+so folding works in every language the build has a grammar for without anyone
+adding a line. org is here because org has no grammar and a headline is not a
+syntax node.")
 
 (defparameter *fold-all-functions*
   '(("org-mode" . org-subtrees))
   "Major mode -> a function answering every foldable (BEG . END) in the buffer.
 Read by `fold-all' only, and separate from `*fold-subtree-functions*' because
-\"every top-level heading\" is not \"the heading under point\" applied N times.")
+\"every top-level heading\" is not \"the heading under point\" applied N times.
+Falls through to `tree-sitter-subtrees' the same way.")
+
+(defun %fold-fn (table fallback)
+  "The function TABLE names for this major mode, else FALLBACK."
+  (let ((f (cdr (assoc (major-mode) table :test #'string=))))
+    (if (and f (fboundp f)) f fallback)))
 
 (defun %fold-range ()
   "The range `fold-dwim' should act on: the selection if there is one, else
-whatever this major mode calls a subtree."
-  (or (region) (let ((f (cdr (assoc (major-mode) *fold-subtree-functions*
-                                    :test #'string=))))
-                 (and f (fboundp f) (funcall f)))))
+whatever this major mode calls a subtree, else what the parser calls one."
+  (or (region) (funcall (%fold-fn *fold-subtree-functions*
+                                  'tree-sitter-subtree-at-point))))
 
 (defun fold-dwim ()
   "Fold or unfold what is under point.
@@ -205,12 +272,10 @@ CHILDREN one; see the ceiling at the top of this file."
 
 Opens what is already folded first, so pressing it twice does not stack a second
 overlay over the first and leave `fold-dwim' needing two presses to undo."
-  (let ((f (cdr (assoc (major-mode) *fold-all-functions* :test #'string=))))
-    (cond ((not (and f (fboundp f))) (message "nothing to fold in this mode"))
-          (t (unfold-all)
-             (let ((ranges (funcall f)))
-               (dolist (r ranges) (fold-region (car r) (cdr r)))
-               (message (format nil "~a fold~:p" (length ranges))))))))
+  (unfold-all)
+  (let ((ranges (funcall (%fold-fn *fold-all-functions* 'tree-sitter-subtrees))))
+    (dolist (r ranges) (fold-region (car r) (cdr r)))
+    (message (format nil "~a fold~:p" (length ranges)))))
 
 (defun fold-open-all ()
   "Open every fold in the buffer."

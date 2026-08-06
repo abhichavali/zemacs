@@ -123,7 +123,7 @@ impl Key {
     pub fn is_editor_key(self) -> bool {
         matches!(
             self,
-            Key::Meta(_) | Key::CtrlMeta(_) | Key::CtrlEnter | Key::CtrlMetaEnter
+            Key::Meta(_) | Key::CtrlMeta(_) | Key::CtrlEnter | Key::CtrlMetaEnter | Key::MetaEnter
         )
     }
 }
@@ -152,9 +152,19 @@ pub enum Key {
     // now owed, and the debt is a match arm in every crate that reads a `Key`.
     CtrlEnter,
     CtrlMetaEnter,
+    /// `⌘⏎`. org's `M-RET`: a new list item, a new heading — "another one of
+    /// what this line is". A named key for [`Key::MetaBackspace`]'s reason, and
+    /// it used to be dropped on the floor: `combo_char` cannot spell `<ret>`, so
+    /// the `Meta(char)` arm answered `None` and the keystroke reached nothing.
+    MetaEnter,
     /// `⌘⌫`. Deletes the word before point, and in a terminal is handed to the
     /// shell, which has its own idea of where a word starts.
     MetaBackspace,
+    /// `⌘←` and `⌘→` — Meta plus an arrow, which is word-at-a-time motion
+    /// everywhere it means anything. Named keys rather than `Meta(char)` for
+    /// [`Key::MetaBackspace`]'s reason: an arrow has no character to carry.
+    MetaLeft,
+    MetaRight,
     Enter,
     Tab,
     /// `⇧⇥`. Its own key and not a shifted `Tab`, because that is what every
@@ -180,7 +190,10 @@ impl Key {
             Key::CtrlMeta(c) => format!("C-M-{}", c.to_ascii_lowercase()),
             Key::CtrlEnter => "C-<ret>".into(),
             Key::CtrlMetaEnter => "C-M-<ret>".into(),
+            Key::MetaEnter => "M-<ret>".into(),
             Key::MetaBackspace => "M-<bs>".into(),
+            Key::MetaLeft => "M-<left>".into(),
+            Key::MetaRight => "M-<right>".into(),
             Key::Enter => "<ret>".into(),
             Key::Tab => "<tab>".into(),
             Key::BackTab => "<backtab>".into(),
@@ -228,7 +241,10 @@ impl Key {
             "<down>" => Key::Down,
             "C-<ret>" => Key::CtrlEnter,
             "C-M-<ret>" => Key::CtrlMetaEnter,
+            "M-<ret>" => Key::MetaEnter,
             "M-<bs>" => Key::MetaBackspace,
+            "M-<left>" => Key::MetaLeft,
+            "M-<right>" => Key::MetaRight,
             // Order matters: `C-M-` has to be tried before `C-`.
             _ if s.starts_with("C-M-") => Key::CtrlMeta(one(&s[4..])?.to_ascii_lowercase()),
             _ if s.starts_with("C-") => Key::Ctrl(one(&s[2..])?.to_ascii_lowercase()),
@@ -593,7 +609,8 @@ pub enum EditorCommand {
 
     /// A dired verb — `"open"`, `"up"`, `"enter"`, `"mark"`, `"unmark"`,
     /// `"toggle-marks"`, `"flag-delete"`, `"execute"`, `"rename"`, `"copy"`,
-    /// `"mkdir"`, `"toggle-hidden"`, `"refresh"`. Core has no filesystem in it.
+    /// `"mkdir"`, `"create-file"`, `"toggle-hidden"`, `"refresh"`. Core has no
+    /// filesystem in it.
     Dired(String),
 
     // --- dashboard, configured from Lisp ---
@@ -771,7 +788,19 @@ pub enum CompletionEdit {
     /// Append one candidate, or — with `None` — empty the list without taking
     /// the popup down. Exactly [`EditorCommand::WhichKey`]'s idiom, and for
     /// exactly its reason: one string per call is what the envelope carries.
+    ///
+    /// A row is tab-separated into *kind glyph*, *label* and *detail*, and a row
+    /// with no tabs in it is all label — so a caller that knows nothing about
+    /// the columns still draws correctly. The split is here rather than in the
+    /// image because the columns have to be *aligned*, which means measuring
+    /// cells, which is the renderer's side of the boundary.
     Row(Option<String>),
+    /// Append one line of documentation for the *selected* candidate, or — with
+    /// `None` — empty it. Resent whenever the selection moves, which is the one
+    /// place this differs from [`CompletionEdit::Row`]: a doc is a fact about
+    /// one candidate rather than about the list, and there is no anchor to hang
+    /// its lifetime on.
+    Doc(Option<String>),
 }
 
 /// The in-buffer completion popup: candidates for the word being typed, drawn
@@ -808,6 +837,27 @@ pub struct Completion {
     /// Index into `rows`. Kept clamped by [`Editor::apply`] rather than trusted,
     /// since it arrives from the image and the renderer indexes with it.
     pub selected: usize,
+    /// The selected candidate's documentation, one line per entry, drawn in a
+    /// second box beside the list — vscode's shape, and the one thing a bare
+    /// list of identifiers cannot tell you.
+    pub doc: Vec<String>,
+    /// Highlight spans over `doc` joined by newlines, filled in by the *app*
+    /// layer: core cannot parse (`zemacs-syntax` depends on core, not the other
+    /// way round) and the renderer has no parser either.
+    ///
+    /// `None` means "nobody has parsed this yet" and draws as plain text;
+    /// `Some(vec![])` means "parsed, and there was nothing to colour". Two
+    /// states rather than one empty vector, because a doc that is pure prose
+    /// would otherwise look unparsed forever and be re-parsed every frame.
+    pub doc_spans: Option<Vec<Span>>,
+    /// True from the moment a key asked the image to accept a candidate until
+    /// the image takes the popup down.
+    ///
+    /// Set in core and cleared in core, because the round trip through Lisp is
+    /// a queue turn wide (`docs/threading.org`) and `RET RET` is faster than
+    /// that: without it the second `RET` sees a popup that is still up, accepts
+    /// the same candidate a second time, and eats the newline that was meant.
+    pub accepting: bool,
 }
 
 impl Completion {
@@ -825,6 +875,50 @@ impl Completion {
             .saturating_sub(max - 1)
             .min(self.rows.len().saturating_sub(max));
         (first, &self.rows[first..(first + max).min(self.rows.len())])
+    }
+}
+
+/// The menu a right-click puts under the pointer.
+///
+/// **Pixels, in core**, which is unusual here and is the same exception
+/// [`frame::Frame::divider_at`] already is: this is anchored to *the pointer*
+/// and not to anything in the document, so there is no offset for the renderer
+/// to convert. A [`Completion`] carries a buffer offset for the opposite
+/// reason.
+///
+/// **A short fixed list.** The verbs are the ones a mouse is plausibly reaching
+/// for — a second window, a split, closing one — and they are built-ins, so a
+/// menu works in a build with no config at all. ponytail: not extensible from
+/// Lisp. The upgrade path is the `which-key`/`completion-row` idiom, one string
+/// per call, and it is worth building the first time somebody wants their own
+/// entry in here rather than a keybinding.
+#[derive(Clone, Debug)]
+pub struct ContextMenu {
+    pub x: i32,
+    pub y: i32,
+    /// `(label, verb)`. The verb goes through [`Editor::run_action`], which is
+    /// the same door a keybinding uses — so a menu entry cannot do anything a
+    /// key could not.
+    pub items: Vec<(&'static str, &'static str)>,
+    /// The row under the pointer, for hover. `None` between the rows and in the
+    /// padding, which is the honest answer and stops a click there picking the
+    /// nearest one.
+    pub hover: Option<usize>,
+}
+
+impl Default for ContextMenu {
+    fn default() -> Self {
+        ContextMenu {
+            x: 0,
+            y: 0,
+            items: vec![
+                ("New Window", "new-frame"),
+                ("Split Right", "split-window-right"),
+                ("Split Below", "split-window-below"),
+                ("Close Window", "delete-window"),
+            ],
+            hover: None,
+        }
     }
 }
 
@@ -1874,6 +1968,8 @@ pub struct Editor {
     /// and only the second one is ever the right one to ask. See
     /// [`Editor::completion`].
     completion: Option<Completion>,
+    /// The right-click menu, if one is up. See [`ContextMenu`].
+    pub context_menu: Option<ContextMenu>,
     /// Column a run of `j`/`k` is trying to hold.
     ///
     /// Without it, passing through a short line permanently forgets how far
@@ -1964,6 +2060,7 @@ impl Editor {
             ace: None,
             which_key: Vec::new(), // which-key panel
             completion: None,      // corfu
+            context_menu: None,
             desired_col: None,
             register: String::new(),
             register_linewise: false,
@@ -2740,6 +2837,17 @@ impl Editor {
                         }
                     }
                 }
+                CompletionEdit::Doc(line) => {
+                    if let Some(c) = self.completion.as_mut() {
+                        match line {
+                            Some(l) => c.doc.push(l),
+                            None => c.doc.clear(),
+                        }
+                        // Stale the moment the text changes, and re-derived by
+                        // the app from `doc` — see [`Completion::doc_spans`].
+                        c.doc_spans = None;
+                    }
+                }
             },
             // --- end of the lisp-api block ------------------------------------
 
@@ -2973,6 +3081,57 @@ impl Editor {
             // to know that `j` moves the cursor.
             && line_col_of(&self.buffer, c.at).0 == line_col_of(&self.buffer, cursor).0;
         live.then_some(c)
+    }
+
+    // --- the right-click menu ----------------------------------------------
+    //
+    // Called by the app rather than driven by an `EditorCommand`, the way
+    // `Frame::divider_at` and `adopt_window` are: the whole gesture is a
+    // pointer position and a hit test, and neither is a thing a keybinding or
+    // the image can produce. What a picked entry *does* goes back through
+    // `run_action`, which is the door everything else uses.
+
+    /// Put the menu under the pointer.
+    pub fn open_context_menu(&mut self, x: i32, y: i32) {
+        self.context_menu = Some(ContextMenu { x, y, ..Default::default() });
+    }
+
+    pub fn close_context_menu(&mut self) {
+        self.context_menu = None;
+    }
+
+    /// The verb on row `i`, and the menu taken down. `None` for a click that
+    /// landed on no row, which closes the menu and does nothing else — the way
+    /// a click outside a menu does everywhere.
+    pub fn pick_context_menu(&mut self, i: Option<usize>) -> Option<&'static str> {
+        let menu = self.context_menu.take()?;
+        Some(menu.items.get(i?)?.1)
+    }
+
+    /// The documentation the popup is showing, and whether anybody has coloured
+    /// it yet. `None` when there is no popup or it has no doc.
+    ///
+    /// The app's half of [`Completion::doc_spans`]: this is the read, and
+    /// [`Editor::set_completion_doc_spans`] is the write. A pair of narrow
+    /// methods rather than a public field, so the invariant — spans are offsets
+    /// into `doc` joined by newlines — has exactly one place it can be broken.
+    pub fn completion_doc_to_colour(&self) -> Option<&[String]> {
+        let c = self.completion.as_ref()?;
+        (!c.doc.is_empty() && c.doc_spans.is_none()).then_some(&c.doc[..])
+    }
+
+    pub fn set_completion_doc_spans(&mut self, spans: Vec<Span>) {
+        if let Some(c) = self.completion.as_mut() {
+            c.doc_spans = Some(spans);
+        }
+    }
+
+    /// Latch [`Completion::accepting`]: a key has asked the image to take the
+    /// highlighted candidate, and the popup is no longer the keyboard's.
+    fn completion_accepting(&mut self) {
+        if let Some(c) = self.completion.as_mut() {
+            c.accepting = true;
+        }
     }
 
     /// Forget a popup that [`Editor::completion`] is already hiding.
@@ -3255,7 +3414,17 @@ impl Editor {
     /// sideways down the screen.
     pub(crate) fn cursor_vcol(&self) -> usize {
         let (line, col) = self.buffer.cursor_line_col();
-        display::visual_col(&self.line_cells(line), col) % self.wrap_cols.max(1)
+        let cells = self.line_cells(line);
+        let vc = display::visual_col(&cells, col);
+        // The offset into the cursor's *own* row, which used to be `vc % cols`.
+        // It is a subtraction now for the reason `wrap_breaks` exists: rows no
+        // longer start at multiples of the width, so the modulus was the wrong
+        // number the moment a line broke between words instead of at the edge.
+        // `max(1)` for the same reason [`Editor::visual_target`] does it: the
+        // two have to agree about where the rows are, and `g j` is reachable
+        // with nothing drawn yet (`wrap_cols == 0`).
+        let breaks = display::wrap_breaks(&cells, self.wrap_cols.max(1));
+        vc - breaks[display::wrap_row_of(&breaks, vc)]
     }
 
     /// Char offset `n` display rows below (`down`) or above the cursor, landing
@@ -3269,13 +3438,14 @@ impl Editor {
         let buf = &self.buffer;
         let (mut line, col) = buf.cursor_line_col();
         let mut cells = self.line_cells(line);
-        let mut row = display::visual_col(&cells, col) / cols;
+        let mut breaks = display::wrap_breaks(&cells, cols);
+        let mut row = display::wrap_row_of(&breaks, display::visual_col(&cells, col));
         for _ in 0..n {
             // Crossing into another buffer line goes through `step_line`, which
             // steps over anything a fold is hiding — the rows of a folded line
             // are not drawn, so they are not rows to move through either.
             match (down, row) {
-                (true, r) if r + 1 < display::wrap_row_count(cells.len(), cols) => row += 1,
+                (true, r) if r + 1 < breaks.len() => row += 1,
                 (false, r) if r > 0 => row -= 1,
                 _ => match self.step_line(line, down) {
                     // The first or last visible row: stop, exactly as `j` on the
@@ -3284,18 +3454,21 @@ impl Editor {
                     l => {
                         line = l;
                         cells = self.line_cells(line);
+                        breaks = display::wrap_breaks(&cells, cols);
                         row = match down {
                             true => 0,
-                            false => display::wrap_row_count(cells.len(), cols) - 1,
+                            false => breaks.len() - 1,
                         };
                     }
                 },
             }
         }
-        // Past the end of a short row is the end of it, which on the last row of
-        // a line is the end of the line — the same clamp `move_to_line_col` does
-        // in characters, done in cells because that is the unit `vcol` is in.
-        let want = (row * cols + vcol).min(cells.len());
+        // Past the end of a short row is the end of *that row* — not of the
+        // line, which is what a raw `cells.len()` clamp gave: with word wrap a
+        // row can end well short of the pane's edge, and landing past its end
+        // would jump the cursor into the row below.
+        let (start, end) = display::wrap_row_range(&breaks, row, cells.len());
+        let want = (start + vcol).min(end);
         buf.line_start(line) + display::char_at_cell(&cells, want, buf.line_len(line))
     }
 
@@ -3448,6 +3621,54 @@ mod tests {
         ed
     }
 
+    /// The three keys core answers *instead of* the image, and the reason it
+    /// has to: a Lisp command bound to `RET` could not insert the newline in
+    /// the no-popup case without landing a queue turn late. Asked here, the
+    /// question is exact and the fallback is the ordinary arm below it.
+    #[test]
+    fn tab_and_ret_drive_the_popup_while_one_is_up_and_mean_themselves_otherwise() {
+        let lisp_of = |cmds: &[EditorCommand]| {
+            cmds.iter().find_map(|c| match c {
+                EditorCommand::CallLisp(s) => Some(s.clone()),
+                _ => None,
+            })
+        };
+
+        let mut ed = completing("let foo", 4, 7, &["format!", "foo_bar"]);
+        assert_eq!(
+            lisp_of(&ed.handle_key(Key::Tab)).as_deref(),
+            Some("(lsp-complete-next)"),
+            "TAB cycles rather than typing whitespace"
+        );
+        assert_eq!(
+            lisp_of(&ed.handle_key(Key::BackTab)).as_deref(),
+            Some("(lsp-complete-previous)")
+        );
+        assert_eq!(
+            lisp_of(&ed.handle_key(Key::Enter)).as_deref(),
+            Some("(lsp-complete-accept)")
+        );
+
+        // ...and the second `RET`, pressed before the image has had its queue
+        // turn, is a newline and not a second accept. Without the latch it
+        // would insert the same candidate twice and eat the line break.
+        assert!(
+            ed.handle_key(Key::Enter)
+                .contains(&EditorCommand::InsertNewline),
+            "an accept already in flight hands RET back to the document"
+        );
+
+        // With no popup at all both keys are themselves, on the same keystroke
+        // rather than a frame later.
+        let mut ed = fresh("let foo");
+        ed.mode = Mode::Insert;
+        assert!(ed.handle_key(Key::Enter).contains(&EditorCommand::InsertNewline));
+        assert!(matches!(
+            ed.handle_key(Key::Tab).as_slice(),
+            [EditorCommand::InsertText(_)]
+        ));
+    }
+
     #[test]
     fn a_completion_popup_is_only_shown_while_point_is_still_in_the_word_it_describes() {
         let mut ed = completing("let foo\nbar", 4, 7, &["format!", "foo_bar"]);
@@ -3513,7 +3734,7 @@ mod tests {
         let mut c = Completion {
             at: 0,
             rows: (0..8).map(|i| i.to_string()).collect(),
-            selected: 0,
+            ..Default::default()
         };
         assert_eq!(c.visible(3), (0, &c.rows[0..3]));
         // Still in the first window.
@@ -3852,7 +4073,10 @@ mod tests {
             Key::CtrlMeta('j'),
             Key::CtrlEnter,
             Key::CtrlMetaEnter,
+            Key::MetaEnter,
             Key::MetaBackspace,
+            Key::MetaLeft,
+            Key::MetaRight,
             Key::Enter,
             Key::Tab,
             Key::BackTab,

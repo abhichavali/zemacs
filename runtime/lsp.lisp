@@ -235,20 +235,26 @@ the table only holds the exceptions.")
         "textDocument"
         (jobj "synchronization" (jobj "didSave" t "willSave" :false)
               "definition" (jobj "linkSupport" t)
-              ;; Completion, and every claim in here is a *refusal*, which is
-              ;; the useful half of this negotiation: a server told we do
+              ;; Completion, and most of what is in here is a *refusal*, which
+              ;; is the useful half of this negotiation: a server told we do
               ;; snippets sends `$1' placeholders we would insert literally, and
               ;; one told we resolve lazily sends items with no `detail' until
               ;; asked. Both are real features and neither is built, so both are
               ;; declined and the server sends us plain text it has finished
-              ;; filling in. `documentationFormat' is empty for the reason
-              ;; `markdown parser none' is: nothing renders it.
+              ;; filling in.
+              ;;
+              ;; `documentationFormat' is the one claim that is now a *request*:
+              ;; there is a panel beside the popup to put a docstring in, so ask
+              ;; for one. Plaintext first, because that is the order of
+              ;; preference and nothing here renders markdown — a server with
+              ;; only markdown sends it anyway and we show the source, which for
+              ;; a signature and a paragraph is very nearly the same text.
               "completion"
               (jobj "completionItem"
                     (jobj "snippetSupport" :false
                           "insertReplaceSupport" :false
                           "resolveSupport" :false
-                          "documentationFormat" :empty-array)
+                          "documentationFormat" (jarr "plaintext" "markdown"))
                     "contextSupport" t)
               "publishDiagnostics" (jobj "relatedInformation" :false))
         "workspace" (jobj "workspaceFolders" :false
@@ -509,13 +515,18 @@ LINE is 1-based, agreeing with `line-number'; COLUMN is 0-based, agreeing with
 ;;; looks like. Severity goes in the *shape* of the mark instead, which no theme
 ;;; can take away and which reads the same in a light theme and a dark one.
 ;;;
-;;; `line-prefix' is the property that makes this one overlay rather than two:
-;;; it pushes the whole line right and draws in the gap it opened, continuation
-;;; rows included, so a wrapped line stays lined up under its own mark. And it
-;;; is an overlay, so the mark slides down when you type a line above it and
-;;; dies with the text it marked — without waiting for the server to answer
-;;; again, which on a slow server is most of a second of the marks pointing at
-;;; the wrong lines.
+;;; `gutter' is the property, and it used to be `line-prefix' — which was a bug
+;;; and a visible one. A prefix *pushes its line right by its own width*, which
+;;; is what a quote bar over a whole passage wants and is exactly wrong for a
+;;; mark on one line in fifty: that line then sat a column out from the code
+;;; around it, so the indentation you were reading was a lie and every diagnostic
+;;; looked like a formatting error of its own. `gutter' draws in the spare column
+;;; the line numbers already reserve and moves nothing.
+;;;
+;;; It is still an overlay, which is the other half of the point: the mark slides
+;;; down when you type a line above it and dies with the text it marked — without
+;;; waiting for the server to answer again, which on a slow server is most of a
+;;; second of the marks pointing at the wrong lines.
 ;;;
 ;;; ponytail: the *message* is still `SPC l e'. Putting it in the buffer wants
 ;;; virtual text — a string drawn after a line's end without covering anything —
@@ -525,8 +536,10 @@ LINE is 1-based, agreeing with `line-number'; COLUMN is 0-based, agreeing with
 ;;; branch in the renderer's line loop.
 
 (defparameter *lsp-diagnostic-marks*
-  '((1 . "● ") (2 . "▲ ") (3 . "› ") (4 . "· "))
-  "Severity -> the mark drawn in the left margin of its line.
+  '((1 . "●") (2 . "▲") (3 . "›") (4 . "·"))
+  "Severity -> the mark drawn in the gutter of its line.
+One cell each, and no trailing space: this goes in the gutter's spare column
+rather than in front of the text, so there is nothing to pad away from.
 Severities are 1 error, 2 warning, 3 information, 4 hint, as `*lsp-diagnostics*'
 records them. A `defparameter' because it is the whole of the taste here: change
 the strings, or set it to NIL to stop drawing marks at all.")
@@ -553,8 +566,8 @@ list would strand a mark in every file you looked at and never take it off.")
          (end (max (line-end line) (min (1+ beg) (point-max))))
          (ov (and (> end beg) (make-overlay beg end))))
     (when ov
-      (overlay-put ov 'line-prefix
-                   (or (cdr (assoc severity *lsp-diagnostic-marks*)) "? "))
+      (overlay-put ov 'gutter
+                   (or (cdr (assoc severity *lsp-diagnostic-marks*)) "?"))
       ;; Not read by the renderer — it is how these are told from anyone else's
       ;; overlays, the way `folds-in' tells folds from org's bullets.
       (overlay-put ov 'lsp-diagnostic severity))
@@ -904,12 +917,54 @@ happens to have no items."
         ((%json-object-p result) nil)
         ((listp result) result)))
 
+;;; What a candidate *is*, in the vocabulary the editor already has.
+;;;
+;;; LSP's `CompletionItemKind' is twenty-five numbers and the editor's face list
+;;; is ten names, so this is a lossy map on purpose: the popup draws a badge in
+;;; the theme's colour for that face, which means a function in the list is the
+;;; same hue as a function call in the buffer behind it. Sending a *colour* or a
+;;; *glyph* from here would put the taste in the client and take it away from
+;;; the theme, which is the trade `*lsp-diagnostic-marks'" already refused for
+;;; the gutter and refuses again here.
+(defparameter *lsp-completion-kinds*
+  '((2 . "function") (3 . "function") (4 . "function")   ; method, function, ctor
+    (5 . "variable") (6 . "variable") (10 . "variable")  ; field, variable, property
+    (7 . "type") (8 . "type") (13 . "type") (22 . "type") (25 . "type")
+    (9 . "type") (17 . "string") (19 . "string")         ; module, file, folder
+    (14 . "keyword") (15 . "keyword")                    ; keyword, snippet
+    (12 . "constant") (20 . "constant") (21 . "constant")
+    (24 . "operator") (11 . "number") (16 . "string"))
+  "`CompletionItemKind' -> the face its badge is drawn in. Anything not here —
+`Text', `Reference', `Event' — falls back to `default', which is the honest
+answer for a candidate whose kind says nothing about how to read it.")
+
+(defun %lsp-completion-kind (item)
+  (or (cdr (assoc (jget item "kind") *lsp-completion-kinds*)) "default"))
+
+(defun %lsp-doc-string (item)
+  "The `documentation' on ITEM as a string, or NIL.
+
+Two shapes are legal — a bare string, and a `MarkupContent' with `kind' and
+`value' — and servers ship both, which is why this is a function rather than a
+`jget'."
+  (let ((doc (jget item "documentation")))
+    (cond ((stringp doc) doc)
+          ((null doc) nil)
+          (t (jget doc "value")))))
+
 (defun %lsp-completion-row (item)
-  "(INSERT FILTER ROW) for one `CompletionItem', or NIL for one with no label.
+  "(INSERT FILTER ROW DOC) for one `CompletionItem', or NIL for one with no label.
 
 INSERT is what goes in the buffer, FILTER is what the prefix is tested against,
-and ROW is what is drawn — three fields because LSP says they can differ, and a
-server that sets `filterText' has told us the label is not what to match on.
+ROW is what is drawn and DOC is what the panel beside the list shows — four
+fields because LSP says the first three can differ, and a server that sets
+`filterText' has told us the label is not what to match on.
+
+ROW is tab-separated into KIND, LABEL and DETAIL, which the renderer draws as
+three aligned columns. Tabs and not spaces because the *alignment* has to be
+done where cells can be measured, and this side of the boundary cannot measure
+one — the old two-space join is exactly what that produced: a ragged second
+column.
 
 ponytail: `textEdit' is ignored, so a server whose edit range is not exactly
 [anchor, point) — clangd replacing a whole call, a server that completes past a
@@ -921,18 +976,81 @@ convert its line/character pair through `line-start', and pass that range to
   (let* ((label (or (jget item "label") ""))
          (insert (or (jget item "insertText") label))
          (filter (or (jget item "filterText") label))
-         (detail (jget item "detail")))
+         (detail (or (jget item "detail") "")))
     (when (plusp (length label))
       (list insert filter
-            ;; The detail beside the name — a type for clangd, a signature for
-            ;; pylsp. Two spaces and no column, because the renderer draws one
-            ;; string per row and lining them up would mean measuring cells in
-            ;; the image, which is the boundary this editor keeps on the other
-            ;; side. ponytail: no kind icon; upgrade path is a table from
-            ;; `CompletionItemKind' to a glyph, prepended here.
-            (if (and detail (plusp (length detail)))
-                (format nil "~a  ~a" label detail)
-                label)))))
+            (format nil "~a~c~a~c~a"
+                    (%lsp-completion-kind item) #\Tab label #\Tab detail)
+            (%lsp-doc-string item)))))
+
+;;; ---------------------------------------------------------------------------
+;;; The documentation panel
+;;;
+;;; A docstring is prose and the box it goes in is a fixed number of columns, so
+;;; something has to wrap it. That something is here rather than in the renderer
+;;; for the reason every other layout decision went the other way: wrapping is
+;;; about *words*, not cells, and a greedy fill on spaces is right at any font.
+;;;
+;;; ponytail: wrapped on ASCII spaces and counted in characters, so a CJK
+;;; docstring wraps late — the same byte-versus-cell approximation the prefix
+;;; scan above is written up for, and with the same upgrade path. A markdown
+;;; docstring is shown as its source: no renderer, and fences and backticks read
+;;; well enough that stripping them would lose more than it hides.
+
+(defparameter *lsp-doc-columns* 56
+  "Where a documentation line is wrapped. Matches `DOC_POPUP_COLS' in the
+renderer — wrapping wider only means the box truncates what this already fitted.")
+
+(defparameter *lsp-doc-lines* 10
+  "Most lines of documentation shown. Matches `POPUP_ROWS': past this the panel
+is a manual page hanging off your cursor.")
+
+;;; Spelled out here rather than borrowed from `ai.lisp', for the reason
+;;; `%lsp-mode-name' is: this file is loadable on its own and that is worth two
+;;; lines.
+(defun %lsp-split (string char)
+  "STRING split on CHAR. Empty fields are kept; the caller drops them."
+  (loop with start = 0
+        for i = (position char string :start start)
+        collect (subseq string start i)
+        while i do (setf start (1+ i))))
+
+(defun %lsp-first-n (list n)
+  "The first N elements of LIST, or all of them if it is shorter."
+  (subseq list 0 (min n (length list))))
+
+(defun %lsp-wrap (text columns)
+  "TEXT as a list of lines no wider than COLUMNS, breaking on spaces.
+
+Existing newlines are kept — a docstring's paragraph breaks are the only
+structure it has — and a word longer than COLUMNS is left long rather than
+split, since the one thing in a docstring that is too wide to break is usually
+a type or a path."
+  (let ((out nil))
+    (dolist (para (%lsp-split text #\Newline) (nreverse out))
+      (let ((line ""))
+        (dolist (word (remove "" (%lsp-split para #\Space) :test #'string=))
+          (cond ((zerop (length line)) (setf line word))
+                ((<= (+ (length line) 1 (length word)) columns)
+                 (setf line (concatenate 'string line " " word)))
+                (t (push line out) (setf line word))))
+        (push line out)))))
+
+(defun %lsp-completion-doc-draw ()
+  "Send the selected candidate's documentation to the panel.
+
+Cleared and refilled rather than diffed, and resent on every selection move:
+the panel is about one candidate, so there is nothing to keep. `completion-doc'
+with no argument is the clear, which is also what a candidate with no
+documentation sends — an empty panel is not drawn at all."
+  (let* ((rows (getf *lsp-completion* :shown))
+         (row (nth (getf *lsp-completion* :index) rows))
+         (doc (fourth row)))
+    (completion-doc)
+    (when (and doc (plusp (length doc)))
+      (dolist (line (%lsp-first-n (%lsp-wrap doc *lsp-doc-columns*) *lsp-doc-lines*))
+        (completion-doc line))))
+  nil)
 
 (defun %lsp-completion-hide ()
   "Take the popup down and forget what was in it.
@@ -959,7 +1077,8 @@ rather than an append."
       (rows
        (completion-show (getf *lsp-completion* :at) (getf *lsp-completion* :index))
        (completion-row)
-       (dolist (r rows) (completion-row (third r))))
+       (dolist (r rows) (completion-row (third r)))
+       (%lsp-completion-doc-draw))
       ;; Nothing to draw — and the state stays, in both of the ways this
       ;; happens.
       ;;
@@ -1068,30 +1187,38 @@ Upgrade path is one `jget' and a flag on the plist that forces the re-ask."
 ;;; ---------------------------------------------------------------------------
 ;;; The keys
 ;;;
-;;; `C-n' `C-p' `C-y' `C-e', which is vim's insert-mode completion and not
-;;; corfu's `RET'/`TAB' — and the choice is about the async gap rather than about
-;;; taste. Every one of these is a *dead key in Insert mode today*: core answers
-;;; a bare `Ctrl' with no command at all. So binding them costs nothing and needs
-;;; no fallback.
+;;; `TAB' cycles, `S-TAB' cycles back and `RET' accepts — corfu's bindings — and
+;;; **none of those three is bound here**. They cannot be: a Lisp command bound
+;;; to `RET' would have to insert the newline itself when no popup was up, and it
+;;; would insert it a queue turn late, *after* whatever you typed next, so
+;;; `a<RET>b' would come out as `ab' and a newline (`docs/threading.org').
 ;;;
-;;; `RET' and `TAB' would need one, and the fallback is what makes them wrong: a
-;;; Lisp command that inserted a newline when no popup was up would insert it a
-;;; queue turn later, *after* whatever you typed next — so `a<RET>b' would come
-;;; out as `ab' and a newline. There is no way to write that command correctly
-;;; from the image, which is exactly the sort of thing `docs/threading.org'
-;;; exists to say out loud.
+;;; So core asks the question instead, in `Evil::insert_key': is a popup on
+;;; screen *right now*? It knows synchronously, because it is what decides — and
+;;; a question with no fallback in it is a question the image cannot answer. The
+;;; three keys reach this file as `lsp-complete-next' and friends, which is why
+;;; those stay commands even though nothing here binds them.
+;;;
+;;; `C-n' `C-p' `C-y' `C-e' are bound here, and stay: vim's insert-mode spelling,
+;;; every one of them a dead key in Insert mode otherwise, and muscle memory for
+;;; anyone who came from `C-x C-o'.
 
 (defun %lsp-completion-move (delta)
   "Move the selection by DELTA, wrapping.
 
 One `completion-show' and no rows: the candidates have not changed, and
 resending them would be one command per candidate on a keypress whose whole
-point is to be cheap."
+point is to be cheap.
+
+The *documentation* does go again, because it is about the candidate rather than
+about the list — a dozen short lines against a hundred candidates, which is
+exactly why those are two verbs with two lifetimes."
   (let ((rows (and *lsp-completion* (getf *lsp-completion* :shown))))
     (when rows
       (let ((i (mod (+ (getf *lsp-completion* :index) delta) (length rows))))
         (setf (getf *lsp-completion* :index) i)
-        (completion-show (getf *lsp-completion* :at) i))))
+        (completion-show (getf *lsp-completion* :at) i)
+        (%lsp-completion-doc-draw))))
   nil)
 
 (defun lsp-complete-next ()
@@ -1164,7 +1291,10 @@ have. NIL means there is nothing to accept."
                ;; does nothing at all, which is not a command — it is half of a
                ;; key binding, and the other half is the popup.
                "lsp-complete-maybe" "lsp-complete-next" "lsp-complete-previous"
-               "lsp-complete-accept" "lsp-complete-abort"))
+               "lsp-complete-accept" "lsp-complete-abort"
+               ;; The popup's own verbs, which take an argument and answer
+               ;; nothing: running one by hand draws half a box.
+               "completion-doc" "completion-row" "completion-show"))
     (pushnew n (symbol-value '*hidden-commands*) :test #'string=)))
 
 (export '(lsp lsp-stop lsp-restart lsp-status lsp-goto-definition

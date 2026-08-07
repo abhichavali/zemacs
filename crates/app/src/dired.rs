@@ -46,9 +46,54 @@ impl Dired {
         self.pending.is_some()
     }
 
+    /// Run a `dired-*` verb, asking first if it destroys files.
+    ///
+    /// The guard is here rather than in the arms of [`Self::try_run`] because
+    /// this is the funnel: a keybinding, `M-x` and `(dired "…")` from Lisp all
+    /// arrive as one `EditorCommand::Dired`, so one check in front of them
+    /// covers all three and cannot be forgotten by whoever adds the fourth.
+    /// `crates/app/src/magit.rs` guards the same way for the same reason.
     pub fn run(&mut self, editor: &mut Editor, verb: &str) {
+        if let Some(question) = self.confirm_question(editor, verb) {
+            editor.confirm(
+                &question,
+                EditorCommand::Confirmed(Box::new(EditorCommand::Dired(verb.to_string()))),
+            );
+            return;
+        }
+        self.run_confirmed(editor, verb)
+    }
+
+    /// The far side of a `yes`, and the entry point for every verb that never
+    /// had to ask.
+    pub fn run_confirmed(&mut self, editor: &mut Editor, verb: &str) {
         if let Err(e) = self.try_run(editor, verb) {
             editor.apply(EditorCommand::Message(format!("dired: {e:#}")));
+        }
+    }
+
+    /// The question to ask before `verb`, or `None` if it cannot lose work.
+    ///
+    /// Both arms name *what* is about to go rather than asking "are you sure":
+    /// a prompt you can answer without reading is worth nothing, and the whole
+    /// value of this one is that `D` on the wrong line is survivable.
+    ///
+    /// `None` when there is nothing to destroy, so the verb runs and reports
+    /// "no file on this line" itself — a confirmation for a no-op teaches the
+    /// habit of dismissing confirmations.
+    fn confirm_question(&self, editor: &Editor, verb: &str) -> Option<String> {
+        let doomed = match verb {
+            "delete" => self.selected(editor).ok()?,
+            "execute" => self.flagged().ok()?,
+            _ => return None,
+        };
+        match doomed.as_slice() {
+            [] => None,
+            [one] => Some(format!(
+                "Delete {}?",
+                one.file_name().unwrap_or(one.as_os_str()).to_string_lossy()
+            )),
+            many => Some(format!("Delete {} files?", many.len())),
         }
     }
 
@@ -165,6 +210,39 @@ impl Dired {
                 self.refresh(editor)
             }
             "execute" => self.execute(editor),
+            // Emacs' `D`: delete now, rather than flagging and expunging. The
+            // guard is in `run`, so nothing reaches here unasked.
+            "delete" => {
+                let doomed = self.selected(editor)?;
+                if doomed.is_empty() {
+                    anyhow::bail!("no file on this line");
+                }
+                self.remove_all(editor, &doomed)
+            }
+            // `u` clears one mark and `t` inverts them all; neither is the
+            // "I have lost track of what is marked" gesture, which is this.
+            "unmark-all" => {
+                self.marks.clear();
+                self.refresh(editor)
+            }
+            // Emacs' `w`. The *name*, not the path, because that is what Emacs
+            // copies and what you want when the next thing you type is a shell
+            // command in this directory.
+            "copy-filename" => {
+                let name = self
+                    .entry_at_cursor(editor)
+                    .filter(|e| !e.is_dot())
+                    .map(|e| e.name.to_string_lossy().into_owned());
+                let Some(name) = name else {
+                    anyhow::bail!("no file on this line");
+                };
+                editor.apply(EditorCommand::SetRegister {
+                    text: name.clone(),
+                    linewise: false,
+                });
+                editor.apply(EditorCommand::Message(name));
+                Ok(())
+            }
             "rename" | "copy" => {
                 let Some(entry) = self.entry_at_cursor(editor) else {
                     anyhow::bail!("no file on this line");
@@ -205,24 +283,51 @@ impl Dired {
         }
     }
 
-    /// Delete everything flagged `D`. Nothing else acts on the delete flags, so
-    /// this is the only place data is destroyed — and it reports a count rather
-    /// than going quiet.
-    fn execute(&mut self, editor: &mut Editor) -> anyhow::Result<()> {
-        let doomed: Vec<PathBuf> = self
+    /// What `x` acts on: everything flagged `D`.
+    fn flagged(&self) -> anyhow::Result<Vec<PathBuf>> {
+        Ok(self
             .listing()?
             .entries
             .iter()
             .filter(|e| self.marks.get(&e.name) == Some(&dired::MARK_DELETE))
             .map(|e| e.path.clone())
+            .collect())
+    }
+
+    /// What `D` acts on: everything marked `*`, or the entry under the cursor
+    /// when nothing is marked.
+    ///
+    /// Emacs' rule, and the reason `D` is worth having next to `d`+`x`: the
+    /// common case is deleting the one file you are looking at, and making that
+    /// a two-key ceremony is how people stop using the marks for the case that
+    /// needs them. `.` and `..` are never it.
+    fn selected(&self, editor: &Editor) -> anyhow::Result<Vec<PathBuf>> {
+        let marked: Vec<PathBuf> = self
+            .listing()?
+            .entries
+            .iter()
+            .filter(|e| self.marks.get(&e.name) == Some(&dired::MARK_SELECT))
+            .map(|e| e.path.clone())
             .collect();
-        if doomed.is_empty() {
-            editor.apply(EditorCommand::Message("nothing flagged for deletion".into()));
-            return Ok(());
+        if !marked.is_empty() {
+            return Ok(marked);
         }
+        Ok(self
+            .entry_at_cursor(editor)
+            .filter(|e| !e.is_dot())
+            .map(|e| vec![e.path.clone()])
+            .unwrap_or_default())
+    }
+
+    /// Delete `doomed`, and say how it went.
+    ///
+    /// Both `D` and `x` come through here, so this is the only place data is
+    /// destroyed — one routine to audit, one count to trust, and no way for a
+    /// second delete path to grow its own quieter reporting.
+    fn remove_all(&mut self, editor: &mut Editor, doomed: &[PathBuf]) -> anyhow::Result<()> {
         let mut gone = 0usize;
         let mut failed = Vec::new();
-        for path in &doomed {
+        for path in doomed {
             match dired::delete(path) {
                 Ok(()) => {
                     gone += 1;
@@ -240,6 +345,17 @@ impl Dired {
         };
         editor.apply(EditorCommand::Message(msg));
         Ok(())
+    }
+
+    /// Delete everything flagged `D`. Guarded by [`Self::confirm_question`], so
+    /// by the time this runs the count has been shown and agreed to.
+    fn execute(&mut self, editor: &mut Editor) -> anyhow::Result<()> {
+        let doomed = self.flagged()?;
+        if doomed.is_empty() {
+            editor.apply(EditorCommand::Message("nothing flagged for deletion".into()));
+            return Ok(());
+        }
+        self.remove_all(editor, &doomed)
     }
 
     fn enter_dir(&mut self, editor: &mut Editor, dir: PathBuf) -> anyhow::Result<()> {
@@ -364,5 +480,89 @@ mod tests {
     fn names_with_spaces_are_not_split() {
         let dir = Path::new("/tmp");
         assert_eq!(resolve(dir, "two words.md"), Path::new("/tmp/two words.md"));
+    }
+
+    /// A listing of three files, with the cursor parked on a real entry.
+    fn listing_of_three(name: &str) -> (Dired, Editor, PathBuf) {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let mut editor = Editor::default();
+        let mut dired = Dired {
+            dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        dired.refresh(&mut editor).unwrap();
+        // Onto the first real entry — past `.` and `..`, which `selected`
+        // refuses and which would otherwise make this fixture assert nothing.
+        let entries = &dired.listing.as_ref().unwrap().entries;
+        let line = dired
+            .lines
+            .iter()
+            .position(|l| match l {
+                dired::Line::Entry(i) => !entries[*i].is_dot(),
+                _ => false,
+            })
+            .expect("a listing of three files has a real entry");
+        editor.buffer.cursor = editor.buffer.line_start(line);
+        (dired, editor, dir)
+    }
+
+    /// The rule `D` lives or dies by. Deleting is not undoable here, so
+    /// "which files" has to be exactly Emacs' answer and nothing looser.
+    #[test]
+    fn delete_takes_the_marks_or_the_line_and_asks_before_either() {
+        let (mut dired, editor, dir) = listing_of_three("zemacs_dired_delete_one");
+
+        // Nothing marked: the entry under the cursor, alone.
+        let one = dired.selected(&editor).unwrap();
+        assert_eq!(one.len(), 1, "unmarked D takes only the current line");
+        assert!(one[0].starts_with(&dir));
+
+        // ...and it asks by *name*, not by count, so a wrong line is visible.
+        let q = dired.confirm_question(&editor, "delete").unwrap();
+        assert!(q.starts_with("Delete ") && q.ends_with('?'), "{q}");
+        assert!(q.contains(".txt"), "one file is named in the question: {q}");
+
+        // Marks win over the cursor, and take *all* of them.
+        for f in ["a.txt", "c.txt"] {
+            dired.marks.insert(f.into(), dired::MARK_SELECT);
+        }
+        assert_eq!(dired.selected(&editor).unwrap().len(), 2);
+        assert_eq!(
+            dired.confirm_question(&editor, "delete").as_deref(),
+            Some("Delete 2 files?"),
+        );
+
+        // `x` is a different set: delete *flags*, not selection marks. Mixing
+        // the two would make `D` expunge what `d` flagged, or the reverse.
+        assert!(dired.flagged().unwrap().is_empty());
+        assert_eq!(dired.confirm_question(&editor, "execute"), None);
+
+        // Verbs that cannot lose work are never guarded — a confirmation for a
+        // no-op is how people learn to dismiss them unread.
+        assert_eq!(dired.confirm_question(&editor, "refresh"), None);
+        assert_eq!(dired.confirm_question(&editor, "mark"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `U` clears every mark, where `u` clears one. Asserted because the
+    /// difference between them is the whole reason `U` exists.
+    #[test]
+    fn unmark_all_clears_both_kinds_of_mark() {
+        let (mut dired, mut editor, dir) = listing_of_three("zemacs_dired_unmark_all");
+        dired.marks.insert("a.txt".into(), dired::MARK_SELECT);
+        dired.marks.insert("b.txt".into(), dired::MARK_DELETE);
+
+        dired.run_confirmed(&mut editor, "unmark-all");
+
+        assert!(dired.marks.is_empty());
+        assert!(dired.selected(&editor).unwrap().len() <= 1, "back to the line");
+        assert!(dired.flagged().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

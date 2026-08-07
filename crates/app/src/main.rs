@@ -846,6 +846,7 @@ impl App {
             EditorCommand::Confirmed(inner) => match *inner {
                 EditorCommand::SaveFile(path) => save_file(editor, path, Save::Forced),
                 EditorCommand::Git(verb) => self.magit.run_confirmed(editor, &verb),
+                EditorCommand::Dired(verb) => self.dired.run_confirmed(editor, &verb),
                 // Nothing else parks a command, so this is a confirmation for
                 // something that never asked — a bug in the caller, not in the
                 // answer, and worth saying rather than running.

@@ -29,6 +29,11 @@ type Id = *mut c_void;
 type Sel = *const c_void;
 type Class = *mut c_void;
 
+// Named explicitly rather than inherited. The SDL2 build linked Cocoa — and so
+// libobjc — on this crate's behalf, so these resolved by luck; SDL3's does not,
+// and the link broke the moment it changed. A file that calls the Objective-C
+// runtime should say that it does.
+#[link(name = "objc")]
 extern "C" {
     fn objc_getClass(name: *const c_char) -> Class;
     fn object_getClass(obj: Id) -> Class;

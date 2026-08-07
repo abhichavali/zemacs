@@ -46,12 +46,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use sdl2::pixels::{Color, PixelFormatEnum};
-use sdl2::rect::Rect;
-use sdl2::render::{BlendMode, Texture, TextureCreator, WindowCanvas};
-use sdl2::surface::Surface;
-use sdl2::ttf::{Font, Hinting, Sdl2TtfContext};
-use sdl2::video::WindowContext;
+use sdl3::pixels::{Color, PixelFormat};
+use sdl3::rect::Rect;
+use sdl3::render::{BlendMode, Texture, TextureCreator, WindowCanvas};
+use sdl3::surface::Surface;
+use sdl3::ttf::{Font, Hinting, Sdl3TtfContext};
+use sdl3::video::WindowContext;
 use zemacs_core::display::{
     char_cells, expand_line, str_cells, visual_col, wrap_breaks, wrap_row_of, wrap_row_range,
 };
@@ -148,7 +148,7 @@ pub struct Renderer {
     // leaves its creator — one `Rc` and a pointer — behind for good, and it is
     // *because* nothing will ever drop that `Rc` that [`Drop`] has to take the
     // SDL renderer and window down by hand. Upgrade path: `self_cell`/
-    // `ouroboros`, or the sdl2 `unsafe_textures` feature (which would also leak
+    // `ouroboros`, or the sdl3 `unsafe_textures` feature (which would also leak
     // into the app crate).
     //
     // The TTF context was leaked the same way and per renderer, which is what
@@ -324,30 +324,45 @@ impl Drop for Renderer {
         // free these are in a `Box::leak` that never drops, so no destructor can
         // run behind us and double-free.
         unsafe {
-            sdl2::sys::SDL_DestroyRenderer(renderer);
-            sdl2::sys::SDL_DestroyWindow(window);
+            sdl3::sys::render::SDL_DestroyRenderer(renderer);
+            sdl3::sys::video::SDL_DestroyWindow(window);
         }
     }
 }
 
 impl Renderer {
     /// The SDL render backend actually in use — `"metal"` on macOS, `"opengl"`
-    /// or `"vulkan"` elsewhere. `accelerated()` below *asks* for a GPU driver;
-    /// this is how you check it got one rather than falling back to `"software"`.
+    /// or `"vulkan"` elsewhere.
+    ///
+    /// SDL3 has no "ask for acceleration" flag to check the result of: it picks
+    /// the best driver it has and falls back to `"software"` only when there is
+    /// nothing else. So this went from confirming a request to reporting what
+    /// happened, which is the only thing it was ever read for.
     pub fn backend(&self) -> String {
-        self.canvas.info().name.to_string()
+        self.canvas.renderer_name.clone()
     }
 
     /// `sdl` is created (and the event pump owned) by the app.
-    pub fn new(sdl: &sdl2::Sdl, title: &str, width: u32, height: u32) -> anyhow::Result<Self> {
+    pub fn new(sdl: &sdl3::Sdl, title: &str, width: u32, height: u32) -> anyhow::Result<Self> {
         let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL video init: {e}"))?;
         let window = video
             .window(title, width, height)
             .position_centered()
             .resizable()
-            .allow_highdpi()
+            .high_pixel_density()
             .build()?;
-        let mut canvas = window.into_canvas().accelerated().present_vsync().build()?;
+        // `into_canvas` in SDL3 is infallible-by-panic; the fallible spelling is
+        // what keeps the `?` this function is built on.
+        let mut canvas = sdl3::render::create_renderer(window, None)?;
+        // **Vsync is off by default in SDL3** and is no longer part of creating
+        // the renderer. Without this the editor spins at unbounded frame rate
+        // and `present` stops pacing the loop — see the note on `present`, which
+        // is only true because of this line.
+        if !unsafe { sdl3::sys::render::SDL_SetRenderVSync(canvas.raw(), 1) } {
+            // Not fatal: a display or driver that refuses vsync still draws.
+            // The loop's own timeout keeps it from becoming a busy spin.
+            eprintln!("zemacs: vsync unavailable, falling back to the frame timer");
+        }
         canvas.set_blend_mode(BlendMode::Blend);
 
         let textures: &'static TextureCreator<WindowContext> =
@@ -413,6 +428,14 @@ impl Renderer {
         // preview renders at the new size and the stale entries are unreachable.
         self.images.clear();
         Ok(())
+    }
+
+    /// This frame's window, for the one thing SDL3 made per-window that the app
+    /// still decides: text input. Handing the window out beats handing the
+    /// *policy* in — the app knows which mode is current, and this crate would
+    /// have to be told about modes to do it here.
+    pub fn window(&self) -> &sdl3::video::Window {
+        self.canvas.window()
     }
 
     /// This window's SDL id, so the app can route events to the right frame.
@@ -699,9 +722,9 @@ impl Renderer {
     /// next vertical blank, and that blank is the 14 ms the skip exists to save.
     pub fn discard(&mut self) {
         // Safe in spite of the signature. `SDL_RenderFlush` takes the renderer
-        // and answers a status; `sdl2` marks the entry points it added late as
+        // and answers a status; `sdl3` marks the entry points it added late as
         // `unsafe` rather than auditing them.
-        unsafe { self.canvas.render_flush() };
+        unsafe { self.canvas.flush_renderer() };
     }
 
     /// Whether the frame [`Renderer::render`] just drew differs from the one on
@@ -739,16 +762,23 @@ impl Renderer {
     /// 60 Hz when SDL cannot say. Asked per sleep rather than cached because a
     /// window can be dragged to a display with a different rate, and the call is
     /// a field read behind an SDL lock — far cheaper than the sleep it sizes.
+    /// Through the *display*, not the window. SDL3's `Window::display_mode` is
+    /// `SDL_GetWindowFullscreenMode`, which answers `None` for any window that
+    /// is not in exclusive fullscreen — that is every window this editor makes,
+    /// so asking it would pin this to 60 Hz forever and silently double the
+    /// latency of a Lisp-thread change on a 120 Hz panel. The desktop mode of
+    /// the display the window is on is the number that was always meant.
     pub fn frame_ms(&self) -> u32 {
         let hz = self
             .canvas
             .window()
-            .display_mode()
+            .get_display()
             .ok()
+            .and_then(|d| d.get_mode().ok())
             .map(|m| m.refresh_rate)
-            .filter(|hz| *hz > 0)
-            .unwrap_or(60);
-        (1000 / hz).max(1) as u32
+            .filter(|hz| *hz > 0.0)
+            .unwrap_or(60.0);
+        ((1000.0 / hz) as u32).max(1)
     }
 
     // --- pointing ----------------------------------------------------------
@@ -2459,7 +2489,7 @@ impl Cut {
 /// cached from one `Font` is meaningless against another, so anything that drops
 /// the font must drop the glyphs in the same move.
 struct Face {
-    font: Font<'static, 'static>,
+    font: Font<'static>,
     glyphs: HashMap<char, Option<Texture<'static>>>,
 }
 
@@ -2653,7 +2683,7 @@ fn on_this_box(key: FaceKey, prose: Option<&std::path::Path>) -> FaceKey {
 /// delete the gate, not to widen it.
 fn substituted<'a>(
     key: FaceKey,
-    named: impl FnOnce(FaceKey) -> Option<&'a Font<'static, 'static>>,
+    named: impl FnOnce(FaceKey) -> Option<&'a Font<'static>>,
     c: char,
 ) -> FaceKey {
     if c.is_ascii() || !key.prose() {
@@ -2722,7 +2752,7 @@ const MAX_FACE_GLYPHS: usize = 256;
 /// One opener for all of them; the two callers differ only in what they do with a
 /// refusal.
 fn open_face(path: &std::path::Path, key: FaceKey) -> anyhow::Result<Face> {
-    let mut font = ttf()?.load_font(path, key.point_size).map_err(|e| {
+    let mut font = ttf()?.load_font(path, f32::from(key.point_size)).map_err(|e| {
         anyhow::anyhow!("cannot open font {} at {}pt: {e}", path.display(), key.point_size)
     })?;
     // macOS does not hint at all — CoreText positions glyphs on the real outline
@@ -2730,7 +2760,7 @@ fn open_face(path: &std::path::Path, key: FaceKey) -> anyhow::Result<Face> {
     // snaps stems to the pixel grid and is why the same font looks subtly wrong
     // here next to a native application. Light hints vertically only, which keeps
     // the baseline crisp without distorting letterforms sideways.
-    font.set_hinting(Hinting::Light);
+    font.set_hinting(Hinting::LIGHT);
     // Synthetic, both of them: FreeType smears the outline for bold and shears
     // it for italic rather than loading designed faces, which is what keeps the
     // advance the grid's and not the font's. A designed italic would need a
@@ -2739,12 +2769,12 @@ fn open_face(path: &std::path::Path, key: FaceKey) -> anyhow::Result<Face> {
     // *body* bold wants: the advance is unchanged, so a bold run occupies the
     // columns a plain one would and the modeline's segments do not shift when a
     // mode name changes.
-    let mut style = sdl2::ttf::FontStyle::NORMAL;
+    let mut style = sdl3::ttf::FontStyle::NORMAL;
     if key.style & 1 != 0 {
-        style |= sdl2::ttf::FontStyle::BOLD;
+        style |= sdl3::ttf::FontStyle::BOLD;
     }
     if key.style & 2 != 0 {
-        style |= sdl2::ttf::FontStyle::ITALIC;
+        style |= sdl3::ttf::FontStyle::ITALIC;
     }
     font.set_style(style);
     Ok(Face {
@@ -2757,7 +2787,7 @@ fn open_face(path: &std::path::Path, key: FaceKey) -> anyhow::Result<Face> {
 ///
 /// One for the whole process rather than one leaked per [`Renderer`], which is
 /// what it was and what made "one `Renderer` per process" a documented ceiling.
-/// It never needed to be: `Sdl2TtfContext` is a zero-sized handle onto a C
+/// It never needed to be: `Sdl3TtfContext` is a zero-sized handle onto a C
 /// library that counts its own initialisations, so a second frame's `init` was
 /// only ever bumping that count — and leaking the handle so the `Font`s it hands
 /// out can be `'static` is a decision about the *process*, not about a window.
@@ -2769,12 +2799,12 @@ fn open_face(path: &std::path::Path, key: FaceKey) -> anyhow::Result<Face> {
 /// Fallible on the first call and infallible after. [`Renderer::new`] is where
 /// the first font is opened, so a broken FreeType is still an error the app can
 /// print rather than a panic in the middle of a frame.
-fn ttf() -> anyhow::Result<&'static Sdl2TtfContext> {
-    static TTF: OnceLock<Sdl2TtfContext> = OnceLock::new();
+fn ttf() -> anyhow::Result<&'static Sdl3TtfContext> {
+    static TTF: OnceLock<Sdl3TtfContext> = OnceLock::new();
     match TTF.get() {
         Some(ctx) => Ok(ctx),
         None => {
-            let ctx = sdl2::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
+            let ctx = sdl3::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
             Ok(TTF.get_or_init(move || ctx))
         }
     }
@@ -2825,7 +2855,7 @@ fn glyph_texture(
     let surface = font.render(c.encode_utf8(&mut buf)).blended(Color::WHITE).ok()?;
     // A known layout to walk: `blended` picks its own, and the alpha byte is
     // not in the same place in all of them.
-    let mut surface = surface.convert_format(PixelFormatEnum::ARGB8888).ok()?;
+    let mut surface = surface.convert_format(PixelFormat::ARGB8888).ok()?;
     darken_stems(&mut surface);
 
     let mut tex = textures.create_texture_from_surface(&surface).ok()?;
@@ -2853,7 +2883,7 @@ fn image_texture(
         image.width,
         image.height,
         image.width * 4,
-        PixelFormatEnum::ABGR8888,
+        PixelFormat::ABGR8888,
     )
     .ok()?;
     let mut tex = textures.create_texture_from_surface(&surface).ok()?;
@@ -2902,7 +2932,7 @@ fn metrics(font: &Font) -> (i32, i32) {
 fn dpi_scale(canvas: &WindowCanvas) -> f32 {
     let win = canvas.window();
     let (logical, _) = win.size();
-    let (drawable, _) = win.drawable_size();
+    let (drawable, _) = win.size_in_pixels();
     if logical == 0 {
         1.0
     } else {
@@ -2982,7 +3012,7 @@ fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     ]
 }
 
-/// A pixel rectangle. Not `sdl2::rect::Rect`: that one stores its size
+/// A pixel rectangle. Not `sdl3::rect::Rect`: that one stores its size
 /// unsigned, and every bit of layout below wants to subtract freely and clamp
 /// once at the end. [`Renderer::fill`] drops non-positive rects anyway.
 ///
@@ -4414,7 +4444,7 @@ fn line_in(font: Option<&Font>, line_h: i32, ascent: i32, pct: u16) -> (i32, i32
 /// were a `RefCell` around `faces` — which would put a runtime borrow on
 /// [`Renderer::draw_glyph_in`], the hottest path there is, to serve a call that
 /// happens once per relayout — and a separate struct borrowing the fonts, which
-/// would have to be `pub` and would therefore put `sdl2::ttf::Font` in this
+/// would have to be `pub` and would therefore put `sdl3::ttf::Font` in this
 /// crate's public API. The pre-pass costs one walk of the arena and changes
 /// nothing about how a glyph is drawn.
 ///
@@ -4500,7 +4530,7 @@ impl Renderer {
     }
 
     /// The font handle behind `key`, without opening anything.
-    fn face_font(&self, key: FaceKey) -> Option<&Font<'static, 'static>> {
+    fn face_font(&self, key: FaceKey) -> Option<&Font<'static>> {
         match self.body_face(key) {
             Some(false) => Some(&self.body.font),
             Some(true) => Some(&self.bold.font),
@@ -4805,7 +4835,7 @@ impl Renderer {
         }
 
         match restore {
-            sdl2::render::ClippingRect::Some(p) => self.set_clip(Area {
+            sdl3::render::ClippingRect::Some(p) => self.set_clip(Area {
                 x: p.x(),
                 y: p.y(),
                 w: p.width() as i32,
@@ -4815,13 +4845,13 @@ impl Renderer {
             // cannot arise from anything in this file — the pane loop skips a
             // pane dragged to nothing rather than clipping it away — so this
             // arm exists to keep the match total and honest.
-            sdl2::render::ClippingRect::Zero => self.set_clip(Area {
+            sdl3::render::ClippingRect::Zero => self.set_clip(Area {
                 x: 0,
                 y: 0,
                 w: 0,
                 h: 0,
             }),
-            sdl2::render::ClippingRect::None => self.clear_clip(),
+            sdl3::render::ClippingRect::None => self.clear_clip(),
         }
     }
 
@@ -6980,7 +7010,7 @@ mod tests {
     /// point size not moving, would draw a heading at body size and no amount of
     /// layout testing would notice.
     ///
-    /// No window — `Sdl2TtfContext` needs no video subsystem — so this runs on a
+    /// No window — `Sdl3TtfContext` needs no video subsystem — so this runs on a
     /// headless box like every other test here. It is the process's own [`ttf`],
     /// initialised by whichever of these tests runs first, which is exactly the
     /// sharing the editor does between two frames.
@@ -7213,7 +7243,7 @@ mod scenes {
         assert_eq!(line_in(None, 20, 16, 100), (20, 16));
     }
 
-    /// The real path, with a real font and no window — `Sdl2TtfContext` needs no
+    /// The real path, with a real font and no window — `Sdl3TtfContext` needs no
     /// video subsystem, which is what lets this run on a headless box, and
     /// [`ttf`] is one for the whole test binary the way it is one per editor.
     #[test]
@@ -7542,7 +7572,7 @@ mod scenes {
         let asked = std::cell::Cell::new(false);
         let never = |_| {
             asked.set(true);
-            None::<&Font<'static, 'static>>
+            None::<&Font<'static>>
         };
         for c in (0u8..=127).map(char::from) {
             assert_eq!(substituted(key, never, c), key, "{c:?} was substituted");

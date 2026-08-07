@@ -1120,6 +1120,21 @@ there is no such link does the row itself get read for one."
 (define-key "dired" "t" "dired-toggle-marks")
 (define-key "dired" "d" "dired-flag-delete")
 (define-key "dired" "x" "dired-execute")
+;;; `D' deletes now, where `d'+`x' flags and expunges — Emacs has both for the
+;;; reason both are worth having: `x' is the batch you built up on purpose, and
+;;; `D' is the one file you are looking at. `D' takes the `*' marks if there are
+;;; any, so it is also "delete what I selected" without a second flagging pass.
+;;;
+;;; Both ask first, and both ask by naming what goes — a count for several, the
+;;; filename for one. That is the whole value: `D' on the wrong line is a
+;;; keystroke away from `d', and neither of them is undoable.
+(define-key "dired" "D" "dired-delete")
+;;; `u' clears the mark under the cursor and `t' inverts every mark; neither is
+;;; "I have lost track of what is marked", which is what `U' is for.
+(define-key "dired" "U" "dired-unmark-all")
+;;; Emacs' `w': the file's *name* into the register, which is this editor's kill
+;;; ring and its clipboard both — so `p' pastes it and so does ⌘V elsewhere.
+(define-key "dired" "w" "dired-copy-filename")
 (define-key "dired" "R" "dired-rename")
 (define-key "dired" "C" "dired-copy")
 (define-key "dired" "+" "dired-mkdir")

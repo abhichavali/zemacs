@@ -21,9 +21,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
-use sdl2::event::{Event, WindowEvent};
-use sdl2::keyboard::{Keycode, Mod};
-use sdl2::mouse::{Cursor, MouseButton, MouseWheelDirection, SystemCursor};
+use sdl3::event::{Event, WindowEvent};
+use sdl3::keyboard::{Keycode, Mod};
+use sdl3::mouse::{Cursor, MouseButton, MouseWheelDirection, SystemCursor};
 
 use zemacs_core::frame::{Divider, Split};
 use zemacs_core::{
@@ -150,6 +150,14 @@ impl Cursors {
 /// Which frame an SDL event belongs to, given every renderer's window id in
 /// frame order. `None` for a window that has already been closed but still has
 /// events queued behind it.
+/// SDL's monotonic clock in nanoseconds — the unit `Event::timestamp` is in.
+///
+/// `sdl3::timer::ticks()` answers milliseconds, so it is deliberately not used
+/// anywhere in this file: one clock, one unit, no arithmetic between the two.
+fn now_ns() -> u64 {
+    unsafe { sdl3::sys::timer::SDL_GetTicksNS() }
+}
+
 fn frame_for_window(mut windows: impl Iterator<Item = u32>, window_id: u32) -> Option<usize> {
     windows.position(|id| id == window_id)
 }
@@ -304,7 +312,7 @@ impl Perf {
     }
 }
 
-/// Hints that have to be set *before* `sdl2::init`, because SDL reads them
+/// Hints that have to be set *before* `sdl3::init`, because SDL reads them
 /// while it is registering the application with Cocoa.
 ///
 /// The green button is the one that needs saying out loud: without
@@ -318,14 +326,14 @@ impl Perf {
 /// keyboard focus properly, which is the same root cause as a new frame not
 /// receiving typing.
 fn mac_window_hints() {
-    sdl2::hint::set("SDL_VIDEO_MAC_FULLSCREEN_SPACES", "1");
+    sdl3::hint::set("SDL_VIDEO_MAC_FULLSCREEN_SPACES", "1");
     // `SDL_MAC_BACKGROUND_APP`, not `SDL_HINT_MAC_BACKGROUND_APP`: the latter is
     // the *name of the C macro*, and SDL reads the string it expands to. Setting
     // the macro's name sets a hint nothing has ever asked for.
-    sdl2::hint::set("SDL_MAC_BACKGROUND_APP", "0");
+    sdl3::hint::set("SDL_MAC_BACKGROUND_APP", "0");
     // Ctrl-click is a right click on this platform, and taking it would make
     // the trackpad's own secondary click unreachable.
-    sdl2::hint::set("SDL_MAC_CTRL_CLICK_EMULATE_RIGHT_CLICK", "1");
+    sdl3::hint::set("SDL_MAC_CTRL_CLICK_EMULATE_RIGHT_CLICK", "1");
 }
 
 /// Where focus lands once the frame at `closed` is removed from `before`
@@ -428,7 +436,7 @@ fn main() -> anyhow::Result<()> {
     start_in_home();
     inherit_login_path();
     mac_window_hints();
-    let sdl = sdl2::init().map_err(|e| anyhow::anyhow!("SDL init: {e}"))?;
+    let sdl = sdl3::init().map_err(|e| anyhow::anyhow!("SDL init: {e}"))?;
     // One renderer per frame, in frame order. See the module docs.
     let mut renderers = vec![Renderer::new(&sdl, "zemacs", WINDOW_W, WINDOW_H)?];
     // After the first renderer, because that is what brings the video subsystem
@@ -444,10 +452,15 @@ fn main() -> anyhow::Result<()> {
     let mut pump = sdl
         .event_pump()
         .map_err(|e| anyhow::anyhow!("SDL event pump: {e}"))?;
-    // Only the perf report reads this, but it has to be SDL's own clock: an
+    // Only the perf report reads the clock, but it has to be SDL's own: an
     // event's timestamp is in it, and the interesting part of a keystroke's life
     // is over before this loop ever sees the event.
-    let timer = sdl.timer().map_err(|e| anyhow::anyhow!("SDL timer: {e}"))?;
+    //
+    // SDL3 retired the timer *subsystem* and moved the clock to free functions —
+    // and moved event timestamps to **nanoseconds** while `ticks()` stayed in
+    // milliseconds. Subtracting one from the other is the kind of mistake that
+    // compiles and then reports nonsense forever, so `now_ns` is the only clock
+    // this file reads and it is the one events are stamped in.
     let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL video: {e}"))?;
 
     let init_path = resolve_init_path();
@@ -506,7 +519,7 @@ fn main() -> anyhow::Result<()> {
         let idle = Instant::now();
         let waited = (!presented)
             .then(|| {
-                pump.wait_event_timeout(app.renderers.first().map_or(16, Renderer::frame_ms))
+                pump.wait_event_timeout_ms(app.renderers.first().map_or(16, Renderer::frame_ms))
             })
             .flatten();
         let frame_start = Instant::now();
@@ -591,7 +604,7 @@ fn main() -> anyhow::Result<()> {
         // buffer — has no latency to report, only a frame that decided not to
         // happen.
         if let Some(stamped) = batch.typed.filter(|_| presented) {
-            perf.key(timer.ticks().saturating_sub(stamped));
+            perf.key((now_ns().saturating_sub(stamped) / 1_000_000) as u32);
         }
         perf.frame(frame_start, presents, draws);
     }
@@ -627,7 +640,7 @@ fn main() -> anyhow::Result<()> {
 struct App {
     /// Kept for [`App::housekeep`] alone: a frame core pushed needs an OS
     /// window, and opening one needs the video subsystem back.
-    sdl: sdl2::Sdl,
+    sdl: sdl3::Sdl,
     lisp: Lisp,
     init_path: PathBuf,
     /// One renderer per frame, in frame order. See the module docs.
@@ -641,7 +654,7 @@ struct App {
     clipboard: Clipboard,
     /// Text input is toggled per mode — see [`wants_text_input`]. It is off to
     /// begin with because the editor opens on the dashboard.
-    text_input: sdl2::keyboard::TextInputUtil,
+    text_input: sdl3::keyboard::TextInputUtil,
     text_input_on: bool,
     last_revision: u64,
     /// How much of the live buffer's change log each reader has already acted
@@ -685,7 +698,7 @@ struct Batch {
     closing: Option<usize>,
     /// When the earliest keystroke of this batch was stamped, for the perf
     /// report to subtract from the present at the bottom.
-    typed: Option<u32>,
+    typed: Option<u64>,
 }
 
 impl Batch {
@@ -700,21 +713,24 @@ impl Batch {
     /// A keystroke or a composed character arrived, stamped on SDL's own clock.
     /// The earliest wins: what the perf report wants is how long the *first* key
     /// of the batch waited, which is the one that waited longest.
-    fn stamp(&mut self, timestamp: u32) {
+    fn stamp(&mut self, timestamp: u64) {
         self.typed = Some(self.typed.map_or(timestamp, |t| t.min(timestamp)));
     }
 }
 
 impl App {
     fn new(
-        sdl: sdl2::Sdl,
-        video: &sdl2::VideoSubsystem,
+        sdl: sdl3::Sdl,
+        video: &sdl3::VideoSubsystem,
         renderers: Vec<Renderer>,
         lisp: Lisp,
         init_path: PathBuf,
     ) -> Self {
+        // Not stopped here: SDL3 wants a window to stop it *on*, and the windows
+        // are about to be moved into `self`. The first `sync_text_input` of the
+        // loop does it, from `text_input_on: false` against a dashboard that
+        // wants no text input — which is the state this call was asserting.
         let text_input = video.text_input();
-        text_input.stop();
         Self {
             sdl,
             lisp,
@@ -939,7 +955,7 @@ impl App {
                             self.dispatch(editor, EditorCommand::FocusFrame(i));
                         }
                     }
-                    WindowEvent::Close => {
+                    WindowEvent::CloseRequested => {
                         if let Some(i) = frame {
                             batch.closing.get_or_insert(i);
                         }
@@ -971,7 +987,7 @@ impl App {
                 y,
                 ..
             } => {
-                if let Some((i, x, y)) = self.pointer(window_id, x, y) {
+                if let Some((i, x, y)) = self.pointer(window_id, x as i32, y as i32) {
                     // Focused first, for the left click's reason: the menu's
                     // verbs act on the focused frame, and right-clicking an
                     // unfocused window and getting a split in another one is
@@ -987,7 +1003,7 @@ impl App {
                 y,
                 ..
             } => {
-                let Some((i, x, y)) = self.pointer(window_id, x, y) else {
+                let Some((i, x, y)) = self.pointer(window_id, x as i32, y as i32) else {
                     return ControlFlow::Continue(());
                 };
                 let area = self.renderers[i].content_area();
@@ -1112,7 +1128,7 @@ impl App {
                 // which is why clicking in `vim` or `htop` in here did
                 // nothing until the *next* click.
                 if editor.mode == zemacs_core::Mode::Terminal {
-                    if let Some((_, x, y)) = self.pointer(window_id, x, y) {
+                    if let Some((_, x, y)) = self.pointer(window_id, x as i32, y as i32) {
                         let (col, row) = cell_at(editor, &self.renderers, x, y);
                         self.term_mouse(editor, zemacs_term::MouseKind::Release, col, row);
                     }
@@ -1132,12 +1148,12 @@ impl App {
                 // bug this avoids.
                 Some(i) => {
                     if let Some(renderer) = self.renderers.get(i) {
-                        let (x, y) = renderer.to_pixels(x, y);
+                        let (x, y) = renderer.to_pixels(x as i32, y as i32);
                         self.mouse.motion(&mut editor.frames, x, y);
                     }
                 }
                 None => {
-                    if let Some((i, x, y)) = self.pointer(window_id, x, y) {
+                    if let Some((i, x, y)) = self.pointer(window_id, x as i32, y as i32) {
                         let area = self.renderers[i].content_area();
                         if let Some(cursors) = &mut self.cursors {
                             cursors.hover(editor.frames[i].divider_at(area, x, y).map(|d| d.dir));
@@ -1204,9 +1220,15 @@ impl App {
             // rather than a setting — a `set-scroll-direction` primitive is
             // a C shim, an extern, a defprim and an export for one bool.
             // Add it when a second person disagrees about which way is up.
+            // `integer_y`, not `y`. SDL3 made `y` the *precise* delta — a
+            // trackpad delivers a stream of fractions — where SDL2's `y` was the
+            // quantised notch count this arm is written against. `integer_y` is
+            // that notch count, so it is the port of the old field and not the
+            // similarly-named new one; taking `y` compiles and then scrolls
+            // either not at all or wildly, depending on where you truncate.
             Event::MouseWheel {
                 window_id,
-                y,
+                integer_y: y,
                 direction,
                 mouse_x,
                 mouse_y,
@@ -1216,7 +1238,7 @@ impl App {
                     MouseWheelDirection::Flipped => -y,
                     _ => y,
                 };
-                let frame = self.pointer(window_id, mouse_x, mouse_y);
+                let frame = self.pointer(window_id, mouse_x as i32, mouse_y as i32);
                 if let (true, Some((i, px, py))) = (y != 0, frame) {
                     // Scroll the pane under the pointer — by focusing it
                     // first. `ScrollLines` moves the *live* window, and
@@ -1285,12 +1307,26 @@ impl App {
         if want_text == self.text_input_on {
             return;
         }
-        if want_text {
-            self.text_input.start();
-        } else {
-            self.text_input.stop();
-        }
+        self.apply_text_input(want_text);
         self.text_input_on = want_text;
+    }
+
+    /// Tell *every* window, because SDL3 made text input a property of a window
+    /// rather than of the application.
+    ///
+    /// Two consequences the guarded `sync_text_input` above cannot see on its
+    /// own: a frame opened later starts at SDL's default rather than at ours, so
+    /// the loop re-applies this after pushing a renderer; and the mode is global
+    /// to the editor, so telling only the focused window would leave Insert mode
+    /// dead the moment you clicked into another frame.
+    fn apply_text_input(&self, on: bool) {
+        for renderer in &self.renderers {
+            if on {
+                self.text_input.start(renderer.window());
+            } else {
+                self.text_input.stop(renderer.window());
+            }
+        }
     }
 
     /// Everything the image and the parser are told about this frame.
@@ -1456,6 +1492,10 @@ impl App {
             renderer.focus();
             editor.focus_frame = self.renderers.len();
             self.renderers.push(renderer);
+            // Text input is per-window in SDL3, and this one was born with
+            // SDL's default rather than the editor's mode — so a frame opened
+            // from Insert mode would take keys and compose nothing.
+            self.apply_text_input(self.text_input_on);
         }
 
         // Size each session to the pane it is actually shown in, then let them
@@ -1951,7 +1991,7 @@ fn elide(s: String) -> String {
 // question nobody asked is exactly the kind of thing that shows up in a profile.
 
 struct Clipboard {
-    util: sdl2::clipboard::ClipboardUtil,
+    util: sdl3::clipboard::ClipboardUtil,
     /// The revision already pushed. Also updated after a *pull*, so adopting
     /// the clipboard's text does not read back as a register change and bounce
     /// straight out again.
@@ -1959,7 +1999,7 @@ struct Clipboard {
 }
 
 impl Clipboard {
-    fn new(video: &sdl2::VideoSubsystem) -> Self {
+    fn new(video: &sdl3::VideoSubsystem) -> Self {
         Clipboard {
             util: video.clipboard(),
             pushed: 0,
@@ -2887,7 +2927,7 @@ mod tests {
             (Keycode::J, 'j'),
             (Keycode::K, 'k'),
             (Keycode::D, 'd'),
-            (Keycode::Num4, '4'),
+            (Keycode::_4, '4'),
         ] {
             assert_eq!(
                 key_from_keydown(kc, Mod::NOMOD, true),
@@ -2897,7 +2937,7 @@ mod tests {
         }
         // shifted punctuation and letters, so `$`, `:` and `ZZ` still work
         assert_eq!(
-            key_from_keydown(Keycode::Num4, Mod::LSHIFTMOD, true),
+            key_from_keydown(Keycode::_4, Mod::LSHIFTMOD, true),
             Some(Key::Char('$'))
         );
         assert_eq!(

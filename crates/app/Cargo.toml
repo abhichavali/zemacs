@@ -27,4 +27,4 @@ crossbeam-channel.workspace = true
 anyhow.workspace = true
 # `use-pkgconfig` is required on Apple Silicon: Homebrew's /opt/homebrew/lib is
 # not on the default linker search path, so SDL2 is otherwise not found.
-sdl2 = { version = "0.38", features = ["use-pkgconfig"] }
+sdl3 = { version = "0.18.4", features = ["use-pkg-config"] }

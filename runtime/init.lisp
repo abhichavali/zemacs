@@ -880,6 +880,122 @@ The third way into a project, beside `SPC p p' (one you have visited) and
 
 (define-leader "SPC p n" "project-clone")
 
+;;; ---------------------------------------------------------------------------
+;;; The recipes in the Makefile
+;;;
+;;; `SPC p c' already runs *the* build — cargo build, npm run build, make — and
+;;; one key for the usual thing is right. But a Makefile is a menu, and the entry
+;;; you want is as often `test' or `fmt' or `deploy' as it is the default. So this
+;;; reads the menu and asks.
+;;;
+;;; In Lisp for `project-clone''s reason: it is a line scanner, a picker and a
+;;; shell command, and not one of the three is hot. Rust already knows how to run
+;;; a program and how to draw a completing prompt; it does not need make's
+;;; grammar as well.
+
+(defun %directory-of (file)
+  "The directory FILE sits in, as a pathname."
+  (make-pathname :name nil :type nil :defaults file))
+
+(defun %makefile-near (start)
+  "The nearest Makefile at or above START, or NIL.
+
+Climbs rather than asking for the project root, and that is the useful answer in
+a monorepo: there is a Makefile per package, and the one you mean is the one
+beside the file you are looking at, not the one at the top of the checkout.
+
+Walks the *directory components* rather than repeatedly taking a pathname's
+parent. Shortening a list is total — `(:absolute \"a\" \"b\")' to `(:absolute)'
+and then to nothing — where climbing by pathname has to decide when it has
+reached the root, and gets there by asking a question the root itself answers
+badly."
+  (let ((parts (pathname-directory (merge-pathnames start))))
+    (loop for n from (length parts) downto 1
+          for dir = (make-pathname :directory (subseq parts 0 n)
+                                   :name nil :type nil)
+          thereis (or (probe-file (merge-pathnames "Makefile" dir))
+                      (probe-file (merge-pathnames "makefile" dir))))))
+
+(defun %makefile-targets (path)
+  "Every target PATH declares, in the order it declares them.
+
+A line scanner rather than an understanding of make, deliberately. A rule starts
+in column zero and carries a colon; a recipe line starts with a tab; everything
+else is a comment, an assignment or a directive. That reads multi-target rules
+correctly and is wrong only about computed names — and a `$(BINS):' names nothing
+a picker could have offered anyway.
+
+Targets beginning with a dot are skipped, which is how `.PHONY' and `.DEFAULT'
+stay out of the list without needing to be known by name: the real targets a
+`.PHONY' line mentions have rules of their own further down."
+  (with-open-file (in path :if-does-not-exist nil)
+    (when in
+      (let ((found '()))
+        (loop for line = (read-line in nil nil)
+              while line
+              do (let* ((colon (position #\: line))
+                        ;; `:=', `::=' and `:::=' all assign. Skipping the run of
+                        ;; colons and asking what follows reads every one of them
+                        ;; — where a fixed-width window after the first colon
+                        ;; reads `:=' and quietly lets `::=' through as a rule.
+                        (after-colons
+                         (and colon (position-if-not (lambda (c) (char= c #\:))
+                                                     line :start colon))))
+                   (when (and colon (plusp colon)
+                              (not (find (char line 0) '(#\Tab #\Space #\#)))
+                              (not (find #\= line :end colon))
+                              (not (and after-colons (char= (char line after-colons) #\=)))
+                              (not (find #\$ line :end colon))
+                              (not (find #\% line :end colon)))
+                     (dolist (name (split-string (subseq line 0 colon) #\Space))
+                       (let ((name (string-trim '(#\Space #\Tab) name)))
+                         (when (and (plusp (length name))
+                                    (char/= (char name 0) #\.)
+                                    (not (member name found :test #'string=)))
+                           (push name found)))))))
+        (nreverse found)))))
+
+(defun %term-line (line)
+  "Type LINE into the terminal session and press Return.
+
+`term-send-key' is the whole channel — the vocabulary `key-bindings' reports,
+travelling the other way — so this arrives exactly as if it had been typed. The
+race it looks like it has is the shell's, and shells are good at it: the PTY
+exists the moment the session does, so characters sent before the prompt is
+drawn sit in its input buffer and are read after."
+  (loop for c across line do (term-send-key (string c)))
+  (term-send-key "<ret>"))
+
+(defun project-make ()
+  "Pick a target out of the nearest Makefile and run it in a terminal.
+
+A terminal rather than `run-process', for the reason that function's own
+docstring gives: a build is minutes, and `run-process' parks the Lisp thread for
+its whole length. Through a shell the output streams as it arrives, `C-c'
+interrupts, and a failure is left on screen where it can be read."
+  (let* ((here (let ((file (buffer-file-name)))
+                 (if file
+                     (%directory-of (pathname file))
+                     *default-pathname-defaults*)))
+         (makefile (%makefile-near here))
+         (dir (and makefile (%directory-of makefile))))
+    (cond
+      ((null makefile) (message "no Makefile here or above"))
+      (t
+       (let ((targets (%makefile-targets makefile)))
+         (if (null targets)
+             (message (format nil "no targets in ~a" makefile))
+             (completing-read
+              "make: " targets
+              (lambda (target)
+                (when (and target (plusp (length target)))
+                  (terminal)
+                  (%term-line (format nil "make -C ~a ~a"
+                                      (namestring dir) target))))))))))
+  nil)
+
+(define-leader "SPC p m" "project-make")
+
 ;;; The terminal. A real shell on a real PTY, in a buffer.
 ;;;
 ;;; In `terminal' mode the shell owns the keyboard: `d', `j', Esc and above all

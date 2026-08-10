@@ -18,6 +18,15 @@
 //! No SDL, no fonts, no window: the width of a character is a property of
 //! Unicode, and the *pixel* width of a cell — which really is the renderer's —
 //! never appears here.
+//!
+//! Overlays are here for the same reason `j` is: an org-modern bullet, a
+//! checkbox glyph or a revealed link is drawn *instead of* the characters it
+//! covers, so it moves every column on its line. That substitution used to live
+//! in the renderer alone, which meant core and the screen laid the same line out
+//! differently and `j` down a heading landed a character off — see
+//! [`line_cells`], which is now the single answer both of them ask for.
+
+use crate::overlay::Overlay;
 
 /// Cells `c` occupies. Two for East Asian wide and most emoji, zero for
 /// combining marks, one for everything else.
@@ -95,6 +104,120 @@ pub fn expand_line(line: &str, tab_width: usize) -> Vec<Cell> {
         }
     }
     out
+}
+
+/// Replace the cells of each `(start, end, text)` — line-relative *source* char
+/// offsets — with `text`'s characters, all attributed to `start`.
+///
+/// Attributing them to `start` is what keeps everything else working unchanged:
+/// [`visual_col`] still finds a column for a cursor inside the hidden range, the
+/// highlight cursor still walks monotonically, and wrapping counts the cells
+/// that are actually drawn.
+///
+/// `subs` must be sorted by `start`. Overlapping substitutions are not
+/// composable and are not composed — the one that starts first wins and the rest
+/// are dropped. In practice they never overlap: LaTeX fragments are disjoint by
+/// construction, and so are bullets.
+///
+/// Offsets in, offsets out: nothing here invents a character, so a substitution
+/// hides text from the *screen* and never from an edit. The buffer is still the
+/// truth about what `x` deletes.
+pub fn substitute(cells: &[Cell], subs: &[(usize, usize, String)]) -> Vec<Cell> {
+    let mut out = Vec::with_capacity(cells.len());
+    let (mut i, mut si) = (0usize, 0usize);
+    while i < cells.len() {
+        let src = cells[i].1;
+        while si < subs.len() && subs[si].1 <= src {
+            si += 1;
+        }
+        match subs.get(si) {
+            Some((s, e, text)) if *s <= src => {
+                out.extend(text.chars().map(|c| (c, *s)));
+                while i < cells.len() && cells[i].1 < *e {
+                    i += 1;
+                }
+                let e = *e;
+                si += 1;
+                while si < subs.len() && subs[si].0 < e {
+                    si += 1; // started inside the one just applied
+                }
+            }
+            _ => {
+                out.push(cells[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The substitutions the overlays touching one buffer line — chars
+/// `[start, end)` — ask for, rebased onto it and sorted for [`substitute`].
+///
+/// `display` strings only. An overlay carrying an **image** is deliberately not
+/// here: the cells a bitmap reserves are its pixel width over the width of a
+/// cell, and a cell's width in pixels is the renderer's alone. Core guessing one
+/// would put a second disagreement where this removes the first. The renderer
+/// pushes its own image substitutions *in front of* these, so an overlay
+/// carrying both still draws as an image — the earlier start wins in
+/// [`substitute`], and a stable sort leaves them in that order — while one whose
+/// bitmap has not been rasterised yet falls back to its string exactly as it did
+/// before.
+///
+/// An overlay reaching onto later lines substitutes on the first of them and
+/// blanks the rest: one bullet, then the empty rows its own source lines have
+/// become. That rule is the draw loop's and is copied here rather than left
+/// there, because a continuation row genuinely *is* empty on screen and a cursor
+/// walking onto it belongs in column zero.
+pub fn display_subs<'a>(
+    overlays: impl IntoIterator<Item = &'a Overlay>,
+    start: usize,
+    end: usize,
+) -> Vec<(usize, usize, String)> {
+    let mut subs: Vec<(usize, usize, String)> = overlays
+        .into_iter()
+        .filter(|o| o.end > start && o.start < end && o.display.is_some())
+        .map(|o| {
+            let text = match o.start < start {
+                true => String::new(),
+                false => o.display.clone().unwrap_or_default(),
+            };
+            (o.start.max(start) - start, o.end.min(end) - start, text)
+        })
+        .collect();
+    // Stable, so that two overlays claiming the same start are still separated
+    // by creation order — which is the order the renderer resolves every other
+    // overlay attribute in.
+    subs.sort_by_key(|&(s, _, _)| s);
+    subs
+}
+
+/// The cells of one buffer line: [`expand_line`] over its text, then whatever
+/// its overlays draw instead of parts of it.
+///
+/// **The one layout, and the reason this function exists.** Core used to expand
+/// a line without overlays while the renderer substituted into it, so on any
+/// line carrying a bullet, a checkbox or a shortened link the two disagreed
+/// about how many cells there were and where each character sat — and `j` down
+/// such a line landed a character off. Both sides call this now.
+///
+/// `text` is the line's own characters and `start`/`end` its char range in the
+/// buffer, because that is the coordinate overlays are stored in.
+pub fn line_cells<'a>(
+    text: &str,
+    tab_width: usize,
+    overlays: impl IntoIterator<Item = &'a Overlay>,
+    start: usize,
+    end: usize,
+) -> Vec<Cell> {
+    let cells = expand_line(text, tab_width);
+    let subs = display_subs(overlays, start, end);
+    match subs.is_empty() {
+        // Every line of every code buffer, and most lines of an org one: no
+        // second vector and no second walk when nothing was substituted.
+        true => cells,
+        false => substitute(&cells, &subs),
+    }
 }
 
 /// Visual column of source char `src`; the end of the line if it is past it
@@ -341,5 +464,206 @@ mod tests {
         assert_eq!(cells[4].1, 3);
         // tab_width 0 must not divide by zero.
         assert_eq!(expand_line("\t", 0).len(), 1);
+    }
+
+    // --- overlays ---------------------------------------------------------
+    //
+    // The half of a line's layout that is not its text. Everything below is
+    // about one claim: what core counts and what the renderer draws are the
+    // same cells, on a line whose stars became a bullet or whose `[ ]` became
+    // one box.
+
+    use crate::overlay::{OverlayEdit, OverlayId, Overlays};
+
+    /// `display` overlays as `(id, start, end, text)` in **buffer** char
+    /// offsets — the coordinate they are really stored in, so that clipping a
+    /// multi-line one onto a later line is testable at all.
+    fn overlays(spans: &[(OverlayId, usize, usize, &str)]) -> Overlays {
+        let mut ovs = Overlays::default();
+        for &(id, s, e, text) in spans {
+            ovs.add(id, s, e);
+            ovs.edit(OverlayEdit::Display(id, Some(text.to_string())));
+        }
+        ovs
+    }
+
+    fn text_of(cells: &[Cell]) -> String {
+        cells.iter().map(|&(c, _)| c).collect()
+    }
+
+    /// Motion has to stay **total** over a substituted line: every source char
+    /// still has a column, every column still has a source char, and neither map
+    /// ever goes backwards. Asserted as a property rather than by example
+    /// because the failure mode this guards is a cursor that skips a character
+    /// or cannot be moved off one.
+    fn motion_is_total(cells: &[Cell], line_len: usize) {
+        let mut last = 0;
+        for src in 0..=line_len {
+            let col = visual_col(cells, src);
+            assert!(col >= last, "visual_col went backwards at {src}");
+            assert!(col <= cells.len(), "visual_col past the line at {src}");
+            last = col;
+            // Landing on a column and asking what is under it never answers a
+            // character *after* the one asked about — that is the shape of a
+            // cursor that walks right on its own.
+            if col < cells.len() {
+                assert!(char_at_cell(cells, col, line_len) <= src, "overshot at {src}");
+            }
+        }
+        for col in 0..cells.len() {
+            let src = char_at_cell(cells, col, line_len);
+            assert!(src < line_len.max(1), "char_at_cell past the text at {col}");
+        }
+    }
+
+    /// The bug this whole path exists to close. org-modern draws `** ` as one
+    /// bullet, so every column after it moves — and core used to expand the line
+    /// without knowing that, which is how `j` down a heading landed a character
+    /// left of the block.
+    #[test]
+    fn a_heading_is_laid_out_with_its_bullet_and_not_with_its_stars() {
+        let line = "** a heading";
+        let ovs = overlays(&[(1, 0, 2, "◉")]);
+        let cells = line_cells(line, 4, ovs.all(), 0, line.chars().count());
+        assert_eq!(text_of(&cells), "◉ a heading");
+
+        // The two stars share the bullet's one column, and the space after them
+        // — deliberately outside the overlay — keeps a column of its own.
+        assert_eq!(visual_col(&cells, 0), 0);
+        assert_eq!(visual_col(&cells, 1), 0);
+        assert_eq!(visual_col(&cells, 2), 1);
+        assert_eq!(visual_col(&cells, 3), 2, "'a' is drawn two columns in");
+        // ...and back: any column inside the substitution answers its start,
+        // which is a real character the buffer has and `x` can delete.
+        assert_eq!(char_at_cell(&cells, 0, 12), 0);
+        assert_eq!(char_at_cell(&cells, 2, 12), 3);
+        motion_is_total(&cells, 12);
+    }
+
+    /// The newest and worst of them: three characters become one glyph, so the
+    /// cursor sits on the same column for all three. That is the price of a
+    /// substitution and it must not become a trap — `l` still walks off the far
+    /// side, because offsets are the truth and only cells were replaced.
+    #[test]
+    fn a_checkbox_puts_three_characters_in_one_column_without_trapping_the_cursor() {
+        let line = "- [ ] milk";
+        let ovs = overlays(&[(1, 2, 5, "☐")]);
+        let cells = line_cells(line, 4, ovs.all(), 0, line.chars().count());
+        assert_eq!(text_of(&cells), "- ☐ milk");
+
+        assert_eq!(visual_col(&cells, 2), 2, "'['");
+        assert_eq!(visual_col(&cells, 3), 2, "the space inside it");
+        assert_eq!(visual_col(&cells, 4), 2, "']'");
+        assert_eq!(visual_col(&cells, 5), 3, "the space after it moved left");
+        assert_eq!(visual_col(&cells, 6), 4, "'m'");
+        // Three `l`s cross the box: the column does not move for two of them and
+        // then it does. No offset was skipped and none was invented.
+        assert_eq!(char_at_cell(&cells, 2, 10), 2);
+        assert_eq!(char_at_cell(&cells, 3, 10), 5);
+        motion_is_total(&cells, 10);
+    }
+
+    /// A substitution changes where a line *breaks*, which is the half of this
+    /// that `j` feels rather than sees: the row below a wrapped heading starts
+    /// at a different word once the stars are one glyph.
+    #[test]
+    fn wrapping_counts_the_cells_a_substitution_left_behind() {
+        let line = "** aaa bbb ccc";
+        let len = line.chars().count();
+        let plain = expand_line(line, 4);
+        let ovs = overlays(&[(1, 0, 2, "◉")]);
+        let cells = line_cells(line, 4, ovs.all(), 0, len);
+
+        // 14 cells break after "** aaa ", 13 break after "◉ aaa bbb " — one
+        // fewer cell is a whole extra word on the first row.
+        assert_eq!(wrap_breaks(&plain, 10), [0, 7]);
+        assert_eq!(wrap_breaks(&cells, 10), [0, 10]);
+        let breaks = wrap_breaks(&cells, 10);
+        assert_eq!(wrap_row_of(&breaks, visual_col(&cells, 11)), 1, "'ccc' is on row 1");
+        // Row 1 is "ccc" and its first character is source char 11.
+        let (s, e) = wrap_row_range(&breaks, 1, cells.len());
+        assert_eq!(text_of(&cells[s..e]), "ccc");
+        assert_eq!(char_at_cell(&cells, s, len), 11);
+    }
+
+    /// An overlay reaching onto later lines draws on the first and blanks the
+    /// rest, and core has to agree or a cursor on a row that is empty on screen
+    /// would be reported somewhere in the middle of it.
+    #[test]
+    fn a_multi_line_overlay_blanks_the_lines_after_the_one_it_draws_on() {
+        // "abc\ndef\n": line 0 is chars [0,3), line 1 is [4,7). The overlay runs
+        // from 'b' to 'e'.
+        let ovs = overlays(&[(1, 1, 6, "X")]);
+        assert_eq!(text_of(&line_cells("abc", 4, ovs.all(), 0, 3)), "aX");
+        assert_eq!(text_of(&line_cells("def", 4, ovs.all(), 4, 7)), "f");
+        // ...and a line the overlay does not touch is untouched.
+        assert_eq!(text_of(&line_cells("ghi", 4, ovs.all(), 8, 11)), "ghi");
+    }
+
+    /// The documented ceiling, asserted so it is a decision and not a surprise:
+    /// core leaves an image overlay's text alone, because the cells a bitmap
+    /// reserves are pixels over a cell width it has not got.
+    #[test]
+    fn core_does_not_try_to_size_an_image() {
+        let mut ovs = Overlays::default();
+        ovs.add(1, 4, 9);
+        ovs.edit(OverlayEdit::Image(1, Some(7)));
+        let line = "see $x^2$ here";
+        let cells = line_cells(line, 4, ovs.all(), 0, line.chars().count());
+        assert_eq!(text_of(&cells), line);
+        // A `display` string on the *same* overlay is still laid out, which is
+        // what the renderer falls back to before the bitmap has been rasterised.
+        ovs.edit(OverlayEdit::Display(1, Some("[eq]".into())));
+        let cells = line_cells(line, 4, ovs.all(), 0, line.chars().count());
+        assert_eq!(text_of(&cells), "see [eq] here");
+    }
+
+    /// Clipped, rebased and sorted — the contract [`substitute`] is written
+    /// against, and the one thing the renderer relies on when it appends these
+    /// behind its own image substitutions.
+    #[test]
+    fn display_subs_are_clipped_to_the_line_and_sorted_by_start() {
+        // Line 1 of a buffer is chars [6, 10).
+        let ovs = overlays(&[(1, 8, 9, "b"), (2, 0, 20, "a"), (3, 10, 12, "c")]);
+        assert_eq!(
+            display_subs(ovs.all(), 6, 10),
+            // The first covers the whole line and starts before it, so it is a
+            // continuation row and blanks; the second is rebased onto it; the
+            // third only touches the newline and the line after it.
+            vec![(0, 4, String::new()), (2, 3, "b".to_string())]
+        );
+        // A face-only overlay hides nothing and is not a substitution.
+        let mut plain = Overlays::default();
+        plain.add(9, 0, 4);
+        assert!(display_subs(plain.all(), 0, 4).is_empty());
+    }
+
+    /// End to end, because the claim is about a *motion* and not about a
+    /// function: `j` from a body line onto a substituted heading lands in the
+    /// column the heading is really drawn in.
+    #[test]
+    fn j_lands_in_the_column_the_substituted_line_draws() {
+        let mut ed = crate::Editor::new();
+        ed.mode = crate::Mode::Normal;
+        ed.buffer = crate::Buffer::from_str("body text here\n** a heading\n");
+        ed.settings.line_overflow = crate::LineOverflow::Wrap;
+        ed.wrap_cols = 40; // what the renderer parks there every frame
+        // org-modern: line 1 starts at char 15, and its two stars are a bullet.
+        ed.buffer.overlays.add(1, 15, 17);
+        ed.buffer.overlays.edit(OverlayEdit::Display(1, Some("◉".into())));
+
+        ed.buffer.cursor = 3; // line 0, column 3
+        assert_eq!(ed.cursor_vcol(), 3);
+        // Column 3 of "◉ a heading" is the space after 'a' — source char 4 of
+        // the line, char 19 of the buffer. Laid out without the bullet it would
+        // have been char 18, which is drawn in column *2*: one column left of
+        // where the block goes, which is the whole bug.
+        let at = ed.visual_target(true, 1, ed.cursor_vcol());
+        assert_eq!(at, 19);
+        ed.buffer.cursor = at;
+        assert_eq!(ed.cursor_vcol(), 3, "and it is still column 3 once it lands");
+
+        // Back up again: `k` from there returns to the column it left.
+        assert_eq!(ed.visual_target(false, 1, ed.cursor_vcol()), 3);
     }
 }

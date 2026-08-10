@@ -76,16 +76,111 @@ extern void rs_rpc_stop(long conn);
 extern char *rs_json_quote(const char *text);
 /* --- end of the JSON-RPC externs ----------------------------------------- */
 
-/* --- Lisp -> C conversions ---------------------------------------------- */
+/* --- The string model ----------------------------------------------------
+ *
+ * **Lisp holds text as characters**, on both sides of this file. `λ` is one
+ * Lisp character whether it arrived in a `load'ed file, in a form Rust queued
+ * for evaluation, or in the answer to `(buffer-string)'; UTF-8 exists only in
+ * the `char *' between the two languages, and it is encoded and decoded here.
+ *
+ * It was bytes until recently — every reader answered a base string of UTF-8
+ * bytes, `%byte-index' and `%char-index' converted between the two counts, and
+ * `utf8-text' in `modes.lisp' decoded at each of the dozen places text left a
+ * buffer. The failure that model has is not that it is inconvenient: it is that
+ * ECL's reader parses a byte string as Latin-1, so `(message "λ")' arriving
+ * from a keybinding reached the status line as `Î»' while the same form in a
+ * file was fine. The two halves — decoding what arrives, and stopping
+ * everything above from decoding it a second time — had to move together,
+ * because either alone makes buffer text and eval'd source incomparable and
+ * `(search-forward "γ" 0)' answers NIL.
+ *
+ * So: `utf8_string' below is the only decoder, `dup_utf8' the only encoder, and
+ * nothing in `runtime/' knows that UTF-8 exists. */
+
+/* --- C -> Lisp ------------------------------------------------------------ */
+
+/* Bytes in the sequence B opens. A stray continuation byte (0x80..0xBF) opens a
+ * one-byte sequence and so passes through as the character of that code rather
+ * than being dropped: what reads this is an editor, and text it cannot make
+ * sense of should still be visible, because the alternative is a screen that
+ * silently disagrees with the file behind it. */
+static cl_index utf8_run(unsigned char b) {
+  if (b < 0xC0)
+    return 1;
+  if (b < 0xE0)
+    return 2;
+  if (b < 0xF0)
+    return 3;
+  return 4;
+}
+
+/* A UTF-8 C string as a Lisp character string.
+ *
+ * Two passes, because a simple string has no fill pointer and the character
+ * count is not the byte count. Both passes step with `utf8_run' and clamp a
+ * truncated tail the same way, so they cannot disagree about how many
+ * characters there are — which they would if the count were "bytes that are not
+ * continuations" and the decoder emitted one character for a stray one.
+ *
+ * Pure ASCII comes back as a *base* string, which for ASCII is the same text in
+ * a quarter of the memory: a base character's code is its byte. That is the
+ * common case — a query answer is nearly always source with no accent in it —
+ * and it is what keeps `buffer-string' on a large file as cheap as it was. */
+static cl_object utf8_string(const char *s) {
+  const unsigned char *p = (const unsigned char *)s;
+  cl_index n = (cl_index)strlen(s);
+
+  int ascii = 1;
+  cl_index nchars = 0;
+  for (cl_index i = 0; i < n;) {
+    if (p[i] >= 0x80)
+      ascii = 0;
+    cl_index len = utf8_run(p[i]);
+    i += (i + len > n) ? 1 : len;
+    nchars++;
+  }
+  if (ascii)
+    return ecl_make_simple_base_string((char *)s, (cl_fixnum)n);
+
+  cl_object out = ecl_alloc_simple_extended_string(nchars);
+  cl_index k = 0;
+  for (cl_index i = 0; i < n;) {
+    unsigned char b = p[i];
+    cl_index len = utf8_run(b);
+    unsigned int c;
+    if (len == 1 || i + len > n) {
+      c = b; /* ASCII, a stray continuation byte, or a truncated tail */
+      len = 1;
+    } else {
+      c = b & (0xFFu >> (len + 1));
+      for (cl_index j = 1; j < len; j++)
+        c = (c << 6) | (p[i + j] & 0x3F);
+    }
+    ecl_char_set(out, k++, (ecl_character)c);
+    i += len;
+  }
+  return out;
+}
+
+/* `ecl_read_from_cstring' with the string decoded first. Every answer Rust
+ * gives is Lisp *source*, and ECL's own macro makes a base string of it — which
+ * is where the whole Latin-1 mis-read used to enter. The boot forms below still
+ * use the macro: they are ASCII C literals, and reading them is not a
+ * boundary. */
+static cl_object read_utf8(const char *src) {
+  return si_string_to_object(1, utf8_string(src));
+}
+
+/* --- Lisp -> C ------------------------------------------------------------ */
 
 /* Owned UTF-8 copy of any object's PRINC form; NULL for NIL. Going through
  * PRINC rather than demanding a string means #\f, "f", 'find-file and #P"/x"
  * all work, so callers never have to think about types.
  *
- * Base strings are copied byte-for-byte: `zemacs_eval` hands ECL raw UTF-8 as
- * a base string, so passing the bytes back untouched round-trips exactly.
- * Extended (unicode) strings — what `load` produces from a UTF-8 file — get
- * encoded here. */
+ * The fast path is *ASCII* base strings, not base strings: a base string may
+ * hold characters up to 255 — `(code-char 233)' is one — and those are Latin-1
+ * characters that have to be encoded like any other. Copying its bytes would
+ * hand Rust something that is not UTF-8 at all. */
 static char *dup_utf8(cl_object x) {
   if (x == ECL_NIL)
     return NULL;
@@ -93,12 +188,18 @@ static char *dup_utf8(cl_object x) {
 
   if (ECL_BASE_STRING_P(s)) {
     cl_index n = s->base_string.fillp;
-    char *buf = (char *)malloc((size_t)n + 1);
-    if (!buf)
-      return NULL;
-    memcpy(buf, s->base_string.self, (size_t)n);
-    buf[n] = '\0';
-    return buf;
+    ecl_base_char *self = s->base_string.self;
+    cl_index i = 0;
+    while (i < n && self[i] < 0x80)
+      i++;
+    if (i == n) {
+      char *buf = (char *)malloc((size_t)n + 1);
+      if (!buf)
+        return NULL;
+      memcpy(buf, self, (size_t)n);
+      buf[n] = '\0';
+      return buf;
+    }
   }
 
   cl_fixnum n = ecl_length(s);
@@ -142,14 +243,6 @@ static char *dup_utf8_or_empty(cl_object x) {
 static char *dup_utf8_or_empty_nil(cl_object x) {
   return x == ECL_NIL ? strdup("") : dup_utf8_or_empty(x);
 }
-
-/* Note on the string model, because it is unusual and everything above depends
- * on it: **Lisp holds text as UTF-8 bytes in base strings**, not as characters.
- * `buffer-string' comes back that way, `%byte-index' and `%char-index' exist to
- * convert between the two counts, and `search-forward' compares a pattern
- * against those bytes. So a string arriving from Rust must stay bytes — decoding
- * it into a character string here would make it incomparable with buffer text
- * and break every search. The ceiling is written up on `f_query'. */
 
 /* --- Primitives --------------------------------------------------------- */
 /* Numbers are converted before strings everywhere: a type error in ecl_to_*
@@ -386,13 +479,10 @@ static cl_object f_register_command(cl_object name) {
  * C signature serves integers, strings, NIL, conses and lists alike — see the
  * zemacs_core::query docs.
  *
- * ponytail: the source arrives as a *base* string, so a non-ASCII buffer comes
- * back as its UTF-8 bytes rather than as characters — `(length (buffer-string))`
- * counts bytes on such a buffer. That is the same convention `zemacs_eval`
- * already uses in the other direction, which is what makes text round-trip
- * through Lisp byte-for-byte. Fixing it properly means decoding into an
- * extended string here; worth doing when Lisp starts doing arithmetic on
- * non-ASCII text, not before. */
+ * `read_utf8' and not ECL's `ecl_read_from_cstring': the answer is UTF-8 and
+ * ECL's macro would read it as Latin-1. This is the single place `(buffer-string)`
+ * becomes characters, which is why `(length (buffer-string))` is the editor's own
+ * `point-max' on any buffer at all. */
 static cl_object f_query(cl_object name, cl_object a, cl_object b) {
   long ia = (a == ECL_NIL) ? 0 : (long)ecl_to_fixnum(a);
   long ib = (b == ECL_NIL) ? 0 : (long)ecl_to_fixnum(b);
@@ -401,7 +491,7 @@ static cl_object f_query(cl_object name, cl_object a, cl_object b) {
   free(n);
   if (!src)
     return ECL_NIL;
-  cl_object form = ecl_read_from_cstring(src);
+  cl_object form = read_utf8(src);
   rs_free_string(src);
   return form;
 }
@@ -521,7 +611,7 @@ static cl_object f_highlight(cl_object lang, cl_object text) {
   free(t);
   if (!src)
     return ECL_NIL;
-  cl_object form = ecl_read_from_cstring(src);
+  cl_object form = read_utf8(src);
   rs_free_string(src);
   return form;
 }
@@ -603,14 +693,20 @@ static cl_object f_rpc_stop(cl_object conn) {
 
 /* The escaping half of the JSON encoder in `runtime/rpc.lisp'. Here rather than
  * there because the string it escapes most often is a whole buffer on its way
- * into a `textDocument/didChange'. */
+ * into a `textDocument/didChange'.
+ *
+ * serde leaves non-ASCII as itself rather than spelling it `\uXXXX', so the
+ * answer is UTF-8 and comes back through `utf8_string' like everything else. It
+ * used to come back as a base string and `json-string' in `runtime/rpc.lisp'
+ * had to undo that with `utf8-text' — a decode written in Lisp, in the file
+ * that could least afford to know about encodings. */
 static cl_object f_json_quote(cl_object text) {
   char *s = dup_utf8_or_empty(text);
   char *json = rs_json_quote(s);
   free(s);
   if (!json)
     return ecl_make_simple_base_string("\"\"", -1);
-  cl_object out = ecl_make_simple_base_string(json, -1);
+  cl_object out = utf8_string(json);
   rs_free_string(json);
   return out;
 }
@@ -659,10 +755,30 @@ static const char *PACKAGE_FORM =
  * reading the Rust side would; it is one FFI function and a query arm, and it is
  * worth doing the moment a third thing needs to know the path. */
 static const char *PATHS_FORM =
-    "(defun zemacs::zemacs-file (name)"
-    "  \"NAME inside ~/.zemacs.d/.\""
-    "  (merge-pathnames (concatenate 'string \".zemacs.d/\" name)"
-    "                   (user-homedir-pathname)))";
+    "(progn"
+    " (defun zemacs::zemacs-file (name)"
+    "   \"NAME inside ~/.zemacs.d/.\""
+    "   (merge-pathnames (concatenate 'string \".zemacs.d/\" name)"
+    "                    (user-homedir-pathname)))"
+    /* Where the *shipped* Lisp lives, as against where your config lives. The
+     * two were the same directory for as long as the config was the copy in the
+     * source tree; they are not once `init.lisp' is yours and sits in
+     * `~/.zemacs.d/', which has no themes/ or modes/ beside it. Booted from the
+     * environment for `zemacs-file's reason — a module loaded on its own by the
+     * test suite cannot depend on a config having been read first — and out of
+     * `$ZEMACS_RUNTIME' rather than a compiled-in path so that one binary can
+     * be pointed at a checkout, an install prefix or a bundle.
+     *
+     * NIL when unset, which is every test that spawns the image without the
+     * application around it. `init.lisp' falls back to its own directory there,
+     * and that is exactly right: the file being loaded by absolute path out of
+     * `runtime/' *is* next to the runtime. */
+    " (defparameter zemacs::*runtime-dir*"
+    "   (let ((d (ext:getenv \"ZEMACS_RUNTIME\")))"
+    "     (when (and d (plusp (length d)))"
+    "       (pathname (concatenate 'string (string-right-trim \"/\" d) \"/\"))))"
+    "   \"Directory of the shipped Lisp library, or NIL if the editor did not"
+    " say. See `runtime-file' in library.lisp.\"))";
 
 /* The readers. Each takes no arguments and forwards to %QUERY, so adding one is
  * a name here and an arm of the match in zemacs_core::query — nothing in C.
@@ -688,6 +804,7 @@ static const char *QUERIES_FORM =
     "              \"key-bindings\" \"command-list\" \"status\" \"face-list\""
     "              \"font-size\" \"tab-width\" \"text-width\" \"line-numbers-p\""
     "              \"relative-line-numbers-p\" \"line-overflow\""
+    "              \"scroll-past-end-p\""
     "              \"completion-style\" \"modeline-relief\" \"modeline-pad\""
     "     \"background\" \"foreground\"))"
     /* LET* so each closure captures its own binding: DOLIST is allowed to
@@ -809,6 +926,14 @@ static const char *LIBRARY_FORM =
     " (defun zemacs::delete-frame () (zemacs::%do \"delete-frame\" nil 0 0))"
     " (defun zemacs::select-frame (i) (zemacs::%do \"select-frame\" nil i 0))"
     " (defun zemacs::scroll-lines (n) (zemacs::%do \"scroll\" nil n 0))"
+    /* The one appearance setting that is a `defun' rather than a primitive: a
+     * bool fits the %DO envelope exactly, so it costs a line here instead of
+     * five places that can drift. Takes its argument the way the other setting
+     * writers do — one required value — which also keeps it out of the M-x
+     * list, since that publishes the zero-argument functions. */
+    " (defun zemacs::set-scroll-past-end (on)"
+    "   (zemacs::%do \"scroll-past-end\" nil (if on 1 0) 0)"
+    "   on)"
     /* The unnamed register, which `p' pastes from. */
     " (defun zemacs::copy-region (beg end &optional linewise)"
     "   (zemacs::%do (if linewise \"yank-lines\" \"yank\") nil beg end))"
@@ -820,7 +945,13 @@ static const char *LIBRARY_FORM =
      * function — they do the same thing, and this is the spelling Lisp can
      * call. */
     " (defun zemacs::magit (verb) (zemacs::%do \"git\" verb 0 0))"
-    " (defun zemacs::dired (verb) (zemacs::%do \"dired\" verb 0 0))"
+    /* dired also takes a directory where the other two take only a verb:
+     * `(dired \"/tmp\")' is the obvious spelling and was the one thing Lisp
+     * could not do — every verb acts on the directory dired is already in, and
+     * nothing from here could put it in one. The two are told apart on the far
+     * side, next to the verb list, rather than by sniffing the string here. */
+    " (defun zemacs::dired (verb-or-directory)"
+    "   (zemacs::%do \"dired\" verb-or-directory 0 0))"
     " (defun zemacs::terminal (verb) (zemacs::%do \"term\" verb 0 0))"
     " (defun zemacs::find-file-at (hit) (zemacs::%do \"open-at\" hit 0 0))"
 
@@ -937,6 +1068,23 @@ static const char *LIBRARY_FORM =
     "   (zemacs::%do \"completion-doc\" (and line (string line)) 0 0))"
     " (defun zemacs::completion-at () (zemacs::%query \"completion-at\" 0 0))"
     " (pushnew \"completion-at\" zemacs::*readers* :test #'string=)"
+    /* avy: hand the *next keystroke* to FUNCTION, as `(FUNCTION "a")'. No
+     * argument stops waiting.
+     *
+     * The key arrives spelled the way `key-bindings' spells one — "a", "SPC",
+     * "C-c", "<esc>" — so what counts as a label is decided up here and core
+     * keeps no label table it could disagree with. One key: the editor forgets
+     * before it calls, so nothing in the image can leave the keyboard captured,
+     * and a key that names no label is a cancel the caller is *told* about
+     * rather than a silent fall-through with the labels still on screen.
+     *
+     * Not `read-string' / `completing-read', which are the other way to get a
+     * keystroke and are the wrong one: those open a *prompt*, and a prompt draws
+     * a minibuffer and owns the keyboard. avy is one key pressed against the
+     * document. `runtime/modes/avy.lisp' is the caller. */
+    " (defun zemacs::grab-key (&optional function)"
+    "   (zemacs::%do \"grab-key\""
+    "                (and function (string-downcase (string function))) 0 0))"
     /* The one verb a scene needs. PAGE is a *printed* node — `(block :pad 48
      * (text (run \"hi\")))' — because a scene crosses the boundary as source,
      * like every other structure; NIL takes the page down and gives the buffer
@@ -1005,33 +1153,17 @@ static const char *LIBRARY_FORM =
     /* Literal string search, in the buffer's own offsets. No regexps: ECL ships
      * no regexp engine, and CL's `search' is what there is.
      *
-     * `buffer-string' arrives as a base string of UTF-8 *bytes* (see the
-     * ponytail note on f_query), and every offset the editor takes is a
-     * *character* index — so a raw `search' result would send `goto-char' into
-     * the middle of a codepoint on any buffer with an accent in it. The two
-     * helpers convert; on ASCII, which is nearly always, both are the identity.
-     * A continuation byte is 10xxxxxx and is not a character of its own. */
-    " (defun zemacs::%char-index (text i)"
-    "   (- i (count-if (lambda (c) (= 128 (logand (char-code c) 192)))"
-    "                  text :end i)))"
-    " (defun zemacs::%byte-index (text c)"
-    "   (or (loop with n = 0"
-    "             for i from 0 below (length text)"
-    "             unless (= 128 (logand (char-code (char text i)) 192))"
-    "               do (when (= n c) (return i)) (incf n))"
-    "       (length text)))"
+     * A bare `search' and no conversion either side of it, which is the whole
+     * dividend of `buffer-string' answering characters: an index into the text
+     * *is* an editor offset, and a pattern typed into a form is the same kind of
+     * string as the buffer it is looked for in. There were two helpers here,
+     * `%byte-index' and `%char-index', because neither of those was true. */
     " (defun zemacs::search-forward (pattern &optional start)"
-    "   (let* ((text (zemacs::buffer-string))"
-    "          (from (zemacs::%byte-index"
-    "                 text (min (or start (zemacs::point)) (zemacs::point-max))))"
-    "          (hit (search (string pattern) text :start2 from)))"
-    "     (when hit (zemacs::%char-index text hit))))"
+    "   (search (string pattern) (zemacs::buffer-string)"
+    "           :start2 (min (or start (zemacs::point)) (zemacs::point-max))))"
     " (defun zemacs::search-backward (pattern &optional start)"
-    "   (let* ((text (zemacs::buffer-string))"
-    "          (to (zemacs::%byte-index"
-    "               text (min (or start (zemacs::point)) (zemacs::point-max))))"
-    "          (hit (search (string pattern) text :from-end t :end2 to)))"
-    "     (when hit (zemacs::%char-index text hit))))"
+    "   (search (string pattern) (zemacs::buffer-string) :from-end t"
+    "           :end2 (min (or start (zemacs::point)) (zemacs::point-max))))"
     /* Built in Lisp and applied in *one* call, which is the whole lesson: N
      * separate edits would be N undo steps with N windows for a keystroke to
      * land in. Answers how many were replaced. */
@@ -1085,7 +1217,8 @@ static const char *LIBRARY_FORM =
      * the readers are: two lists that have to agree will eventually not. */
     " (dolist (n '(\"UNDO\" \"REDO\" \"SPLIT-WINDOW-RIGHT\" \"SPLIT-WINDOW-BELOW\""
     "              \"DELETE-WINDOW\" \"OTHER-WINDOW\" \"SELECT-WINDOW\" \"NEW-FRAME\""
-    "              \"DELETE-FRAME\" \"SELECT-FRAME\" \"SCROLL-LINES\" \"COPY-REGION\""
+    "              \"DELETE-FRAME\" \"SELECT-FRAME\" \"SCROLL-LINES\""
+    "              \"SET-SCROLL-PAST-END\" \"COPY-REGION\""
     "              \"SET-REGISTER\" \"PASTE\" \"MAGIT\" \"DIRED\" \"TERMINAL\""
     "              \"FIND-FILE-AT\" \"BUFFER-NAMES\" \"BUFFER-INDEX\""
     "              \"SWITCH-TO-BUFFER\" \"WITH-CURRENT-BUFFER\" \"SAVE-EXCURSION\""
@@ -1098,7 +1231,7 @@ static const char *LIBRARY_FORM =
     "              \"CREATE-BUFFER\" \"KILL-BUFFER\" \"SET-LANGUAGE\""
     "              \"SET-BUFFER-READ-ONLY\" \"CALL-WITH-INHIBITED-READ-ONLY\""
     "              \"WITH-INHIBITED-READ-ONLY\""
-    "              \"CALL-COMMAND\" \"TERM-SEND-KEY\"))"
+    "              \"CALL-COMMAND\" \"TERM-SEND-KEY\" \"GRAB-KEY\"))"
     "   (export (intern n \"ZEMACS\") \"ZEMACS\")))";
 
 /* --- overlays ------------------------------------------------------------ */
@@ -1116,8 +1249,9 @@ static const char *LIBRARY_FORM =
  * and `display' replace or recolour the cells a range covers; `image' puts a
  * bitmap over them; `scale', `weight' and `slant' say what *type* they are set
  * in; `line-background', `line-prefix', `gutter' and `fold' are about the lines
- * the range touches rather than about its cells. Everything else a config puts on
- * an overlay stops here.
+ * the range touches rather than about its cells. `help-echo' is the odd one and
+ * is sent down for a reason of its own — it draws nothing, and its reader is the
+ * mouse. Everything else a config puts on an overlay stops here.
  *
  * ponytail: an overlay the editor deletes on its own — because an edit swallowed
  * the text it was about — leaves its plist behind, a few conses per stale entry.
@@ -1201,6 +1335,20 @@ static const char *OVERLAY_FORM =
      * broken. `gutter' draws in the margin and moves nothing. */
     "       (:gutter"
     "        (zemacs::%do \"overlay-gutter\" (and value (string value)) ov 0))"
+    /* Emacs' `help-echo', and the only property in this CASE that draws
+     * nothing: it is what the pointer resting on this overlay says. Sent down
+     * rather than left in the plist above — which is where every undrawn
+     * property stops — because the reader is the *mouse*, and the mouse is in
+     * Rust: a motion event asking the image "what is under the pointer" would
+     * be a round trip on the one path that fires once per pixel. Here it is a
+     * scan of the overlays on one line, in core, costing nothing per pixel and
+     * a few nanoseconds per row crossed.
+     *
+     * A string, like every other payload here, and NIL takes it off. The full
+     * value stays in the plist above as well, so `overlay-get' still answers
+     * whatever was put — this arm is the copy the pointer can reach. */
+    "       (:help-echo"
+    "        (zemacs::%do \"overlay-help-echo\" (and value (string value)) ov 0))"
     /* The line property that changes how many rows there are: the lines after
      * the overlay's first one stop occupying rows at all. The renderer does
      * not draw them and `j' steps over them, which is code folding — and
@@ -1439,7 +1587,7 @@ void zemacs_boot(void) {
           0);
   /* Four arguments, and `%'-prefixed because of the fourth: `defprim' binds a
      fixed arity, so growing this one would have broken every config that calls
-     `dashboard-item' with the three it has always taken. init.lisp defines the
+     `dashboard-item' with the three it has always taken. library.lisp defines the
      three-or-four-argument `dashboard-item' over it, which is the same shape
      `%save-file' and `%make-marker' already have. */
   defprim("%DASHBOARD-ITEM", (cl_objectfn_fixed)f_dashboard_item, 4);
@@ -1493,16 +1641,22 @@ void zemacs_boot(void) {
 
 /* Strings are self-evaluating, so `(zemacs::f "...")` needs no QUOTE. Both
  * entry points funnel through Lisp helpers that HANDLER-CASE their body, and
- * cl_safe_eval is the backstop for anything that escapes that. */
+ * cl_safe_eval is the backstop for anything that escapes that.
+ *
+ * Both decode, and `zemacs_eval' is the one that matters: the source is READ
+ * inside `eval-string', so a base string would have `(message "λ")' from a
+ * keybinding arrive as the two Latin-1 characters its UTF-8 spells and put
+ * `Î»' in the status line. A path is decoded for the smaller version of the
+ * same reason — an accented directory in `~' is a real thing. */
 
 void zemacs_load_init(const char *path) {
-  cl_object form = cl_list(2, ecl_make_symbol("LOAD-INIT", "ZEMACS"),
-                           ecl_make_simple_base_string((char *)path, -1));
+  cl_object form =
+      cl_list(2, ecl_make_symbol("LOAD-INIT", "ZEMACS"), utf8_string(path));
   cl_safe_eval(form, ECL_NIL, ECL_NIL);
 }
 
 void zemacs_eval(const char *src) {
-  cl_object form = cl_list(2, ecl_make_symbol("EVAL-STRING", "ZEMACS"),
-                           ecl_make_simple_base_string((char *)src, -1));
+  cl_object form =
+      cl_list(2, ecl_make_symbol("EVAL-STRING", "ZEMACS"), utf8_string(src));
   cl_safe_eval(form, ECL_NIL, ECL_NIL);
 }

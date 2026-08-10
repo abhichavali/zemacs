@@ -18,9 +18,14 @@
 //! * **Where have I been** ([`recent`], [`remember`]): a persisted list so that
 //!   "switch project" is a prompt over real history rather than a path to type.
 //! * **What is in it, textually** ([`search`]): ripgrep, scoped to the root.
-//! * **How is it built** ([`Project::build`], [`Project::test`]): a program plus
-//!   arguments, never a shell string — a project living in `~/my code/thing`
-//!   must not need quoting to compile.
+//!
+//! **How it is built is no longer here.** `Marker::commands` was a `match`
+//! saying `cargo build` for a `Cargo.toml`, which meant a config could not
+//! change what `SPC p c` runs without recompiling the editor. That table is now
+//! `*project-builders*` in `runtime/plugins/project.lisp`, and the climb that
+//! reads it is the same rule [`find`] applies here — the two are kept in step
+//! by `crates/lisp/tests/project_plugin.rs`, which asserts them against the
+//! same trees this crate's own tests build.
 //!
 //! Nothing here prints, panics on bad input, or holds state between calls.
 //! "Nothing found" is an empty result; only a genuinely broken world (a root
@@ -93,77 +98,6 @@ impl Marker {
             Marker::Make => "Makefile",
         }
     }
-
-    /// One word for a modeline, where `.git` reads as a directory and `git`
-    /// reads as a fact about the project.
-    pub fn label(self) -> &'static str {
-        match self {
-            Marker::Explicit => "project",
-            Marker::Git => "git",
-            Marker::Mercurial => "hg",
-            Marker::Subversion => "svn",
-            Marker::Cargo => "cargo",
-            Marker::Npm => "npm",
-            Marker::Python => "python",
-            Marker::Go => "go",
-            Marker::Make => "make",
-        }
-    }
-
-    /// `(build, test)`, or `None` for a marker that says nothing about how the
-    /// code is built — every VCS one.
-    fn commands(self) -> Option<(Command, Command)> {
-        let (build, test) = match self {
-            Marker::Cargo => (("cargo", &["build"][..]), ("cargo", &["test"][..])),
-            Marker::Npm => (("npm", &["run", "build"][..]), ("npm", &["test"][..])),
-            // `python3`, not `python`: on a machine with both, `python` is
-            // either python 2 or missing entirely.
-            Marker::Python => (
-                ("python3", &["-m", "build"][..]),
-                ("python3", &["-m", "pytest"][..]),
-            ),
-            Marker::Go => (
-                ("go", &["build", "./..."][..]),
-                ("go", &["test", "./..."][..]),
-            ),
-            // No target for `make`: the default target is the build, and it is
-            // the one thing every Makefile has.
-            Marker::Make => (("make", &[][..]), ("make", &["test"][..])),
-            Marker::Explicit | Marker::Git | Marker::Mercurial | Marker::Subversion => return None,
-        };
-        Some((Command::new(build.0, build.1), Command::new(test.0, test.1)))
-    }
-}
-
-/// A program to spawn plus its arguments, deliberately *not* a shell string.
-///
-/// Handing a caller `"cargo test"` means the caller splits it, and splitting is
-/// where paths with spaces and arguments with quotes go wrong. Spawn
-/// [`Command::program`] with [`Command::args`] and there is nothing to escape.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Command {
-    pub program: String,
-    pub args: Vec<String>,
-}
-
-impl Command {
-    fn new(program: &str, args: &[&str]) -> Command {
-        Command {
-            program: program.to_string(),
-            args: args.iter().map(|a| a.to_string()).collect(),
-        }
-    }
-
-    /// For the echo area — "running: cargo test". Not for a shell: this is
-    /// space-joined, and a shell would re-split it wrongly.
-    pub fn display(&self) -> String {
-        let mut out = self.program.clone();
-        for arg in &self.args {
-            out.push(' ');
-            out.push_str(arg);
-        }
-        out
-    }
 }
 
 /// A project root and the reason it is one.
@@ -184,28 +118,6 @@ impl Project {
             .unwrap_or(self.root.as_os_str())
             .to_string_lossy()
             .into_owned()
-    }
-
-    /// What to run to build this project, to be spawned with [`Project::root`]
-    /// as the working directory. `None` when nothing in the root says how.
-    pub fn build(&self) -> Option<Command> {
-        Some(self.build_marker()?.commands()?.0)
-    }
-
-    /// What to run to test it. Same contract as [`Project::build`].
-    pub fn test(&self) -> Option<Command> {
-        Some(self.build_marker()?.commands()?.1)
-    }
-
-    /// The marker that describes how the project is *built*, which is usually
-    /// not the one that made it a root: a Cargo workspace is identified by its
-    /// `.git`, and `cargo build` is still the answer. Costs one `stat` per
-    /// build marker, and only when someone asks to compile.
-    fn build_marker(&self) -> Option<Marker> {
-        if BUILD.contains(&self.marker) {
-            return Some(self.marker);
-        }
-        marker_in(&self.root, &BUILD)
     }
 }
 
@@ -296,24 +208,9 @@ fn resolved(path: &Path) -> PathBuf {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The mapping is a table, and a table is worth pinning down so that a
-    /// mistyped `npm run build` is a test failure rather than a puzzled user.
-    #[test]
-    fn every_build_marker_names_a_program_and_no_vcs_marker_does() {
-        for marker in BUILD {
-            let (build, test) = marker.commands().expect("build marker has commands");
-            assert!(!build.program.is_empty(), "{marker:?}");
-            assert!(!test.program.is_empty(), "{marker:?}");
-        }
-        for marker in VCS.iter().chain(EXPLICIT.iter()) {
-            assert!(marker.commands().is_none(), "{marker:?}");
-        }
-        assert_eq!(Marker::Cargo.commands().unwrap().1.display(), "cargo test");
-        assert_eq!(Marker::Npm.commands().unwrap().0.display(), "npm run build");
-        assert_eq!(Marker::Make.commands().unwrap().0.display(), "make");
-    }
-}
+// The one unit test that lived here pinned down the build table — every build
+// marker names a program, no VCS marker does, and `npm run build` is spelled
+// exactly that. The table is `*project-builders*` in
+// `runtime/plugins/project.lisp` now, and so is the assertion: see
+// `every_builder_row_is_complete_and_no_root_marker_pretends_to_build` in
+// `crates/lisp/tests/project_plugin.rs`.

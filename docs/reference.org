@@ -87,8 +87,9 @@ an =end-of-line=.
 | =(search-backward pattern &optional start)= | H | Offset of the last =pattern= ending at or before =start=, or =NIL=. |
 
 Search is *literal*. ECL ships no regexp engine, so =cl:search= is what there is.
-Both helpers answer in character offsets even though the buffer arrives as UTF-8
-bytes, so the result feeds straight into =goto-char=.
+Buffer text and editor offsets are both counted in characters, so a hit feeds
+straight into =goto-char= and a pattern written into a form is the same kind of
+string as the buffer it is looked for in.
 
 =buffer-lines= is the line-oriented starting point, and exists because a rope
 counts the empty line after a trailing newline: =(line-count)= on ="a\nb\n"= is 3
@@ -356,8 +357,8 @@ a grammar added to the build brings its folding with it. org is in the alists
 because org has no grammar here and a headline is not a syntax node.
 
 =fold-ranges= answers *every* named node spanning more than one line, in **lines**
-rather than offsets — a fold hides whole lines, and asking in those units is what
-saves anyone converting bytes to characters. Picking among the nested ranges is
+rather than offsets — a fold hides whole lines, and asking in those units saves
+the caller converting an offset back to one. Picking among the nested ranges is
 the policy half: the innermost one covering point for "fold what I am in", the
 outermost ones for "show me the shape of the file". A buffer with no grammar
 answers =()=.
@@ -366,6 +367,10 @@ ponytail: no =folds.scm=. A fold query per grammar is more precise — it is how
 Neovim does it — and it is a file per language to write and keep in step with
 upstream. The imprecision costs a =z a= landing on something smaller than you
 meant (a multi-line argument list is a node too) and never costs a wrong fold.
+
+A run of =//= lines is *not* a fold: each is its own one-line node, and a comment
+block is a thing the reader would have to invent rather than read. A =/* … */=
+spanning lines is one node and does fold.
 
 ponytail: =fold-ranges= re-parses the buffer on each call. It runs on the Lisp
 thread, so nothing waits on it, and the press that asks is a press you made
@@ -427,7 +432,7 @@ another package are the same property.
 | =(latex-preview source)=  | P | An image handle for an =image= overlay property, or =NIL=.     |
 
 Together with overlays these are the whole of =org-latex-preview=, which is
-written in Lisp in =runtime/init.lisp= and is worth reading as the shape of a
+written in Lisp in =runtime/modes/org-latex.lisp= and is worth reading as the shape of a
 feature here: Rust finds the fragments and rasterises one, Lisp decides which
 ones and what to do with the result.
 
@@ -476,14 +481,14 @@ Two things to get right when calling it:
   list; =emacs-lisp= is =lisp= and =py= is =python=, and a name no grammar answers to
   simply gets an empty list back — the same answer a parse failure gives, so
   there is one case to handle and not three.
-- =TEXT= must be real characters. =buffer-substring= answers one character per
-  UTF-8 *byte* — the convention =docs/threading.org= writes up and the reason
-  =%char-index= exists — and handing that over unchanged makes the parser count a
-  longer string than the buffer holds, so every run after the first accented
-  character lands a byte or two to the right. =utf8-text= in
-  =runtime/modes/modes.lisp= is the decoder — every mode file and every mode test
-  loads that file, which is why it lives there — and its docstring is where the
-  whole story is written down.
+- =TEXT= is measured in characters and so are the offsets it answers, which is
+  the same unit =buffer-substring= hands out and the same unit =make-overlay=
+  takes — so a run's start is a buffer offset with nothing done to it. This used
+  to need saying at length: buffer text arrived as one Lisp character per UTF-8
+  *byte*, so handing it over unchanged made the parser count a longer string than
+  the buffer held and every run after the first accented character landed a byte
+  or two to the right. See =docs/boundary.org=, "The shim returns bytes, not
+  characters".
 
 The image is rasterised to match the text it sits in and placed against the
 *baseline*, so =$x_1$= hangs below the line the way a descender does. A fragment
@@ -495,7 +500,7 @@ shortfall, so =\begin{equation}= looks exactly as it did.
 
 ** Previewing without being asked
 
-An org buffer typesets itself. Two triggers, both policy in =runtime/init.lisp=
+An org buffer typesets itself. Two triggers, both policy in =runtime/modes/org-latex.lisp=
 and both chosen to keep a =latex= run off the keystroke path:
 
 - *entering =org-mode== — the buffer arrives typeset. Cold, that is one render per
@@ -707,7 +712,7 @@ stay valid:
 | =(with-current-buffer name &body body)= | H | Switch, run =body=, switch back. Answers =body='s value, or =NIL= if there is no such buffer. |
 | =(create-buffer name &optional language)= | H | A buffer with no file behind it. Shows it if it is already open. Answers =name=. |
 | =(kill-buffer &optional name)=          | H | Kill it, or the live one. =T=, or =NIL= and a message.  |
-| =(set-language &optional language)=     | H | What tree-sitter colours the live buffer as. =NIL= is plain text. |
+| =(set-language &optional language)=     | H | What tree-sitter colours the live buffer as. =(set-language nil)= is plain text; with *no* argument it asks, since it is declared =interactive=. |
 | =(set-buffer-read-only &optional on)=   | H | Refuse, or stop refusing, every edit to the live buffer. |
 | =(with-inhibited-read-only &body body)= | H | Run =body= able to write to a buffer a *mode* froze. |
 
@@ -873,6 +878,7 @@ top of the one hook above, and documented in that file's header and in
 | =(clear-commands)=                 | P | Empty the =M-x= list — call it before republishing.     |
 | =(command-list)=                   | R | What =M-x= currently offers.                             |
 | =(call-command name)=              | H | *Run* a command by name — the same resolution a key binding does. |
+| =(interactive name spec...)=       | L | Declare how =M-x= should get =name='s arguments. See below. |
 | =(term-send-key key)=              | H | Send one keystroke to the shell. Dropped if none is running. |
 
 =call-command= is the other half of =define-key=: it resolves =name= exactly as
@@ -883,6 +889,52 @@ called as =(name)= in the image. =(call-command "magit-status")= and a key bound
 =term-send-key= takes a key spelled the way =(key-bindings)= reports one — ="a"=,
 ="SPC"=, ="C-c"=, ="<esc>"=, ="M-<bs>"= — so the string read out of a binding is the
 string that can be sent. One token, never a sequence; an unspellable one reports.
+
+** =interactive= — a command that takes arguments
+
+=M-x= sends the name you picked into the image as =(name)=, with no arguments. So
+the list it offers is the functions for which that is a legal call: the
+zero-argument ones, and the ones that say how to *ask* for what they need.
+
+#+begin_src lisp
+(defun set-scale (n) ...)
+(interactive set-scale ("Font size: " :number))
+
+(set-scale 20)   ; from a config: called, unchanged
+(set-scale)      ; from M-x or a key: asks for `n', then calls
+#+end_src
+
+One spec per argument, in order. A spec is one of:
+
+| Spec   | Prompt                                                             |
+|--------+--------------------------------------------------------------------|
+| =:string= | Free text.                                                         |
+| =:number= | Free text, read as an integer. A non-number stops and says so.     |
+| /form/   | Evaluated when the prompt opens; the list of strings it answers are the completion candidates. Nothing is required to match. |
+
+Any of the three may be written =(LABEL SPEC)= to say what the prompt should read.
+Without a =LABEL= it is the parameter's own name, which is a good default and a
+poor prompt — every declaration in the shipped runtime overrides it.
+
+#+begin_src lisp
+(interactive load-theme          ("Theme: "    (theme-names)))
+(interactive set-language        ("Language: " *languages*))
+(interactive lsp-register-server ("Mode: " (mapcar #'car *lsp-language-ids*))
+                                 ("Program: " :string))
+#+end_src
+
+- Put it *directly under the =defun=*. It captures the function that is there when
+  it runs, so a config reload re-reads the =defun= and then re-wraps it.
+- The command runs *once, at the end, with everything*. Cancelling any prompt in
+  the chain runs nothing at all — the same rule [[file:threading.org][threading.org]] states for edits.
+- The dispatch is on *whether it was given any arguments*, which is this
+  editor's whole definition of "called interactively". A call that means
+  something with none of them passes =NIL= explicitly: =(set-language nil)=.
+- A key binding gets the same behaviour for free — =SPC t t= to a declared command
+  asks, exactly as =M-x= does, because both arrive as =(name)=.
+- It is a Lisp wrapper on =symbol-function= and nothing in core knows about it.
+  Arguments never travel through the =M-x= line: the candidate rows carry a
+  docstring and a key, so core takes the first *word* of a row as the name.
 
 ** =mode=
 
@@ -990,6 +1042,42 @@ questions.
 =C-n= / =C-p= / =C-y= / =C-e= in Insert mode), and it is only a consumer: nothing in
 these three forms knows what a language server is, so a completion source over
 the buffer's own words, or over a REPL's symbols, is Lisp and nothing else.
+
+** One keystroke
+
+=(grab-key 'my-function)= says "the next key is mine". Whatever is pressed next
+does not reach the editor at all; it arrives as =(my-function "a")=, spelled the
+way =key-bindings= spells a key — ="a"=, ="SPC"=, ="C-c"=, ="<esc>"=. =(grab-key)=
+with no argument stops waiting.
+
+The third surface of the same shape as the two above, and the one with nothing to
+draw: which-key has a panel and completion has a popup, and this has only the
+keyboard, because whatever the key is *for* is already on screen as overlays you
+put there. =runtime/modes/avy.lisp= is the shipped consumer and the whole of it.
+
+Two things about it are the design rather than details:
+
+- *The key that is not yours arrives too.* An =Esc=, an arrow, a letter you did
+  not label — all of them come to your function, which is what makes cancelling
+  something you cannot forget to do. A transient keymap is the obvious
+  alternative and cannot say this: it catches the keys that are in it, and the
+  rest fall through and edit the buffer under whatever you drew.
+- *It is one key, and the editor forgets before it calls.* There is no mode to
+  leave and no way to be left holding the keyboard, so the worst a broken handler
+  can do is drop one keystroke.
+
+Not =read-string=: that opens a *prompt*, and a prompt draws a minibuffer and owns
+the keyboard. This is a key pressed against the document, with the document still
+on screen.
+
+#+begin_src lisp
+(defun pick-a-letter ()
+  (message "press something")
+  (grab-key 'saw-it))
+
+(defun saw-it (key)                    ; not a command — the editor calls it
+  (message (format nil "you pressed ~a" key)))
+#+end_src
 
 #+begin_src lisp
 (where-is "find-file")
@@ -1126,13 +1214,14 @@ Every setting now has both halves. Writers are primitives, readers are readers.
 | =(set-tab-width n)=                     | =(tab-width)=                 | Clamped 1–16.                     |
 | =(set-text-width n)=                    | =(text-width)=                | Columns to hold the text column to, centred in the pane — =olivetti-mode=. =0= is off and means the pane's full width. Claimed by =org-mode= at 80. |
 | =(set-line-overflow mode)=              | =(line-overflow)=             | ="truncate"= or ="wrap"=.            |
+| =(set-scroll-past-end on)=              | =(scroll-past-end-p)=         | Whether the view may keep going after the last line, into empty rows — vim's =~= filler, VSCode's =scrollBeyondLastLine=. *On.* Nothing is inserted: the buffer is untouched, point cannot go there, the gutter numbers none of it and a click in it is =point-max=. The last line stops on the *top* row. Generated buffers (dired, magit, a terminal, the dashboard) keep the full-pane clamp whatever this says. |
 | =(set-completion-style style)=          | =(completion-style)=          | ="minibuffer"=, ="bottom"=, ="center"=. |
 | =(set-modeline-relief n)=               | =(modeline-relief)=           | Emacs' =:box :line-width=. Signed: positive raises, negative *sinks*. Clamped ±16. |
 | =(set-modeline-pad n)=                  | =(modeline-pad)=              | Pixels. Clamped 0–64.             |
 
 Anything =NIL= is false and only =NIL= is false, as in Lisp.
 
-The two face writers are almost always wanted together, so =init.lisp= defines
+The two face writers are almost always wanted together, so =library.lisp= defines
 =(set-face name rgb &key bold italic)= over them — a =defun=, not a third primitive.
 That is the whole reason the editor learned only one new verb for weight.
 
@@ -1180,7 +1269,7 @@ app layer, which does the work and feeds the result back as buffer text.
 | Form                   |    | Verbs                                                        |
 |------------------------+----+--------------------------------------------------------------|
 | =(magit verb)=           | HA | ="status"= ="stage"= ="unstage"= ="stage-all"= ="unstage-all"= ="commit"= ="commit-finish"= ="push"= ="pull"= ="refresh"= |
-| =(dired verb)=           | HA | ="open"= ="up"= ="enter"= ="mark"= ="unmark"= ="toggle-marks"= ="flag-delete"= ="execute"= ="rename"= ="copy"= ="mkdir"= ="toggle-hidden"= ="refresh"= |
+| =(dired verb-or-directory)= | HA | ="open"= ="up"= ="enter"= ="mark"= ="unmark"= ="toggle-marks"= ="flag-delete"= ="execute"= ="rename"= ="copy"= ="mkdir"= ="create-file"= ="toggle-hidden"= ="refresh"= — or a *directory* to list, ="~/"= expanded |
 | =(terminal verb)=        | HA | ="open"= ="new"= ="close"= ="restart"= ="next"= ="prev"= ="normal"= ="insert"= ="run:NAME:COMMAND"= ="rerun:NAME:COMMAND"= |
 | =(term-send-key key)=    | HA | One keystroke, spelled as =(key-bindings)= spells one.        |
 
@@ -1336,6 +1425,7 @@ would be aliases for the one that already is the clipboard.
 | =(completion-show &optional at index)= | H | Put the in-buffer completion popup at offset =at= with row =index= lit; no argument takes it down. |
 | =(completion-row &optional row)= | H | Append one candidate; no argument empties the list. |
 | =(completion-at)=   | R | Where the *live* popup is anchored, or NIL.              |
+| =(grab-key &optional function)= | H | The *next* keystroke goes to =function= as =(function "a")= instead of to the editor; no argument stops waiting. |
 | =(quit)=            | P | Quit the editor.                                         |
 
 =message= takes a string, so =format= does the work:
@@ -1346,7 +1436,7 @@ would be aliases for the one that already is the clipboard.
 
 =(messages)= is the log behind =*Messages*=: the status line only ever shows the
 last one, so this is the only record that a message which was immediately
-replaced was ever produced at all. =runtime/init.lisp= puts it in a buffer with
+replaced was ever produced at all. =runtime/library.lisp= puts it in a buffer with
 =messages-buffer=, bound to =SPC h m= and written in five lines over
 =create-buffer= — there is nothing in Rust behind it.
 
@@ -1521,7 +1611,7 @@ It fires at most once per keystroke, in every buffer, so a function on it gets
 the same budget the change hook has: a constant amount of work, or a cheap test
 that decides whether to do any. A buffer rescan here is felt. It carries no
 *previous* position either — a config that wants to act on the range you left
-has to remember it, which is what =org-latex-maybe-preview= in =init.lisp= does
+has to remember it, which is what =org-latex-maybe-preview= in =modes/org-latex.lisp= does
 with one integer.
 
 * The escape hatch

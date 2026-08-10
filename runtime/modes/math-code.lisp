@@ -938,7 +938,7 @@ line below is."
 
 ;;; `math-code-build-poll' is machinery rather than a verb: it is on a hook and
 ;;; running it by hand does nothing you can see. `*hidden-commands*' is
-;;; `init.lisp''s existing answer to exactly that, and is why this is declared
+;;; `library.lisp''s existing answer to exactly that, and is why this is declared
 ;;; here rather than renamed with a `%' it would then share with the internals.
 (when (boundp '*hidden-commands*)
   (pushnew "math-code-build-poll" *hidden-commands* :test #'string=))

@@ -12,12 +12,11 @@
 ;;;; this buffer, but its tree is not reachable from Lisp and would not answer
 ;;;; "which paren closes this one" any faster than counting does.
 ;;;;
-;;;; Offsets are the awkward part, and the only part. `buffer-string' hands out
-;;;; UTF-8 *bytes* in a base string while every offset the editor takes is a
-;;;; *character*, so the scanners work in bytes and `%char-index' /
-;;;; `%byte-index' convert at the edges. On ASCII — which Lisp source almost
-;;;; always is — both are the identity, and they are the same two helpers
-;;;; `search-forward' has always used.
+;;;; Offsets used to be the awkward part. `buffer-string' handed out UTF-8
+;;;; *bytes* while every offset the editor takes is a *character*, so the
+;;;; scanners worked in bytes and `%char-index' / `%byte-index' converted at
+;;;; every edge. Both are gone: an index into `(buffer-string)' is an editor
+;;;; offset, and a scanner's answer goes straight to `goto-char'.
 
 (in-package :zemacs)
 
@@ -93,22 +92,22 @@ reason this exists — `#\\(' opens no list and `\";)\"' closes none."
 
 (defmacro %with-lisp-scan ((text classes here) &body body)
   "Bind TEXT to the buffer, CLASSES to its syntax classes and HERE to point —
-all in *byte* offsets, which is the space `buffer-string' hands out. Anything
-going back to the editor converts with `%char-index'."
+all in the one offset space the editor and `buffer-string' share, so an answer
+goes back to `goto-char' or `replace-region' as it is."
   `(let* ((,text (buffer-string))
           (,classes (%lisp-classes ,text))
-          (,here (%byte-index ,text (point))))
+          (,here (point)))
      ,@body))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Moving over expressions
 ;;;
-;;; Every one of these takes and answers a byte index, and answers NIL rather
-;;; than erroring when there is nothing there — the same contract every reader
-;;; in this editor has.
+;;; Every one of these takes and answers a character index — the editor's own
+;;; offset — and answers NIL rather than erroring when there is nothing there,
+;;; which is the contract every reader in this editor has.
 
 (defun %blank-at-p (text classes i)
-  "True when byte I is whitespace that is not inside anything, or comment."
+  "True when I is whitespace that is not inside anything, or comment."
   (let ((k (aref classes i)))
     (or (eq k :comment)
         (and (eq k :code) (member (char text i) *lisp-whitespace*)))))
@@ -228,7 +227,7 @@ lands, and which is what makes `kill-sexp' after it take the whole thing."
         (when start (%with-prefixes text classes start))))))
 
 (defun %toplevel-form (text classes at)
-  "(START . END) in bytes of the outermost form AT is inside, or — at top level
+  "(START . END) of the outermost form AT is inside, or — at top level
 — of the last complete form before it. NIL when there is neither.
 
 The fallback is what makes `C-c C-c' after a form do what it does in Emacs:
@@ -255,7 +254,7 @@ point sitting on the blank line under a `defun' still means that `defun'."
   (%with-lisp-scan (text classes here)
     (let ((end (%sexp-end text classes here)))
       (if end
-          (goto-char (%char-index text end))
+          (goto-char end)
           (message "no expression forward")))))
 
 (defun lisp-backward-sexp ()
@@ -263,7 +262,7 @@ point sitting on the blank line under a `defun' still means that `defun'."
   (%with-lisp-scan (text classes here)
     (let ((start (%sexp-start text classes here)))
       (if start
-          (goto-char (%char-index text start))
+          (goto-char start)
           (message "no expression backward")))))
 
 (defun lisp-match-paren ()
@@ -280,7 +279,7 @@ you were about to ask next."
                       (%list-start text classes here))
                      (t (%enclosing-open text classes here)))))
       (if to
-          (goto-char (%char-index text to))
+          (goto-char to)
           (message "no matching parenthesis")))))
 
 (defun lisp-kill-sexp ()
@@ -289,7 +288,7 @@ and `p' somewhere else is how an expression is moved."
   (%with-lisp-scan (text classes here)
     (let ((end (%sexp-end text classes here)))
       (if end
-          (let ((a (%char-index text here)) (b (%char-index text end)))
+          (let ((a here) (b end))
             (copy-region a b)
             (delete-region a b))
           (message "no expression to kill")))))
@@ -306,7 +305,7 @@ undo step and no keystroke can land in the middle of a list with no end."
            (close (and end (1- end)))
            (after (and end (%sexp-end text classes end))))
       (if after
-          (replace-region (%char-index text close) (%char-index text after)
+          (replace-region close after
                           (concatenate 'string
                                        (subseq text end after)
                                        (string (char text close))))
@@ -323,8 +322,8 @@ the answer would be an empty list and a stranded form."
            (close (and end (1- end)))
            (last (and close (%sexp-start text classes close))))
       (if (and last (> last (1+ open)))
-          (replace-region (%char-index text (%skip-blanks-back text classes last))
-                          (%char-index text end)
+          (replace-region (%skip-blanks-back text classes last)
+                          end
                           (concatenate 'string (string (char text close)) " "
                                        (subseq text last close)))
           (message "nothing to barf")))))
@@ -412,7 +411,7 @@ it."
     (coerce (nreverse out) 'vector)))
 
 (defun %line-of (starts i)
-  "The 1-based line byte I is on."
+  "The 1-based line offset I is on."
   (let ((lo 0) (hi (1- (length starts))))
     (loop while (< lo hi)
           do (let ((mid (ceiling (+ lo hi) 2)))
@@ -429,7 +428,7 @@ its enclosing form the line at BOL is about to be."
     n))
 
 (defun %lisp-indent-anchor (text classes bol)
-  "Where the line starting at byte BOL takes its indentation from, as
+  "Where the line starting at BOL takes its indentation from, as
 (ANCHOR . OFFSET) meaning ANCHOR's column plus OFFSET. NIL at top level.
 
 Four cases, and they are the whole of Lisp indentation:
@@ -519,8 +518,8 @@ look at the text twice."
                    (setf (gethash i deltas) (- want have))
                    (push (cons want (subseq content have)) rows)))
         (replace-region
-         (%char-index text (aref starts (1- from)))
-         (%char-index text (if (< to lines) (1- (aref starts to)) n))
+         (aref starts (1- from))
+         (if (< to lines) (1- (aref starts to)) n)
          (format nil "~{~a~^~%~}"
                  (mapcar (lambda (row)
                            (concatenate 'string

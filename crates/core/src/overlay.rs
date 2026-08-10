@@ -175,6 +175,24 @@ pub struct Overlay {
     /// and stealing a column of text would be the bug this property was added to
     /// fix.
     pub gutter: Option<String>,
+    /// What the pointer resting on this overlay says — Emacs' `help-echo`,
+    /// spelled the same way and meaning the same thing.
+    ///
+    /// The one property here that is **not drawn**. Everything else on this
+    /// struct is a fact about pixels the renderer needs every frame; this is a
+    /// fact about *the pointer*, read once when it stops somewhere, and it is on
+    /// the overlay rather than in a table of its own for the reason the mark is:
+    /// an overlay slides when you type above it and dies with the text it was
+    /// about, so a message hung here cannot come to describe a different line.
+    /// The alternative — core asking Lisp "what is at line 40" on hover — is a
+    /// round trip on the one path that must not have one, and it re-derives from
+    /// a table what the overlay already knows.
+    ///
+    /// Not `display`, which replaces the cells it covers, and not an
+    /// `after-string`, which does not exist and would be the wrong shape anyway:
+    /// a hover message is transient and lives at the pointer, and an
+    /// `after-string` is permanent and lives at the end of a line.
+    pub help_echo: Option<String>,
     /// **Hide the lines after this overlay's first one.** The one payload here
     /// that is about *lines* rather than about cells, and the whole of code
     /// folding: everything else an overlay carries replaces some characters with
@@ -203,6 +221,7 @@ impl Overlay {
             line_background: None,
             line_prefix: None,
             gutter: None,
+            help_echo: None,
             fold: false,
         }
     }
@@ -264,6 +283,9 @@ pub enum OverlayEdit {
     /// A mark in the gutter, which unlike [`OverlayEdit::LinePrefix`] leaves the
     /// text where it is.
     Gutter(OverlayId, Option<String>),
+    /// What the pointer resting on this overlay says. See [`Overlay::help_echo`]
+    /// — the one attribute here that changes no pixel until a mouse asks.
+    HelpEcho(OverlayId, Option<String>),
     /// Fold, or unfold, the lines after this overlay's first one.
     Fold(OverlayId, bool),
     Delete(OverlayId),
@@ -327,6 +349,7 @@ impl Overlays {
             | OverlayEdit::LineBackground(id, _)
             | OverlayEdit::LinePrefix(id, _)
             | OverlayEdit::Gutter(id, _)
+            | OverlayEdit::HelpEcho(id, _)
             | OverlayEdit::Fold(id, _) => id,
         };
         let Some(o) = self.live.iter_mut().find(|o| o.id == id) else {
@@ -345,6 +368,7 @@ impl Overlays {
             OverlayEdit::LineBackground(_, k) => o.line_background = k,
             OverlayEdit::LinePrefix(_, s) => o.line_prefix = s,
             OverlayEdit::Gutter(_, s) => o.gutter = s,
+            OverlayEdit::HelpEcho(_, s) => o.help_echo = s,
             OverlayEdit::Fold(_, f) => o.fold = f,
             OverlayEdit::Delete(_) | OverlayEdit::RemoveIn(..) => unreachable!("returned above"),
         }

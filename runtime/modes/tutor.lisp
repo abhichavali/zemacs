@@ -100,7 +100,7 @@
 ;;;; `%org-property' and the org-mode body itself), `modes.lisp' (for
 ;;;; `define-minor-mode'), `repl.lisp' (for `%eval-source', `%condition-string'
 ;;;; and `%repl-print') and `ai.lisp' (for `executable-find', which this file
-;;;; guards with `fboundp'). It is loaded after all four in `init.lisp'.
+;;;; guards with `fboundp'). It is listed after all four in `*runtime-modules*'.
 
 (in-package :zemacs)
 
@@ -1202,6 +1202,83 @@ brings them back, at the contents, with everything you typed still in them."
   (message "tutor: progress cleared"))
 
 ;;; ---------------------------------------------------------------------------
+;;; Marking the marker
+;;;
+;;; Every exercise carries the answer it is waiting for, and this runs the lot:
+;;; the `:answer' must pass its own `:check' and the `:template' must not. Both
+;;; halves are the point. An answer that no longer passes is a lesson teaching
+;;; something the editor stopped doing; a template that passes is an exercise
+;;; that hands itself in, and the first build of this file shipped two of those.
+;;;
+;;; This used to be a sweep somebody ran by hand after adding a lesson, and a
+;;; sweep run by hand is a sweep that rots. `crates/lisp/tests/tutor.rs' calls
+;;; it and insists on NIL, so `cargo test' now runs it — which is the only
+;;; version of this check that stays true. Running it yourself at the REPL while
+;;; writing a lesson is still the fast way round: it answers a list of
+;;; complaints, one string each, and takes about ten seconds, nearly all of it
+;;; Stage 1's ninety child `ecl's.
+;;;
+;;; The template is run *before* the answer, and that ordering is load-bearing
+;;; for Stage 2: an answer that publishes `tutor-hello' to M-x or registers
+;;; `tutor-demo-mode' leaves the editor changed, and the same exercise's template
+;;; run afterwards would inherit the change and pass for a reason that has
+;;; nothing to do with the template.
+
+(defun %tutor-audit-run (stage source check)
+  "SOURCE marked against CHECK the way STAGE asks, from a known starting point.
+
+Stage 2's exercises write in the scratch buffer and hang overlays on it, and
+several of them care what is there — the folding lesson needs four lines and the
+`writers' lesson replaces the whole buffer with one. So the buffer is put back
+before every run, which is also what makes the sweep independent of the order it
+walks in. `tutor-reset-playground' is the same three lines with a `message' on
+the end, and a hundred and thirty-eight of those would bury the complaints.
+
+ponytail: putting the buffer back is also what stops this seeing an exercise
+whose template passes only *after* some other lesson has rearranged the scratch
+buffer — `readers' 1 asks for the current line and its template answers the
+whole buffer, which are the same string once `writers' 2 has replaced the buffer
+with one line. Nobody meets that going forwards, since `readers' is the earlier
+lesson. Catching it would mean sweeping every ordering, and the upgrade path if
+it ever matters is to sweep each stage a second time without the reset."
+  (when (eq (getf stage :check) :image)
+    (%tutor-ensure-playground)
+    (with-current-buffer *tutor-playground*
+      (remove-overlays)
+      (replace-region 0 (point-max) (%tutor-playground-text))
+      (goto-char 0)))
+  (%tutor-run stage source check))
+
+(defun %tutor-audit ()
+  "Check every exercise against its own answer and its own template. Answers a
+list of complaints, one string each, and NIL when the tutorial is sound."
+  (let ((bad nil))
+    (dolist (stage *tutor-stages* (nreverse bad))
+      (dolist (lesson (getf stage :lessons))
+        (loop for exercise in (%tutor-exercises lesson)
+              for index from 0
+              for where = (format nil "~a/~a/~d"
+                                  (getf stage :id) (getf lesson :id) (1+ index))
+              do (when (eq (car (%tutor-audit-run stage
+                                                  (getf exercise :template)
+                                                  (getf exercise :check)))
+                           :pass)
+                   (push (format nil "~a: the template already passes" where) bad))
+                 (let ((answer (getf exercise :answer)))
+                   (if (null answer)
+                       (push (format nil "~a: no :answer, so the check is unchecked"
+                                     where)
+                             bad)
+                       (let ((verdict (%tutor-audit-run stage answer
+                                                        (getf exercise :check))))
+                         (unless (eq (car verdict) :pass)
+                           (push (format nil "~a: the answer ~(~a~)~@[ — ~a~]"
+                                         where (car verdict)
+                                         (and (cdr verdict)
+                                              (%tutor-one-line-short (cdr verdict))))
+                                 bad))))))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; The way in
 
 (defvar *tutor-loaded* nil
@@ -1318,7 +1395,7 @@ command is a toggle, so re-rendering would switch the motions off."
 
 ;;; The progress file's two doors are nouns rather than verbs — `M-x' is a list
 ;;; of things to run, and running either of these by hand does nothing you can
-;;; see. `*hidden-commands*' is `init.lisp''s existing answer to exactly this.
+;;; see. `*hidden-commands*' is `library.lisp''s existing answer to exactly this.
 (when (boundp '*hidden-commands*)
   (dolist (name '("tutor-save-progress" "tutor-load-progress"))
     (pushnew name *hidden-commands* :test #'string=)))
@@ -1347,6 +1424,7 @@ command is a toggle, so re-rendering would switch the motions off."
 ;;;
 ;;;   (:prompt   "what to do"
 ;;;    :template "code to start from — runnable, and wrong"
+;;;    :answer   "one answer that is right; never shown to the student"
 ;;;    :check    (equal value '(1 2 3))
 ;;;    :hint     "one sentence, shown on C-c C-h")
 ;;;
@@ -1367,9 +1445,18 @@ command is a toggle, so re-rendering would switch the motions off."
 ;;; with one argument missing — the template is a comment saying what to write,
 ;;; which evaluates to nothing and fails just as usefully.
 ;;;
-;;; Both halves of that are worth checking when a lesson is added, and the way
-;;; to check them is the way `crates/lisp/tests/tutor.rs' does: run the template
-;;; against the check and make sure it does *not* pass.
+;;; `:answer' is *not* the hint and the student never sees it. It exists so that
+;;; both halves of the paragraph above can be checked by a machine: `%tutor-audit'
+;;; runs every answer against its own check and insists it passes, and every
+;;; template against the same check and insists it does not. Nothing else reads
+;;; it. It is one answer and not the answer — the checks are written over the
+;;; *value*, so a student's route to it is their own.
+;;;
+;;; So the rule when adding an exercise is: write the check, write a template
+;;; that fails it, write an answer that passes it, and run `(%tutor-audit)'. It
+;;; is also what `crates/lisp/tests/tutor.rs' does on every `cargo test', which
+;;; is why an exercise that stops working now breaks a build rather than waiting
+;;; to be noticed by a beginner.
 
 (defparameter *tutor-stage-1*
   '(:id "cl"
@@ -1433,6 +1520,7 @@ looking for one."
 "Answer the number of elements in the list the reader makes from the text
 \"(+ 1 2)\". Do not count them by eye — call the reader and ask the list."
         :template "(read-from-string \"(+ 1 2)\")"
+        :answer "(length (read-from-string \"(+ 1 2)\"))"
         :check (eql value 3)
         :hint "`length' takes a list. `read-from-string' answers one.")
        (:prompt
@@ -1440,6 +1528,7 @@ looking for one."
 symbol whose name is \"+\", so answering the character or the string will
 not do."
         :template "(first (read-from-string \"(1 2 3)\"))"
+        :answer "(first (read-from-string \"(+ 1 2)\"))"
         :check (and (symbolp value) (string= (symbol-name value) "+"))
         :hint "`first' — or `car', which is the same function under an older name.")
        (:prompt
@@ -1447,6 +1536,7 @@ not do."
 two spellings of the same symbol and asking whether the results are =eq= —
 that is, the very same object in memory, not merely equal."
         :template "(eq (read-from-string \"foo\") (read-from-string \"bar\"))"
+        :answer "(eq (read-from-string \"foo\") (read-from-string \"FOO\"))"
         :check (eq value t)
         :hint "The reader upcases. What else, besides \"foo\", reads as FOO?")))
 
@@ -1504,12 +1594,14 @@ and knowing which you want is most of knowing what quoting is for."
 "Make =value= the three-element *list* whose elements are the symbol +, the
 number 1 and the number 2 — not the number 3."
         :template "(+ 1 2)"
+        :answer "'(+ 1 2)"
         :check (equal value '(+ 1 2))
         :hint "One character in front of the form is enough.")
        (:prompt
 "Now go the other way. Starting from that list as data, produce the number
 3 — without typing 3 anywhere."
         :template "'(+ 1 2)"
+        :answer "(eval '(+ 1 2))"
         :check (eql value 3)
         :hint "There is a function that takes a form and runs it.")
        (:prompt
@@ -1517,6 +1609,7 @@ number 1 and the number 2 — not the number 3."
 =quote= together. The point is to feel where evaluation stops: =list=
 evaluates its arguments, so each symbol has to be protected on its own."
         :template "(list 'a 1 'b 2)"
+        :answer "(list 'a 1 (list 'b 2))"
         :check (equal value '(a 1 (b 2)))
         :hint "The third element is itself a list. `list' can make that too.")))
 
@@ -1580,12 +1673,14 @@ everything after the first cell."
 "Make the list (1 2 3) using nothing but =cons= and =nil=. The template
 below builds a one-element list; extend it."
         :template "(cons 1 nil)"
+        :answer "(cons 1 (cons 2 (cons 3 nil)))"
         :check (equal value '(1 2 3))
         :hint "Three cells. The cdr of each one is the rest of the list.")
        (:prompt
 "Now make something that is *not* a list: a single cons cell whose car is 1
 and whose cdr is 2."
         :template "(list 1 2)"
+        :answer "(cons 1 2)"
         :check (and (consp value) (eql (car value) 1) (eql (cdr value) 2)
                     (not (listp (cdr value))))
         :hint "One call, two arguments, and neither of them NIL.")
@@ -1594,6 +1689,8 @@ and whose cdr is 2."
 passes — recursion, =loop=, =reduce= — as long as it does not call
 =length=. It must answer 0 for the empty list."
         :template "(defun my-length (xs) 1)"
+        :answer "(defun my-length (xs)
+  (if (null xs) 0 (1+ (my-length (rest xs)))))"
         :check (and (= (my-length '()) 0)
                     (= (my-length '(a)) 1)
                     (= (my-length '(a b c d)) 4))
@@ -1654,12 +1751,14 @@ inside a function call, inside another =let=, as the body of a =defun=."
 =let= will not have it. Fix it so the whole thing answers 3, changing as
 little as possible."
         :template "(let ((a 1) (b (+ a 1))) (+ a b))"
+        :answer "(let* ((a 1) (b (+ a 1))) (+ a b))"
         :check (eql value 3)
         :hint "One character.")
        (:prompt
 "Shadowing. Bind x to 1, then in an inner scope bind it to 10, and answer
 the cons cell (INNER . OUTER) — proving the outer binding survived."
         :template "(let ((x 1)) (cons x x))"
+        :answer "(let ((x 1)) (cons (let ((x 10)) x) x))"
         :check (equal value '(10 . 1))
         :hint "The inner `let' is an expression, so it can be the first argument to `cons'.")
        (:prompt
@@ -1667,6 +1766,7 @@ the cons cell (INNER . OUTER) — proving the outer binding survived."
 =incf= (which you will meet properly in lesson 11), and answer it — all
 inside one =let=."
         :template "(let ((total 0)) total)"
+        :answer "(let ((total 0)) (incf total 5) (incf total 5) total)"
         :check (and (integerp value) (> value 0))
         :hint "`(incf total 5)' adds 5 to total. Two of those, then `total'.")))
 
@@ -1745,6 +1845,7 @@ lived with both."
 it in Fahrenheit: multiply by 9/5 and add 32. The check calls it three
 times, so a function that only gets one case right will not pass."
         :template "(defun celsius->fahrenheit (c) c)"
+        :answer "(defun celsius->fahrenheit (c) (+ 32 (* c 9/5)))"
         :check (and (= (celsius->fahrenheit 0) 32)
                     (= (celsius->fahrenheit 100) 212)
                     (= (celsius->fahrenheit -40) -40))
@@ -1754,6 +1855,10 @@ times, so a function that only gets one case right will not pass."
 number held between them. Use =return-from= at least once, for the practice
 — though nothing checks that you did."
         :template "(defun clamp (x lo hi) x)"
+        :answer "(defun clamp (x lo hi)
+  (when (< x lo) (return-from clamp lo))
+  (when (> x hi) (return-from clamp hi))
+  x)"
         :check (and (= (clamp 5 0 10) 5) (= (clamp -3 0 10) 0) (= (clamp 99 0 10) 10))
         :hint "`return-from' takes the block name — which is the function's name — then a value.")
        (:prompt
@@ -1761,6 +1866,8 @@ number held between them. Use =return-from= at least once, for the practice
 its argument, then, in a =let= that binds the *variable* f to 10, answer the
 two-element list ((f 4) f)."
         :template "(progn (defun f (x) (* 2 x)) (list (f 4) 4))"
+        :answer "(progn (defun f (x) (* 2 x))
+       (let ((f 10)) (list (f 4) f)))"
         :check (equal value '(8 10))
         :hint "Nothing clever is needed. Write it as it reads and it works.")))
 
@@ -1827,6 +1934,8 @@ it is a simplification."
 "Define =greet= taking a name and an optional greeting that defaults to
 \"hello\", answering the two joined by \", \"."
         :template "(defun greet (name &optional greeting) name)"
+        :answer "(defun greet (name &optional (greeting \"hello\"))
+  (concatenate 'string greeting \", \" name))"
         :check (and (string= (greet "ada") "hello, ada")
                     (string= (greet "ada" "hi") "hi, ada"))
         :hint "A default goes in a list beside the parameter name.")
@@ -1834,6 +1943,7 @@ it is a simplification."
 "Define =make-point= taking keyword parameters x and y, each defaulting to
 0, and answering them as a cons cell (X . Y)."
         :template "(defun make-point (x y) (cons x y))"
+        :answer "(defun make-point (&key (x 0) (y 0)) (cons x y))"
         :check (and (equal (make-point) '(0 . 0))
                     (equal (make-point :y 3) '(0 . 3))
                     (equal (make-point :x 1 :y 2) '(1 . 2)))
@@ -1842,6 +1952,7 @@ it is a simplification."
 "Define =total=, taking any number of numbers and answering their sum. It
 must answer 0 when called with none."
         :template "(defun total (a b) (+ a b))"
+        :answer "(defun total (&rest numbers) (apply #'+ numbers))"
         :check (and (= (total) 0) (= (total 7) 7) (= (total 1 2 3) 6))
         :hint "&rest gives you a list. `apply' calls a function with a list of arguments.")))
 
@@ -1916,6 +2027,7 @@ are there because the bug happened."
 "Make =value= a function of one argument that adds 5 to it. Do not use
 =defun= — the answer is an expression whose value is a function."
         :template "(lambda (x) x)"
+        :answer "(lambda (x) (+ x 5))"
         :check (and (functionp value) (= (funcall value 1) 6) (= (funcall value 0) 5))
         :hint "The template is already the right shape. Change the body.")
        (:prompt
@@ -1923,6 +2035,8 @@ are there because the bug happened."
 answers 1 the first time it is called, 2 the second time, and so on. Two
 counters made separately must not interfere."
         :template "(defun make-counter () (lambda () 1))"
+        :answer "(defun make-counter ()
+  (let ((n 0)) (lambda () (incf n))))"
         :check (let ((c (make-counter)) (d (make-counter)))
                  (and (= (funcall c) 1) (= (funcall c) 2)
                       (= (funcall c) 3) (= (funcall d) 1)))
@@ -1933,6 +2047,9 @@ arguments, the first answering 0, the second 1, the third 2 — built with
 =dotimes= rather than written out. The template is the bug; fix it."
         :template "(let ((fns nil))
   (dotimes (i 3) (push (lambda () i) fns))
+  (reverse fns))"
+        :answer "(let ((fns nil))
+  (dotimes (i 3) (let ((j i)) (push (lambda () j) fns)))
   (reverse fns))"
         :check (equal (mapcar #'funcall value) '(0 1 2))
         :hint "Give each iteration a binding of its own with an inner `let'.")))
@@ -1990,17 +2107,20 @@ checked earlier and it respects =flet= and =labels=.
 "Answer the list of the squares of 1 through 5, using =mapcar= and a list
 literal. You will do this again two more ways in the next lesson."
         :template "(mapcar #'identity '(1 2 3 4 5))"
+        :answer "(mapcar (lambda (x) (* x x)) '(1 2 3 4 5))"
         :check (equal value '(1 4 9 16 25))
         :hint "A `lambda' is fine as the function argument.")
        (:prompt
 "Answer the sum of the integers 1 through 10 with =reduce=."
         :template "(reduce #'max '(1 2 3 4 5 6 7 8 9 10))"
+        :answer "(reduce #'+ '(1 2 3 4 5 6 7 8 9 10))"
         :check (eql value 55)
         :hint "The function you fold with is the one that adds two numbers.")
        (:prompt
 "From the list (1 2 3 4 5 6 7), answer only the even numbers, in order,
 using one of the filtering functions."
         :template "(remove-if #'evenp '(1 2 3 4 5 6 7))"
+        :answer "(remove-if-not #'evenp '(1 2 3 4 5 6 7))"
         :check (equal value '(2 4 6))
         :hint "The template removes exactly the ones you want to keep.")))
 
@@ -2061,6 +2181,7 @@ filters, and =dolist= where it is issuing commands to the editor."
 "The same list of squares as last lesson — 1 through 5 — but with =loop=
 this time. One expression, no helper function."
         :template "(loop for i from 1 to 5 collect i)"
+        :answer "(loop for i from 1 to 5 collect (* i i))"
         :check (equal value '(1 4 9 16 25))
         :hint "`collect' takes an expression, not just a variable.")
        (:prompt
@@ -2068,12 +2189,14 @@ this time. One expression, no helper function."
 and pushing each element onto an accumulator. =push= adds to the front,
 which is why this comes out reversed — that is the point."
         :template "(let ((out nil)) (dolist (x '(1 2 3)) x) out)"
+        :answer "(let ((out nil)) (dolist (x '(1 2 3)) (push x out)) out)"
         :check (equal value '(3 2 1))
         :hint "`(push x out)' inside the `dolist' body.")
        (:prompt
 "With one =loop=, answer the sum of the even numbers between 1 and 20
 inclusive."
         :template "(loop for i from 1 to 20 sum i)"
+        :answer "(loop for i from 1 to 20 when (evenp i) sum i)"
         :check (eql value 110)
         :hint "`when' can go between `for' and `sum'.")))
 
@@ -2143,6 +2266,7 @@ and whether it worked."
 quotient and the remainder. The check uses =multiple-value-bind=, so
 answering a list will not pass."
         :template "(defun divmod (a b) (list (floor a b) (mod a b)))"
+        :answer "(defun divmod (a b) (floor a b))"
         :check (multiple-value-bind (q r) (divmod 17 5)
                  (and (eql q 3) (eql r 2)))
         :hint "`floor' already answers both. There is a way to pass them straight through.")
@@ -2150,12 +2274,14 @@ answering a list will not pass."
 "Answer the *second* value of =(floor 17 5)= — the remainder — without
 calling =mod= and without =multiple-value-bind=."
         :template "(floor 17 5)"
+        :answer "(nth-value 1 (floor 17 5))"
         :check (eql value 2)
         :hint "There is a function that takes an index and a form.")
        (:prompt
 "Show that extra values are dropped. Make =value= the one-element list
 containing only the primary value of =(floor 17 5)=."
         :template "(multiple-value-list (floor 17 5))"
+        :answer "(list (floor 17 5))"
         :check (equal value '(3))
         :hint "`list' takes one value from each argument form. That is all you need.")))
 
@@ -2209,12 +2335,17 @@ first if you mean to change it."
 "Make a cons cell holding 1 and 2, change its car to 99 with =setf=, and
 answer the cell. Build the cell with =cons= rather than quoting one."
         :template "(let ((pair (cons 1 2))) pair)"
+        :answer "(let ((pair (cons 1 2))) (setf (car pair) 99) pair)"
         :check (equal value '(99 . 2))
         :hint "`(car pair)' is the place.")
        (:prompt
 "Make a hash table, put 1 under the key :a and 2 under :b, and answer the
 table. The check reads both keys back out."
         :template "(let ((h (make-hash-table))) h)"
+        :answer "(let ((h (make-hash-table)))
+  (setf (gethash :a h) 1)
+  (setf (gethash :b h) 2)
+  h)"
         :check (and (hash-table-p value)
                     (eql (gethash :a value) 1)
                     (eql (gethash :b value) 2))
@@ -2223,6 +2354,7 @@ table. The check reads both keys back out."
 "=incf= takes a place, not just a variable. Make a cons cell holding 0 and
 0, add 5 to its cdr with one =incf=, and answer the cell."
         :template "(let ((p (cons 0 0))) p)"
+        :answer "(let ((p (cons 0 0))) (incf (cdr p) 5) p)"
         :check (equal value '(0 . 5))
         :hint "`(incf (cdr p) 5)'.")))
 
@@ -2308,6 +2440,8 @@ need is control over evaluation."
 only when TEST is false, and answers NIL otherwise. Use =&body= for the
 body."
         :template "(defmacro my-unless (test &body body) (list 'if test nil))"
+        :answer "(defmacro my-unless (test &body body)
+  `(if ,test nil (progn ,@body)))"
         :check (and (eql (my-unless nil 41 42) 42)
                     (null (my-unless t 41 42)))
         :hint "A backquote template with `,test' and `,@body' in it.")
@@ -2315,6 +2449,9 @@ body."
 "Write =swap=, a macro taking two places and exchanging their contents. Use
 =gensym= for the temporary, so that =(swap a tmp)= would still work."
         :template "(defmacro swap (a b) `(let ((tmp ,a)) (setf ,a ,b) (setf ,b tmp)))"
+        :answer "(defmacro swap (a b)
+  (let ((tmp (gensym)))
+    `(let ((,tmp ,a)) (setf ,a ,b) (setf ,b ,tmp))))"
         :check (let ((a 1) (b 2) (tmp 3))
                  (swap a b)
                  (swap a tmp)
@@ -2325,6 +2462,7 @@ body."
 two forms, which evaluates the second only when the first is true, and
 answers the second's value (or NIL)."
         :template "(defun my-and2 (a b) (if a b nil))"
+        :answer "(defmacro my-and2 (a b) `(if ,a ,b nil))"
         :check (let ((hits 0))
                  (flet ((bump () (incf hits) t))
                    (my-and2 nil (bump))
@@ -2407,6 +2545,7 @@ signal is a request to stop."
 "Answer the keyword :oops when the division below signals, using
 =handler-case=. Catch =division-by-zero= specifically, not =error=."
         :template "(handler-case (/ 1 0) (error () :caught))"
+        :answer "(handler-case (/ 1 0) (division-by-zero () :oops))"
         :check (eq value :oops)
         :hint "The clause is (TYPE (VARS) FORMS...); an empty variable list is fine.")
        (:prompt
@@ -2417,6 +2556,11 @@ amount you get back out of it."
         :template "(progn
   (define-condition too-big (error) ())
   (handler-case (error 'too-big) (too-big (c) 0)))"
+        :answer "(progn
+  (define-condition too-big (error)
+    ((amount :initarg :amount :reader too-big-amount)))
+  (handler-case (error 'too-big :amount 99)
+    (too-big (c) (too-big-amount c))))"
         :check (eql value 99)
         :hint "The clause variable is bound to the condition object; hand it to your reader.")
        (:prompt
@@ -2426,6 +2570,10 @@ Keep a log: push :cleaned from a cleanup form, push :caught from a
 order that is, is the thing worth finding out."
         :template "(let ((log nil))
   (handler-case (progn (error \"boom\"))
+    (error () (push :caught log)))
+  (reverse log))"
+        :answer "(let ((log nil))
+  (handler-case (unwind-protect (error \"boom\") (push :cleaned log))
     (error () (push :caught log)))
   (reverse log))"
         :check (equal value '(:cleaned :caught))
@@ -2486,6 +2634,7 @@ exactly the property lesson 12 needed."
 "Answer the *name* of the package that the symbol =car= calls home, as a
 string."
         :template "(symbol-package 'car)"
+        :answer "(package-name (symbol-package 'car))"
         :check (and (stringp value) (string= value "COMMON-LISP"))
         :hint "`package-name' turns a package object into its name.")
        (:prompt
@@ -2493,12 +2642,14 @@ string."
 keyword :foo is =eq= to the symbol you get by interning the string \"FOO\"
 in the KEYWORD package."
         :template "(eq :foo (intern \"foo\" \"KEYWORD\"))"
+        :answer "(eq :foo (intern \"FOO\" \"KEYWORD\"))"
         :check (eq value t)
         :hint "The reader upcased :foo before interning it. The template did not upcase its string.")
        (:prompt
 "The reader upcases, but =intern= does not. Make =value= a symbol whose
 =symbol-name= is the lowercase string \"foo\"."
         :template "'foo"
+        :answer "(intern \"foo\")"
         :check (and (symbolp value) (string= (symbol-name value) "foo"))
         :hint "`intern' takes the name exactly as you give it.")))
 
@@ -2582,6 +2733,11 @@ answer an instance made with x = 3 and y = 4."
         :template "(progn
   (defclass point () ((x) (y)))
   (make-instance 'point))"
+        :answer "(progn
+  (defclass point ()
+    ((x :initarg :x :initform 0 :accessor point-x)
+     (y :initarg :y :initform 0 :accessor point-y)))
+  (make-instance 'point :x 3 :y 4))"
         :check (and (= (point-x value) 3) (= (point-y value) 4)
                     (= (point-x (make-instance 'point)) 0))
         :hint "Each slot is (NAME :initarg ... :initform ... :accessor ...).")
@@ -2593,6 +2749,12 @@ circle of radius 1 has area pi."
         :template "(progn
   (defclass square () ((side :initarg :side :reader side)))
   (defgeneric area (shape)))"
+        :answer "(progn
+  (defclass square () ((side :initarg :side :reader side)))
+  (defclass circle () ((radius :initarg :radius :reader radius)))
+  (defgeneric area (shape))
+  (defmethod area ((s square)) (* (side s) (side s)))
+  (defmethod area ((c circle)) (* pi (radius c) (radius c))))"
         :check (and (= (area (make-instance 'square :side 3)) 9)
                     (< (abs (- (area (make-instance 'circle :radius 1)) pi)) 1/1000))
         :hint "A method's parameter list specialises with ((s square)) — the class name beside the parameter.")
@@ -2606,6 +2768,12 @@ two different method selections."
   (defclass paper () ())
   (defgeneric beats (a b))
   (defmethod beats ((a rock) (b paper)) :rock))"
+        :answer "(progn
+  (defclass rock () ())
+  (defclass paper () ())
+  (defgeneric beats (a b))
+  (defmethod beats ((a rock) (b paper)) :paper)
+  (defmethod beats ((a paper) (b rock)) :paper))"
         :check (and (eq (beats (make-instance 'rock) (make-instance 'paper)) :paper)
                     (eq (beats (make-instance 'paper) (make-instance 'rock)) :paper))
         :hint "Two methods, differing only in the order of their two specialisers.")))))
@@ -2676,19 +2844,24 @@ Three things you can use from anywhere:
 step, because it has to know the names before you type them. A zero-argument
 function becomes a command when =refresh-commands= publishes it — that call
 at the foot of =init.lisp= is why every function in your config is already
-there."
+there. The function itself lives in =library.lisp=, beside the rest of the
+machinery your config calls."
       :exercises
       ((:prompt
 "Put something in the status line. The check looks in the message log for
 the word =hello=, so any message containing it will do."
         :template "(message \"nothing to see here\")"
+        :answer "(message \"hello\")"
         :check (find-if (lambda (m) (search "hello" m)) (messages 5))
         :hint "`message' takes a string. `(format nil ...)' makes one if you want the practice.")
        (:prompt
 "Define a zero-argument function =tutor-hello= that messages something, then
 make =M-x= able to find it. Defining it is not enough — the M-x list is
-published, and there is a command in =init.lisp= that publishes it."
+published, and =library.lisp= has the command that publishes it. Your config
+calls it once, at the foot of =init.lisp=; that was before your =defun=."
         :template "(defun tutor-hello () (message \"hi\"))"
+        :answer "(progn (defun tutor-hello () (message \"hi from the tutor\"))
+       (refresh-commands))"
         :check (and (fboundp (find-symbol "TUTOR-HELLO" :zemacs))
                     (find-if (lambda (c) (search "tutor-hello" c)) (command-list)))
         :hint "`refresh-commands' walks the ZEMACS package and republishes every zero-argument function.")
@@ -2697,6 +2870,7 @@ published, and there is a command in =init.lisp= that publishes it."
 the editor then reports it as — the setter answers nothing useful, so you
 will need the reader too. Press =M-0= afterwards to put it back."
         :template "(set-font-size 30)"
+        :answer "(progn (set-font-size 30) (font-size))"
         :check (and (numberp value) (= value 30) (= (font-size) 30))
         :hint "`font-size' is a reader: no arguments, answers the live value.")))
 
@@ -2738,7 +2912,7 @@ selected, =(buffer-file-name)= is NIL for a buffer with no file. So
 rather than the empty string, which is a distinction worth keeping.
 
 A reader is a noun, not a command, which is why none of them appears in
-=M-x= — =init.lisp= takes the whole set out of the list by reading
+=M-x= — =library.lisp= takes the whole set out of the list by reading
 =*readers*=, the same list the shim interned them from.
 
 =M-x lisp-version= is a reader dressed as a command, and worth running once:
@@ -2749,6 +2923,7 @@ in this stage lives in."
 "Answer the text of the line point is on — without calling =line-string=.
 Two readers and one substring."
         :template "(buffer-string)"
+        :answer "(buffer-substring (line-start) (line-end))"
         :check (equal value (line-string))
         :hint "`line-start' and `line-end' with no arguments mean this line.")
        (:prompt
@@ -2756,6 +2931,7 @@ Two readers and one substring."
 same number worked out from the two ends of the buffer — proving to yourself
 that offsets start at 0."
         :template "(cons (buffer-size) 0)"
+        :answer "(cons (buffer-size) (- (point-max) (point-min)))"
         :check (and (consp value) (= (car value) (cdr value) (buffer-size)))
         :hint "`point-max' minus `point-min'.")
        (:prompt
@@ -2763,6 +2939,7 @@ that offsets start at 0."
 string \"nothing selected\" if there is not. There is no selection right now,
 so the check expects the second."
         :template "(region-text)"
+        :answer "(if (region) (region-text) \"nothing selected\")"
         :check (if (region) (equal value (region-text)) (equal value "nothing selected"))
         :hint "`(if (region) ... ...)'. `region' is the reader that answers NIL.")))
 
@@ -2801,7 +2978,7 @@ So where it matters, use the one primitive that does the whole job:
         (message \"no selection\"))))
 #+end_src
 
-That is from =init.lisp=, unedited. Written as =delete-region= then =insert=
+That is =surround-region= from =library.lisp=, unedited. Written as =delete-region= then =insert=
 it would also work, almost always, and would occasionally eat a character
 somebody typed in between. =insert-at= exists for the same reason: it is
 =replace-region= over an empty range, so it neither moves point nor leaves a
@@ -2832,12 +3009,14 @@ whole editor is built on."
 and not =insert=, which goes wherever point happens to be and would only
 work by luck."
         :template "(insert-at (point-max) \"hello\")"
+        :answer "(insert-at 0 \"hello\")"
         :check (and (>= (buffer-size) 5) (string= (buffer-substring 0 5) "hello"))
         :hint "The template has the right verb and the wrong position.")
        (:prompt
 "Replace the whole scratch buffer with exactly the text =(list 1 2 3)= — in
 one atomic call, not a delete followed by an insert."
         :template "(delete-region (point-min) (point-max))"
+        :answer "(replace-region (point-min) (point-max) \"(list 1 2 3)\")"
         :check (string= (buffer-string) "(list 1 2 3)")
         :hint "`replace-region' takes a beginning, an end and the replacement.")
        (:prompt
@@ -2845,6 +3024,11 @@ one atomic call, not a delete followed by an insert."
 point is on in =<<= and =>>= using one =replace-region= — then call it. The
 check looks for a line so wrapped anywhere in the buffer."
         :template "(defun tutor-shout-line () (message \"not written yet\"))"
+        :answer "(progn
+  (defun tutor-shout-line ()
+    (replace-region (line-start) (line-end)
+                    (concatenate 'string \"<<\" (line-string) \">>\")))
+  (tutor-shout-line))"
         :check (find-if (lambda (l)
                           (and (>= (length l) 4)
                                (string= "<<" (subseq l 0 2))
@@ -2857,8 +3041,30 @@ check looks for a line so wrapped anywhere in the buffer."
       :title "Commands and keys"
       :prose
 "*A command is a zero-argument function in the ZEMACS package.* That is
-the whole of it. There is no =interactive= declaration, no command table to
-add yourself to, and no macro to use instead of =defun=.
+the whole of it: no command table to add yourself to, and no macro to use
+instead of =defun=.
+
+A command that *needs* an argument says so underneath, and =M-x= asks for it
+before calling:
+
+#+begin_src lisp
+(defun set-scale (n) ...)
+(interactive set-scale (\"Font size: \" :number))
+#+end_src
+
+One spec per argument — =:string=, =:number=, or a form evaluated *when the
+prompt opens*, whose list of strings are the completion candidates — and
+=(LABEL SPEC)= where you want the prompt to read as something other than the
+parameter's name. It goes under the =defun= rather than inside it because it
+wraps whatever function is there when it runs, so a config reload re-reads
+the =defun= and then re-wraps the fresh definition, and never stacks a
+wrapper on a wrapper. =load-theme= and =set-language= in =library.lisp= are
+the worked examples.
+
+That is Emacs' =interactive= arrived at from the other end. There the
+declaration lives inside the function and the function is the command; here
+the function stays an ordinary function anybody can call with arguments, and
+the declaration is only the part that teaches =M-x= how to fill them in.
 
 Key bindings and dashboard items name commands *as strings*, and anything
 that is not one of the editor's built-in verbs is called in this image:
@@ -2874,7 +3080,7 @@ The first argument is a keymap: an editing state (\"normal\", \"insert\",
 only in that mode's buffers. Sequences are space-separated tokens: =SPC=,
 =C-x=, =<esc>=, =<ret>=, =<tab>=, or a literal key.
 
-=init.lisp= wraps this in two helpers worth copying:
+=library.lisp= wraps this in two helpers worth copying:
 
 #+begin_src lisp
 (define-leader \"SPC o t\" \"terminal\")     the four states with a leader
@@ -2901,14 +3107,17 @@ To run a built-in verb from Lisp — one the editor resolves itself, like
 resolves the name exactly as a key binding does.
 
 M-x, finally: =(register-command \"name\")= offers one, =(clear-commands)=
-empties the list, and =refresh-commands= in =init.lisp= does both by walking
-the package for zero-argument functions."
+empties the list, and =refresh-commands= in =library.lisp= does both by walking
+the package for the functions =(name)= can call — the zero-argument ones, plus
+the ones declared =interactive=, which are zero-argument on purpose."
       :exercises
       ((:prompt
 "Define =tutor-shout=, which messages something in capitals, and bind it to
 =SPC m y= in the \"normal\" keymap. The check looks the binding up through
 the editor's own reader, so it has to have really landed."
         :template "(defun tutor-shout () (message \"quiet\"))"
+        :answer "(progn (defun tutor-shout () (message \"HELLO\"))
+       (define-key \"normal\" \"SPC m y\" \"tutor-shout\"))"
         :check (and (fboundp (find-symbol "TUTOR-SHOUT" :zemacs))
                     (find-if (lambda (b) (and (string= (second b) "SPC m y")
                                               (string= (third b) "tutor-shout")))
@@ -2920,6 +3129,7 @@ than reading =init.lisp=. The check insists on =SPC f f= being among the
 answers *and* on every answer being about =find-file= — so handing back the
 whole keymap is not the same as asking the question."
         :template "(key-bindings)"
+        :answer "(where-is \"find-file\")"
         :check (and (listp value) (plusp (length value))
                     (every (lambda (b) (string= (third b) "find-file")) value)
                     (find "SPC f f" value :key #'second :test #'equal))
@@ -2929,6 +3139,8 @@ whole keymap is not the same as asking the question."
 normal, visual, visual-line and visual-block — with one form. The check
 counts the bindings, so four separate calls also pass; a loop is the point."
         :template "(define-key \"normal\" \"SPC m z\" \"tutor-shout\")"
+        :answer "(dolist (state '(\"normal\" \"visual\" \"visual-line\" \"visual-block\"))
+  (define-key state \"SPC m z\" \"tutor-shout\"))"
         :check (>= (count-if (lambda (b) (string= (second b) "SPC m z")) (key-bindings)) 4)
         :hint "`dolist' over a list of state names.")))
 
@@ -2961,9 +3173,11 @@ the live buffer in the mode and which =M-x= offers, and NAME-hook, which the
 editor calls and which drives the machinery. NAME-exit-hook is yours to
 write if you want one.
 
-*Settings are claimed, not set.* The settings the editor has —
-=line-overflow=, =line-numbers=, =relative-line-numbers=, =tab-width=,
-=font-size= — are global, one per editor and not one per buffer. So a hook
+*Settings are claimed, not set.* The settings a mode may claim are the seven
+in =*mode-settings*= — =line-overflow=, =line-numbers=,
+=relative-line-numbers=, =tab-width=, =text-width=, =font-size= and
+=scroll-past-end= — and every one of them is global, one per editor and not
+one per buffer. So a hook
 that set =line-overflow= would leave every other mode to put it back, which
 does not scale past two modes. Instead:
 
@@ -2976,17 +3190,23 @@ change — baseline, then the major mode and its ancestors, then each active
 minor mode. Recomputing rather than saving and restoring in pairs is what
 makes it order-proof.
 
-This tutor's own mode is three lines of exactly that, at the foot of
-=runtime/modes/tutor.lisp=:
+This tutor has no major mode of its own, and that is worth a minute because
+it is the same decision one size smaller. The pane you are reading is
+=org-mode= and the pane you type in is =lisp-mode=, because everything that
+makes either of them work — the bullets and the headings on this side, the
+indenter and the =C-c C-*= keys on that side — hangs off those two. A
+=tutor-mode= deriving from either would mean every feature added to that mode
+afterwards had to remember to derive too. So the tutor is two *minor* modes
+instead, at the foot of =runtime/modes/tutor.lisp=:
 
 #+begin_src lisp
-(define-derived-mode tutor-mode text-mode)
-(set-mode-local 'tutor-mode 'tab-width 2)
-(set-mode-local 'tutor-mode 'line-overflow \"wrap\")
+(define-minor-mode tutor-lesson \"...\")
+(define-minor-mode tutor-answer \"...\")
 #+end_src
 
-and the reason it derives from =text-mode= rather than =lisp-mode= is
-written out beside them.
+What a minor mode buys is a keymap consulted *before* the major mode's, which
+is why =SPC m n= means \"next exercise\" here and is free in every other org
+buffer.
 
 One ceiling, named where it lives: switching *buffers* fires no hook, because
 the editor reports none, so the settings on screen follow the last mode
@@ -2997,6 +3217,7 @@ the editor reports none, so the settings on screen follow the last mode
 asks the mode registry whether the relationship really exists, so the
 =define-derived-mode= has to have run."
         :template "(defun tutor-demo-mode () (message \"not a mode\"))"
+        :answer "(define-derived-mode tutor-demo-mode prog-mode)"
         :check (and (fboundp (find-symbol "TUTOR-DEMO-MODE" :zemacs))
                     (derived-mode-p 'prog-mode "tutor-demo-mode"))
         :hint "`(define-derived-mode tutor-demo-mode prog-mode)' — no body needed.")
@@ -3005,6 +3226,7 @@ asks the mode registry whether the relationship really exists, so the
 =*mode-locals*=, which is the table =set-mode-local= writes into — there is
 no reader for a setting's *claim*, only for its current value."
         :template "(set-tab-width 7)"
+        :answer "(set-mode-local 'tutor-demo-mode 'tab-width 7)"
         :check (eql 7 (cdr (assoc 'tab-width (gethash "tutor-demo-mode" *mode-locals*))))
         :hint "`set-mode-local' takes the mode, the setting name as a symbol, and the value.")
        (:prompt
@@ -3015,6 +3237,7 @@ check can tell: it looks in =*mode-keys*=, the table that remembers a
 binding so a child defined *later* can still inherit it, as well as in the
 editor's own keymap."
         :template "(define-key \"tutor-demo-mode\" \"SPC m q\" \"tutor-hello\")"
+        :answer "(define-mode-key 'tutor-demo-mode \"SPC m q\" \"tutor-hello\")"
         :check (and (assoc "SPC m q" (gethash "tutor-demo-mode" *mode-keys*)
                            :test #'string=)
                     (find-if (lambda (b) (and (string= (first b) "tutor-demo-mode")
@@ -3041,16 +3264,37 @@ the text as you type in front of it, and it dies with the text it covers.
 (remove-overlays &optional beg end)
 #+end_src
 
-*Five properties are drawn*; everything else stays in this image and can
-be any Lisp object at all — a closure, a diagnostic, a window id.
+*A dozen properties reach the renderer*; everything else stays in this image
+and can be any Lisp object at all — a closure, a diagnostic, a window id.
 
 #+begin_example
-face          a foreground, named from `face-list'
+face             a foreground, named from `face-list'
 background
-display       a string drawn *instead of* the characters it covers
-image         an id from `latex-preview'
-fold          the lines after the first stop occupying rows
+display          a string drawn *instead of* the characters it covers
+image            an id from `latex-preview' or `image-file'
+scale            a multiplier on the font size, not a point size
+weight  slant    `bold'/`italic', `normal', or NIL for no opinion
+line-background  a band the width of the pane
+line-prefix      drawn before every row the range touches
+gutter           a mark in the margin, moving nothing
+help-echo        what the pointer resting here says
+fold             the lines after the first stop occupying rows
 #+end_example
+
+The division to hold on to is *cells* against *lines*. =face= and
+=background= paint the characters a range covers, so a source block drawn
+with =background= is a stripe as ragged as its own text; =line-background=
+is the one that squares it off. =line-prefix= moves the line right by its
+own width, which is what a quote bar over a whole passage wants and what a
+mark on one line in fifty does not — that one is =gutter=, which draws in
+the margin the line numbers already reserve and moves nothing.
+
+=help-echo= is the odd one out: it is the only property here that draws
+nothing at all. It is what the pointer resting on the overlay says, and it
+goes down to Rust rather than staying in this image because the reader is
+the *mouse* — asking the image what is under the pointer would be a round
+trip on the one path that fires once per pixel. =runtime/lsp.lisp= puts a
+diagnostic's message on one and has hover for nothing.
 
 Colours are *face names*, not RGB triples: the theme already owns that
 vocabulary, so an overlay recoloured by =load-theme= costs nothing and no
@@ -3059,9 +3303,10 @@ second colour table exists.
 =display= is the one that changes what is possible. The renderer substitutes
 cells rather than painting over them, so three =***= really do become one
 bullet and the heading text really does stay where it was. That mechanism is
-the whole of =runtime/modes/org-modern.lisp= — and the whole of the framed
-answer areas you are typing into right now, whose buffer text is the plain
-comment =;;; @answer 0=.
+the whole of =runtime/modes/org-modern.lisp= — and you are looking at it. The
+bullets, the two heading sizes and the bare descriptions on the =[[id:...]]=
+links in the pane beside this one are =display=, =scale= and =weight= over
+ordinary org text you could open in Emacs and read unchanged.
 
 *Mark your own.* =remove-overlays= is the blunt instrument and takes
 everybody's. Put a property of your own on the ones you make and walk
@@ -3072,7 +3317,7 @@ everybody's. Put a property of your own on the ones you make and walk
                (mapcar #'first (overlays-in beg end)))
 #+end_src
 
-That is =org-latex-preview= in =init.lisp=, and it is why re-previewing
+That is =org-latex-preview= in =modes/org-latex.lisp=, and it is why re-previewing
 equations does not eat org-modern's bullets, or this tutor's frames, or an
 avy hint somebody else's config drew.
 
@@ -3085,6 +3330,10 @@ deliberate case."
 "Make an overlay over the first line of the scratch buffer, mark it with the
 property =:mine= set to T, and give it the =string= face so you can see it."
         :template "(make-overlay (line-start 1) (line-end 1))"
+        :answer "(let ((ov (make-overlay (line-start 1) (line-end 1))))
+  (overlay-put ov :mine t)
+  (overlay-put ov 'face \"string\")
+  ov)"
         :check (find-if (lambda (o) (overlay-get (first o) :mine))
                         (overlays-in (point-min) (point-max)))
         :hint "`make-overlay' answers the handle; two `overlay-put' calls on it.")
@@ -3093,6 +3342,7 @@ property =:mine= set to T, and give it the =string= face so you can see it."
 they actually are. Look at the scratch buffer afterwards: the text is
 unchanged and what you see is not."
         :template "(overlay-put (make-overlay 0 3) 'face \"keyword\")"
+        :answer "(overlay-put (make-overlay 0 3) 'display \"abc\")"
         :check (find-if (lambda (o) (equal (overlay-get (first o) 'display) "abc"))
                         (overlays-in 0 3))
         :hint "The property is `display' and its value is a string.")
@@ -3101,6 +3351,12 @@ unchanged and what you see is not."
 marked =:keep=, then delete only the scrap ones — leaving the keeper alive.
 =remove-overlays= would take all three, so it is not the answer."
         :template "(remove-overlays (point-min) (point-max))"
+        :answer "(progn
+  (overlay-put (make-overlay 0 1) :scrap t)
+  (overlay-put (make-overlay 1 2) :scrap t)
+  (overlay-put (make-overlay 2 3) :keep t)
+  (dolist (o (overlays-in (point-min) (point-max)))
+    (when (overlay-get (first o) :scrap) (delete-overlay (first o)))))"
         :check (and (null (remove-if-not (lambda (o) (overlay-get (first o) :scrap))
                                          (overlays-in (point-min) (point-max))))
                     (find-if (lambda (o) (overlay-get (first o) :keep))
@@ -3148,6 +3404,7 @@ some."
 "Fold lines 2 to 4 of the scratch buffer. Look at it afterwards — line 2
 stays and the two below it stop taking up rows."
         :template "(make-overlay (line-start 2) (line-end 4))"
+        :answer "(fold-region (line-start 2) (line-end 4))"
         :check (plusp (length (folds-in (line-start 2) (line-end 4))))
         :hint "One call, and it takes two character offsets rather than line numbers.")
        (:prompt
@@ -3155,6 +3412,8 @@ stays and the two below it stop taking up rows."
 made. The check compares it with what the editor answers, so it has to be a
 real handle."
         :template "(folds-in (point-min) (point-max))"
+        :answer "(progn (fold-region (line-start 2) (line-end 4))
+       (folded-p (line-start 3)))"
         :check (and value (eql value (folded-p (line-start 3))))
         :hint "There is a reader whose whole job this is, and it takes an optional position.")
        (:prompt
@@ -3163,6 +3422,8 @@ unfolding form already tells you. The check wants a positive number *and* an
 empty buffer afterwards, so =there were none to begin with= does not count
 as having opened them."
         :template "(folds-in (point-min) (point-max))"
+        :answer "(progn (fold-region (line-start 2) (line-end 4))
+       (unfold-all))"
         :check (and (integerp value) (plusp value)
                     (null (folds-in (point-min) (point-max))))
         :hint "There is a zero-argument form of `unfold-region', and it answers the count.")))
@@ -3232,6 +3493,9 @@ the shape it would start you from is the shape that does not work."
         :template ";; `read-string' does not answer the text. It answers an id and calls a
 ;; function you give it, later, with the text or with NIL. Write `tutor-ask'
 ;; below, and run it with M-x afterwards — that is the real check."
+        :answer "(defun tutor-ask ()
+  (read-string \"say something: \"
+               (lambda (answer) (when answer (message answer)))))"
         :check (fboundp (find-symbol "TUTOR-ASK" :zemacs))
         :hint "`read-string' takes two arguments: the label and a function of one argument.")
        (:prompt
@@ -3239,6 +3503,9 @@ the shape it would start you from is the shape that does not work."
 and \"blue\" with =completing-read= and messages whichever you chose."
         :template ";; Three arguments this time, and the last one is still the callback.
 ;; Write `tutor-pick' below."
+        :answer "(defun tutor-pick ()
+  (completing-read \"colour: \" '(\"red\" \"green\" \"blue\")
+                   (lambda (answer) (when answer (message answer)))))"
         :check (fboundp (find-symbol "TUTOR-PICK" :zemacs))
         :hint "Three arguments: the label, the list of candidates, and the callback.")
        (:prompt
@@ -3247,6 +3514,9 @@ the string \"delivered\" to it by hand with =%prompt-reply=, and answer what
 it stored — with no prompt ever opening."
         :template "(let ((got nil))
   (%prompt-park (lambda (a) (setf got a)))
+  got)"
+        :answer "(let ((got nil))
+  (%prompt-reply (%prompt-park (lambda (a) (setf got a))) \"delivered\")
   got)"
         :check (equal value "delivered")
         :hint "`%prompt-park' answers the id. Keep it, and hand it to `%prompt-reply' with the string.")))))

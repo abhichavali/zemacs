@@ -2,10 +2,18 @@
 #+SUBTITLE: a Common Lisp machine that edits text
 
 zemacs is an editor whose configuration language is a live Common Lisp image.
-=runtime/init.lisp= is not a settings file that a program reads — it is a
+=~/.zemacs.d/init.lisp= is not a settings file that a program reads — it is a
 program, loaded into an ECL image that runs for as long as the editor does, and
 every function it defines can be named by a key binding, a dashboard item or
 =M-x=.
+
+Your config and the library it calls are separate files, deliberately. The
+editor seeds =~/.zemacs.d/init.lisp= from =runtime/init.lisp= the first time it
+runs and then never touches it again, so a config is *yours*; everything that
+config calls — =set-face=, =define-leader=, =load-theme=, =refresh-commands= —
+lives in =runtime/library.lisp= and is upgraded with the editor. The rule for
+which file a thing belongs in: if changing it would change *your* editor it is
+config, and if changing it would change *every* zemacs it is library.
 
 This directory is the reference for that image: what it can reach, what it
 cannot, and why the line is where it is.
@@ -64,8 +72,10 @@ bound to =ZEMACS=, so you never have to qualify a name.
 | =crates/lisp/src/lib.rs=       | The Rust side of every primitive; the module docs are the contract.  |
 | =crates/core/src/query.rs=     | The readers. Adding one is one arm of one =match=.                     |
 | =crates/core/src/evil.rs=      | The built-in verbs a key binding can name, in =run_action=.            |
-| =runtime/init.lisp=            | The shipped config. Ordinary Lisp, all of it replaceable.            |
+| =runtime/init.lisp=            | The *default* config, seeded into =~/.zemacs.d/= on first run.         |
+| =runtime/library.lisp=         | The machinery a config calls. Ships with the editor, upgraded with it. |
 | =runtime/modes/=               | Major and minor mode machinery, written in Lisp on top of one hook.  |
+| =runtime/plugins/=             | App plugins whose policy has moved out of Rust. =project.lisp= is the first: where a project starts, and what "build it" means there. |
 
 The tests are executable documentation: =crates/lisp/tests/api.rs=, =eval.rs=,
 =modes.rs= and =prompt.rs= each boot a real image against a real editor and

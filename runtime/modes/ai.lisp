@@ -266,13 +266,17 @@ Bound to `C-a'."
 ;;; chord, which `Key::is_editor_key' already reserves for the editor and which
 ;;; no terminal program has ever been able to see.
 ;;;
-;;; ponytail: these are bound in the "terminal" *state*, not in `ai-mode', so a
-;;; shell gets them too. `terminal_key' in core consults only the state's keymap
-;;; — not the buffer's major-mode map, the way `normal_key' does — so a
-;;; mode-local binding in a terminal would silently never fire. Every verb here
-;;; is meaningful in a shell as well, so the honest fix (layer the major-mode
-;;; map into `terminal_key') buys nothing yet and is one `if' in `crates/core'
-;;; when it does.
+;;; These are bound in the "terminal" *state*, not in `ai-mode', so a shell gets
+;;; them too — which is now a choice and no longer the only option. It used to
+;;; be: `terminal_key' consulted the state's keymap alone, so a mode-local
+;;; binding in a session silently never fired. It asks the buffer's minor then
+;;; major modes first now, ahead of the state, so `(define-key "ai-mode" "C-M-r"
+;;; ...)' works and a verb that means nothing in a shell belongs there.
+;;; Everything here means something in a shell, so everything here stays put.
+;;;
+;;; The one thing a terminal still will not do is wait for a multi-key sequence
+;;; — holding the first key back from a running program is not affordable — so
+;;; a session binding is one chord, which every binding below already is.
 
 (defun ai-mode-hook ()
   "Runs once when a session becomes an agent rather than a shell."

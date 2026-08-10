@@ -810,6 +810,14 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
             a.max(0) as u64,
             (!arg.is_empty()).then_some(arg),
         )),
+        // ...and the one attribute that changes no pixel: what the pointer
+        // resting on this overlay says. It comes down the same envelope as the
+        // drawn ones because the mouse lives on this side — see
+        // `Overlay::help_echo`, and see the `:help-echo` arm in `shim.c`.
+        "overlay-help-echo" => EditorCommand::Overlay(OverlayEdit::HelpEcho(
+            a.max(0) as u64,
+            (!arg.is_empty()).then_some(arg),
+        )),
         // Code folding, and the only overlay property that is about *lines*:
         // the lines after the overlay's first stop occupying rows entirely.
         // `b` rather than `arg` because the value is a flag, so one overlay can
@@ -862,6 +870,11 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
         // already has and for the same reason: it is a claim that is turned on
         // and off, and a mode's exit hook has to be able to say the other one.
         "set-read-only" => EditorCommand::SetReadOnly(a != 0),
+        // The one *setting* that arrives as a verb rather than as a primitive
+        // of its own. Every `set-*` above it in the C file predates the `%do`
+        // envelope; a bool fits it exactly, so this costs one arm and one
+        // `defun` instead of an extern, an `f_`, a `defprim` and an export.
+        "scroll-past-end" => EditorCommand::SetScrollPastEnd(a != 0),
 
         // `read-string` and `completing-read`. `a` is the continuation id the
         // image parked its closure under, `b` says whether to draw a candidate
@@ -897,6 +910,11 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
         "completion-doc" => {
             EditorCommand::Completion(CompletionEdit::Doc((!arg.is_empty()).then_some(arg)))
         }
+
+        // avy: the next keystroke goes to this Lisp function rather than to the
+        // editor. Empty means "stop waiting", which is `which-key`'s idiom for
+        // its clear and reads the same way here — `(grab-key)` with no argument.
+        "grab-key" => EditorCommand::GrabKey((!arg.is_empty()).then_some(arg)),
 
         // A keystroke for the shell. `Key::from_token` is the inverse of the
         // spelling `key-bindings` already reports, so the string a config reads

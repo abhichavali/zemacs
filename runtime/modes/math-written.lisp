@@ -989,7 +989,7 @@ A frozen page does not need it — installing a scene rebuilds the page and its
 builder rasterises through the same cache — but calling it there is harmless
 and one branch cheaper than asking which mode is up.
 
-`fboundp' because `runtime/modes/' is loaded from the middle of `init.lisp' and
+`fboundp' because `runtime/modes/' is loaded by `load-runtime-modules' and
 these live below it, so at load time the name is genuinely not there yet. The
 same guard `org-frozen.lisp' puts on `*org-latex-auto*', for the same reason."
   (ignore-errors
@@ -1275,7 +1275,7 @@ had given up on: asking by hand is how you say you have fixed it."
 (add-hook '*org-mode-functions* 'math-written-maybe-watch)
 
 ;;; A hook, not a verb: running it from `M-x' does nothing you can see, and
-;;; `*hidden-commands*' is `init.lisp''s existing answer for exactly that. The
+;;; `*hidden-commands*' is `library.lisp''s existing answer for exactly that. The
 ;;; rest of this file is either a `%'-prefixed helper, which `refresh-commands'
 ;;; already skips, or a command worth having in the list.
 (when (boundp '*hidden-commands*)

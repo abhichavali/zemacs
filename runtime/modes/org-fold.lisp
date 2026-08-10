@@ -286,6 +286,13 @@ overlay over the first and leave `fold-dwim' needing two presses to undo."
 ;;; keeps `<tab>' for indentation and magit keeps it for its sections.
 (define-mode-key 'org-mode "<tab>" "org-cycle")
 
+;;; TAB in Normal state, everywhere else: the outline gesture, applied to the
+;;; thing tree-sitter calls a node. Normal only — Insert needs TAB to indent —
+;;; and a major mode that has claimed `<tab>' for itself keeps it, since a mode
+;;; keymap is consulted first: org still cycles, `lisp-mode' still indents,
+;;; magit still toggles its sections.
+(define-key "normal" "<tab>" "fold-dwim")
+
 ;;; vim's own fold keys, which is the muscle memory this is for. `z' is not a
 ;;; prefix in the built-in grammar and is bound only inside magit, so these
 ;;; cost nothing anywhere else.

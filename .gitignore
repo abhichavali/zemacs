@@ -12,3 +12,7 @@ Cargo.lock
 
 # Agent worktrees — transient, and each is its own checkout of this repo.
 .claude/worktrees/
+
+# Python bytecode from scripts/zemacs_ctl.py, which is a client and not a build.
+__pycache__/
+*.pyc

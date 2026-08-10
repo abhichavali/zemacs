@@ -935,14 +935,15 @@ fn frozen_org_builds_a_page_of_nodes_that_the_cell_grid_could_not_have_drawn() {
     // synthetic document above cannot make: that nothing here falls over on a
     // file somebody actually wrote.
     //
-    // Its title carries an em dash, and that is the encoding proof. Lisp holds
-    // buffer text as UTF-8 *bytes*, one character per byte, while the encoder
-    // that carries a scene back to Rust encodes each *character* — so a string
-    // that skipped `utf8-text` arrives twice-encoded and is drawn as the
+    // Its title carries an em dash, and that is the encoding proof. Buffer text
+    // used to reach the image as UTF-8 *bytes*, one character per byte, while
+    // the encoder carrying a scene back to Rust encoded each *character* — so a
+    // string that skipped `utf8-text` arrived twice-encoded and was drawn as the
     // Latin-1 reading of its own encoding. A scene makes that worse than the
     // grid did rather than better: every run is measured in a real font, so
     // three characters where the document has one is a wrong wrap and a wrong
-    // column width as well as three wrong glyphs.
+    // column width as well as three wrong glyphs. The shim decodes now, and this
+    // is the assertion that says the whole path still lands one character.
     let sample =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/math/linear-algebra.org");
     if let Ok(text) = std::fs::read_to_string(&sample) {
@@ -981,10 +982,10 @@ fn frozen_org_builds_a_page_of_nodes_that_the_cell_grid_could_not_have_drawn() {
 
         // --- a dash *and* an equation on the same line -----------------------
         //
-        // The one that will actually happen, and the reason `utf8-text`
-        // exists. `latex-fragments` answers **character** offsets into the
-        // buffer; `line-string` answers UTF-8 **bytes**, one Lisp character per
-        // byte. Line 116 of this file is
+        // The one that will actually happen, and what the two offset spaces
+        // used to cost. `latex-fragments` answers **character** offsets into
+        // the buffer; `line-string` answered UTF-8 **bytes**, one Lisp
+        // character per byte. Line 116 of this file is
         //
         //     Prove the rank–nullity theorem: for $T : V \to W$ with $V$ ...
         //
@@ -1089,39 +1090,26 @@ fn frozen_org_builds_a_page_of_nodes_that_the_cell_grid_could_not_have_drawn() {
     says(&shared, &lisp, r#"(%org-frozen-uncomma ",#+end_src")"#, "#+end_src");
     says(&shared, &lisp, r#"(%org-frozen-uncomma ", not markup")"#, ", not markup");
 
-    // --- the decoder, which is what makes any of the above true of real text ----
+    // --- characters, which is what makes any of the above true of real text ----
     //
-    // `utf8-text` is shared now — it is in `runtime/modes/modes.lisp`, and
-    // `crates/lisp/tests/utf8.rs` is where it is proved byte for byte against a
-    // known sample. What stays here is the pair of facts *this* mode depends
-    // on: that it is reachable through a full `init.lisp` boot, and that a table
-    // column is measured in the characters a cell spells rather than its bytes.
+    // There was a decoder here — `utf8-text`, in `runtime/modes/modes.lisp` —
+    // and a rule that every string this mode took out of a buffer went through
+    // it. `crates/lisp/tests/utf8.rs` now pins the boundary that replaced it.
+    // What stays here is the fact *this* mode depends on: a table column is
+    // measured in the characters a cell spells, and a cell holding an em dash is
+    // one character wide, so the column stated for it lines up. Three would have
+    // pulled every row after it.
     //
-    // Written with `code-char` and never with a literal, and that is not
-    // fussiness: a non-ASCII literal in a form *evaluated from Rust* is the
-    // second half of the same bug, so a test spelling the em dash here would be
-    // asserting against mojibake it introduced itself.
-    const EM_DASH: &str = "(coerce (list (code-char 226) (code-char 128) (code-char 148)) 'string)";
-    says(&shared, &lisp, &format!("(length (utf8-text {EM_DASH}))"), "1");
+    // The em dash is written as a literal on purpose, and it is the assertion
+    // that would have been a lie before: this form is *evaluated from Rust*, so
+    // its source crosses the shim, and a test spelling a dash here used to be
+    // asserting against mojibake it had introduced itself.
+    says(&shared, &lisp, "(length \"\u{2014}\")", "1");
+    says(&shared, &lisp, "(char-code (char \"\u{2014}\" 0))", "8212");
     says(
         &shared,
         &lisp,
-        &format!("(char-code (char (utf8-text {EM_DASH}) 0))"),
-        "8212",
-    );
-    // ASCII is the identity, which is both the fast path and the common one.
-    says(&shared, &lisp, r#"(utf8-text "abc")"#, "abc");
-    // A truncated sequence is passed through one character at a time rather than
-    // dropped: this is a renderer, and text it cannot make sense of should still
-    // be on the page.
-    says(&shared, &lisp, r#"(length (utf8-text (string (code-char 200))))"#, "1");
-    // ...and that is what a column measures. A cell holding an em dash is *one*
-    // character wide, so the column stated for it lines up; measuring the
-    // undecoded bytes would have made it three and pulled every row after it.
-    says(
-        &shared,
-        &lisp,
-        &format!("(length (first (%org-frozen-cells (format nil \"| ~a | bb |\" {EM_DASH}))))"),
+        "(length (first (%org-frozen-cells \"| \u{2014} | bb |\")))",
         "1",
     );
     says(&shared, &lisp, r#"(length (%org-frozen-cells "| a | bb |"))"#, "2");

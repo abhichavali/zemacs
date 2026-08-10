@@ -6,7 +6,7 @@
 ;;;; does stay where it was. That is the whole mechanism. Everything below is
 ;;;; policy: which ranges, which glyph, and when to stop hiding.
 ;;;;
-;;;; `org-latex-preview' in `init.lisp' is the model, and this is the same shape
+;;;; `org-latex-preview' in `org-latex.lisp' is the model, and this is the same shape
 ;;;; one size up: a Lisp-side property (`:org-modern') marks an overlay as ours,
 ;;;; so a refresh replaces exactly its own overlays and leaves the LaTeX images,
 ;;;; an avy hint or anything else alone. `remove-overlays' is the blunt
@@ -112,6 +112,20 @@ org-modern does too, and what makes a checkbox read as one thing.
 An empty box, a tick and a cross rather than the ballot boxes `☐ ☑ ☒' Emacs's
 org-modern uses: those three are the clearer set and *none of them is in
 SFNSMono*, so all three drew nothing. See the note at the head of this section.")
+
+(defparameter *org-todo-keywords* '("TODO" "DONE")
+  "The keywords a headline may carry, in the order `C-c C-t' walks them before
+coming back round to none. org's own default.
+
+Here rather than in `org-structure.lisp' with the command that cycles them,
+because it is *vocabulary* rather than policy and this file has to read it too:
+a headline's checkbox sits after its keyword, so the thing that draws the
+checkbox has to know where the keyword ends. This file loads first and depends
+on nothing, which is the direction the dependency has to point.
+
+A DEFPARAMETER, so a config setting it to `'(\"TODO\" \"WAIT\" \"DONE\")'
+changes the cycle *and* the parse with nothing to reload — every reader below
+consults the list on each call and none of them holds state.")
 
 (defparameter *org-modern-emphasis*
   '((#\* . "bold") (#\/ . "italic") (#\_ . "italic")
@@ -268,6 +282,47 @@ than showing the URL you can read."
                (assoc (char line (1+ i)) *org-modern-checkboxes*))
       (cons i (+ i 3)))))
 
+(defun %org-heading-head (line stars)
+  "Index in LINE just past a headline's stars and the space after them."
+  (min (1+ stars) (length line)))
+
+(defun %org-heading-keyword (line stars)
+  "The TODO keyword headline LINE carries, or NIL when it carries none.
+
+Only a word from `*org-todo-keywords*' counts, which is org's own rule and what
+keeps `* Doneness matters' from being read as a heading in some state called
+`Doneness'."
+  (let* ((n (length line))
+         (head (%org-heading-head line stars))
+         (sp (position #\Space line :start head))
+         (word (subseq line head (or sp n))))
+    (when (member word *org-todo-keywords* :test #'string=) word)))
+
+(defun %org-heading-body (line stars)
+  "Index in LINE of the first character of a headline's *text*.
+
+Past the stars and their space, and past a TODO keyword when there is one — so
+`* TODO [ ] ship' and `* [ ] ship' both answer the index of the `['.
+
+Clamped to the length of the line, because a keyword can be the whole of a
+heading: `** TODO' with nothing after it has no space to step over, and the
+unclamped answer would be one past the end."
+  (let ((kw (%org-heading-keyword line stars))
+        (head (%org-heading-head line stars)))
+    (if kw
+        (min (+ head (length kw) 1) (length line))
+        head)))
+
+(defun %org-heading-box (line stars)
+  "(BEG . END) of headline LINE's checkbox, or NIL when it has none.
+
+At the *front* of the heading's text and nowhere else, which is the whole of the
+rule and the reason this is not a search: `* Fix the [ ] rendering' is a
+sentence about a checkbox, not a checkbox, and drawing a glyph over those three
+characters — or letting `C-c C-c' tick them — would be wrong in a way that edits
+the file."
+  (%org-checkbox-at line (%org-heading-body line stars)))
+
 (defun %org-modern-inline (line from)
   "The links and emphasis runs in LINE at or after FROM, as (BEG END KIND).
 
@@ -291,10 +346,12 @@ The three lines that are *not* prose — a `#+directive', a `# comment' and a
 about them and for the same reason: a rule like `|--+--|' would otherwise read
 as a `+strike+' run.
 
-A heading is skipped whole too, and that one is a rule about agreement rather
-than about taste: the highlighter paints a heading line in one face, emphasis
-included, so substituting inside one would be the only place two things claimed
-the same cells."
+A heading's *emphasis* is skipped for a rule about agreement rather than about
+taste: the highlighter paints a heading line in one face, emphasis included, so
+substituting inside one would be the only place two things claimed the same
+cells. Its checkbox is drawn, and does not have that problem — a cookie claims
+`display' and no face, so it inherits the heading's colour like every other
+substitution and the highlighter's one-face-per-heading rule still holds."
   (let* ((n (length line))
          (indent (or (position-if-not #'%org-blank-p line) n))
          (head (and (< indent n) (char line indent)))
@@ -307,8 +364,16 @@ the same cells."
       ;; type size, and the text after them carries the weight. See the
       ;; `:heading-line' arm of `%org-modern-render' for why they cannot be the
       ;; same overlay.
-      (stars (list (list 0 stars :heading)
-                   (list stars n :heading-line)))
+      ;;
+      ;; ...and a third when the heading carries a checkbox. It sits *inside*
+      ;; the `:heading-line' range, which is the one place this file lets two of
+      ;; its own overlays overlap — safely, because only one of them claims
+      ;; `display': the box substitutes three cells for a glyph and the heading
+      ;; run underneath only asks for weight.
+      (stars (let ((box (%org-heading-box line stars)))
+               (append (list (list 0 stars :heading))
+                       (when box (list (list (car box) (cdr box) :checkbox)))
+                       (list (list stars n :heading-line)))))
       ((member head '(#\# #\|)) nil)
       ;; `- item' / `+ item', then its checkbox, then the prose after both.
       ((and (member head '(#\- #\+))
@@ -326,11 +391,10 @@ the same cells."
 *character* offsets — which is what `make-overlay' takes — and LITERAL the text
 between them, which is what `%org-modern-render' turns into a glyph.
 
-Two offset spaces, and both are needed. `buffer-string' hands out UTF-8 bytes,
-every offset the editor takes is a character, and `%char-index' converts. It is
-called per *line* rather than per hit, because it counts continuation bytes from
-the start of whatever it is given — over the whole buffer that would be
-quadratic, and over a line it is a few dozen characters."
+One offset space, which is the whole of it: `buffer-string' answers characters
+and `make-overlay' takes characters, so an index into TEXT is already an editor
+offset. There were two, and a `%char-index' per line converting between them,
+for as long as a buffer handed out UTF-8 bytes."
   (let ((n (length text)) (out nil) (in-block nil) (bol 0) (cbol 0))
     (loop while (<= bol n)
           do (let* ((eol (or (position #\Newline text :start bol) n))
@@ -343,13 +407,13 @@ quadratic, and over a line it is a few dozen characters."
                      (in-block)
                      (t (dolist (s (%org-modern-line line))
                           (destructuring-bind (a b kind) s
-                            (push (list (+ cbol (%char-index line a))
-                                        (+ cbol (%char-index line b))
+                            (push (list (+ cbol a)
+                                        (+ cbol b)
                                         kind
                                         (subseq line a b))
                                   out)))))
                (setf bol (1+ eol)
-                     cbol (+ cbol (%char-index line (length line)) 1))))
+                     cbol (+ cbol (length line) 1))))
     (nreverse out)))
 
 ;;; ---------------------------------------------------------------------------
@@ -381,18 +445,13 @@ display string is attributed to the first character it covers, so it inherits
 that character's highlight for free. Only emphasis and links need to say
 otherwise, because the character they start on is a markup marker.
 
-TEXT arrives as buffer **bytes** — the scan's literal, or a `buffer-substring'
-from `%org-modern-rehide' — and is decoded here, once, at the top. It has to be
-decoded *somewhere*: a `display' string goes back to the editor through
-`dup_utf8', which encodes each character as UTF-8, so `[[a][café]]' drawn from
-raw bytes shows `cafÃ©' and `*em—dash*' shows three glyphs where the file has
-one. At the top rather than in the two arms that hand text back, which is the
-decision `org-frozen.lisp' made for the same reason: with it done once, every
-`char' and `length' below counts what the document actually says, and an arm
-added later cannot forget. The arms that only match ASCII markers — stars,
-bullets, `[X]' — are unaffected either way."
-  (let* ((text (utf8-text text))
-         (n (length text)))
+TEXT is the scan's literal, or a `buffer-substring' from `%org-modern-rehide',
+and either way it is characters — so every `char' and `length' below counts what
+the document says. It used to arrive as UTF-8 bytes and be decoded here at the
+top, because a `display' string handed back raw showed `[[a][café]]' as `cafÃ©'
+and `*em—dash*' as three glyphs where the file has one. The decode is in the
+shim now and this arm list never sees the question."
+  (let ((n (length text)))
     (case kind
       (:heading
        (when (and (plusp n) (every (lambda (c) (char= c #\*)) text))
@@ -488,6 +547,44 @@ DEFVAR rather than DEFPARAMETER: reloading the config must not forget that
 something on screen is revealed, or the next `org-modern-appear' would leave it
 revealed forever.")
 
+(defvar *org-modern-blocks* nil
+  "Where the `#+begin_'..`#+end_' bodies are, as (BUFFER LINE-COUNT . RANGES).
+
+`org-modern-refresh-line' redraws one line per keystroke and therefore cannot
+see the `#+begin_src' six lines above it — inside one, a `- ' is a diff line and
+a `*' is a glob, and drawing either as markup is wrong. This is how it knows.
+
+RANGES are (FIRST . LAST) **line numbers**, not character offsets, and that is
+the whole reason the cache works: offsets are invalidated by every keystroke
+anywhere above them, while a line number is invalidated only by adding or
+removing a line — which LINE-COUNT detects for one integer's worth of work. So
+ordinary typing never rescans, and pressing RET rescans once.
+
+BUFFER is in the key because this variable is not: like `*org-modern-revealed*'
+beside it there is one of these for the whole image, and two org files open at
+once would otherwise answer each other's question whenever they happened to be
+the same length — a src block in one drawn with bullets because the other has
+prose at those lines. See `%org-modern-in-block-p', the only reader and its own
+invalidator.")
+
+(defparameter *org-modern-appear-kinds* '(:emphasis :link)
+  "The kinds of substitution that give way to the cursor. *This is the policy.*
+
+Emphasis and links, and deliberately not the structural glyphs — a heading's
+bullet, a list's `•', a `[X]' — which stay drawn wherever point is.
+
+That asymmetry is the whole of org-appear's actual behaviour and it took a bug
+report to get right here. Markup gives way because you have to *see what you are
+about to type into*: the asterisks around a word are punctuation you are
+editing. A heading's stars are not that. They are structure, org-modern replaces
+them permanently, and revealing them means the bullet turns back into a `*' the
+moment the cursor reaches column 0 and turns back into a bullet when you leave —
+so a heading appears to vanish while you write and come back when you press
+RET. Which is exactly what it was reported as.
+
+A list rather than a test, so a config that wants its checkboxes to open under
+the cursor adds `:checkbox' and nothing here changes.")
+
 (defvar *org-modern-appear-inhibit-modes* nil
   "Major modes in which markup is never revealed under the cursor.
 
@@ -521,29 +618,146 @@ which is what the `:org-modern' mark exists to prevent."
   "Take every substitution off, showing org's punctuation again."
   (message (format nil "~d substitution~:p cleared" (%org-modern-remove))))
 
+(defun %org-modern-draw (beg end kind text at)
+  "Make one overlay over BEG..END, drawn as a KIND substitution of TEXT.
+
+Answers the overlay, or NIL when TEXT is not that kind of markup any more —
+`%org-modern-render' decides, and this is only the two calls that follow a yes.
+Born revealed when AT — point — is inside it, which is what stops a redraw from
+hiding the run the cursor is in for the one frame before `org-modern-appear'
+opens it again.
+
+AT is passed rather than read, and that is not style: `point' is a `%query'
+round trip, and reading it here would be one per hit — a few thousand on the
+full pass over a curriculum-sized file, to answer a question whose answer cannot
+change while the pass is running."
+  (let ((look (%org-modern-render kind text)))
+    (when look
+      (let ((ov (make-overlay beg end)))
+        (when ov
+          (overlay-put ov :org-modern kind)
+          (%org-modern-apply ov look)
+          (when (and (member kind *org-modern-appear-kinds*)
+                     (<= beg at) (<= at end))
+            (overlay-put ov 'display nil)
+            (setf *org-modern-revealed* ov))
+          ov)))))
+
+(defun %org-modern-redraw ()
+  "Redraw every substitution in the buffer, and answer how many there are.
+
+The work half of `org-modern-refresh', so that `org-modern-refresh-line' can
+escalate to a full pass without printing a count at somebody who was typing."
+  (%org-modern-remove)
+  (let ((made 0) (at (point)))
+    (dolist (s (%org-modern-scan (buffer-string)))
+      (destructuring-bind (beg end kind text) s
+        (when (%org-modern-draw beg end kind text at) (incf made))))
+    ;; Whatever the cursor is already sitting in should not have been hidden.
+    (org-modern-appear)
+    made))
+
 (defun org-modern-refresh ()
   "Redraw every substitution in the buffer.
 
-Its own overlays first, so this doubles as `refresh' and is safe to call as
-often as you like. One scan of `buffer-string' and one overlay per hit — which
-is why it is a *command* and not something on `after-change-hook' — see the
-note beside that hook at the foot of this file."
-  (%org-modern-remove)
-  (let ((made 0))
-    (dolist (s (%org-modern-scan (buffer-string)))
-      (destructuring-bind (beg end kind text) s
-        (let ((look (%org-modern-render kind text)))
-          (when look
-            (let ((ov (make-overlay beg end)))
-              (when ov
-                (overlay-put ov :org-modern kind)
-                (%org-modern-apply ov look)
-                (incf made)))))))
-    ;; Whatever the cursor is already sitting in should not have been hidden.
-    (org-modern-appear)
-    ;; Ends on the message, so it answers NIL: `eval-string' echoes the value of
-    ;; the last form and would otherwise wipe out what this just said.
-    (message (format nil "~d substitution~:p" made))))
+Its own overlays first, so this is safe to call as often as you like. One scan
+of `buffer-string' and one overlay per hit — which is why the *typing* path is
+`org-modern-refresh-line' and this is the one you ask for by hand."
+  ;; Ends on the message, so it answers NIL: `eval-string' echoes the value of
+  ;; the last form and would otherwise wipe out what this just said.
+  (message (format nil "~d substitution~:p" (%org-modern-redraw))))
+
+(defun %org-modern-block-lines ()
+  "(FIRST . LAST) line numbers of each `#+begin_'..`#+end_' *body*.
+
+The delimiter lines themselves are outside their range, deliberately: they are
+what `org-modern-refresh-line' escalates on, and it can only notice them if they
+do not read as being inside a block already.
+
+An unterminated block runs to the end of the buffer, which is the same answer
+`%org-modern-scan' gives it — one rule, applied by both, and it beats guessing
+where the author meant to close it."
+  (let ((lines (buffer-lines)) (n 0) (open nil) (out nil))
+    (dolist (line lines)
+      (incf n)
+      (cond ((%org-directive-p line "#+begin_") (setf open (1+ n)))
+            ((%org-directive-p line "#+end_")
+             (when (and open (<= open (1- n))) (push (cons open (1- n)) out))
+             (setf open nil))))
+    (when (and open (<= open n)) (push (cons open n) out))
+    (nreverse out)))
+
+(defun %org-modern-in-block-p (line)
+  "True when LINE — a line *number* — is inside a `#+begin_'..`#+end_' body.
+
+Its own invalidator, which is what keeps the cache from being a second thing to
+remember to update: the ranges are line numbers, so they survive every edit that
+does not change how many lines there are, and the buffer name and line count are
+two cheap reads to compare. `org-modern-refresh-line' clears the cache outright
+when the line being edited *is* a delimiter — that is the one edit which changes
+what a block is without changing either."
+  (let ((name (buffer-name))
+        (count (line-count)))
+    (unless (and (equal name (first *org-modern-blocks*))
+                 (eql count (second *org-modern-blocks*)))
+      (setf *org-modern-blocks*
+            (list* name count (%org-modern-block-lines)))))
+  (some (lambda (r) (and (<= (car r) line) (<= line (cdr r))))
+        (cddr *org-modern-blocks*)))
+
+(defun org-modern-refresh-line ()
+  "Redraw the substitutions on the line point is on.
+
+**This is what makes typing feel live**, and it is the ceiling the note at the
+foot of this file used to describe: a full rescan per keystroke is a `%do' per
+bullet between you and your next character, so nothing was rescanned at all and
+markup you had just typed stayed as punctuation until you pressed `SPC m m'. A
+*line* is the unit that closes it — one `line-string', no `buffer-string', and
+an overlay per hit on one line — so `- ' becomes a bullet as you type it and a
+heading whose text you extended keeps its weight over the new words.
+
+The line is also the unit that is *correct*: every substitution org-modern makes
+lives inside one line (`%org-modern-line' is the whole grammar), so a line's
+overlays can be replaced without asking what the rest of the buffer looks like.
+
+The two things one line cannot answer for itself:
+
+  - Whether it is inside a `#+begin_src' block, where a `- ' is a diff line and
+    a `*' is a glob. `%org-modern-in-block-p' remembers, and rescans itself
+    when the buffer or its line count changes underneath it.
+  - Whether it *is* a block delimiter, which changes what every line below it
+    means. That one escalates to a full redraw, which is rare enough to be free
+    — you type `#+end_src' once per block."
+  (when (and (minor-mode-p 'org-modern)
+             (notany #'derived-mode-p *org-modern-appear-inhibit-modes*))
+    (let ((line (line-string))
+          (beg (line-start))
+          (end (line-end))
+          (at (point)))
+      (cond
+        ((or (%org-directive-p line "#+begin_") (%org-directive-p line "#+end_"))
+         ;; Typing a delimiter changes what every line below it *means* without
+         ;; necessarily changing how many lines there are, which is the one
+         ;; thing `%org-modern-in-block-p' cannot notice for itself.
+         (setf *org-modern-blocks* nil)
+         (%org-modern-redraw))
+        ((%org-modern-in-block-p (line-number)))
+        (t
+         ;; Its own overlays on this line, and only this line: `overlays-in'
+         ;; does not count touching at a boundary as overlapping, so BEG..END is
+         ;; exactly the line and neither neighbour is disturbed.
+         (dolist (o (%org-modern-overlays beg end))
+           (when (eql o *org-modern-revealed*) (setf *org-modern-revealed* nil))
+           (delete-overlay o))
+         (dolist (s (%org-modern-line line))
+           (destructuring-bind (a b kind) s
+             (%org-modern-draw (+ beg a)
+                               (+ beg b)
+                               kind
+                               (subseq line a b)
+                               at)))))))
+  ;; A hook as well as a command, so it answers NIL rather than a count.
+  nil)
 
 (defun %org-modern-rehide (ov)
   "Put OV's glyph back, re-reading the text it covers."
@@ -563,6 +777,27 @@ note beside that hook at the foot of this file."
         ;; overlay that cannot draw itself has nothing to say.
         (t (delete-overlay ov))))))
 
+(defun %org-modern-openable (pos)
+  "The overlay POS is inside that should give way to the cursor, or NIL.
+
+Inside **or against the closing edge**, which is the difference between markup
+that opens as you write it and markup that snaps shut under your hands: typing
+the second `*' of `*bold*' leaves point one past the run, and a test that only
+asked `is point within' hid the asterisks on the very keystroke that finished
+them. `<=' on both ends says what org-appear means by \"in\".
+
+Only `*org-modern-appear-kinds*' are candidates, so the structural glyphs are
+never returned and therefore never revealed."
+  (find-if (lambda (o)
+             (let ((at (overlay-position o)))
+               (and at
+                    (member (overlay-get o :org-modern) *org-modern-appear-kinds*)
+                    (<= (car at) pos) (<= pos (cdr at)))))
+           ;; One character either side, because `overlays-in' does not count
+           ;; touching at a boundary as overlapping and the edge cases above are
+           ;; exactly the boundaries.
+           (%org-modern-overlays (max 0 (1- pos)) (1+ pos))))
+
 (defun org-modern-appear ()
   "Reveal the literal markup the cursor is inside, and hide everything else.
 
@@ -572,7 +807,7 @@ revealed' and, when it is not, two `overlay-put's. That is what makes this
 affordable on every keystroke where a full rescan is not."
   (when (and (minor-mode-p 'org-modern)
              (notany #'derived-mode-p *org-modern-appear-inhibit-modes*))
-    (let ((now (first (%org-modern-overlays (point) (1+ (point))))))
+    (let ((now (%org-modern-openable (point))))
       (unless (eql now *org-modern-revealed*)
         (%org-modern-rehide *org-modern-revealed*)
         ;; NIL clears the property, so the characters underneath are drawn —
@@ -600,20 +835,15 @@ affordable on every keystroke where a full rescan is not."
 (defun %org-lines (&optional (text (buffer-string)))
   "Every line of TEXT as (STRING BEGIN END).
 
-BEGIN and END are *character* offsets, which is what every editor primitive
-takes; TEXT arrives as UTF-8 bytes, which is what `%char-index' is for. END is
-the newline's own offset — so `(subseq buffer BEGIN END)' is the line without
-it, and END is also where a line-final insertion goes.
-
-Converted per *line* and not per hit, for `%org-modern-scan''s reason: the
-conversion counts continuation bytes from the start of whatever it is handed,
-which over a whole buffer would be quadratic and over one line is a few dozen
-characters."
+BEGIN and END are character offsets, which is what every editor primitive takes
+and what TEXT is counted in. END is the newline's own offset — so
+`(subseq buffer BEGIN END)' is the line without it, and END is also where a
+line-final insertion goes."
   (let ((n (length text)) (out nil) (bol 0) (cbol 0))
     (loop while (<= bol n)
           do (let* ((eol (or (position #\Newline text :start bol) n))
                     (line (subseq text bol eol))
-                    (chars (%char-index line (length line))))
+                    (chars (length line)))
                (push (list line cbol (+ cbol chars)) out)
                (setf bol (1+ eol) cbol (+ cbol chars 1))))
     (nreverse out)))
@@ -688,12 +918,12 @@ browser you actually use.")
 (defun %org-link-at-point ()
   "The (TARGET . LABEL) of the link point is inside, or NIL.
 
-Point's column has to be converted into the same index space `%org-link-at'
-reports in, which is bytes — `line-string' hands out UTF-8 like `buffer-string'
-does, and a heading with an accent in it would otherwise put the cursor one
-character to the left of where it is."
+Point's column and the offsets `%org-modern-inline' reports are the same unit —
+characters — so the column goes in as it comes out of `(point)'. It was a
+conversion for as long as `line-string' answered UTF-8 bytes, and an accented
+heading was where forgetting it showed."
   (let* ((line (line-string))
-         (col (%byte-index line (- (point) (line-start)))))
+         (col (- (point) (line-start))))
     (loop for (beg end kind) in (%org-modern-inline line 0)
           when (and (eq kind :link) (<= beg col) (< col end))
             return (%org-link-parts (subseq line beg end)))))
@@ -885,8 +1115,8 @@ which is what indents a figure inside a list item along with the item."
                 (let* ((parts (%org-link-parts (subseq text i j)))
                        (path (and parts (%org-image-target (car parts)))))
                   (when path
-                    (push (list (+ begin (%char-index text i))
-                                (+ begin (%char-index text j))
+                    (push (list (+ begin i)
+                                (+ begin j)
                                 path)
                           out)))))))))))
 
@@ -989,14 +1219,22 @@ Turning it off removes exactly the overlays it made."
 ;;; nothing has moved, so the overlap costs a function call rather than a scan,
 ;;; and `after-change-hook' is one Lisp evaluation whether this is on it or not.
 ;;;
-;;; Note what is *not* hung here: `org-modern-refresh'. A rescan is one query
-;;; plus an overlay per hit, and doing that per keystroke would put a `%do' per
-;;; bullet between you and your next character. So markup typed since the last
-;;; refresh has no glyph until you ask for one — `SPC m m', or leaving and
-;;; re-entering the mode. Closing that properly wants the change *delta*
-;;; `boundary.org' lists as missing, which would let this rescan the two lines
-;;; that moved instead of all of them.
-(add-hook '*after-change-functions* 'org-modern-appear)
+;;; What is hung on the *change* hook is `org-modern-refresh-line' and not
+;;; `org-modern-refresh'. That note used to read "a rescan per keystroke would
+;;; put a `%do' per bullet between you and your next character, so markup you
+;;; typed has no glyph until you ask for one" — which was true about the cost
+;;; and wrong about the conclusion. The unit was too big, not the idea: a
+;;; *line* is one `line-string' and an overlay per hit on that line, which is
+;;; the same order as the org-appear check next to it, and it is all a
+;;; keystroke can dirty. See `org-modern-refresh-line' for the two things it
+;;; escalates on.
+;;;
+;;; It subsumes the appear check on this hook — a redrawn line is born with the
+;;; run under point already open — so the change hook has one entry, not two.
+;;; The *cursor* hook still needs its own: moving `j' onto a `*bold*' changes
+;;; what point is inside without changing a character, and that is the event
+;;; this whole mechanism exists for.
+(add-hook '*after-change-functions* 'org-modern-refresh-line)
 (add-hook '*point-moved-functions* 'org-modern-appear)
 
 ;;; ---------------------------------------------------------------------------
@@ -1014,11 +1252,12 @@ Turning it off removes exactly the overlays it made."
 ;;; entry would switch the glyphs back off. That guard is the mode system's job
 ;;; and `modes.lisp' does it; the docstring there is the long version.
 
-;;; `org-latex-preview-new' comes from `init.lisp', which is read before this
-;;; file — so the FBOUNDP is about a *config* that never loaded it rather than
-;;; about load order. It is here and not there because this is the last
-;;; `define-derived-mode org-mode' in the runtime and therefore the only body
-;;; that runs: declaring one in `init.lisp' would be silently replaced by this.
+;;; `org-latex-preview-new' comes from `org-latex.lisp', which `*runtime-modules*'
+;;; lists immediately before this file — so the FBOUNDP is about a *config* that
+;;; dropped it from that list rather than about load order. The call is here and
+;;; not there because this is the last `define-derived-mode org-mode' in the
+;;; runtime and therefore the only body that runs: declaring one in
+;;; `org-latex.lisp' would be silently replaced by this.
 ;;;
 ;;; Entering the mode is the right moment for it. The buffer has just been read,
 ;;; nothing is being typed into it, and previewing here is what makes an org

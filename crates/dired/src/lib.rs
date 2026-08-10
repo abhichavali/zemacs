@@ -212,7 +212,14 @@ fn mode_of(meta: &fs::Metadata) -> u32 {
     }
 }
 
-fn sort_entries(entries: &mut [Entry], sort: Sort) {
+/// Order a listing the way [`list`] does: `.`, `..`, directories, files, then
+/// whichever [`Sort`] was asked for, then the name.
+///
+/// Public because a listing does not have to come from `std::fs` — a remote one
+/// arrives from `zemacs-tramp` already built, and it must sort by the same rule
+/// or the same directory would read differently depending on which machine it
+/// is on.
+pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
     entries.sort_by(|a, b| {
         rank(a)
             .cmp(&rank(b))

@@ -567,4 +567,55 @@ fn modes_are_built_in_lisp() {
     // The editor-wide flag never moved: this is a per-buffer decision, which is
     // the entire reason it exists.
     assert!(shared.lock().unwrap().settings.line_numbers);
+
+    // --- the settings follow the buffer on screen, not the last mode entered -
+    //
+    // The one check that fails if `buffer-switch-hook` regresses, driven exactly
+    // as the bug was reported: open an org file, open a rust one, switch back.
+    // The third step is the whole of it — before the hook existed it read
+    // `(org-mode truncate 0)`, the mode right and the settings the *rust*
+    // buffer's, so one visit to a code file cost every prose buffer its wrapping
+    // and its measure for the rest of the session.
+    //
+    // Nothing here enters a mode. Both buffers have been in theirs since they
+    // were loaded, so `%enter-major-mode` cannot be what puts the claims back
+    // and only a report of the *switch* can — which is why the assertion is
+    // meaningful rather than a restatement of the entry test above.
+    //
+    // Last in the file for the reason the block above is: it leaves two more
+    // buffers open and changes major mode twice, and two assertions earlier are
+    // counts of how many mode changes happened.
+    let org = {
+        let mut ed = shared.lock().unwrap();
+        ed.load(
+            "* notes\n",
+            Some(PathBuf::from("/tmp/zemacs_test_modes_a.org")),
+            Some("org".into()),
+        );
+        ed.buffer.id
+    };
+    wait(&shared, "the org buffer's own settings", |ed| {
+        (ed.buffer.major_mode == "org-mode"
+            && ed.settings.line_overflow == LineOverflow::Wrap
+            && ed.settings.text_width == 80)
+            .then_some(())
+    });
+    shared.lock().unwrap().load(
+        "fn main() {}\n",
+        Some(PathBuf::from("/tmp/zemacs_test_modes_b.rs")),
+        Some("rust".into()),
+    );
+    wait(&shared, "the rust buffer's own settings", |ed| {
+        (ed.buffer.major_mode == "rust-mode"
+            && ed.settings.line_overflow == LineOverflow::Truncate
+            && ed.settings.text_width == 0)
+            .then_some(())
+    });
+    shared.lock().unwrap().switch_buffer_id(org);
+    wait(&shared, "org's claims to come back with its buffer", |ed| {
+        (ed.buffer.major_mode == "org-mode"
+            && ed.settings.line_overflow == LineOverflow::Wrap
+            && ed.settings.text_width == 80)
+            .then_some(())
+    });
 }

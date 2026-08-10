@@ -7,6 +7,20 @@
 //! working directory — an editor open on two repos at once should answer
 //! "which project" differently in each window, and the file on screen is the
 //! only honest way to tell.
+//!
+//! # What is left here, and what went to Lisp
+//!
+//! `project-root`, `project-dired`, `project-compile` and `project-test` are
+//! now `runtime/plugins/project.lisp`: each is a handful of `probe-file` calls
+//! and a table, run once per command, and *which* command builds a Cargo
+//! project is exactly the kind of decision a config has to be able to change.
+//!
+//! What stayed is what the boundary says stays. `find-file` and `find-dir` walk
+//! the whole tree behind [`project::Cache`] and have to answer between two
+//! keystrokes; `switch` and `open` need a prompt seeded with candidates core
+//! owns, and there is no primitive that seeds one. [`Project::search_root`] is
+//! not a verb at all — it is where a project-scoped ripgrep starts, asked for
+//! by `main.rs` on every `OpenAt`.
 
 use std::path::{Path, PathBuf};
 
@@ -18,9 +32,6 @@ pub struct Project {
     /// One walk per root, reused across keystrokes. Owned here rather than
     /// globally so it dies with the editor.
     cache: project::Cache,
-    /// Set when a verb wants a shell command run; the app drains it, because
-    /// spawning belongs to the terminal.
-    pub run: Option<project::Command>,
 }
 
 impl Project {
@@ -50,35 +61,12 @@ impl Project {
         match verb {
             "find-file" => self.find_file(editor, &found)?,
             "find-dir" => self.find_dir(editor, &found)?,
-            "dired" => editor.apply(EditorCommand::OpenFile(found.root.clone())),
-            "root" => editor.apply(EditorCommand::Message(format!(
-                "{} ({})",
-                found.root.display(),
-                found.marker.label()
-            ))),
             // The cache is what makes completion instant; forgetting is how a
             // file created outside the editor becomes findable at once instead
             // of on the next staleness check.
             "forget" => {
                 self.cache.forget(&found.root);
                 editor.apply(EditorCommand::Message("project file list refreshed".into()));
-            }
-            "compile" | "test" => {
-                let command = if verb == "compile" {
-                    found.build()
-                } else {
-                    found.test()
-                };
-                match command {
-                    Some(command) => {
-                        editor.apply(EditorCommand::Message(format!("run: {}", command.display())));
-                        self.run = Some(command);
-                    }
-                    None => editor.apply(EditorCommand::Message(format!(
-                        "no {verb} command for a {} project",
-                        found.marker.label()
-                    ))),
-                }
             }
             other => editor.apply(EditorCommand::Message(format!(
                 "unknown project verb: {other}"

@@ -117,13 +117,25 @@ impl Key {
     /// True for the keys a *terminal* has no use for, and which therefore stay
     /// with the editor even while a shell has the keyboard.
     ///
-    /// On macOS that is everything involving Command, plus the two modified
-    /// Enters. Ctrl is deliberately excluded: `C-c`, `C-a`, `C-d`, `C-r` and
-    /// `C-w` all belong to the shell, and taking any of them would break it.
+    /// On macOS that is everything involving Command, plus the modified Enters.
+    /// Ctrl is deliberately excluded: `C-c`, `C-a`, `C-d`, `C-r` and `C-w` all
+    /// belong to the shell, and taking any of them would break it.
+    ///
+    /// `M-S-<left>`/`M-S-<right>` are here while `M-<left>`/`M-<right>` are not,
+    /// and the split is the shell's own doing: a terminal reads `M-<left>` as
+    /// word-wise motion (`Input::AltLeft`) and has no encoding at all for the
+    /// shifted pair, so keeping them is taking nothing away from it.
     pub fn is_editor_key(self) -> bool {
         matches!(
             self,
-            Key::Meta(_) | Key::CtrlMeta(_) | Key::CtrlEnter | Key::CtrlMetaEnter | Key::MetaEnter
+            Key::Meta(_)
+                | Key::CtrlMeta(_)
+                | Key::CtrlEnter
+                | Key::CtrlMetaEnter
+                | Key::MetaEnter
+                | Key::MetaShiftEnter
+                | Key::MetaShiftLeft
+                | Key::MetaShiftRight
         )
     }
 }
@@ -146,10 +158,14 @@ pub enum Key {
     Meta(char),
     /// Both together, `C-M-` in a binding.
     CtrlMeta(char),
-    // ponytail: four named keys now carry modifiers — the two window splits,
-    // `M-<bs>` and `<backtab>` — which is the threshold this note set for
-    // itself. A modifier bitset over a `Named` enum is the real answer; it is
-    // now owed, and the debt is a match arm in every crate that reads a `Key`.
+    // ponytail: fifteen named keys carry a modifier now — the two window splits,
+    // `M-<bs>`, `<backtab>`, the Meta'd arrows, and the Shift'd ones org's
+    // structure keys are spelled with — where this note once set its threshold
+    // at four. A modifier bitset over a `Named` enum is still the real answer
+    // and still owed. It was not taken here because the debt is a match arm in
+    // every crate that reads a `Key`, and eight more arms is a duller change
+    // than rewriting ~400 `Key::` sites across fifteen files in the most
+    // safety-critical code in the editor.
     CtrlEnter,
     CtrlMetaEnter,
     /// `⌘⏎`. org's `M-RET`: a new list item, a new heading — "another one of
@@ -165,6 +181,28 @@ pub enum Key {
     /// [`Key::MetaBackspace`]'s reason: an arrow has no character to carry.
     MetaLeft,
     MetaRight,
+    /// `⇧⏎` and `⌘⇧⏎`. Shift is a modifier in this enum only on the keys below,
+    /// and this is the one that asked for it: org spells "another one of these,
+    /// but a *task*" `M-S-<ret>`, and until these existed there was no way to
+    /// write that binding down at all.
+    ShiftEnter,
+    MetaShiftEnter,
+    /// `⇧←` and its three relatives. Named keys for [`Key::MetaLeft`]'s reason —
+    /// an arrow carries no character for `combo_char` to spell.
+    ///
+    /// Unbound they still mean what the bare arrow means (see `insert_key` and
+    /// `Editor::motion`), so a shift left over from typing a capital moves the
+    /// cursor as it always did rather than turning it into a dead key.
+    ShiftLeft,
+    ShiftRight,
+    ShiftUp,
+    ShiftDown,
+    /// `⌘⇧←`/`⌘⇧→` — org's promote/demote *subtree*, which is precisely what
+    /// plain `M-<left>` deliberately does not do. No `M-S-<up>`/`M-S-<down>`
+    /// twins: nothing binds them, and a variant nothing produces is a match arm
+    /// in four crates for a key nobody presses.
+    MetaShiftLeft,
+    MetaShiftRight,
     Enter,
     Tab,
     /// `⇧⇥`. Its own key and not a shifted `Tab`, because that is what every
@@ -194,6 +232,14 @@ impl Key {
             Key::MetaBackspace => "M-<bs>".into(),
             Key::MetaLeft => "M-<left>".into(),
             Key::MetaRight => "M-<right>".into(),
+            Key::ShiftEnter => "S-<ret>".into(),
+            Key::MetaShiftEnter => "M-S-<ret>".into(),
+            Key::ShiftLeft => "S-<left>".into(),
+            Key::ShiftRight => "S-<right>".into(),
+            Key::ShiftUp => "S-<up>".into(),
+            Key::ShiftDown => "S-<down>".into(),
+            Key::MetaShiftLeft => "M-S-<left>".into(),
+            Key::MetaShiftRight => "M-S-<right>".into(),
             Key::Enter => "<ret>".into(),
             Key::Tab => "<tab>".into(),
             Key::BackTab => "<backtab>".into(),
@@ -245,6 +291,16 @@ impl Key {
             "M-<bs>" => Key::MetaBackspace,
             "M-<left>" => Key::MetaLeft,
             "M-<right>" => Key::MetaRight,
+            // Spelled `M-S-`, never `S-M-`: one order, so a keymap cannot hold
+            // the same chord twice under two names. Emacs' order too.
+            "S-<ret>" => Key::ShiftEnter,
+            "M-S-<ret>" => Key::MetaShiftEnter,
+            "S-<left>" => Key::ShiftLeft,
+            "S-<right>" => Key::ShiftRight,
+            "S-<up>" => Key::ShiftUp,
+            "S-<down>" => Key::ShiftDown,
+            "M-S-<left>" => Key::MetaShiftLeft,
+            "M-S-<right>" => Key::MetaShiftRight,
             // Order matters: `C-M-` has to be tried before `C-`.
             _ if s.starts_with("C-M-") => Key::CtrlMeta(one(&s[4..])?.to_ascii_lowercase()),
             _ if s.starts_with("C-") => Key::Ctrl(one(&s[2..])?.to_ascii_lowercase()),
@@ -545,6 +601,8 @@ pub enum EditorCommand {
     /// `"truncate"` or `"wrap"`.
     SetLineOverflow(String),
     SetRelativeLineNumbers(bool),
+    /// See [`Settings::scroll_past_end`].
+    SetScrollPastEnd(bool),
 
     /// Names offered by `M-x`. The Lisp image publishes these at startup and
     /// after a config reload.
@@ -763,6 +821,41 @@ pub enum EditorCommand {
     /// is filled the same way — see [`CompletionEdit`] and [`Completion`].
     Completion(CompletionEdit),
 
+    /// Hand the **next keystroke** to the image, as `(FUNCTION "a")`, instead of
+    /// to the editor. `None` stops wanting it. The key is spelled the way
+    /// [`Key::token`] spells one, so `<esc>` arrives as `"<esc>"` and what counts
+    /// as a label is entirely the image's opinion.
+    ///
+    /// avy, and the fourth answer to "a label drawn over the frame". The other
+    /// three all draw *in core* — [`Editor::ace`]'s window letters,
+    /// [`EditorCommand::WhichKey`]'s panel, [`Completion`]'s popup — and this one
+    /// draws nothing at all, because avy's labels are `display` overlays and the
+    /// image has owned those since overlays landed. What is left over is the one
+    /// fact the image cannot have for itself: *the next keystroke, whatever it
+    /// is.* So that is the whole of what crosses.
+    ///
+    /// **Not a prompt**, which is which-key's and corfu's objection and is
+    /// sharpest here: a prompt opens a minibuffer and owns the keyboard, and
+    /// avy's entire gesture is one key pressed against the *document*.
+    ///
+    /// **Not `ace`**, though it is the closest relative and was tried first:
+    /// `ace` resolves the label itself, into a [`WindowId`] core owns. A jump
+    /// target is a buffer offset hung off an overlay, which lives in the image —
+    /// so core resolving it means core keeping a second copy of a label table
+    /// Lisp already has, and the two disagreeing is exactly the half-cleared
+    /// screenful of labels this feature must never leave behind.
+    ///
+    /// **Not a Lisp-only transient keymap**, which was the laziest candidate and
+    /// is wrong on the case that matters: a keymap catches the keys that are *in*
+    /// it, so a key that is not a label falls through and edits the buffer with
+    /// the labels still up. "Anything else cancels" is not expressible as a
+    /// keymap; it is expressible as three lines here.
+    ///
+    /// A function *name* rather than a bool, which costs the same one field and
+    /// keeps the word "avy" out of core — core is not the layer that knows what a
+    /// label means, and this is the second caller's door as well as the first's.
+    GrabKey(Option<String>),
+
     // --- end of the lisp-api block -------------------------------------------
 }
 
@@ -886,12 +979,14 @@ impl Completion {
 /// to convert. A [`Completion`] carries a buffer offset for the opposite
 /// reason.
 ///
-/// **A short fixed list.** The verbs are the ones a mouse is plausibly reaching
-/// for — a second window, a split, closing one — and they are built-ins, so a
-/// menu works in a build with no config at all. ponytail: not extensible from
-/// Lisp. The upgrade path is the `which-key`/`completion-row` idiom, one string
-/// per call, and it is worth building the first time somebody wants their own
-/// entry in here rather than a keybinding.
+/// **A short list.** The verbs are the ones a mouse is plausibly reaching for —
+/// a second window, a split, closing one — and they are built-ins, so a menu
+/// works in a build with no config at all. [`Editor::open_context_menu`] adds
+/// dired's **New File** on top of them in a listing, which is the only place
+/// the list is not the same everywhere. ponytail: not extensible from Lisp. The
+/// upgrade path is the `which-key`/`completion-row` idiom, one string per call,
+/// and it is worth building the first time somebody wants their own entry in
+/// here rather than a keybinding.
 #[derive(Clone, Debug)]
 pub struct ContextMenu {
     pub x: i32,
@@ -920,6 +1015,57 @@ impl Default for ContextMenu {
             hover: None,
         }
     }
+}
+
+/// The box the pointer resting on something puts under itself — a diagnostic's
+/// message when you hover its mark in the gutter.
+///
+/// The fourth surface drawn *over* the frame rather than in it, after
+/// [`Editor::ace`], [`EditorCommand::WhichKey`] and [`Completion`], and the
+/// second one anchored in **pixels** — [`ContextMenu`] is the first, for the
+/// identical reason: this hangs off *the pointer* and not off anything in the
+/// document, so there is no offset for the renderer to convert. A `Completion`
+/// carries a buffer offset because it is anchored to a word.
+///
+/// **Not an `after-string` overlay**, which is what `lsp.lisp` predicted the
+/// answer would be, and it is worth saying why the prediction does not survive
+/// contact with the word *hover*. That note was written for an **inline**
+/// message — text sitting permanently at the end of the offending line, the way
+/// some editors show diagnostics — and both halves of it are wrong here. An
+/// `after-string` is pinned to the end of a line, and a hover box belongs at the
+/// pointer, which may be forty columns away in the margin; and an `after-string`
+/// is *on* until something removes it, where the entire contract of a hover is
+/// that it is gone the moment you look away. A property that is permanent and
+/// line-anchored cannot express a thing that is transient and pointer-anchored.
+/// The inline-message feature is still an `after-string` and is still unbuilt.
+///
+/// **Not the echo area**, which already does this: `SPC l e` puts the same text
+/// in [`Editor::status`]. That is the keyboard's answer to the question and it
+/// stays; a message in the echo area is not "over the thing you are pointing
+/// at", it is at the bottom of the frame, and it survives until the next message
+/// overwrites it rather than until the pointer moves.
+///
+/// **Text, not rows.** Deliberately one string and not a `Vec<String>`: where a
+/// paragraph of prose breaks depends on how many cells the box has, which is the
+/// renderer's arithmetic and nobody else's — the same division of labour that
+/// keeps [`Completion::at`] a buffer offset. It carries newlines, because a
+/// server that sends a two-paragraph diagnostic meant them.
+///
+/// Filling it is [`Editor::help_echo_at`] plus whoever is holding the pointer;
+/// emptying it is *four* places, and that is the design rather than an
+/// oversight — see the callers, and see [`Completion`] for why a hook was not
+/// good enough at exactly this.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tooltip {
+    /// Which OS window's pixels `x` and `y` are in. [`ContextMenu`] gets away
+    /// without one because a right-click focuses the frame it landed in first,
+    /// and *pointing* at a window deliberately does not focus it — so without
+    /// this, hovering a mark in a second frame draws the box in the first one,
+    /// at coordinates that mean nothing there.
+    pub frame: usize,
+    pub x: i32,
+    pub y: i32,
+    pub text: String,
 }
 
 impl EditorCommand {
@@ -1007,6 +1153,14 @@ pub struct Settings {
     /// characters — "66 characters per line" is the typographic rule, and it
     /// stays true when the font size changes.
     pub text_width: usize,
+    /// Let the view keep going after the last line, into rows the document does
+    /// not reach — Emacs, vim's `~` filler, VSCode's `scrollBeyondLastLine`.
+    ///
+    /// **Nothing is inserted.** The buffer is untouched and the empty rows are
+    /// not a place: point cannot go there, the gutter does not number them, and
+    /// a click in them lands at `point-max`. The whole feature is one number,
+    /// [`Editor::max_scroll`], and this is the switch on it.
+    pub scroll_past_end: bool,
 }
 
 impl Default for Settings {
@@ -1023,6 +1177,11 @@ impl Default for Settings {
             line_overflow: LineOverflow::default(),
             relative_line_numbers: false,
             text_width: 0,
+            // On, because both editors this one is measured against do it and
+            // neither offers a way not to: vim draws `~` past the end and Emacs
+            // lets the last line reach the top of the window. It is the switch
+            // to turn it *off* that is the feature here.
+            scroll_past_end: true,
         }
     }
 }
@@ -1924,10 +2083,27 @@ pub struct Editor {
     pub font_px: f32,
     /// Command names published by the Lisp image, for `M-x` completion.
     pub commands: Vec<String>,
+    /// What has been answered to prompts before, oldest first, so `M-p` in a
+    /// prompt can walk back through it.
+    ///
+    /// One flat log tagged by kind rather than a list per kind: walking filters
+    /// it, which is a scan of at most [`HISTORY_LIMIT`] entries on a keypress a
+    /// human made, and it costs no map, no `Hash` on [`PromptKind`] and no
+    /// decision about what to do with a kind nobody has typed into yet.
+    pub prompt_history: Vec<(PromptKind, String)>,
     /// Mode hooks waiting to be run. Core records that a hook is due; the app
     /// drains this and asks the Lisp image to run each one, since core cannot
     /// call Lisp itself.
     pub pending_hooks: Vec<String>,
+    /// Buffers whose text was replaced under them and which want a fresh parse.
+    /// The same division of labour as [`Editor::pending_hooks`] one line up, and
+    /// for the same reason: highlighting happens on a thread core does not own,
+    /// so core can only record that it is due.
+    ///
+    /// A *parked* buffer is what this exists for. The live one bumps the
+    /// revision and gets re-parsed for that alone; the buffer nobody is looking
+    /// at has no such signal and used to sit uncoloured until it was visited.
+    pub pending_highlight: Vec<BufferId>,
     pub mode: Mode,
     pub settings: Settings,
     pub theme: Theme,
@@ -2006,8 +2182,20 @@ pub struct Editor {
     /// and only the second one is ever the right one to ask. See
     /// [`Editor::completion`].
     completion: Option<Completion>,
+    /// A Lisp function the image parked here to receive the *next* keystroke —
+    /// avy. See [`EditorCommand::GrabKey`], which is where the design is.
+    ///
+    /// Filed beside `ace` and `which_key` for their reason and with one
+    /// difference: those two are a *surface* core draws, and this is only the
+    /// keyboard half. Nothing reads it but [`Editor::dispatch_key`], which takes
+    /// it — so the flag is spent by the keystroke that satisfies it and no path
+    /// through the image can leave the keyboard captured.
+    pub grab_key: Option<String>,
     /// The right-click menu, if one is up. See [`ContextMenu`].
     pub context_menu: Option<ContextMenu>,
+    /// The box under the pointer, if it is resting on something that has
+    /// anything to say. See [`Tooltip`].
+    pub tooltip: Option<Tooltip>,
     /// Column a run of `j`/`k` is trying to hold.
     ///
     /// Without it, passing through a short line permanently forgets how far
@@ -2052,6 +2240,11 @@ const CHANGE_LIMIT: usize = 256;
 /// How many messages [`Editor::messages`] keeps before dropping the oldest.
 pub const MESSAGE_LIMIT: usize = 500;
 
+/// How many prompt answers are kept. Emacs' own default for a history ring is
+/// 100 and nobody scrolls past the last few; the cap exists so a long session
+/// does not grow a list forever, not because the tail is precious.
+pub const HISTORY_LIMIT: usize = 100;
+
 impl Editor {
     pub fn new() -> Self {
         // Buffer 0 is *dashboard*, buffer 1 is *scratch*. Both are real
@@ -2077,7 +2270,9 @@ impl Editor {
             images: HashMap::new(),
             font_px: Settings::default().font_size,
             commands: Vec::new(),
+            prompt_history: Vec::new(),
             pending_hooks: Vec::new(),
+            pending_highlight: Vec::new(),
             mode: Mode::Dashboard,
             settings: Settings::default(),
             theme: Theme::default(),
@@ -2098,7 +2293,9 @@ impl Editor {
             ace: None,
             which_key: Vec::new(), // which-key panel
             completion: None,      // corfu
+            grab_key: None,        // avy
             context_menu: None,
+            tooltip: None,
             desired_col: None,
             register: String::new(),
             register_linewise: false,
@@ -2218,10 +2415,16 @@ impl Editor {
         // `splice` sets it and is wrong to: the buffer now holds exactly what is
         // on disk, which is the definition of unmodified.
         buffer.modified = false;
-        // Spans describe text that is gone. The live buffer gets a fresh parse
-        // from the revision bump below; a parked one is colourless until it is
-        // looked at, which beats colouring the wrong characters.
+        // Spans describe text that is gone, so they go — but clearing them was
+        // only ever half an answer. The live buffer gets a fresh parse from the
+        // revision bump below; a parked one got *nothing*, which is how a file
+        // rewritten under the editor by an agent came back correct and
+        // completely colourless and stayed that way until you switched to it
+        // and typed. So the buffer is named as wanting a parse rather than left
+        // uncoloured, and the app hands the name to the syntax thread on its
+        // next pass.
         buffer.highlights.clear();
+        self.pending_highlight.push(id);
         self.revision += 1;
         true
     }
@@ -2332,6 +2535,35 @@ impl Editor {
         self.others.insert(0, previous);
     }
 
+    /// Tell Lisp that a *different buffer* is now on screen.
+    ///
+    /// The one report the boundary was missing. Core has always said "this
+    /// buffer entered mode X" and never "you are looking at a different
+    /// buffer", and the settings a mode claims — wrapping, the text measure,
+    /// the tab stop — are **global in the editor**, one of each, so Lisp
+    /// resolves them from the last mode it saw *entered*. Without this line,
+    /// opening one `.rs` file costs every org and prose buffer its wrapping and
+    /// its 80-column measure for the rest of the session, because nothing ever
+    /// tells the image that the org buffer came back.
+    ///
+    /// Queued rather than called, like every other hook: core does not call
+    /// Lisp. The name is dispatched through `pending_hooks` behind the same
+    /// `fboundp` guard, so an image that never loaded `runtime/modes/modes.lisp`
+    /// pays nothing.
+    ///
+    /// **`buffer-switch-hook` owns re-resolving a mode's claims for a switch;
+    /// `%enter-major-mode` owns them for an entry.** The two never fire for the
+    /// same event — every route that swaps the live buffer comes through here
+    /// and queues no mode hook (`load` and `create_buffer` return the moment
+    /// they find the buffer already open), and every route that changes a
+    /// buffer's mode queues `X-hook` and swaps nothing. Where a caller does both
+    /// — a terminal buffer being shown and given `terminal-mode` in one frame —
+    /// the two agree, because each reads the mode from the buffer rather than
+    /// remembering one.
+    fn announce_buffer_switch(&mut self) {
+        self.pending_hooks.push("buffer-switch-hook".into());
+    }
+
     /// Make the focused window's buffer and position the live ones. The
     /// inverse of [`Editor::sync_window`].
     fn adopt_window(&mut self) {
@@ -2341,6 +2573,11 @@ impl Editor {
                 let incoming = self.others.remove(i);
                 let outgoing = std::mem::replace(&mut self.buffer, incoming);
                 self.others.insert(0, outgoing);
+                // Focus moving between two panes changes the buffer on screen
+                // exactly as the switcher does, and one pane on an org file
+                // beside another on a `.rs` is the shape that made this bug
+                // impossible to miss.
+                self.announce_buffer_switch();
             }
         }
         self.buffer.cursor = w.cursor.min(self.buffer.len_chars());
@@ -2430,6 +2667,10 @@ impl Editor {
         // The window now shows this buffer — otherwise the next focus change
         // would swap the old one straight back in.
         self.sync_window();
+        // The chokepoint: `switch_buffer_id`, `create_buffer`, `show_named` and
+        // `load` on an already-open file all reach a different document through
+        // here, so this is the one place the report has to be made.
+        self.announce_buffer_switch();
     }
 
     // --- lisp-api: buffers with no file behind them --------------------------
@@ -2602,10 +2843,16 @@ impl Editor {
                 // Without it a burst — a config load, a command that reports
                 // twice — is indistinguishable from its last line, and there is
                 // nothing to look at afterwards. This is what `*Messages*` is.
-                if self.messages.len() == MESSAGE_LIMIT {
-                    self.messages.remove(0);
+                //
+                // The empty one is how Esc and a cancelled ace *clear* the echo
+                // area, which is not something that happened — so it takes the
+                // status line down without leaving a blank row in the log.
+                if !m.is_empty() {
+                    if self.messages.len() == MESSAGE_LIMIT {
+                        self.messages.remove(0);
+                    }
+                    self.messages.push(m.clone());
                 }
-                self.messages.push(m.clone());
                 self.status = m;
             }
             EditorCommand::Quit => self.should_quit = true,
@@ -2644,6 +2891,7 @@ impl Editor {
             }
             EditorCommand::SetModelinePad(n) => self.settings.modeline_pad = n.clamp(0, 64),
             EditorCommand::SetRelativeLineNumbers(on) => self.settings.relative_line_numbers = on,
+            EditorCommand::SetScrollPastEnd(on) => self.settings.scroll_past_end = on,
             EditorCommand::SetLineOverflow(name) => match LineOverflow::from_name(&name) {
                 Some(o) => self.settings.line_overflow = o,
                 None => self.status = format!("unknown line overflow: {name}"),
@@ -2850,6 +3098,10 @@ impl Editor {
                 Some(r) => self.which_key.push(r),
                 None => self.which_key.clear(),
             },
+            // avy. A plain assignment and not a push: there is one next
+            // keystroke, so a second `GrabKey` before the first is spent is a
+            // change of mind rather than a queue.
+            EditorCommand::GrabKey(f) => self.grab_key = f,
             EditorCommand::Completion(edit) => match edit {
                 CompletionEdit::Show(None) => self.completion = None,
                 CompletionEdit::Show(Some((at, selected))) => {
@@ -2955,7 +3207,20 @@ impl Editor {
         // can react — `(defun org-mode-hook () ...)` is the whole extension
         // point, exactly as in Emacs.
         let major = major_mode_for(self.buffer.language.as_deref());
+        // ...and the gutter follows the mode, here as it does in
+        // `EditorCommand::SetMajorMode`. It did not, and that was a real bug
+        // with a confusing shape: `set-no-gutter-modes` decides for the buffers
+        // that exist *when it runs*, and `SetMajorMode` decides for a mode set by
+        // hand — but a file opened from the prompt reaches its mode through this
+        // function and through neither of those, so it kept whatever flag the
+        // reused buffer happened to carry. The symptom was org files showing
+        // line numbers the shipped config switches off, and `M-x org-mode` on the
+        // same buffer then fixing it, which reads as anything but a missing line.
+        //
+        // Computed before the field writes because it borrows `self`.
+        let gutter = self.gutter_for_mode(&major);
         self.buffer.major_mode = major.clone();
+        self.buffer.line_numbers = Some(gutter);
         self.buffer.minor_modes.clear();
         self.pending_hooks.push(format!("{major}-hook"));
         self.revision += 1;
@@ -3115,8 +3380,23 @@ impl Editor {
     // `run_action`, which is the door everything else uses.
 
     /// Put the menu under the pointer.
+    ///
+    /// The window verbs are the whole of it everywhere except a listing, which
+    /// gets **New File** on top: `C-c n` is the one dired gesture with no key a
+    /// hand on the mouse would guess at, and a menu is where you look for it.
+    /// Same verb the binding runs, so it prompts for a name and creates it in
+    /// the directory on screen.
     pub fn open_context_menu(&mut self, x: i32, y: i32) {
-        self.context_menu = Some(ContextMenu { x, y, ..Default::default() });
+        // The two surfaces anchored to the pointer cannot both be under it. Here
+        // rather than at the call site so every door into the menu closes the
+        // box, which is the same argument `pick_context_menu` makes for taking
+        // the menu itself down in exactly one place.
+        self.tooltip = None;
+        let mut menu = ContextMenu { x, y, ..Default::default() };
+        if self.mode == Mode::Dired {
+            menu.items.insert(0, ("New File", "dired-create-file"));
+        }
+        self.context_menu = Some(menu);
     }
 
     pub fn close_context_menu(&mut self) {
@@ -3129,6 +3409,36 @@ impl Editor {
     pub fn pick_context_menu(&mut self, i: Option<usize>) -> Option<&'static str> {
         let menu = self.context_menu.take()?;
         Some(menu.items.get(i?)?.1)
+    }
+
+    /// What the pointer resting on the line containing `at` has to say, out of
+    /// the overlays there — `None` when nothing there carries a message.
+    ///
+    /// **The whole line**, not the character, and that is what makes the answer
+    /// agree with what is on screen: a gutter mark is drawn from an overlay
+    /// *overlapping the line* (`overlays_for_line` in the renderer, on the line's
+    /// first row only), so a message that answered per character would be
+    /// available in some columns of a marked line and not others.
+    ///
+    /// Creation order, last one wins, which is the rule the renderer already
+    /// resolves every other overlay attribute by. ponytail: so two diagnostics on
+    /// one line show the newer one's message, exactly as they already show only
+    /// the newer one's glyph. The upgrade path is joining them the way
+    /// `lsp-diagnostics-at-point` does — but it belongs on the Lisp side, since
+    /// deciding that two overlays are *both* about the same complaint is not a
+    /// fact core has.
+    pub fn help_echo_at(&self, at: usize) -> Option<&str> {
+        let buf = &self.buffer;
+        let line = buf.text.char_to_line(at.min(buf.len_chars()));
+        let start = buf.line_start(line);
+        // Inclusive of the newline: `%lsp-diagnostic-overlay` falls back to it on
+        // an empty line, which is exactly where an unclosed bracket is reported.
+        let end = start + buf.line_len(line) + 1;
+        buf.overlays()
+            .iter()
+            .filter(|o| o.end > start && o.start < end)
+            .filter_map(|o| o.help_echo.as_deref())
+            .next_back()
     }
 
     /// The documentation the popup is showing, and whether anybody has coloured
@@ -3243,6 +3553,17 @@ impl Editor {
 
     pub fn has_image(&self, id: ImageId) -> bool {
         self.images.contains_key(&id)
+    }
+
+    /// Whether *any* bitmap exists. One `is_empty` rather than a scan, and the
+    /// renderer's guard against paying for images on a session that has none:
+    /// counting the rows an image claims means walking a line's overlays a
+    /// second time, and with nothing rasterised the answer is one row every
+    /// time. True the moment anything is previewed, editor-wide rather than per
+    /// buffer, which is the cheap and safe direction — a buffer with no
+    /// fragments pays a scan it did not need rather than skipping one it did.
+    pub fn has_images(&self) -> bool {
+        !self.images.is_empty()
     }
 
     /// Whether a buffer in major mode `name` should show a gutter.
@@ -3402,7 +3723,7 @@ impl Editor {
     // rather than the way it is stored — press `j` in the middle of a long line
     // and you land on the row below, not four screenfuls of prose later.
     //
-    // Everything here is arithmetic over `display::expand_line`, the *same*
+    // Everything here is arithmetic over `display::line_cells`, the *same*
     // function the renderer lays a line out with, because a `j` that computed
     // cells differently would put the cursor where the block is not drawn. The
     // only thing core cannot work out is how many cells fit — `wrap_cols`, which
@@ -3415,20 +3736,40 @@ impl Editor {
         self.settings.line_overflow == LineOverflow::Wrap && self.wrap_cols > 0
     }
 
-    /// The cells of buffer line `line`, exactly as the renderer expands them.
+    /// The cells of buffer line `line`, exactly as the renderer lays it out —
+    /// overlays and all, which is what makes `j` land in the column the glyph is
+    /// really drawn in on a line whose stars became a bullet or whose `[ ]`
+    /// became one box.
     ///
-    /// ponytail: overlays are not applied, so a `display` substitution — an
-    /// org-modern bullet, ghost text — shifts the renderer's columns and not
-    /// these, and `j` down a line carrying one can land a character off. Ceiling:
-    /// only lines with a substitution, and only by the length difference.
-    /// Upgrade path: `substitute` moves into `display` too and this takes the
-    /// buffer's overlays, which is the same list the renderer already walks.
+    /// A pure function of (text, overlays, tab width), and that matters because
+    /// org-appear changes a line's overlays as the cursor moves onto it: the
+    /// answer here is always for the overlays as they stand *now*, which is what
+    /// the frame just drew, so nothing is self-referential and a `j` measured on
+    /// a revealed line lands on the substituted one below it by its own cells.
+    ///
+    /// ponytail: an overlay carrying an *image* and no `display` string still
+    /// counts as its raw text, because the cells a bitmap reserves are pixels
+    /// over a cell width core does not have — see [`display::display_subs`].
+    /// Ceiling: a line with a LaTeX preview on it, off by the difference between
+    /// the fragment's source and the bitmap's width. Upgrade path: the renderer
+    /// parks a cell width on the editor the way it already parks `wrap_cols`.
     fn line_cells(&self, line: usize) -> Vec<display::Cell> {
         let start = self.buffer.line_start(line);
-        let text = self
-            .buffer
-            .slice_string(start, start + self.buffer.line_len(line));
-        display::expand_line(&text, self.settings.tab_width)
+        let end = start + self.buffer.line_len(line);
+        let text = self.buffer.slice_string(start, end);
+        // ponytail: a linear scan of the buffer's whole overlay list per call,
+        // which is exactly what the renderer already does per line per frame.
+        // Ceiling: `j` costs O(overlays) per row crossed — microseconds on the
+        // few thousand org-modern makes for a file. Upgrade path is an overlay
+        // list kept sorted by start, which is a change to `Overlays` and not to
+        // anything here.
+        display::line_cells(
+            &text,
+            self.settings.tab_width,
+            self.buffer.overlays(),
+            start,
+            end,
+        )
     }
 
     /// Cell column the cursor is drawn in, *within its display row* — the thing
@@ -3525,7 +3866,7 @@ impl Editor {
     /// the view straight back to wherever the cursor was.
     fn scroll_lines(&mut self, delta: i32) {
         let h = self.viewport_lines.max(1);
-        let max = self.buffer.len_lines().saturating_sub(h) as i64;
+        let max = self.max_scroll() as i64;
         self.scroll = (self.scroll as i64 + delta as i64).clamp(0, max.max(0)) as usize;
 
         let (line, col) = self.buffer.cursor_line_col();
@@ -3544,10 +3885,61 @@ impl Editor {
         } else if line >= self.scroll + h {
             self.scroll = line + 1 - h;
         }
-        // Never scroll past the last line sitting at the bottom of the window.
-        // `C-d` adds to `scroll` unconditionally, so without this a file
-        // shorter than the viewport walks straight off the top of the screen.
-        self.scroll = self.scroll.min(self.buffer.len_lines().saturating_sub(h));
+        // `C-d` and `z t` add to `scroll` unconditionally, so without this a
+        // file shorter than the viewport walks straight off the top of the
+        // screen. The number is [`Editor::max_scroll`] and is the *only* thing
+        // `scroll-past-end` changes.
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// The furthest `scroll` may go, in buffer lines — asked by every writer of
+    /// a scroll offset, which is `scroll_lines` and the backstop above. `C-d`
+    /// and `z t` write one without clamping and are caught by the backstop.
+    ///
+    /// Off, this is the rule it always was: the last line sits on the *bottom*
+    /// row and the pane is full of document. On, the last line may sit on the
+    /// *top* row and the rows below it are empty — which is vim's `~` filler
+    /// and Emacs' end of buffer, and is why the number is `last_line()` rather
+    /// than a count of rows.
+    ///
+    /// Three things about that spelling are load-bearing:
+    ///
+    /// - `last_line()` and not `len_lines() - 1`, because a rope counts the
+    ///   empty string after a trailing newline and `scroll_lines` *drags point
+    ///   to `scroll`*. Naming the phantom line here would put point on a line
+    ///   `G` refuses to visit — point leaving the document is the one thing
+    ///   this feature must never do, and it is one function call away.
+    /// - a *line* and not a row count, so no second row-counting rule enters
+    ///   the codebase. The renderer already spends rows on lines exactly once —
+    ///   `visible_lines`, which is what parked `viewport_lines` here — and a
+    ///   limit expressed in rows would have to agree with it. This one cannot
+    ///   disagree with anything: it is the last line, and the draw loop stops
+    ///   at `len_lines()` on its own, so the empty rows and the unnumbered
+    ///   gutter come out of the renderer unchanged.
+    /// - `.max()` and not a plain swap, so the setting can only ever let the
+    ///   view go *further*. A one-row pane already reached `len_lines() - 1`
+    ///   under the old rule and still does.
+    ///
+    /// Generated buffers keep the old clamp whatever the setting says. Their
+    /// text is a rendering of state rather than a document — there is no "past
+    /// the end" of a directory listing or of a terminal's visible grid, and the
+    /// wheel over a terminal is intercepted by the app before it ever gets
+    /// here. Same instinct as `set-no-gutter-modes`: the chrome a document
+    /// wants is noise on a listing.
+    ///
+    /// ponytail: a *line* and not a drawn line, so a fold covering the end of
+    /// the file can be scrolled into and shows an empty pane rather than the
+    /// last visible heading. Inherited rather than introduced — the old clamp
+    /// walked into the same fold `viewport_lines` earlier — and it closes with
+    /// the same upgrade both the fold and the image work named: a scroll
+    /// position of (line, row) on `Window`.
+    fn max_scroll(&self) -> usize {
+        let h = self.viewport_lines.max(1);
+        let full = self.buffer.len_lines().saturating_sub(h);
+        if !self.settings.scroll_past_end || self.buffer.kind.is_generated() {
+            return full;
+        }
+        full.max(self.buffer.last_line())
     }
 
     /// The text the status / prompt line should display.
@@ -3625,6 +4017,27 @@ mod tests {
         ed.buffer = Buffer::from_str(text);
         ed.status.clear();
         ed
+    }
+
+    /// The menu is the window verbs everywhere, plus the one gesture a listing
+    /// has that no mouse would guess at. Through `run_action`, so the entry
+    /// cannot do anything the key could not.
+    #[test]
+    fn a_listing_gets_new_file_on_top_of_the_window_verbs() {
+        let mut ed = fresh("a\n");
+        ed.open_context_menu(10, 10);
+        let plain = ed.context_menu.as_ref().unwrap().items.clone();
+        assert!(!plain.iter().any(|(l, _)| *l == "New File"));
+
+        ed.apply(EditorCommand::SetMode(Mode::Dired));
+        ed.open_context_menu(10, 10);
+        assert_eq!(ed.context_menu.as_ref().unwrap().items[0].0, "New File");
+        assert_eq!(ed.context_menu.as_ref().unwrap().items[1..], plain[..]);
+        assert_eq!(ed.pick_context_menu(Some(0)), Some("dired-create-file"));
+        assert_eq!(
+            ed.run_action("dired-create-file"),
+            vec![EditorCommand::Dired("create-file".into())]
+        );
     }
 
     // --- corfu -----------------------------------------------------------
@@ -4048,6 +4461,37 @@ mod tests {
         assert_ne!(ed.buffer.id, second);
     }
 
+    /// Opening a file applies the no-gutter list, like every other route to a
+    /// major mode.
+    ///
+    /// The bug this pins had a shape worth remembering: the list was applied
+    /// when it was *set* (to the buffers that existed then) and when a mode was
+    /// set *by hand*, and a file opened from the prompt goes through neither —
+    /// so it inherited whatever flag the reused buffer carried. Every org file
+    /// opened normally showed the numbers the shipped config switches off, and
+    /// `M-x org-mode` on that same buffer then took them away, which reads as a
+    /// mystery rather than as a missing line.
+    ///
+    /// Asserted in both directions on one editor, because "org has no gutter" is
+    /// only interesting beside "rust still does" — a fix that switched the
+    /// gutter off everywhere would pass half of this.
+    #[test]
+    fn opening_a_file_takes_the_gutter_from_its_mode() {
+        let mut ed = Editor::new();
+        ed.apply(EditorCommand::SetNoGutterModes("org-mode text-mode".into()));
+
+        ed.load("fn main() {}", None, Some("rust".into()));
+        assert_eq!(ed.buffer.line_numbers, Some(true), "rust keeps its gutter");
+
+        ed.load("* Heading", None, Some("org".into()));
+        assert_eq!(ed.buffer.line_numbers, Some(false), "org is on the list");
+
+        // ...and back, so the flag tracks the mode rather than latching on the
+        // first file that set it.
+        ed.load("fn main() {}", None, Some("rust".into()));
+        assert_eq!(ed.buffer.line_numbers, Some(true), "the flag follows the mode");
+    }
+
     /// ...but a buffer whose *text* was replaced has no business keeping spans
     /// that described the old text.
     #[test]
@@ -4100,6 +4544,14 @@ mod tests {
             Key::MetaBackspace,
             Key::MetaLeft,
             Key::MetaRight,
+            Key::ShiftEnter,
+            Key::MetaShiftEnter,
+            Key::ShiftLeft,
+            Key::ShiftRight,
+            Key::ShiftUp,
+            Key::ShiftDown,
+            Key::MetaShiftLeft,
+            Key::MetaShiftRight,
             Key::Enter,
             Key::Tab,
             Key::BackTab,
@@ -4116,6 +4568,9 @@ mod tests {
         // A chord is folded to lower case on the way out, so that is what comes
         // back — `token` is the canonical spelling and this agrees with it.
         assert_eq!(Key::from_token("C-A"), Some(Key::Ctrl('a')));
+        // The shifted spellings have exactly one order, so `S-M-<ret>` is a typo
+        // rather than a second name for a chord already in the map.
+        assert_eq!(Key::from_token("S-M-<ret>"), None);
         // A *sequence* is not a key. `normalize_keys` owns those.
         assert_eq!(Key::from_token("g d"), None);
         assert_eq!(Key::from_token("C-xy"), None);
@@ -4421,6 +4876,14 @@ mod tests {
         assert!(ed.has_image(7), "the figure is named by the page");
         assert!(ed.has_image(8), "so is the fragment in the sentence");
         assert!(!ed.has_image(9), "and nothing at all names the overlay's");
+
+        // The renderer's O(1) guard, asserted on the same events, because it is
+        // what decides whether a line's overlays get walked for the rows an
+        // image claimed at all: `false` while a bitmap is live is a display
+        // equation the row count silently stops seeing, and `true` forever is a
+        // scan every line of every buffer pays for nothing.
+        assert!(ed.has_images(), "three bitmaps went in, two survived");
+        assert!(!Editor::new().has_images(), "and a fresh editor has none");
     }
 
     /// The whole argument for the field living on the buffer: there is no scene

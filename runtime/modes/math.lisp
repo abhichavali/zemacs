@@ -45,22 +45,15 @@
 ;;;;   :response-end    subsection, or both NIL when it has none
 ;;;;
 ;;;; Every offset in this file is a **character** offset, which is what every
-;;;; primitive in this editor takes. `buffer-string' hands out UTF-8 bytes and
-;;;; `%org-lines' does the conversion once per line; nothing above that layer
-;;;; ever sees a byte.
+;;;; primitive in this editor takes and what `buffer-string' is counted in. So
+;;;; is every string: a `:title' or a property value can be `message'd or put in
+;;;; a `run' without asking where it came from.
 ;;;;
-;;;; The same is true of the *text* in a plist, and it has to be said separately
-;;;; because it is a different conversion: `:title' and every property value go
-;;;; through `utf8-text' as they are read. Offsets and text were decoded in
-;;;; different places for a while, and the symptom was a status line reading
-;;;; `Ãlgebra â€" Vectores' under a page whose cursor landed exactly right. The
-;;;; readers below are therefore the boundary: a caller may `message' a title or
-;;;; put a status in a `run' without asking where it came from.
-;;;;
-;;;; The line *vector* is still raw, deliberately — the writers re-find their
-;;;; heading in it by offset, and `%org-property' matches ASCII markers in it —
-;;;; so a `first' out of `%org-lines' is bytes and everything a plist carries is
-;;;; characters.
+;;;; That took work once. Buffer text arrived as UTF-8 bytes, `%org-lines'
+;;;; converted the offsets and `utf8-text' converted the strings, in different
+;;;; places — and the symptom of getting the two out of step was a status line
+;;;; reading `Ãlgebra â€" Vectores' under a page whose cursor landed exactly
+;;;; right. The shim decodes now and neither conversion exists.
 ;;;;
 ;;;; Offsets go stale. A plist is a *reading*, not a handle: it describes the
 ;;;; buffer as it was when it was made, and a keystroke that lands afterwards
@@ -209,11 +202,10 @@ specifies them, and it is what stops a `#+ZEMACS_CURRICULUM' quoted inside a
 source block, in a document *about* the format, from turning that document into
 a curriculum. `docs/curriculum.org' is exactly such a document.
 
-The *value* is decoded and the matching is not. A keyword's name is ASCII by the
-format, so the prefix compare can run against the raw bytes and the tail after it
-still starts on a character boundary; the value is free text a person wrote —
-`#+TITLE:' most of all — and `math-progress' puts it straight in the status
-line, where undecoded bytes come out as mojibake."
+The value is free text a person wrote — `#+TITLE:' most of all — and
+`math-progress' puts it straight in the status line. That used to want a decode
+here; the string a line is cut out of is characters now, so a `subseq' of it is
+the title."
   (let ((want (concatenate 'string "#+" name ":")))
     (dolist (l lines)
       (let ((text (first l)))
@@ -221,9 +213,8 @@ line, where undecoded bytes come out as mojibake."
         (let ((s (%math-trim text)))
           (when (and (>= (length s) (length want))
                      (string-equal want s :end2 (length want)))
-            (return (utf8-text
-                     (string-trim '(#\Space #\Tab)
-                                  (subseq s (length want)))))))))))
+            (return (string-trim '(#\Space #\Tab)
+                                  (subseq s (length want))))))))))
 
 (defun %math-drawer-lines (v n i)
   "(OPEN . CLOSE) line indices of the property drawer belonging to the heading on
@@ -254,16 +245,14 @@ strings, and `assoc' with `string-equal' is the case-insensitive lookup org
 promises. Interning them as keywords would put every typo in a generated file
 into the image's symbol table forever.
 
-The whole drawer line is decoded before it is split, rather than the value
-afterwards. One call instead of one per property, and it leaves the name and the
-value in the same index space as the `position' that separated them — a value
-decoded after the split would be right and a name decoded nowhere would be a
-second rule to remember. Values are why it matters: a property is free text a
-generator wrote, and `%math-page-problem' puts one straight in a `run'."
+Values are free text a generator wrote and `%math-page-problem' puts one
+straight in a `run', so they come out as the document spells them — which costs
+nothing now, and cost a decode of the whole drawer line before the split for as
+long as buffer text was bytes."
   (let ((d (%math-drawer-lines v n i)))
     (when d
       (loop for j from (1+ (car d)) below (cdr d)
-            for trimmed = (utf8-text (%math-trim (first (aref v j))))
+            for trimmed = (%math-trim (first (aref v j)))
             for colon = (and (> (length trimmed) 1)
                              (char= (char trimmed 0) #\:)
                              (position #\: trimmed :start 1))
@@ -306,13 +295,11 @@ the quadratic walk the obvious version does on a flat document."
                          (next (find-if (lambda (e) (<= (cdr e) level)) rest))
                          (last (max i (if next (1- (car next)) (1- n)))))
                     (list :level level
-                          ;; Decoded, like every other piece of *text* in a
-                          ;; plist here: a title is prose and `math-units'
-                          ;; hands it to whatever draws a curriculum. LEVEL is
-                          ;; a count of leading stars, so the SUBSEQ still
-                          ;; starts on a character boundary.
-                          :title (utf8-text
-                                  (%math-trim (subseq (first line) level)))
+                          ;; LEVEL is a count of leading stars, so the SUBSEQ
+                          ;; drops exactly the stars: a title is prose and
+                          ;; `math-units' hands it to whatever draws a
+                          ;; curriculum.
+                          :title (%math-trim (subseq (first line) level))
                           :begin (second line)
                           :head-end (third line)
                           :end (third (aref v last))
@@ -770,7 +757,7 @@ progress for."
 (define-key "math-curriculum" "SPC m s" "math-progress")
 
 ;;; The readers are nouns and `M-x' is a list of verbs. `*hidden-commands*' is
-;;; `init.lisp''s existing answer to exactly this — `%zero-arg-p' counts a
+;;; `library.lisp''s existing answer to exactly this — `%zero-arg-p' counts a
 ;;; function whose arguments are all `&optional' as callable, which every reader
 ;;; above is — so they are declared here rather than by renaming them with a `%'
 ;;; they do not deserve: these are the published contract.

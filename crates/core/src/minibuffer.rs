@@ -160,6 +160,27 @@ pub struct Prompt {
     /// with the buffer's own highlight spans, and it is one number rather than
     /// a re-parse per row because the format is decided here.
     pub prefix: usize,
+    /// How far back `M-p` has walked, counting from the newest entry of this
+    /// kind's history. `0` means "not walking" — the text on screen is yours.
+    pub history: usize,
+    /// What was typed before the first `M-p`, so `M-n` all the way forward
+    /// gives it back. Without it, glancing at the last command costs you the
+    /// filter you had already narrowed to.
+    pub stash: String,
+    /// This prompt wants free text, whatever its kind would normally complete.
+    ///
+    /// dired's `+` and `C-c n` are a [`PromptKind::File`] asking for a *name*:
+    /// the file lands in the directory on screen, so a path is not merely
+    /// unnecessary but refused. Candidates there are actively wrong —
+    /// [`Prompt::value`] answers with the highlighted one, so `+` typed `notes`
+    /// and submitted whatever the filesystem listing had put under the cursor.
+    ///
+    /// A field rather than a kind of its own, because the *destination* is
+    /// unchanged — this is still the prompt whose answer opens a file — and a
+    /// new `PromptKind` is a match arm in three crates. See
+    /// [`PromptKind::Lisp`]'s `completing`, which is the same distinction
+    /// carried for the same reason.
+    pub bare: bool,
 }
 
 impl PromptKind {
@@ -200,9 +221,18 @@ impl Prompt {
             ids: Vec::new(),
             origin_buffer: None,
             prefix: 0,
+            history: 0,
+            stash: String::new(),
+            bare: false,
         };
         p.refilter();
         p
+    }
+
+    /// True when this prompt should show a candidate list. [`Prompt::bare`]
+    /// overrides the kind; everything else is the kind's own answer.
+    pub fn completes(&self) -> bool {
+        !self.bare && self.kind.completes()
     }
 
     /// Recompute `matches` for the current `text`.
@@ -245,6 +275,37 @@ impl Prompt {
     /// when nothing matched (so you can still open a file that doesn't exist).
     pub fn value(&self) -> String {
         self.current().unwrap_or(&self.text).to_string()
+    }
+
+    /// What accepting this prompt *means*, as opposed to what it shows.
+    ///
+    /// The two differ for `Command`, whose candidates carry an annotation the
+    /// image pads onto the row — a docstring and a key. A command name never
+    /// contains a space, so the first word is the whole of the answer and the
+    /// rest is chrome. This is also what goes in the history, which is why it
+    /// is one function and not a split at each call site: recalling `M-x` has to
+    /// give back the command, not the row it was read off.
+    ///
+    /// `Ex` and `Search` answer with the text as typed. Both have no candidate
+    /// list, and `value` would fall back to `text` anyway — saying so here means
+    /// the reader does not have to go and check that.
+    pub fn submitted(&self) -> String {
+        match self.kind {
+            PromptKind::Ex | PromptKind::Search => self.text.clone(),
+            PromptKind::Command => self
+                .value()
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string(),
+            _ => self.value(),
+        }
+    }
+
+    /// Put `entry` in the input as if it had been typed, for `M-p`/`M-n`.
+    pub fn recall(&mut self, entry: String) {
+        self.text = entry;
+        self.refilter();
     }
 
     pub fn next(&mut self) {

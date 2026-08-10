@@ -31,7 +31,9 @@ use zemacs_core::{
 };
 use zemacs_lisp::Lisp;
 use zemacs_render::Renderer;
+use zemacs_tramp as tramp;
 
+mod control;
 mod dired;
 #[cfg(target_os = "macos")]
 mod dock;
@@ -432,7 +434,55 @@ fn lisp_call(name: &str, args: &str) -> String {
     )
 }
 
+/// What the command line asked for.
+///
+/// Parsed by hand. Two flags and an optional file is not a case for a CLI
+/// crate: `clap` is a build-time dependency, a derive macro and a help format
+/// to keep in step, and what it would buy here is a `match` on three strings.
+#[derive(Default)]
+struct Args {
+    /// Protocol on stdin/stdout, and no window unless `show` says otherwise.
+    control: bool,
+    /// With `control`, open a real window as well — for watching an automated
+    /// session happen, which is the one thing the plain-text `screen` op and a
+    /// PNG cannot give you.
+    show: bool,
+    file: Option<PathBuf>,
+}
+
+fn args() -> Args {
+    let mut args = Args::default();
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--control" => args.control = true,
+            "--show" => args.show = true,
+            // The first non-flag is the file to open, exactly as it was when
+            // the whole of this was `args().nth(1)`.
+            _ if args.file.is_none() => args.file = Some(PathBuf::from(arg)),
+            _ => {}
+        }
+    }
+    args
+}
+
 fn main() -> anyhow::Result<()> {
+    let args = args();
+    // **The first statement, and it has to be.** SDL3 does not read `environ`
+    // when it wants a hint; it reads a *copy* it takes the first time anything
+    // asks for one — and `mac_window_hints` below is exactly such a call. A
+    // `set_var` after it is set in this process and invisible to SDL, which
+    // shows up as `--control` cheerfully opening a window on your screen.
+    // Belt and braces: the hint is set too, because that path is immune to the
+    // ordering entirely and the two names are different vintages of SDL.
+    //
+    // Everything downstream — the window, the renderer, the pane arithmetic,
+    // `term.sync`, the present — runs exactly as it does with a display
+    // attached; the dummy driver just has nowhere to put the pixels. That is
+    // what makes this a headless *editor* rather than a stub of one.
+    if args.control && !args.show {
+        std::env::set_var("SDL_VIDEODRIVER", "dummy");
+        sdl3::hint::set("SDL_VIDEO_DRIVER", "dummy");
+    }
     start_in_home();
     inherit_login_path();
     mac_window_hints();
@@ -463,6 +513,13 @@ fn main() -> anyhow::Result<()> {
     // this file reads and it is the one events are stamped in.
     let video = sdl.video().map_err(|e| anyhow::anyhow!("SDL video: {e}"))?;
 
+    // Both before the image starts, and in this order. The image reads
+    // `$ZEMACS_RUNTIME` while it boots — that is how `init.lisp` finds
+    // `library.lisp` — and `seed_user_init` reads the same path to find the
+    // default it copies, so the variable has to be set first.
+    std::env::set_var("ZEMACS_RUNTIME", runtime_dir());
+    seed_user_init();
+
     let init_path = resolve_init_path();
     let (tx, rx): (Sender<EditorCommand>, Receiver<EditorCommand>) =
         crossbeam_channel::unbounded();
@@ -471,15 +528,27 @@ fn main() -> anyhow::Result<()> {
     // directly rather than only being able to shout commands at it. Seeded
     // before `spawn` so `init.lisp` cannot observe a half-built dashboard.
     let shared: zemacs_core::Shared = Default::default();
+    // Built out here for one reason: `zemacs /ssh:host:/etc/nginx.conf` is a
+    // `find-file` like any other, and the request it queues has to go to the
+    // worker the loop will poll rather than to one dropped on the next line.
+    let mut remote = Remote::default();
     {
         let mut editor = shared.lock().expect("fresh mutex");
         seed_dashboard(&mut editor, &init_path, &renderers[0].backend());
         // Any file named on the command line opens instead of the dashboard.
-        if let Some(arg) = std::env::args().nth(1) {
-            open_file(&mut editor, &PathBuf::from(arg), &init_path);
+        if let Some(path) = &args.file {
+            open_file(&mut editor, path, &init_path, &mut remote);
         }
     }
     let lisp = zemacs_lisp::spawn(tx, shared.clone(), init_path.clone());
+
+    // Immediately after `spawn` and before the loop: the probe it queues has to
+    // be the first thing in the image's request channel, or a client's own
+    // `eval` could be answered before the config it depends on has loaded.
+    let mut control = args
+        .control
+        .then(|| control::Control::start(&sdl, &lisp, init_path.clone()))
+        .transpose()?;
 
     // Thread three: highlighting. The main thread owns input and drawing, the
     // Lisp thread owns the image, and neither ever waits on a parse.
@@ -489,7 +558,7 @@ fn main() -> anyhow::Result<()> {
     // handle goes in with it, because `pump`, `timer` and `video` above are all
     // it was wanted for out here and the one remaining caller — opening a window
     // for a frame core pushed — belongs to the app rather than to this function.
-    let mut app = App::new(sdl, &video, renderers, lisp, init_path);
+    let mut app = App::new(sdl, &video, renderers, lisp, init_path, remote);
     let mut batch = Batch::default();
     let mut perf = Perf::new();
     // Whether the last iteration put anything on screen, which is the same
@@ -516,8 +585,14 @@ fn main() -> anyhow::Result<()> {
         // editor would put every Lisp primitive behind the user's next
         // keystroke, which is precisely what `docs/threading.org` promises never
         // happens.
+        //
+        // A queued control request is the third reason not to park, beside a
+        // frame that has already been paced. The request woke us with a pushed
+        // SDL event, so the *first* of a burst always arrives at once; this is
+        // what keeps the second through tenth from each costing a wakeup.
         let idle = Instant::now();
-        let waited = (!presented)
+        let queued = control.as_ref().is_some_and(control::Control::pending);
+        let waited = (!presented && !queued)
             .then(|| {
                 pump.wait_event_timeout_ms(app.renderers.first().map_or(16, Renderer::frame_ms))
             })
@@ -558,6 +633,16 @@ fn main() -> anyhow::Result<()> {
             app.dispatch(&mut editor, EditorCommand::NewFrame);
         }
 
+        // Above the key drain, and that is the whole of why `keys` is honest: a
+        // request that feeds keystrokes puts them in `batch.keys` and they go
+        // through `handle_key` and `dispatch` on the next four lines, exactly
+        // as the ones SDL produced do.
+        if let Some(c) = &mut control {
+            if !c.poll(&mut app, &mut editor, &mut batch) {
+                break 'main;
+            }
+        }
+
         for key in batch.keys.drain(..) {
             for cmd in editor.handle_key(key) {
                 app.dispatch(&mut editor, cmd);
@@ -591,6 +676,14 @@ fn main() -> anyhow::Result<()> {
         let draws = app.draw(&mut editor, &screens)?;
         perf.draw += drawing.elapsed();
 
+        // Between the draw and the present, because that is the one moment the
+        // frame being asked for exists in a buffer that can be read back — see
+        // `Renderer::save_png`, which presents on the caller's behalf for
+        // exactly this reason.
+        if let Some(c) = &mut control {
+            c.shoot(&mut app, &editor);
+        }
+
         // Drawing is done; the editor is nobody's until the next iteration.
         // Presenting parks this thread until the next vertical blank, which is
         // most of the frame, and holding the lock across it would put every
@@ -612,7 +705,38 @@ fn main() -> anyhow::Result<()> {
     // one stray `clangd` indexing a repository per session, which is the kind of
     // thing you only notice when the fan starts.
     zemacs_rpc::stop_all();
-    Ok(())
+    // Every way out of the loop, not just the `quit` op: a client waiting on
+    // this also hears about the window being closed and about the editor
+    // quitting itself.
+    if let Some(c) = &mut control {
+        c.exit(0);
+    }
+    // Everything the protocol promised is on the wire before the process is
+    // taken down without running a single `atexit` handler.
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+    }
+    // `_exit` and not `exit`, and not a plain `return`.
+    //
+    // This process embeds two runtimes that outlive `main`: ECL, with a GC
+    // marker pool and an asynchronous signal servicer, and AppKit, with its
+    // event thread. Returning normally left the process alive with its own main
+    // thread already gone — every response written, the exit event flushed, and
+    // nothing to reap it but `SIGKILL`, which is also the only signal it would
+    // take. `std::process::exit` did not help either: it runs `atexit`, and that
+    // is where the wait actually is. Only skipping the handlers ends it.
+    //
+    // Reproducible, and worth keeping reproducible: take a screenshot, then
+    // quit. Without a readback the process happens to come down on its own,
+    // which is why this survived a suite that never asked for a picture. Under
+    // `--control` the cost was a leaked editor per session.
+    //
+    // Nothing is lost by skipping the handlers. `zemacs_rpc::stop_all` above
+    // already took the language servers — the one thing that genuinely outlives
+    // this process — and a PTY's child gets its `SIGHUP` from the kernel.
+    unsafe { libc::_exit(0) }
 }
 
 // --- the app ---------------------------------------------------------------
@@ -650,6 +774,11 @@ struct App {
     term: Term,
     project: Project,
     mouse: Mouse,
+    /// The gutter row [`App::hover`] last resolved — `(frame, window, row)` —
+    /// and whether it left a box up. Purely a cache: see `hover`, which is where
+    /// both halves are argued for. Beside `mouse` because it is the same kind of
+    /// thing, a fact about the pointer that outlives one event.
+    hovered: (Option<(usize, zemacs_core::frame::WindowId, usize)>, bool),
     cursors: Option<Cursors>,
     clipboard: Clipboard,
     /// Text input is toggled per mode — see [`wants_text_input`]. It is off to
@@ -674,6 +803,9 @@ struct App {
     last_autosave: Instant,
     last_revert: Instant,
     revert_watch: Revert,
+    /// Reads, writes and listings on other machines. Inert — no thread, no
+    /// socket — until the first `/ssh:` name of the session.
+    remote: Remote,
 }
 
 /// What one turn of the event pump produced.
@@ -725,6 +857,7 @@ impl App {
         renderers: Vec<Renderer>,
         lisp: Lisp,
         init_path: PathBuf,
+        remote: Remote,
     ) -> Self {
         // Not stopped here: SDL3 wants a window to stop it *on*, and the windows
         // are about to be moved into `self`. The first `sync_text_input` of the
@@ -741,6 +874,7 @@ impl App {
             term: Term::default(),
             project: Project::default(),
             mouse: Mouse::default(),
+            hovered: Default::default(),
             cursors: Cursors::new(),
             clipboard: Clipboard::new(video),
             text_input,
@@ -754,6 +888,7 @@ impl App {
             last_autosave: Instant::now(),
             last_revert: Instant::now(),
             revert_watch: Revert::default(),
+            remote,
         }
     }
 
@@ -771,6 +906,46 @@ impl App {
         let i = self.frame_for(window_id)?;
         let (x, y) = self.renderers[i].to_pixels(x, y);
         Some((i, x, y))
+    }
+
+    /// What the pointer at `(x, y)` in frame `i` is resting on, into
+    /// [`Editor::tooltip`] — a diagnostic's message when it is a mark in the
+    /// gutter, and nothing at all anywhere else.
+    ///
+    /// **This runs once per pixel of pointer movement**, which is the whole
+    /// shape of it. Resolving a pixel to a buffer line means walking the visible
+    /// lines through folds, wraps and image rows — [`Renderer::click_target`],
+    /// the drag path's own arithmetic — and doing that per pixel would allocate
+    /// a cell vector per line per pixel. So the work is behind
+    /// [`Renderer::gutter_row`], which answers in a pane lookup, one compare and
+    /// one division, and the expensive half runs **once per row crossed**: a
+    /// gutter mark is a row tall, so an answer cannot change inside one.
+    ///
+    /// `hovered` remembers what that cheap question last answered *and whether a
+    /// box was up when it did*, and the second half is not decoration. Anything
+    /// else may take the box down — a keystroke does, in `handle_key` — and
+    /// without noticing that, the pointer sitting inside one row after a
+    /// keystroke would be stuck: the cheap answer matches, the work is skipped,
+    /// and the box only returns when you cross into the next row.
+    fn hover(&mut self, editor: &mut Editor, i: usize, x: i32, y: i32) {
+        let hit = self.renderers[i].gutter_row(editor, i, x, y);
+        let seen = (hit.map(|(w, row)| (i, w, row)), editor.tooltip.is_some());
+        if seen == self.hovered {
+            return;
+        }
+        // Through `click_target` rather than a second walk of its own: it is the
+        // draw loop's twin, it already lands on column zero of the row for a
+        // pointer in the gutter, and a hover box that disagreed with a click
+        // about which line you are on would be worse than no box.
+        let text = hit
+            .and_then(|_| self.renderers[i].click_target(editor, i, x, y))
+            .and_then(|(_, at)| editor.help_echo_at(at))
+            .map(str::to_owned);
+        // The pointer's position when the box *appeared*, not wherever it is
+        // now: re-anchoring it per pixel would make it jitter under the hand
+        // that is holding still to read it.
+        editor.tooltip = text.map(|text| zemacs_core::Tooltip { frame: i, x, y, text });
+        self.hovered = (hit.map(|(w, row)| (i, w, row)), editor.tooltip.is_some());
     }
 
     /// [`lisp_call`], sent. Four of the five signals build and send in the same
@@ -813,21 +988,7 @@ impl App {
         match cmd {
             EditorCommand::CallLisp(form) => self.lisp.eval(form),
             EditorCommand::Term(verb) => self.term.run(editor, &verb),
-            EditorCommand::Project(verb) => {
-                self.project.run_verb(editor, &verb);
-                // `compile` and `test` ask for a shell command; running one belongs
-                // to the terminal, which is the only thing here that owns a process.
-                if let Some(command) = self.project.run.take() {
-                    self.term.run(editor, "open");
-                    let mut line = command.program.clone();
-                    for arg in &command.args {
-                        line.push(' ');
-                        line.push_str(arg);
-                    }
-                    line.push('\r');
-                    self.term.send(editor, line.into_bytes());
-                }
-            }
+            EditorCommand::Project(verb) => self.project.run_verb(editor, &verb),
             // Dropped when no shell is running: a keystroke aimed at something that
             // is not there is nothing, not an error worth reporting on every key.
             EditorCommand::TermKey(key) => {
@@ -849,18 +1010,27 @@ impl App {
                 editor.buffer.path = Some(path);
                 self.dired.run(editor, "open");
             }
-            EditorCommand::OpenFile(path) => open_file(editor, &path, &self.init_path),
+            // A remote name reaches here rather than the arm above, because
+            // `/ssh:host:/etc` is not a directory *on this machine* — which is
+            // the only question `is_dir` can answer. `open_file` sorts it out.
+            EditorCommand::OpenFile(path) => {
+                open_file(editor, &path, &self.init_path, &mut self.remote)
+            }
             EditorCommand::OpenAt(hit) => {
                 let root = self.project.search_root(editor);
-                open_at(editor, &root, &hit, &self.init_path);
+                open_at(editor, &root, &hit, &self.init_path, &mut self.remote);
             }
-            EditorCommand::SaveFile(path) => save_file(editor, path, Save::Guarded),
+            EditorCommand::SaveFile(path) => {
+                save_file(editor, path, Save::Guarded, &mut self.remote)
+            }
             EditorCommand::Git(verb) => self.magit.run(editor, &verb),
             // The far side of a `yes`. Each arm goes to the *same* worker its
             // guarded twin does, with the guard spent — so the question is asked in
             // exactly one place and answered in exactly one place.
             EditorCommand::Confirmed(inner) => match *inner {
-                EditorCommand::SaveFile(path) => save_file(editor, path, Save::Forced),
+                EditorCommand::SaveFile(path) => {
+                    save_file(editor, path, Save::Forced, &mut self.remote)
+                }
                 EditorCommand::Git(verb) => self.magit.run_confirmed(editor, &verb),
                 EditorCommand::Dired(verb) => self.dired.run_confirmed(editor, &verb),
                 // Nothing else parks a command, so this is a confirmation for
@@ -875,7 +1045,12 @@ impl App {
                 // `RET` on a file leaves dired; opening a buffer is this layer's
                 // job, so dired asks rather than doing it.
                 if let Some(path) = self.dired.open_file.take() {
-                    open_file(editor, &path, &self.init_path);
+                    open_file(editor, &path, &self.init_path, &mut self.remote);
+                }
+                // Same shape, same reason: dired owns no ssh worker, so a
+                // remote directory it has moved to is fetched from here.
+                if let Some(dir) = self.dired.want_list.take() {
+                    self.remote.list(dir);
                 }
             }
             EditorCommand::CloseFrame => {
@@ -912,7 +1087,7 @@ impl App {
             // turns into this. Dragging a file onto the window is the same
             // event, so both work off one arm.
             Event::DropFile { filename, .. } => {
-                open_file(editor, &PathBuf::from(filename), &self.init_path)
+                open_file(editor, &PathBuf::from(filename), &self.init_path, &mut self.remote)
             }
             Event::Window {
                 window_id,
@@ -960,6 +1135,15 @@ impl App {
                             batch.closing.get_or_insert(i);
                         }
                     }
+                    // The one way the pointer can leave a hover box behind that
+                    // motion cannot clean up after: the last motion event is at
+                    // the edge, and there is no motion *outside* the window to
+                    // notice with. Without this, walking the mouse off the side
+                    // of the frame while over a diagnostic leaves the message
+                    // painted there until the next keystroke.
+                    // Nothing has to touch `hovered`: it records whether a box
+                    // was up, so taking one down is itself the invalidation.
+                    WindowEvent::MouseLeave => editor.tooltip = None,
                     _ => {}
                 }
             }
@@ -1006,6 +1190,10 @@ impl App {
                 let Some((i, x, y)) = self.pointer(window_id, x as i32, y as i32) else {
                     return ControlFlow::Continue(());
                 };
+                // A box that only says what is under the pointer has nothing to
+                // add once the pointer has been *used*, and a click is very
+                // often the start of something that moves the text under it.
+                editor.tooltip = None;
                 let area = self.renderers[i].content_area();
                 // A menu is modal to the pointer: while one is up, the
                 // left button belongs to it and to nothing else. Picking
@@ -1166,6 +1354,13 @@ impl App {
                                 m.hover = row;
                             }
                         }
+                        // ...and a mark in the gutter says what it is about.
+                        // Not while a button is down: that is a drag, a
+                        // gesture with a destination, and a box appearing
+                        // under the hand halfway through one is noise.
+                        if !mousestate.left() {
+                            self.hover(editor, i, x, y);
+                        }
                         // Held-button motion is a drag, which is how a
                         // selection is made in `vim` or a pane resized in
                         // `tmux`. The terminal drops it unless the child
@@ -1238,6 +1433,9 @@ impl App {
                     MouseWheelDirection::Flipped => -y,
                     _ => y,
                 };
+                // The one gesture that moves the text under a pointer that has
+                // not moved, so nothing else will notice the box has gone stale.
+                editor.tooltip = None;
                 let frame = self.pointer(window_id, mouse_x as i32, mouse_y as i32);
                 if let (true, Some((i, px, py))) = (y != 0, frame) {
                     // Scroll the pane under the pointer — by focusing it
@@ -1359,7 +1557,11 @@ impl App {
             }
             match &editor.buffer.language {
                 Some(lang) => highlighter.request(zemacs_syntax::Request {
-                    revision: editor.revision,
+                    // The buffer's own change count, not the editor's revision:
+                    // the answer has to be checked against *this* buffer when it
+                    // lands, and a global counter that a keystroke anywhere else
+                    // moves cannot say whether this text is still this text.
+                    seen: editor.buffer.change_count(),
                     buffer: editor.buffer.id,
                     lang: lang.clone(),
                     text: editor.buffer.text.to_string(),
@@ -1390,6 +1592,7 @@ impl App {
                 self.told_syntax = Some((editor.buffer.id, editor.buffer.change_count()));
             }
         }
+        request_pending_parses(editor, highlighter);
         // The other signal the image gets about a buffer, and the twin of the
         // one above: the *cursor* moved. Without it a config only ever hears
         // about a buffer when the document changes, which is the wrong half for
@@ -1465,16 +1668,15 @@ impl App {
         editor: &mut Editor,
         highlighter: &zemacs_syntax::Worker,
     ) -> anyhow::Result<()> {
+        // First, because a reply can replace the whole document — the highlight
+        // adoption and the parse request below should see the buffer this frame
+        // rather than the next one.
+        self.remote.poll(editor, &mut self.dired);
+
         refresh_file_completions(editor, &mut self.last_file_query);
         refresh_grep(editor, &self.project, &mut self.last_grep);
 
-        // Adopt a result only if the buffer hasn't moved on; if it has, a newer
-        // parse is already in flight and the current spans stay up meanwhile.
-        if let Some((revision, spans)) = highlighter.poll() {
-            if revision == editor.revision {
-                editor.buffer.highlights = spans;
-            }
-        }
+        adopt_highlights(editor, highlighter);
 
         highlight_completion_doc(editor);
 
@@ -1620,16 +1822,90 @@ impl App {
     }
 }
 
+// --- highlighting ----------------------------------------------------------
+//
+// The two ends of the syntax thread, as free functions rather than methods on
+// `App`, because between them they are the whole answer to "is this buffer the
+// right colour" and a test that cannot construct an `App` — it owns a window —
+// still has to be able to ask.
+
+/// Ask the syntax thread for a fresh parse of every buffer core has named.
+///
+/// Core names one when it replaces a buffer's text without anyone typing —
+/// auto-revert, which is now the common case rather than the exotic one, since
+/// a coding agent rewrites the files you are *not* looking at.
+///
+/// The live buffer is skipped, and not because it does not need a parse: the
+/// revision block in [`App::tell_readers`] has already asked, and asked better.
+/// It has the change log and this does not, so re-asking here would trade an
+/// incremental parse for a full one on the one buffer whose latency is felt.
+fn request_pending_parses(editor: &mut Editor, highlighter: &zemacs_syntax::Worker) {
+    for id in std::mem::take(&mut editor.pending_highlight) {
+        if id == editor.buffer.id {
+            continue;
+        }
+        // Killed between the revert and this frame, or a buffer with no
+        // language — a `.txt` file is highlighted by nobody.
+        let Some(buffer) = editor.buffer_by_id(id) else {
+            continue;
+        };
+        let Some(lang) = buffer.language.clone() else {
+            continue;
+        };
+        highlighter.request(zemacs_syntax::Request {
+            seen: buffer.change_count(),
+            buffer: id,
+            lang,
+            text: buffer.text.to_string(),
+            // No log to hand over, and none wanted: a revert replaces the whole
+            // document, so there is no edit small enough to be worth describing.
+            edits: None,
+        });
+    }
+}
+
+/// Put each finished parse on the buffer it was a parse *of*.
+///
+/// Every result, not only the newest. "The newest" — which is what a single
+/// slot keyed by the editor's revision amounted to — was right while the live
+/// buffer was the only thing ever parsed, and became the bug the moment it was
+/// not: a parked buffer's colours were thrown away by whatever the live buffer
+/// finished next.
+///
+/// The safety property the revision compare had is kept, and made per-buffer,
+/// which is what it should have been all along: spans are adopted only if the
+/// buffer's own change count *and* its language are still the ones the text was
+/// snapshotted under. A parse of text that has since moved is dropped, because
+/// colouring the wrong characters is worse than colouring none — and a newer
+/// parse is already in flight for exactly that buffer.
+fn adopt_highlights(editor: &mut Editor, highlighter: &zemacs_syntax::Worker) {
+    while let Some(done) = highlighter.poll() {
+        let Some(buffer) = editor.buffer_by_id_mut(done.buffer) else {
+            continue;
+        };
+        if buffer.change_count() == done.seen && buffer.language.as_deref() == Some(&done.lang) {
+            buffer.highlights = done.spans;
+        }
+    }
+}
+
 // --- file effects --------------------------------------------------------
 
 /// `@init` is the sentinel the dashboard's "Edit configuration" item uses —
 /// the core has no idea where the config lives, this layer does.
-fn open_file(editor: &mut Editor, path: &Path, init_path: &Path) {
+fn open_file(editor: &mut Editor, path: &Path, init_path: &Path, remote: &mut Remote) {
     let path = if path == Path::new("@init") {
         init_path.to_path_buf()
     } else {
         path.to_path_buf()
     };
+    // `/ssh:user@host:/etc/nginx.conf`. `None` is every other name there has
+    // ever been, and getting it is one `memcmp` against `/ssh:` — see
+    // [`Remote`] for why the remote half cannot happen on this line.
+    if let Some(there) = tramp::parse(&path.to_string_lossy()) {
+        remote.open(editor, there);
+        return;
+    }
     match std::fs::read_to_string(&path) {
         Ok(text) => {
             let lang = zemacs_syntax::language_for_path(&path);
@@ -1663,14 +1939,17 @@ fn open_file(editor: &mut Editor, path: &Path, init_path: &Path) {
 /// The hit is `path:line:text`, so it is split from the *left* twice and no
 /// further — a match whose text contains a colon is the common case, not an
 /// edge one.
-fn open_at(editor: &mut Editor, root: &Path, hit: &str, init_path: &Path) {
+fn open_at(editor: &mut Editor, root: &Path, hit: &str, init_path: &Path, remote: &mut Remote) {
     let mut parts = hit.splitn(3, ':');
     let (Some(path), Some(line)) = (parts.next(), parts.next()) else {
         editor.apply(EditorCommand::Message(format!("not a match: {hit}")));
         return;
     };
     // Relative, because ripgrep ran with the project root as its directory.
-    open_file(editor, &root.join(path), init_path);
+    // Always local — ripgrep searched this machine — but it goes through the
+    // same door, so a `remote` handle travels with it rather than a second
+    // spelling of "open a file" growing here.
+    open_file(editor, &root.join(path), init_path, remote);
     // ripgrep counts from 1. A hit for a file that changed under us lands on
     // the last line rather than refusing to open it at all.
     if let Ok(line) = line.parse::<usize>() {
@@ -1744,7 +2023,7 @@ enum Save {
     Forced,
 }
 
-fn save_file(editor: &mut Editor, path: Option<PathBuf>, guard: Save) {
+fn save_file(editor: &mut Editor, path: Option<PathBuf>, guard: Save, remote: &mut Remote) {
     // A dired buffer's `path` is the *directory* it lists, and a magit buffer's
     // text is a rendered status. Writing either would overwrite something real
     // with a screenshot of a view.
@@ -1773,6 +2052,18 @@ fn save_file(editor: &mut Editor, path: Option<PathBuf>, guard: Save) {
                 return;
             }
         }
+    }
+    // The fork, and it is *here* rather than in `dispatch` so that everything
+    // above is asked once for both kinds of file: the refusal to write a
+    // rendered view, `:w <path>` as a save-as, and the changed-on-disk
+    // question. That last one self-disables for a remote name, because
+    // `disk_stamp` is a local `stat` and answers `None` — which is the honest
+    // answer and the affordable one; asking it properly is a round trip per
+    // save. Below is the local half and nothing in it means anything off this
+    // machine — see [`Remote`] for what a remote save does instead.
+    if let Some(there) = tramp::parse(&target.to_string_lossy()) {
+        remote.save(editor, there);
+        return;
     }
     let text = editor.buffer.text.to_string();
     // Before the old contents stop existing. Taken here rather than inside
@@ -1807,6 +2098,284 @@ fn save_file(editor: &mut Editor, path: Option<PathBuf>, guard: Save) {
             display_path(&target)
         ))),
     }
+}
+
+// --- remote files --------------------------------------------------------
+//
+// `/ssh:user@host:/etc/nginx.conf` in `find-file`, in `:w` and in dired.
+// `crates/tramp` does all of the work — the syntax, the ssh, the quoting, the
+// atomic remote write. What is left, and all that is here, is the one thing a
+// library cannot decide: *when*.
+//
+// # Why none of it happens on the call
+//
+// An ssh round trip is tens of milliseconds on a warm control socket, a few
+// hundred cold, and up to `tramp::TIMEOUT` — a minute — against a host that
+// accepted a connection and then went away. `docs/threading.org` is the law:
+// the main thread holds the editor lock for one iteration of input and
+// drawing, and every Lisp primitive on the image's thread waits on that same
+// lock. So a blocking read here would freeze the window *and* stop the config
+// dead, for a minute, over a typo in a hostname.
+//
+// So it is the shape the rest of the editor already uses for slow work:
+// `crates/rpc` runs its language servers on their own threads and delivers
+// replies through this loop, `zemacs_syntax::Worker` highlights the same way,
+// and `tramp::Worker` was built to match them. A request goes out, `poll`
+// picks the answer up in `housekeep`, and the effect lands on a later frame.
+// `find-file` from Lisp already lands a frame late (`docs/threading.org` says
+// so out loud); this makes it several frames late, which is the same promise
+// with a worse constant and no new rule to learn.
+//
+// # What the local path pays
+//
+// `tramp::parse` on the name, which is `strip_prefix("/ssh:")`, and nothing
+// else. The worker thread is not spawned until the first remote name of the
+// session, so a user who never types `/ssh:` has one extra `memcmp` per
+// `find-file` and not one thread, socket or allocation.
+//
+// # What a remote buffer does not get
+//
+// Written down because each is a deliberate answer, not an omission:
+//
+//   * **auto-revert: off.** The sweep `stat`s every open file four times a
+//     second. Over ssh that is a network round trip per buffer per 250ms,
+//     which is a performance bug rather than a feature — and the sweep's own
+//     header already named this crate as the condition for changing its
+//     answer. See `Revert::poll`.
+//   * **numbered backups: none.** `backup` is `fs::copy` of the file being
+//     replaced, and the remote copy of that is a whole transfer per save.
+//     ponytail: the upgrade is one line in `tramp`'s `write_script`, which
+//     already `cp -p`s the target aside — it throws the copy away instead of
+//     numbering it. The tearing half of the promise is *not* lost: the remote
+//     write is temp-then-`mv`, exactly as `write_file` is here.
+//   * **the changed-on-disk save guard: off**, since `visited` is a local
+//     `stat`. Asking properly is a round trip per save.
+//   * **auto-save: on, and local.** `~/.zemacs.d/auto-save/#!ssh:host:!etc!x#`
+//     — the path mangler needs no help, the copy is on the machine that would
+//     have crashed, and it is offered back on the next open because the
+//     `stat` that opening does already carries the host's mtime. That is the
+//     data-loss half, and it is the one that could not be skipped.
+//
+// All four are listed in `docs/boundary.org`.
+
+/// One remote operation in flight, and what its answer is for.
+enum Job {
+    /// `find-file` on a name that cannot be classified without asking. One
+    /// `stat` says file, directory, or nothing, and each answer queues its own
+    /// follow-up. Two round trips to open a file — the second on a connection
+    /// the first one opened, which is what `tramp`'s control socket is for.
+    Probe(tramp::RemotePath),
+    /// The read behind a `Probe`, carrying the metadata that `stat` already
+    /// learned so the mode bits and the mtime are not asked for twice.
+    Open(tramp::RemotePath, Option<tramp::RemoteEntry>),
+    /// A directory, for dired.
+    List(tramp::RemotePath),
+    /// A write, and the buffer that asked for it.
+    ///
+    /// Named by id *and* by change count, because a save is the one operation
+    /// whose reply changes state: it lands hundreds of milliseconds later, by
+    /// which time the user may have switched buffers and typed. Both have to
+    /// still be true or the flag stays where it is.
+    Save {
+        buffer: BufferId,
+        at: u64,
+        path: tramp::RemotePath,
+        bytes: usize,
+    },
+}
+
+impl Job {
+    /// What to blame when the operation fails. The remote path is the whole of
+    /// the context a user needs: it names the host and the file.
+    fn path(&self) -> &tramp::RemotePath {
+        match self {
+            Job::Probe(p) | Job::Open(p, _) | Job::List(p) | Job::Save { path: p, .. } => p,
+        }
+    }
+}
+
+/// The editor's end of `tramp::Worker`.
+#[derive(Default)]
+struct Remote {
+    /// `None` until the first remote name of the session — see the header.
+    worker: Option<tramp::Worker>,
+    next: u64,
+    /// By request id, which is the worker's contract: every request produces
+    /// exactly one reply, tagged with the id it went out with, and nothing is
+    /// coalesced or dropped.
+    jobs: std::collections::HashMap<u64, Job>,
+}
+
+impl Remote {
+    fn request(&mut self, op: tramp::Op, job: Job) {
+        let id = self.next;
+        self.next += 1;
+        self.jobs.insert(id, job);
+        self.worker
+            .get_or_insert_with(tramp::spawn_worker)
+            .request(id, op);
+    }
+
+    /// `find-file` on a remote name.
+    fn open(&mut self, editor: &mut Editor, path: tramp::RemotePath) {
+        editor.apply(EditorCommand::Message(format!("opening {path}…")));
+        self.request(tramp::Op::Stat(path.clone()), Job::Probe(path));
+    }
+
+    /// A directory dired asked for. No message: dired said "listing …" when it
+    /// decided to move, and this is the same event.
+    fn list(&mut self, path: tramp::RemotePath) {
+        self.request(tramp::Op::List(path.clone()), Job::List(path));
+    }
+
+    /// `:w` on a remote buffer.
+    ///
+    /// The buffer stays `modified` until the host confirms, which is the whole
+    /// difference from a local save: there is a window here in which the text
+    /// has been *sent* and not *written*, and a buffer that looked saved during
+    /// it would be lying about a file on another machine.
+    fn save(&mut self, editor: &mut Editor, path: tramp::RemotePath) {
+        let text = editor.buffer.text.to_string();
+        let job = Job::Save {
+            buffer: editor.buffer.id,
+            at: editor.buffer.change_count(),
+            path: path.clone(),
+            bytes: text.len(),
+        };
+        self.request(tramp::Op::Write(path.clone(), text.into_bytes()), job);
+        editor.apply(EditorCommand::Message(format!("writing {path}…")));
+    }
+
+    /// Everything that finished since the last frame.
+    ///
+    /// Drained until empty rather than one per frame: every reply here matters,
+    /// and one of them is a save. Costs a `try_recv` on an empty channel in a
+    /// session that never typed `/ssh:` — and not even that, since there is no
+    /// channel until there is a worker.
+    fn poll(&mut self, editor: &mut Editor, dired: &mut Dired) {
+        while let Some((id, reply)) = self.worker.as_ref().and_then(tramp::Worker::poll) {
+            let Some(job) = self.jobs.remove(&id) else {
+                continue;
+            };
+            match reply {
+                Ok(reply) => self.finish(editor, dired, job, reply),
+                // Errors are values. `tramp::Error`'s own words are better than
+                // anything this layer could write — they distinguish "add your
+                // key to the agent" from "accept the host key" from "cannot
+                // reach" — so they go to the status line unedited and the
+                // editor carries on. A failed save leaves the buffer modified,
+                // because it is.
+                Err(e) => {
+                    editor.apply(EditorCommand::Message(format!("{}: {e}", job.path())));
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, editor: &mut Editor, dired: &mut Dired, job: Job, reply: tramp::Reply) {
+        match (job, reply) {
+            // A directory: dired's, and the listing is the second round trip.
+            (Job::Probe(path), tramp::Reply::Stat(Some(meta))) if meta.is_dir => {
+                dired.adopt_remote(&path);
+                self.list(path);
+            }
+            (Job::Probe(path), tramp::Reply::Stat(meta @ Some(_))) => {
+                self.request(tramp::Op::Read(path.clone()), Job::Open(path, meta));
+            }
+            // Not there. Emacs visits the name in an empty buffer, and so do we:
+            // it is the only way to *create* a remote file, and the save that
+            // follows is the same save as any other.
+            (Job::Probe(path), tramp::Reply::Stat(None)) => {
+                visit(editor, &path, String::new(), None);
+                editor.apply(EditorCommand::Message(format!("{path} (new file)")));
+            }
+            (Job::Open(path, meta), tramp::Reply::Read(bytes)) => match String::from_utf8(bytes) {
+                Ok(text) => visit(editor, &path, text, meta),
+                // Same refusal as `tramp::read_to_string`, and for the reason
+                // given there: replacing undecodable bytes with U+FFFD in a
+                // buffer somebody will save destroys the file.
+                Err(_) => editor.apply(EditorCommand::Message(format!(
+                    "{path} is not UTF-8 text"
+                ))),
+            },
+            (Job::List(path), tramp::Reply::List(entries)) => dired.listed(editor, &path, entries),
+            (
+                Job::Save {
+                    buffer,
+                    at,
+                    path,
+                    bytes,
+                },
+                tramp::Reply::Done,
+            ) => {
+                let name = PathBuf::from(path.to_string());
+                let mut named = false;
+                if let Some(b) = editor.buffer_by_id_mut(buffer) {
+                    // Only the text that went out is on the host. Anything
+                    // typed since is not, and the buffer has to keep saying so.
+                    if b.change_count() == at {
+                        b.modified = false;
+                        // ...and only then is the recovery copy stale. Cleared
+                        // by name rather than through `autosave_forget`,
+                        // because that reads a buffer we are already holding.
+                        if let Some(copy) = autosave_file(&name) {
+                            let _ = std::fs::remove_file(copy);
+                        }
+                    }
+                    if b.path.is_none() {
+                        b.language = zemacs_syntax::language_for_path(&name);
+                        b.path = Some(name);
+                        named = true;
+                    }
+                }
+                // The text did not change but the *language* did, and the
+                // highlight request is gated on the revision — the same reason
+                // the local `save_file` bumps it.
+                if named {
+                    editor.revision += 1;
+                }
+                editor.apply(EditorCommand::Message(format!("wrote {path} ({bytes} bytes)")));
+            }
+            // `execute` answers each `Op` with its own `Reply` variant, so this
+            // is a bug in this file rather than anything a host can cause.
+            (job, reply) => editor.apply(EditorCommand::Message(format!(
+                "tramp: {} answered with {reply:?}",
+                job.path()
+            ))),
+        }
+    }
+}
+
+/// A remote file's text, in a buffer.
+///
+/// The `Ok` arm of [`open_file`], minus the parts that mean nothing off this
+/// machine and plus the two the `stat` already paid for.
+fn visit(
+    editor: &mut Editor,
+    path: &tramp::RemotePath,
+    text: String,
+    meta: Option<tramp::RemoteEntry>,
+) {
+    // The tramp name *is* the buffer's path, so it survives into the modeline,
+    // into `:w`, into dired's `locate`, and back through `tramp::parse` —
+    // `Display` is an exact inverse of `parse`, which is what makes that safe.
+    let name = PathBuf::from(path.to_string());
+    let lang = zemacs_syntax::language_for_path(&name);
+    editor.load(&text, Some(name.clone()), lang);
+    editor.buffer.file_mode = meta.as_ref().map(|m| m.mode);
+    // Left `None` deliberately: `visited` is only ever compared against
+    // `disk_stamp`, which is a local `stat`, and a remote one would be a round
+    // trip per save. See the header.
+    editor.buffer.visited = None;
+    let recovery = meta
+        .as_ref()
+        .and_then(|m| m.modified)
+        .and_then(|on_host| recovery_against(&name, on_host));
+    editor.apply(EditorCommand::Message(match recovery {
+        Some(copy) => format!("opened {path} — newer auto-save at {}", copy.display()),
+        None => format!("opened {path} ({} bytes)", text.len()),
+    }));
+    remember_recent(&name);
 }
 
 /// Colour the documentation panel beside the completion popup.
@@ -1851,12 +2420,18 @@ fn highlight_completion_doc(editor: &mut Editor) {
 /// The listing is refreshed only when the *directory* part of the typed path
 /// changes — the filename part is what the fuzzy matcher filters on, so
 /// re-reading the directory per keystroke would be pure waste.
+///
+/// A `bare` prompt is one asking for a *name* — dired's `+` and `C-c n`, which
+/// create in the directory on screen. Listing the filesystem into it is the
+/// whole bug those two had: `Prompt::value` answers with the highlighted
+/// candidate, so `+` typed `notes` and submitted a path, which
+/// `zemacs_dired::child` then refused for having a separator in it.
 fn refresh_file_completions(editor: &mut Editor, last_query: &mut Option<String>) {
     let Some(prompt) = editor.prompt.as_mut() else {
         *last_query = None;
         return;
     };
-    if prompt.kind != PromptKind::File {
+    if prompt.kind != PromptKind::File || prompt.bare {
         *last_query = None;
         return;
     }
@@ -2097,9 +2672,17 @@ fn autosave_one(buffer: &zemacs_core::Buffer) {
 /// file. An older copy is one the last real save already superseded, and
 /// offering it would be offering to go backwards.
 fn recovery_for(path: &Path) -> Option<PathBuf> {
+    recovery_against(path, std::fs::metadata(path).ok()?.modified().ok()?)
+}
+
+/// The half of [`recovery_for`] that does not do the `stat`.
+///
+/// Split out for a remote file, whose mtime arrived over ssh with the rest of
+/// its metadata — asking this machine about it answers `None`, which is how a
+/// remote buffer came to auto-save faithfully and never offer the copy back.
+fn recovery_against(path: &Path, on_disk: std::time::SystemTime) -> Option<PathBuf> {
     let copy = autosave_file(path)?;
     let saved = std::fs::metadata(&copy).ok()?.modified().ok()?;
-    let on_disk = std::fs::metadata(path).ok()?.modified().ok()?;
     (saved > on_disk).then_some(copy)
 }
 
@@ -2328,6 +2911,15 @@ impl Revert {
         let watched: Vec<(zemacs_core::BufferId, PathBuf)> = editor.buffers()
             .filter(|b| !b.kind.is_generated())
             .filter_map(|b| b.path.clone().map(|p| (b.id, p)))
+            // The condition this header named, arrived. A remote buffer's
+            // `stat` is an ssh round trip, and this sweep is four a second per
+            // open file — so a remote file is not swept at all, and one that
+            // moves under you is noticed when you next open it. ponytail: the
+            // upgrade is a second, much slower timer going through the tramp
+            // worker, where the answer arrives as a reply rather than as a
+            // syscall — which is a different `check` and not a longer interval
+            // on this one.
+            .filter(|(_, p)| tramp::parse(&p.to_string_lossy()).is_none())
             .collect();
 
         for (id, path) in watched {
@@ -2447,7 +3039,11 @@ fn read_recent() -> Vec<PathBuf> {
         .unwrap_or_default()
         .lines()
         .map(PathBuf::from)
-        .filter(|p| p.exists())
+        // A remote name cannot be checked without an ssh round trip, and the
+        // dashboard is drawn before the first frame — so it is trusted, and the
+        // open reports if the host or the file has gone. Local entries keep
+        // being pruned, which is what stops the list filling with deleted files.
+        .filter(|p| p.exists() || tramp::parse(&p.to_string_lossy()).is_some())
         .collect()
 }
 
@@ -2455,8 +3051,16 @@ fn read_recent() -> Vec<PathBuf> {
 /// recents file must never get between the user and their editor.
 fn remember_recent(path: &Path) {
     let Some(file) = recent_path() else { return };
-    let Ok(canonical) = path.canonicalize() else {
-        return;
+    // A tramp name is already absolute and already exact — `Display` is the
+    // inverse of `parse` — and `canonicalize` would ask *this* machine about a
+    // file on another one, fail, and drop it. Which is why remote files reached
+    // this list exactly never before the check was here.
+    let canonical = match tramp::parse(&path.to_string_lossy()) {
+        Some(_) => path.to_path_buf(),
+        None => match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return,
+        },
     };
     let mut list = vec![canonical.clone()];
     list.extend(read_recent().into_iter().filter(|p| *p != canonical));
@@ -2639,11 +3243,18 @@ fn key_from_keydown(kc: Keycode, keymod: Mod, raw: bool) -> Option<Key> {
     // "another one of these". Without the third arm `⌘⏎` fell through to the
     // `Meta(char)` case below, which has no character to make and answered
     // `None`, so the keystroke reached nothing at all.
+    //
+    // Shift joins them for the same reason one step later: org's `M-S-<ret>` is
+    // "another one of these, but a task", and a modifier the vocabulary cannot
+    // spell is a binding nobody can write. Ctrl still ignores it — `C-<ret>` and
+    // `C-⇧<ret>` are one key, as `C-a` and `C-A` are.
     if matches!(kc, Keycode::Return | Keycode::KpEnter) {
-        match (ctrl, meta) {
-            (true, true) => return Some(Key::CtrlMetaEnter),
-            (true, false) => return Some(Key::CtrlEnter),
-            (false, true) => return Some(Key::MetaEnter),
+        match (ctrl, meta, shift) {
+            (true, true, _) => return Some(Key::CtrlMetaEnter),
+            (true, false, _) => return Some(Key::CtrlEnter),
+            (false, true, true) => return Some(Key::MetaShiftEnter),
+            (false, true, false) => return Some(Key::MetaEnter),
+            (false, false, true) => return Some(Key::ShiftEnter),
             _ => {}
         }
     }
@@ -2651,14 +3262,28 @@ fn key_from_keydown(kc: Keycode, keymod: Mod, raw: bool) -> Option<Key> {
     if kc == Keycode::Backspace && meta {
         return Some(Key::MetaBackspace);
     }
-    // ...and for the two arrows Meta makes word-wise. Named keys, so
-    // `combo_char` below cannot spell them and they would otherwise be dropped
-    // on the floor — which is exactly what `⌘←` used to do.
-    if meta && !ctrl {
-        match kc {
-            Keycode::Left => return Some(Key::MetaLeft),
-            Keycode::Right => return Some(Key::MetaRight),
-            _ => {}
+    // ...and for the modified arrows. Named keys, so `combo_char` below cannot
+    // spell them and they would otherwise be dropped on the floor — which is
+    // exactly what `⌘←` used to do.
+    //
+    // One arm per key that exists rather than a table over both modifiers:
+    // `M-<up>`/`M-<down>` and `M-S-<up>`/`M-S-<down>` are the four this
+    // deliberately does *not* name, since a key nothing binds is a match arm in
+    // four crates for nothing. Ctrl is excluded from the whole block, as above.
+    if !ctrl {
+        let modified = match (kc, meta, shift) {
+            (Keycode::Left, true, false) => Some(Key::MetaLeft),
+            (Keycode::Right, true, false) => Some(Key::MetaRight),
+            (Keycode::Left, true, true) => Some(Key::MetaShiftLeft),
+            (Keycode::Right, true, true) => Some(Key::MetaShiftRight),
+            (Keycode::Left, false, true) => Some(Key::ShiftLeft),
+            (Keycode::Right, false, true) => Some(Key::ShiftRight),
+            (Keycode::Up, false, true) => Some(Key::ShiftUp),
+            (Keycode::Down, false, true) => Some(Key::ShiftDown),
+            _ => None,
+        };
+        if modified.is_some() {
+            return modified;
         }
     }
     match (ctrl, meta) {
@@ -2854,8 +3479,52 @@ pub fn config_dir() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("HOME")?).join(".zemacs.d"))
 }
 
+/// Where the *shipped* Lisp lives — `library.lisp`, `themes/`, `modes/`, the LSP
+/// client. Distinct from [`config_dir`], and the distinction is the whole point:
+/// your `init.lisp` lives in `~/.zemacs.d` and has none of that beside it, so
+/// the image cannot find the runtime by looking next to the config it just read.
+///
+/// `$ZEMACS_RUNTIME` first, so one binary can be pointed at a checkout, an
+/// install prefix or a bundle; the compiled-in path otherwise, so `cargo run`
+/// works out of the box. Handed to the image through the environment — see
+/// `PATHS_FORM` in `crates/lisp/src/shim.c`, which is the other half of this.
+fn runtime_dir() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("ZEMACS_RUNTIME") {
+        return PathBuf::from(explicit);
+    }
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../runtime"))
+}
+
+/// Put your config where you can edit it, once, the first time zemacs runs.
+///
+/// The shipped `runtime/init.lisp` is a *default*, not the config: copying it to
+/// `~/.zemacs.d/init.lisp` is what makes "edit your configuration" mean editing
+/// a file that belongs to you rather than one inside a checkout that `git pull`
+/// will overwrite. Only the config moves — the library, the themes and the modes
+/// it calls stay in the runtime and are upgraded with the editor, which is why
+/// this copy is a one-line file to keep rather than a fork of the whole runtime.
+///
+/// Never overwrites: an existing file is the answer, whatever is in it. Every
+/// failure is silent and leaves the shipped copy in play — a read-only `$HOME`
+/// is a reason to run with the defaults, not a reason not to start.
+///
+/// Deliberately *not* called from [`resolve_init_path`], which the test module
+/// calls a dozen times: seeding there would have `cargo test` writing into the
+/// developer's own home directory.
+fn seed_user_init() {
+    let Some(dir) = config_dir() else { return };
+    let user = dir.join("init.lisp");
+    if user.exists() {
+        return;
+    }
+    let shipped = runtime_dir().join("init.lisp");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::copy(&shipped, &user);
+    }
+}
+
 /// `$ZEMACS_INIT`, else `~/.zemacs.d/init.lisp` if it exists, else the copy
-/// shipped in the repo — so `cargo run` works out of the box.
+/// shipped in the repo — so a build sandbox with no `$HOME` still starts.
 fn resolve_init_path() -> PathBuf {
     if let Some(explicit) = std::env::var_os("ZEMACS_INIT") {
         return PathBuf::from(explicit);
@@ -2865,10 +3534,7 @@ fn resolve_init_path() -> PathBuf {
             return user;
         }
     }
-    PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../runtime/init.lisp"
-    ))
+    runtime_dir().join("init.lisp")
 }
 
 #[cfg(test)]
@@ -2975,6 +3641,34 @@ mod tests {
         }
     }
 
+    /// Shift on the keys that have no character to carry it. Without these the
+    /// keystroke reached nothing at all: `combo_char` cannot spell `<ret>` or an
+    /// arrow, so org's `M-S-<ret>` was a binding that could not be written down.
+    #[test]
+    fn shift_is_a_modifier_on_the_named_keys() {
+        let m = |kc, keymod| key_from_keydown(kc, keymod, false);
+        assert_eq!(m(Keycode::Return, Mod::LSHIFTMOD), Some(Key::ShiftEnter));
+        assert_eq!(
+            m(Keycode::Return, Mod::LGUIMOD | Mod::LSHIFTMOD),
+            Some(Key::MetaShiftEnter)
+        );
+        assert_eq!(m(Keycode::Left, Mod::RSHIFTMOD), Some(Key::ShiftLeft));
+        assert_eq!(m(Keycode::Up, Mod::LSHIFTMOD), Some(Key::ShiftUp));
+        assert_eq!(
+            m(Keycode::Right, Mod::LGUIMOD | Mod::LSHIFTMOD),
+            Some(Key::MetaShiftRight)
+        );
+        // Ctrl still swallows the bit, so `C-<ret>` splits a window however the
+        // hand that pressed it was holding shift.
+        assert_eq!(
+            m(Keycode::Return, Mod::LCTRLMOD | Mod::LSHIFTMOD),
+            Some(Key::CtrlEnter)
+        );
+        // ...and the unshifted keys are untouched.
+        assert_eq!(m(Keycode::Left, Mod::LGUIMOD), Some(Key::MetaLeft));
+        assert_eq!(m(Keycode::Left, Mod::NOMOD), Some(Key::Left));
+    }
+
     #[test]
     fn text_input_is_on_only_where_text_is_typed() {
         let mut ed = Editor::new();
@@ -3076,7 +3770,7 @@ mod tests {
     fn init_sentinel_resolves_to_the_config() {
         let mut ed = Editor::new();
         let init = resolve_init_path();
-        open_file(&mut ed, Path::new("@init"), &init);
+        open_file(&mut ed, Path::new("@init"), &init, &mut Remote::default());
         // Either it loaded the config or it reported why; it must never be the
         // literal path "@init".
         assert_ne!(ed.buffer.path.as_deref(), Some(Path::new("@init")));
@@ -3165,7 +3859,7 @@ mod tests {
     fn a_modified_buffer_is_not_reverted_out_from_under_you() {
         let path = scratch("unsaved.txt", "one\ntwo\nthree\n");
         let mut ed = Editor::new();
-        open_file(&mut ed, &path, &resolve_init_path());
+        open_file(&mut ed, &path, &resolve_init_path(), &mut Remote::default());
         let mut watch = Revert::default();
         watch.poll(&mut ed); // first sight: records the stamp, reverts nothing
 
@@ -3192,7 +3886,7 @@ mod tests {
     fn an_unmodified_buffer_follows_the_file_and_keeps_point() {
         let path = scratch("external.txt", "alpha\nbeta\ngamma\n");
         let mut ed = Editor::new();
-        open_file(&mut ed, &path, &resolve_init_path());
+        open_file(&mut ed, &path, &resolve_init_path(), &mut Remote::default());
         let mut watch = Revert::default();
         watch.poll(&mut ed);
         ed.buffer.move_to_line_col(2, 1); // on `gamma`
@@ -3214,14 +3908,14 @@ mod tests {
     fn saving_does_not_revert_the_buffer_that_saved() {
         let path = scratch("saved.txt", "alpha\nbeta\ngamma\n");
         let mut ed = Editor::new();
-        open_file(&mut ed, &path, &resolve_init_path());
+        open_file(&mut ed, &path, &resolve_init_path(), &mut Remote::default());
         let mut watch = Revert::default();
         watch.poll(&mut ed);
 
         ed.buffer.move_to_line_col(2, 0);
         ed.apply(EditorCommand::InsertText("delta ".into()));
         let at = ed.buffer.cursor;
-        save_file(&mut ed, None, Save::Guarded);
+        save_file(&mut ed, None, Save::Guarded, &mut Remote::default());
         touch_forward(&path); // a save moves the stamp; make sure it is noticed
         watch.poll(&mut ed);
 
@@ -3344,13 +4038,13 @@ mod tests {
     fn saving_over_a_file_that_changed_underneath_asks_first() {
         let path = scratch("contested.txt", "mine\n");
         let mut ed = Editor::new();
-        open_file(&mut ed, &path, &resolve_init_path());
+        open_file(&mut ed, &path, &resolve_init_path(), &mut Remote::default());
         ed.apply(EditorCommand::InsertText("edited ".into()));
 
         // Somebody else — `git pull`, a formatter, an agent.
         std::fs::write(&path, "theirs\n").unwrap();
         touch_forward(&path);
-        save_file(&mut ed, None, Save::Guarded);
+        save_file(&mut ed, None, Save::Guarded, &mut Remote::default());
 
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -3376,12 +4070,12 @@ mod tests {
     fn confirming_the_clobber_writes_the_buffer() {
         let path = scratch("conceded.txt", "mine\n");
         let mut ed = Editor::new();
-        open_file(&mut ed, &path, &resolve_init_path());
+        open_file(&mut ed, &path, &resolve_init_path(), &mut Remote::default());
         ed.apply(EditorCommand::InsertText("edited ".into()));
         std::fs::write(&path, "theirs\n").unwrap();
         touch_forward(&path);
 
-        save_file(&mut ed, None, Save::Guarded);
+        save_file(&mut ed, None, Save::Guarded, &mut Remote::default());
         ed.prompt.as_mut().unwrap().text = "yes".into();
         // The answer comes back as `Confirmed(SaveFile(..))`, which is the
         // whole mechanism: dispatching it must reach the *forced* save rather
@@ -3393,7 +4087,7 @@ mod tests {
                 Some(path.clone())
             )))]
         );
-        save_file(&mut ed, Some(path.clone()), Save::Forced);
+        save_file(&mut ed, Some(path.clone()), Save::Forced, &mut Remote::default());
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited mine\n");
         assert!(!ed.buffer.modified);
@@ -3406,7 +4100,7 @@ mod tests {
     fn a_save_after_a_revert_does_not_ask() {
         let path = scratch("settled.txt", "one\n");
         let mut ed = Editor::new();
-        open_file(&mut ed, &path, &resolve_init_path());
+        open_file(&mut ed, &path, &resolve_init_path(), &mut Remote::default());
         let mut watch = Revert::default();
         watch.poll(&mut ed);
 
@@ -3415,7 +4109,7 @@ mod tests {
         watch.poll(&mut ed); // unmodified, so this reverts and re-syncs
 
         ed.apply(EditorCommand::InsertText("three ".into()));
-        save_file(&mut ed, None, Save::Guarded);
+        save_file(&mut ed, None, Save::Guarded, &mut Remote::default());
 
         assert!(ed.prompt.is_none(), "nothing to ask about after a revert");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "three two\n");
@@ -3430,8 +4124,8 @@ mod tests {
         let one = scratch("parked_one.txt", "alpha\nbeta\n");
         let two = scratch("parked_two.txt", "gamma\ndelta\n");
         let mut ed = Editor::new();
-        open_file(&mut ed, &one, &resolve_init_path());
-        open_file(&mut ed, &two, &resolve_init_path()); // `one` is now parked
+        open_file(&mut ed, &one, &resolve_init_path(), &mut Remote::default());
+        open_file(&mut ed, &two, &resolve_init_path(), &mut Remote::default()); // `one` is now parked
         assert_eq!(ed.buffer.path.as_deref(), Some(two.as_path()));
 
         let mut watch = Revert::default();
@@ -3456,6 +4150,59 @@ mod tests {
         let _ = std::fs::remove_file(&two);
     }
 
+    /// ...and it comes back *coloured*, without being visited.
+    ///
+    /// The whole chain, because every link in it was part of the bug: core has
+    /// to name the buffer, the request has to be made for a buffer that is not
+    /// live, the queue has to keep it instead of folding it into the live one,
+    /// and the result has to land on its own buffer rather than being tested
+    /// against a revision that has nothing to do with it. Before this, a file
+    /// an agent rewrote came back correct and completely colourless and stayed
+    /// that way until you switched to it and typed.
+    #[test]
+    fn a_parked_buffer_is_recoloured_after_it_reverts() {
+        let parked = scratch("recolour_parked.rs", "fn parked() {}\n");
+        let live = scratch("recolour_live.rs", "fn live() {}\n");
+        let mut ed = Editor::new();
+        open_file(&mut ed, &parked, &resolve_init_path(), &mut Remote::default());
+        let id = ed.buffer.id;
+        open_file(&mut ed, &live, &resolve_init_path(), &mut Remote::default()); // `parked` is now parked
+
+        let highlighter = zemacs_syntax::spawn_worker();
+        let mut watch = Revert::default();
+        watch.poll(&mut ed); // first sight of both
+
+        let after = "fn parked() { let s = \"two\"; }\n";
+        std::fs::write(&parked, after).unwrap();
+        touch_forward(&parked);
+        watch.poll(&mut ed);
+        assert!(
+            ed.buffer_by_id(id).unwrap().highlights.is_empty(),
+            "the spans it had describe text that is gone"
+        );
+
+        request_pending_parses(&mut ed, &highlighter);
+        // The parse is on another thread, so this is a frame loop with the
+        // frames taken out: the same two calls the app makes, until one lands.
+        for _ in 0..200 {
+            adopt_highlights(&mut ed, &highlighter);
+            if !ed.buffer_by_id(id).unwrap().highlights.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Not merely "some spans": the colours of the text it now holds.
+        assert_eq!(
+            ed.buffer_by_id(id).unwrap().highlights,
+            zemacs_syntax::highlight("rust", after),
+        );
+        // ...and the live buffer, which nobody asked about, was left alone.
+        assert!(ed.buffer.highlights.is_empty());
+        let _ = std::fs::remove_file(&live);
+        let _ = std::fs::remove_file(&parked);
+    }
+
     /// The safety property, in the direction that used to be unreachable: an
     /// unsaved *parked* buffer is not clobbered either.
     #[test]
@@ -3463,10 +4210,10 @@ mod tests {
         let one = scratch("parked_dirty.txt", "alpha\n");
         let two = scratch("parked_other.txt", "beta\n");
         let mut ed = Editor::new();
-        open_file(&mut ed, &one, &resolve_init_path());
+        open_file(&mut ed, &one, &resolve_init_path(), &mut Remote::default());
         ed.apply(EditorCommand::InsertText("typed ".into()));
         let mine = ed.buffer.text.to_string();
-        open_file(&mut ed, &two, &resolve_init_path());
+        open_file(&mut ed, &two, &resolve_init_path(), &mut Remote::default());
 
         let mut watch = Revert::default();
         watch.poll(&mut ed);
@@ -3491,7 +4238,7 @@ mod tests {
     fn closed_files_are_forgotten() {
         let path = scratch("forgotten.txt", "x\n");
         let mut ed = Editor::new();
-        open_file(&mut ed, &path, &resolve_init_path());
+        open_file(&mut ed, &path, &resolve_init_path(), &mut Remote::default());
         let mut watch = Revert::default();
         watch.poll(&mut ed);
         assert!(watch.seen.contains_key(&path));
@@ -3500,6 +4247,161 @@ mod tests {
         watch.poll(&mut ed);
         assert!(!watch.seen.contains_key(&path));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- remote files ----------------------------------------------------
+    //
+    // The syntax itself, and every way of writing a local name that merely
+    // looks remote, is pinned in `crates/tramp`'s `path` module — see
+    // `a_local_path_is_recognised_as_local` there, which covers `/ssh:`, a
+    // Windows drive letter, and a relative name full of colons. What is tested
+    // here is the *routing*: which branch this layer takes, and what it costs
+    // the local path to have the other one exist.
+    //
+    // `0.0.0.0#1` is the host wherever one is needed. It is not a name that has
+    // to resolve and not a port anything listens on, so `connect(2)` refuses at
+    // once — the same trick `crates/tramp`'s own always-runs test uses to get a
+    // real failure without a real server.
+
+    /// The one that would be a bug in every session: a local file must not pay
+    /// for remote files existing. No ssh thread, no queued job, no round trip.
+    #[test]
+    fn a_local_file_never_reaches_the_ssh_worker() {
+        let path = scratch("purely_local.txt", "one\n");
+        let mut remote = Remote::default();
+        let mut ed = Editor::new();
+
+        open_file(&mut ed, &path, &resolve_init_path(), &mut remote);
+        assert_eq!(ed.buffer.text.to_string(), "one\n", "{}", ed.status);
+        ed.apply(EditorCommand::InsertText("two ".into()));
+        save_file(&mut ed, None, Save::Guarded, &mut remote);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two one\n");
+
+        assert!(remote.worker.is_none(), "a thread was spawned for a local file");
+        assert!(remote.jobs.is_empty(), "a job was queued for a local file");
+
+        // ...and so does every near miss. Each of these is a file on *this*
+        // machine that happens to be spelled like a host, so each must take the
+        // local branch and report the local failure — a missing file — rather
+        // than trying to reach somebody. The syntax itself is `tramp`'s to
+        // decide; what is asserted here is that this layer believes it.
+        for near in [
+            "/ssh",
+            "/ssh:",             // no host and no second colon
+            "/ssh:host",         // never closed
+            "/ssh:/etc/passwd",  // empty host
+            "/SSH:host:/x",      // the method is spelled in lower case
+            "/sudo:root@host:/x",
+        ] {
+            open_file(&mut ed, Path::new(near), &resolve_init_path(), &mut remote);
+            assert!(remote.worker.is_none(), "{near} was taken for a remote name");
+            assert!(remote.jobs.is_empty(), "{near} queued a job");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `find-file /ssh:…` must not read anything on this machine and must not
+    /// block: it queues one `stat` and returns, and the buffer is whatever it
+    /// was until an answer arrives frames later.
+    #[test]
+    fn a_remote_name_is_queued_rather_than_opened() {
+        let mut remote = Remote::default();
+        let mut ed = Editor::new();
+        let before = ed.buffer.text.to_string();
+
+        open_file(
+            &mut ed,
+            Path::new("/ssh:0.0.0.0#1:/etc/hosts"),
+            &resolve_init_path(),
+            &mut remote,
+        );
+
+        assert_eq!(ed.buffer.text.to_string(), before, "the buffer was replaced");
+        assert_eq!(remote.jobs.len(), 1, "nothing was queued");
+        assert!(matches!(
+            remote.jobs.values().next(),
+            Some(Job::Probe(p)) if p.host == "0.0.0.0" && p.path == "/etc/hosts"
+        ));
+        assert!(ed.status.contains("opening"), "{}", ed.status);
+    }
+
+    /// The promise a remote save is entirely about: **sent is not written**.
+    /// The connection is refused, so this needs no server — only a socket that
+    /// says no — and the buffer has to come out of it still dirty.
+    #[test]
+    fn a_remote_save_that_fails_leaves_the_buffer_modified() {
+        let mut remote = Remote::default();
+        let mut ed = Editor::new();
+        ed.load("secrets\n", Some(PathBuf::from("/ssh:0.0.0.0#1:/tmp/zemacs")), None);
+        ed.apply(EditorCommand::InsertText("more ".into()));
+        assert!(ed.buffer.modified);
+
+        save_file(&mut ed, None, Save::Guarded, &mut remote);
+        assert!(ed.buffer.modified, "cleared before the host had answered");
+        assert_eq!(remote.jobs.len(), 1);
+
+        // Wait for the refusal. Generous, because it is a wall clock on
+        // somebody else's CI; the point is that it is well inside
+        // `tramp::TIMEOUT` and that the answer is a message rather than a
+        // panic.
+        let mut dired = Dired::default();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !remote.jobs.is_empty() && Instant::now() < deadline {
+            remote.poll(&mut ed, &mut dired);
+            std::thread::yield_now();
+        }
+
+        assert!(remote.jobs.is_empty(), "no reply inside 30s");
+        assert!(ed.buffer.modified, "a buffer that was never written looks saved");
+        assert!(
+            ed.status.contains("0.0.0.0"),
+            "the failure did not name the host: {}",
+            ed.status
+        );
+        // And nothing was written to a *local* file of that name, which is what
+        // a missing `parse` would have done.
+        assert!(!Path::new("/ssh:0.0.0.0#1:/tmp/zemacs").exists());
+    }
+
+    /// The sweep is four `stat`s a second per open file. Over ssh that is a
+    /// network round trip on a timer, so a remote buffer is not in it at all.
+    #[test]
+    fn auto_revert_does_not_sweep_a_remote_buffer() {
+        let local = scratch("swept.txt", "x\n");
+        let mut ed = Editor::new();
+        ed.load("x\n", Some(local.clone()), None);
+        ed.load("remote\n", Some(PathBuf::from("/ssh:host:/etc/nginx.conf")), None);
+
+        let mut watch = Revert::default();
+        watch.poll(&mut ed);
+
+        assert!(watch.seen.contains_key(&local), "the local buffer is still swept");
+        assert_eq!(watch.seen.len(), 1, "a remote path was stat'd: {:?}", watch.seen);
+        let _ = std::fs::remove_file(&local);
+    }
+
+    /// A remote file's crash copy is a *local* file, which is the whole point —
+    /// it is on the machine that crashed. The path mangler needs no help, and
+    /// the copy is offered back against the mtime the host sent.
+    #[test]
+    fn a_remote_buffer_auto_saves_locally_and_is_offered_back() {
+        let name = PathBuf::from("/ssh:host:/etc/nginx.conf");
+        let copy = autosave_file(&name).expect("a home directory");
+        let _ = std::fs::remove_file(&copy);
+
+        let mut ed = Editor::new();
+        ed.load("listen 80;\n", Some(name.clone()), None);
+        ed.apply(EditorCommand::InsertText("# ".into()));
+        autosave_all(&ed);
+
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "# listen 80;\n");
+        // Older on the host than the copy: recoverable. Newer: superseded.
+        assert_eq!(
+            recovery_against(&name, std::time::UNIX_EPOCH),
+            Some(copy.clone())
+        );
+        assert_eq!(recovery_against(&name, std::time::SystemTime::now()), None);
+        let _ = std::fs::remove_file(&copy);
     }
 
     #[test]

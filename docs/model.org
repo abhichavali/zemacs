@@ -120,8 +120,14 @@ arguments and no delta; it is what document synchronisation in
 [[file:reference.org][the LSP client]] is built on, and =*after-change-functions*= is the list it runs so
 that more than one thing can want it.
 
-That is the entire hook contract — there is no =add-hook=, no =before-save-hook=,
-no buffer-switch hook.
+A buffer being *switched* to is reported the same way, on
+=*buffer-switch-functions*=. It arrived late and for one reason: settings a mode
+claims are global in the editor, so without it they followed the last mode
+*entered* rather than the buffer on screen — visit a =.rs= file and your org
+buffers lost their wrapping until you re-entered org mode.
+
+That is the entire hook contract — there is no =add-hook= in core, and no
+=before-save-hook=.
 
 Everything else you would expect from Emacs' mode system is built *in Lisp*, on
 top of that one event, in =runtime/modes/modes.lisp=: exit hooks, inheritance,

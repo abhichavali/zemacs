@@ -1,4 +1,4 @@
-//! `project-make`'s Makefile scanner, in `runtime/init.lisp`.
+//! `project-make`'s Makefile scanner, in `runtime/library.lisp`.
 //!
 //! The picker and the terminal half cannot be asserted from here — one waits on
 //! a person and the other on a shell — but the part with an opinion can be, and

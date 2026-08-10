@@ -222,39 +222,14 @@ fn the_root_is_named_by_its_last_component() {
 }
 
 // --------------------------------------------------------- build and test
-
-#[test]
-fn the_build_command_comes_from_the_root_not_from_the_marker() {
-    let temp = Temp::new("commands");
-    temp.dir(".git");
-    temp.write("Cargo.toml", "[package]\n");
-
-    let project = found(temp.path());
-    assert_eq!(project.marker, Marker::Git);
-    let build = project.build().unwrap();
-    assert_eq!(build.program, "cargo");
-    assert_eq!(build.args, ["build"]);
-    assert_eq!(project.test().unwrap().display(), "cargo test");
-}
-
-#[test]
-fn a_project_with_nothing_to_build_says_so_instead_of_guessing() {
-    let temp = Temp::new("nobuild");
-    temp.dir(".git");
-    let project = found(temp.path());
-    assert!(project.build().is_none());
-    assert!(project.test().is_none());
-}
-
-#[test]
-fn a_makefile_project_builds_with_bare_make() {
-    let temp = Temp::new("make");
-    temp.write("Makefile", "all:\n\techo hi\n");
-    let project = found(temp.path());
-    assert_eq!(project.marker, Marker::Make);
-    assert!(project.build().unwrap().args.is_empty());
-    assert_eq!(project.test().unwrap().args, ["test"]);
-}
+//
+// Gone from here, not lost: `Project::build`/`test` were a `match` in this
+// crate saying `cargo build` for a `Cargo.toml`, and that is now
+// `*project-builders*` in `runtime/plugins/project.lisp`. The three assertions
+// that were here — a build file in a repository root still decides the command,
+// a repository with no build file says so rather than guessing, and a Makefile
+// builds with a bare `make` — are `crates/lisp/tests/project_plugin.rs`,
+// against a real image and the same shape of tree.
 
 // ------------------------------------------------------------------ files
 

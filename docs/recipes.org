@@ -6,7 +6,7 @@ editor loads), under =(in-package :zemacs)=. Reload with =M-x reload-config= —
 restart.
 
 A few names below come from the shipped config rather than from the host:
-=define-leader= and =define-key-everywhere= (=runtime/init.lisp=), and
+=define-leader= and =define-key-everywhere= (=runtime/library.lisp=), and
 =define-derived-mode=, =define-minor-mode=, =set-mode-local=, =define-mode-key=,
 =add-auto-mode=, =derived-mode-p= (=runtime/modes/modes.lisp=). They are ordinary
 Lisp and yours to replace; the host API is [[file:reference.org][reference.org]].
@@ -14,7 +14,7 @@ Lisp and yours to replace; the host API is [[file:reference.org][reference.org]]
 * A command bound to a key
 
 A command is a zero-argument function in the =ZEMACS= package. That is the entire
-mechanism: no =interactive=, no registration, no macro.
+mechanism: no declaration, no registration, no macro.
 
 #+begin_src lisp
 (defun insert-date ()
@@ -31,12 +31,29 @@ The command name is a *string* in the binding, because the same namespace also
 holds the editor's built-in verbs — ="find-file"= there means the prompt, not the
 Lisp primitive that takes a path.
 
-For =M-x= to offer it, the name has to be published. =runtime/init.lisp= does that
+For =M-x= to offer it, the name has to be published. =runtime/library.lisp= does that
 for every zero-argument function in the package at the end of the file:
 
 #+begin_src lisp
 (refresh-commands)     ; or (register-command "insert-date") for just this one
 #+end_src
+
+** ...that takes an argument
+
+=M-x= calls the name you pick as =(name)=, so a function needing an argument has to
+say how to get one. One line under the =defun=, and it is offered like any other:
+
+#+begin_src lisp
+(defun insert-heading (level)
+  "Insert an org heading LEVEL stars deep."
+  (insert (concatenate 'string (make-string level :initial-element #\*) " ")))
+
+(interactive insert-heading ("Depth: " :number))
+#+end_src
+
+=(insert-heading 3)= from Lisp is unchanged; =M-x insert-heading= asks. The full spec
+vocabulary — =:string=, =:number=, and a form giving completion candidates — is in
+[[file:reference.org][reference.org]] under "Keys and commands".
 
 * Wrapping the region
 

@@ -10,6 +10,10 @@ zemacs-term.workspace = true
 zemacs-gui.workspace = true
 anyhow.workspace = true
 unicode-width.workspace = true
+# Encoding only, for `Renderer::save_png`. Already the workspace's PNG codec —
+# `zemacs-figure` and `zemacs-latex` decode with it — so this costs no new
+# entry in `Cargo.lock` and no C toolchain. `image` would have cost both.
+png = "0.18"
 
 # `use-pkgconfig` is what finds Homebrew's SDL2 on Apple Silicon — /opt/homebrew/lib
 # is not on the default linker search path, so without it the test binary fails to link.

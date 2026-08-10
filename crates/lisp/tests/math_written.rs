@@ -200,7 +200,7 @@ fn a_photograph_becomes_the_answer_to_the_problem_point_is_in() {
 (defvar *stub-text* "Let $B$ and $C$ be bases.")
 (setf *math-written-transport*
       (lambda (path) (declare (ignore path)) (incf *stub-calls*) *stub-text*))
-;; The typesetting seam. `org-latex-preview-new' lives in `init.lisp', which this
+;; The typesetting seam. `org-latex-preview-new' lives in `modes/org-latex.lisp', which this
 ;; image deliberately does not load — so without this the `fboundp' guard in
 ;; `%mw-typeset' would hold and the call would be untestable rather than tested.
 (defvar *typeset-calls* 0)

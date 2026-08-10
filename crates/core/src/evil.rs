@@ -302,10 +302,11 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "project-open",
     "project-find-dir",
     "project-switch",
-    "project-dired",
-    "project-compile",
-    "project-test",
-    "project-root",
+    // `project-root`, `project-dired`, `project-compile` and `project-test` are
+    // deliberately absent: they are `defun`s in `runtime/plugins/project.lisp`
+    // now, and a name core owns can never reach the image. `M-x` still offers
+    // all four — `refresh-commands` publishes every zero-argument function in
+    // the ZEMACS package — so the only thing that changed is which side answers.
     "project-forget",
     "magit-toggle",
     "magit-amend",
@@ -346,6 +347,16 @@ impl Editor {
         // test: there is no keystroke that means "keep the menu up", since the
         // menu is not on the keyboard's path at all.
         self.context_menu = None;
+        // ...and so is a box the pointer opened. Here rather than in a hook for
+        // `retire_completion`'s reason turned inside out: a completion popup is
+        // retired by a *predicate* because whether it is still true is a question
+        // about the cursor, and this one has no such question to ask — nothing
+        // about the editor can tell you the pointer is still on the mark. So the
+        // rule is the blunt one every platform uses, and it has to fire *before*
+        // the dispatch: a key that scrolls moves the text out from under a
+        // pointer that has not moved, and a box left up would then be describing
+        // whatever line slid under it.
+        self.tooltip = None;
         let cmds = self.dispatch_key(key);
         self.note_change(key, &cmds);
         if self.pending.keys.is_empty() {
@@ -512,6 +523,21 @@ impl Editor {
                 None => vec![EditorCommand::Message(String::new())],
             };
         }
+        // avy: the image has labels up and asked for this keystroke. `take`, so
+        // the grab is spent whatever the key turns out to be — a key that names
+        // no label is a *cancel*, and the image has to be told about it or it is
+        // left holding a screenful of overlays nothing will remove. Ace's rule
+        // ("anything else cancels") one layer up, where the labels live.
+        //
+        // Nothing is resolved here. The key is spelled the way `key-bindings`
+        // spells one and handed straight over; see `EditorCommand::GrabKey` for
+        // why core deliberately keeps no label table of its own.
+        if let Some(f) = self.grab_key.take() {
+            return vec![EditorCommand::CallLisp(format!(
+                "({f} {})",
+                crate::query::lisp_string(&key.token())
+            ))];
+        }
         if self.prompt.is_some() {
             return self.prompt_key(key);
         }
@@ -533,19 +559,32 @@ impl Editor {
     /// keymap is consulted *instead of* the Evil grammar rather than before it:
     /// `j` has to type a `j`, and `d` has to type a `d`.
     ///
-    /// Two ways an editor binding still fires. The Terminal keymap is checked
-    /// first and always wins, so anything at all can be reclaimed by binding it
-    /// in `"terminal"`. Failing that, keys a terminal has no use for — the ones
-    /// carrying Command, plus the two modified Enters — fall through to the
-    /// *Normal* keymap, which is what keeps `M-x`, `C-M-j`, `M-o` and the window
-    /// splits alive inside a shell.
+    /// Three ways an editor binding still fires. The buffer's own modes are
+    /// asked first, which is the precedence `normal_key` already gives them:
+    /// `"terminal"` is every session there will ever be, `ai-mode` is *this*
+    /// one, and the narrower map wins. Then the Terminal keymap, so anything at
+    /// all can still be reclaimed by binding it in `"terminal"`. Failing both,
+    /// keys a terminal has no use for — the ones carrying Command, plus the two
+    /// modified Enters — fall through to the *Normal* keymap, which is what
+    /// keeps `M-x`, `C-M-j`, `M-o` and the window splits alive inside a shell.
     ///
-    /// Ctrl is deliberately not in that set. `C-c`, `C-a`, `C-d`, `C-r` and
+    /// Ctrl is deliberately not in that last set. `C-c`, `C-a`, `C-d`, `C-r` and
     /// `C-w` are the shell's, and a `C-c` that stopped here would mean never
     /// being able to interrupt a running program.
+    ///
+    /// Exact bindings only, with none of `normal_key`'s `mode_prefix` dance. A
+    /// prefix *waits*, and waiting costs nothing in a file buffer but the whole
+    /// keystroke here: the first key of a `C-c C-e` would be held back from a
+    /// program running right now, and released — late, and after whatever the
+    /// second key turned out to be — or dropped. There is no ordering of that
+    /// which is safe, so a session binding is one chord, and the multi-key ones
+    /// live in the Normal buffer you step out to.
     fn terminal_key(&mut self, key: Key) -> Vec<EditorCommand> {
         let token = key.token();
-        if let Some(action) = self.keymap_lookup(&token) {
+        if let Some(action) = self
+            .mode_binding(&token)
+            .or_else(|| self.keymap_lookup(&token))
+        {
             return self.run_action(&action);
         }
         if key.is_editor_key() {
@@ -640,11 +679,18 @@ impl Editor {
             Key::Tab => vec![EditorCommand::InsertText(
                 " ".repeat(self.settings.tab_width),
             )],
-            Key::Enter => vec![EditorCommand::InsertNewline],
+            // A shifted key means what the unshifted one means once the keymap
+            // above has declined it, and that is the whole of the policy: shift
+            // is a *spelling* for a binding, so an unbound `⇧⏎` or `⇧←` must not
+            // become a dead key in the one mode where a hand is already holding
+            // shift to type capitals. This editor has no shift-selection —
+            // Visual state is how you select — so there is nothing else it could
+            // sensibly mean.
+            Key::Enter | Key::ShiftEnter => vec![EditorCommand::InsertNewline],
             Key::Backspace => vec![EditorCommand::DeleteBackward],
             Key::MetaBackspace => self.delete_word_backward(),
-            Key::Left => vec![EditorCommand::MoveCursor(Direction::Left)],
-            Key::Right => vec![EditorCommand::MoveCursor(Direction::Right)],
+            Key::Left | Key::ShiftLeft => vec![EditorCommand::MoveCursor(Direction::Left)],
+            Key::Right | Key::ShiftRight => vec![EditorCommand::MoveCursor(Direction::Right)],
             // A word at a time, which is what a Meta'd arrow means in readline,
             // in every text field on this platform, and — via `Input::AltLeft` —
             // inside a terminal session too.
@@ -658,8 +704,8 @@ impl Editor {
                 self.buffer.cursor,
                 false,
             ))],
-            Key::Up => vec![EditorCommand::MoveCursor(Direction::Up)],
-            Key::Down => vec![EditorCommand::MoveCursor(Direction::Down)],
+            Key::Up | Key::ShiftUp => vec![EditorCommand::MoveCursor(Direction::Up)],
+            Key::Down | Key::ShiftDown => vec![EditorCommand::MoveCursor(Direction::Down)],
             // Nothing, rather than the tab it used to type by arriving here as
             // `Tab`: nobody presses `⇧⇥` wanting whitespace. The keymap above
             // has already had its say, so `(define-key "insert" "<backtab>" …)`
@@ -667,7 +713,13 @@ impl Editor {
             Key::BackTab => vec![],
             // `M-<ret>` among them: it is a binding or it is nothing, and the
             // keymap above has already had its say. Typing a newline is `<ret>`.
-            Key::Ctrl(_) | Key::Meta(_) | Key::CtrlMeta(_) | Key::MetaEnter => vec![],
+            Key::Ctrl(_)
+            | Key::Meta(_)
+            | Key::CtrlMeta(_)
+            | Key::MetaEnter
+            | Key::MetaShiftEnter
+            | Key::MetaShiftLeft
+            | Key::MetaShiftRight => vec![],
             Key::CtrlEnter => vec![EditorCommand::SplitWindow(frame::Split::Columns)],
             Key::CtrlMetaEnter => vec![EditorCommand::SplitWindow(frame::Split::Rows)],
         }
@@ -763,11 +815,15 @@ impl Editor {
             // A register named for a verb that never came must not attach
             // itself to whatever you do next.
             self.vim.pending = None;
-            return if was_visual {
-                vec![EditorCommand::SetMode(Mode::Normal)]
-            } else {
-                vec![]
-            };
+            // ...and the echo area is unwound too, which is `C-g` in Emacs and
+            // is what makes a report *dismissable*: `:!` answers in the status
+            // line now, and a line that only leaves when something else
+            // happens to write there is a line you learn to ignore.
+            let mut cmds = vec![EditorCommand::Message(String::new())];
+            if was_visual {
+                cmds.push(EditorCommand::SetMode(Mode::Normal));
+            }
+            return cmds;
         }
 
         // 3. Counts, before any key lands in the sequence.
@@ -881,7 +937,7 @@ impl Editor {
             true => self.cursor_vcol(),
             false => self.buffer.cursor_line_col().1,
         };
-        if matches!(seq, "j" | "k" | "<down>" | "<up>") {
+        if matches!(seq, "j" | "k" | "<down>" | "<up>" | "S-<down>" | "S-<up>") {
             self.desired_col.get_or_insert(col_now);
         } else {
             self.desired_col = None;
@@ -1378,13 +1434,21 @@ impl Editor {
         let (line, col) = buf.cursor_line_col();
         let cur = buf.cursor;
         let (target, span) = match seq {
-            "h" | "<left>" => (buf.line_start(line) + col.saturating_sub(n), Span::Exclusive),
-            "l" | "<right>" | "SPC" => ((cur + n).min(buf.line_end(line)), Span::Exclusive),
+            // The `S-` spellings alongside the bare ones for `insert_key`'s
+            // reason: shift is how a binding is *written*, and an arrow pressed
+            // with it held still has to move. Reached only when nothing bound
+            // the key, since the keymap is consulted before this table.
+            "h" | "<left>" | "S-<left>" => {
+                (buf.line_start(line) + col.saturating_sub(n), Span::Exclusive)
+            }
+            "l" | "<right>" | "S-<right>" | "SPC" => {
+                ((cur + n).min(buf.line_end(line)), Span::Exclusive)
+            }
             // Vertical motions hold the column. Targeting the line start would
             // send `j` to column 0, which is wrong for the cursor and invisible
             // to an operator (a linewise span only reads the *line*).
-            "j" | "<down>" => return Some(self.vertical(true, n)),
-            "k" | "<up>" => return Some(self.vertical(false, n)),
+            "j" | "<down>" | "S-<down>" => return Some(self.vertical(true, n)),
+            "k" | "<up>" | "S-<up>" => return Some(self.vertical(false, n)),
             "0" => (buf.line_start(line), Span::Exclusive),
             "^" => (buf.first_non_blank(line), Span::Exclusive),
             "$" => (
@@ -2084,6 +2148,8 @@ impl Editor {
         self.vim.recording.is_some()
             && self.prompt.is_none()
             && self.ace.is_none()
+            // ...and avy, for ace's reason: `q` aimed at a label is a label.
+            && self.grab_key.is_none()
             && self.pending.literal.is_none()
             && self.pending.find.is_none()
             && !self.pending.replace
@@ -2242,6 +2308,15 @@ impl Editor {
         // wants it: a `String` clone per keystroke would be a copy of the
         // clipboard on every letter typed into a prompt.
         let paste = matches!(key, Key::Ctrl('y')).then(|| self.register.replace('\n', " "));
+        // Before the borrow below, because walking the history reads a field of
+        // the editor the prompt does not own. `M-p`/`M-n` rather than the arrows
+        // for the reason Emacs uses them: up and down already move the
+        // selection, and a completing prompt needs both gestures at once.
+        match key {
+            Key::Meta('p') => return self.walk_history(1),
+            Key::Meta('n') => return self.walk_history(-1),
+            _ => {}
+        }
         let Some(p) = self.prompt.as_mut() else {
             return vec![];
         };
@@ -2291,12 +2366,73 @@ impl Editor {
             }
             // `C-j`/`C-k` alongside `C-n`/`C-p`: both spellings are muscle
             // memory depending on which completion UI you came from.
-            Key::Ctrl('n') | Key::Ctrl('j') | Key::Down => p.next(),
-            Key::Ctrl('p') | Key::Ctrl('k') | Key::Up => p.prev(),
+            Key::Ctrl('n') | Key::Ctrl('j') | Key::Down | Key::ShiftDown => p.next(),
+            Key::Ctrl('p') | Key::Ctrl('k') | Key::Up | Key::ShiftUp => p.prev(),
             Key::Tab => p.complete(),
             Key::Enter => return self.accept_prompt(),
             _ => return vec![],
         }
+        self.preview()
+    }
+
+    /// File an accepted answer under its prompt's kind, for `M-p` to find.
+    ///
+    /// A repeat moves to the front rather than being appended, which is what
+    /// keeps the ring useful: the half-dozen commands anyone actually runs
+    /// would otherwise push everything else out within a session, and `M-p M-p`
+    /// would walk through the same name three times.
+    fn remember_answer(&mut self, p: &crate::minibuffer::Prompt) {
+        let entry = p.submitted();
+        if entry.is_empty() {
+            return;
+        }
+        self.prompt_history
+            .retain(|(k, e)| *k != p.kind || *e != entry);
+        self.prompt_history.push((p.kind, entry));
+        if self.prompt_history.len() > crate::HISTORY_LIMIT {
+            self.prompt_history.remove(0);
+        }
+    }
+
+    /// The answers given to prompts of `kind`, newest first.
+    fn history_for(&self, kind: PromptKind) -> Vec<&str> {
+        self.prompt_history
+            .iter()
+            .rev()
+            .filter(|(k, _)| *k == kind)
+            .map(|(_, e)| e.as_str())
+            .collect()
+    }
+
+    /// `M-p`/`M-n`: walk this kind's history, `by` entries back or forward.
+    ///
+    /// Position `0` is what you had typed, kept in `stash`, so walking forward
+    /// off the end gives back the filter you were narrowing with instead of
+    /// stranding you on the oldest thing you ever ran.
+    fn walk_history(&mut self, by: isize) -> Vec<EditorCommand> {
+        let Some(kind) = self.prompt.as_ref().map(|p| p.kind) else {
+            return vec![];
+        };
+        let past: Vec<String> = self.history_for(kind).iter().map(|s| s.to_string()).collect();
+        let Some(p) = self.prompt.as_mut() else {
+            return vec![];
+        };
+        if past.is_empty() {
+            return vec![];
+        }
+        if p.history == 0 {
+            p.stash = p.text.clone();
+        }
+        let want = (p.history as isize + by).clamp(0, past.len() as isize) as usize;
+        if want == p.history {
+            return vec![];
+        }
+        p.history = want;
+        let entry = match want {
+            0 => p.stash.clone(),
+            n => past[n - 1].clone(),
+        };
+        p.recall(entry);
         self.preview()
     }
 
@@ -2305,6 +2441,7 @@ impl Editor {
         let Some(p) = self.prompt.take() else {
             return vec![];
         };
+        self.remember_answer(&p);
         match p.kind {
             PromptKind::Ex => self.ex_command(&p.text),
             PromptKind::Search => {
@@ -2320,7 +2457,15 @@ impl Editor {
                 self.search_from(origin + 1, true)
             }
             PromptKind::Command => {
-                let name = p.value();
+                // `submitted` and not `value`: the image pads a docstring and a
+                // key onto the row — see `%annotated-command` in
+                // `runtime/modes/which-key.lisp` — and only the first word is
+                // the command. That is what lets the annotation be plain
+                // readable text rather than a Lisp block comment smuggled onto
+                // the line to keep the whole candidate callable, and it puts an
+                // annotated `project-find-file` back in front of the `project-`
+                // arm in `run_action` instead of past it.
+                let name = p.submitted();
                 if name.is_empty() {
                     vec![]
                 } else {
@@ -2706,10 +2851,11 @@ impl Editor {
         // the split below, since `:!wc -l` is one command line and not a verb
         // with an argument.
         //
-        // Typed at the live shell rather than spawned: core owns no processes,
-        // the terminal is the only place output can be read and scrolled, and a
-        // `Command` built here would be word-split and so would never see a
-        // pipe, an alias, or the directory you had just `cd`-ed to.
+        // Handed to the app because core owns no processes. What happens there
+        // is `Term::shell`: run through `$SHELL -c` — so a pipe, an alias and a
+        // redirect all mean what they say — and *reported* in the echo area
+        // rather than opened. `:!` is a thing you want done; the shell is still
+        // there for the commands you want to sit in front of.
         //
         // ponytail: no filter form. `:%!sort` in vim replaces the range with the
         // command's output, which needs the range fed in as stdin and the result
@@ -2913,7 +3059,13 @@ impl Editor {
             // `terminal-normal` and `terminal-insert` go to the app like every
             // other verb: stepping out of the shell means loading the scrollback
             // into the buffer, and core has no scrollback to load.
-            other if other.starts_with("project-") => {
+            // Only the verbs the app's project backend actually answers to,
+            // which is exactly what `BUILTIN_COMMANDS` lists. A bare prefix
+            // test swallowed every *Lisp* command spelled `project-…` —
+            // `project-make`, `project-clone` — turning a working function
+            // into "unknown project verb: make". Anything not core's own
+            // falls through to the image below, where it was defined.
+            other if other.starts_with("project-") && BUILTIN_COMMANDS.contains(&other) => {
                 vec![EditorCommand::Project(other["project-".len()..].to_string())]
             }
             other if other.starts_with("terminal-") => {
@@ -3270,6 +3422,38 @@ mod tests {
         );
     }
 
+    /// ...and a binding made for the buffer's *mode* fires, which is what
+    /// `(define-key "ai-mode" "C-M-r" ...)` used to do silently nothing.
+    #[test]
+    fn a_mode_binding_fires_inside_a_terminal() {
+        let mut ed = fresh("");
+        ed.apply(EditorCommand::SetMajorMode("ai-mode".into()));
+        ed.apply(EditorCommand::BindKey {
+            mode: "ai-mode".into(),
+            keys: "C-M-r".into(),
+            command: "ai-restart".into(),
+        });
+        // Bound in both maps, so this also pins the order: the mode's map is
+        // the narrower one and wins, exactly as it does in `normal_key`.
+        ed.apply(EditorCommand::BindKey {
+            mode: "terminal".into(),
+            keys: "C-M-r".into(),
+            command: "terminal-normal".into(),
+        });
+        ed.apply(EditorCommand::SetMode(Mode::Terminal));
+        assert_eq!(
+            ed.handle_key(Key::CtrlMeta('r')),
+            vec![EditorCommand::CallLisp("(ai-restart)".into())]
+        );
+
+        // And the lookup reaches for nothing it was not given: `ai-mode` binds
+        // no `C-c`, so SIGINT still leaves for the child.
+        assert_eq!(
+            ed.handle_key(Key::Ctrl('c')),
+            vec![EditorCommand::TermKey(Key::Ctrl('c'))]
+        );
+    }
+
     /// ...but a Command-based binding *is*, so the editor stays reachable from
     /// inside a shell. This is the difference between the two halves of the
     /// policy, and the reason it is Command and not Ctrl.
@@ -3539,6 +3723,39 @@ mod tests {
         }
     }
 
+    /// `+` is a *shifted* key and a vim motion both, so the two ways a dired
+    /// binding on it could quietly stop working are the ones worth pinning: a
+    /// keymap lookup that never sees the `+` the keyboard makes out of `⇧=`,
+    /// and a grammar arm claiming it before the user's binding is consulted.
+    #[test]
+    fn a_shifted_punctuation_binding_reaches_dired() {
+        let mut ed = fresh("a\nb\n");
+        ed.apply(EditorCommand::BindKey {
+            mode: "dired".into(),
+            keys: "+".into(),
+            command: "dired-mkdir".into(),
+        });
+        ed.apply(EditorCommand::SetMode(Mode::Dired));
+        assert_eq!(
+            ed.handle_key(Key::Char('+')),
+            vec![EditorCommand::Dired("mkdir".into())]
+        );
+    }
+
+    /// Esc takes the echo area down, which is what makes a report you can
+    /// dismiss — `:!` answers there now. The log keeps what was *said*, so the
+    /// clear must not land in it as a blank line.
+    #[test]
+    fn esc_clears_the_status_without_logging_the_clear() {
+        let mut ed = fresh("a\n");
+        ed.apply(EditorCommand::Message("42 files".into()));
+        assert_eq!(ed.status, "42 files");
+
+        feed(&mut ed, &[Key::Esc]);
+        assert_eq!(ed.status, "");
+        assert_eq!(ed.messages, vec!["42 files".to_string()]);
+    }
+
     /// The other half: the grammar reaching a listing must not let you into a
     /// mode where every keystroke is refused.
     #[test]
@@ -3641,12 +3858,29 @@ mod tests {
         assert_eq!(ed.buffer.text.to_string(), "aaa\nbbb");
     }
 
+    /// With `scroll-past-end` off, which is what this has always tested: the
+    /// pane must stay full of document, so a file shorter than the window
+    /// cannot scroll at all. `C-d` writes `scroll` without clamping, so this is
+    /// really a test of the backstop at the end of `ensure_cursor_visible`.
     #[test]
     fn scroll_never_walks_a_short_file_off_screen() {
         let mut ed = fresh("a\nb\nc\nd\ne");
+        ed.settings.scroll_past_end = false;
         ed.viewport_lines = 33;
         feed(&mut ed, &[Key::Ctrl('d')]);
         assert_eq!(ed.scroll, 0);
+    }
+
+    /// And with it on, `C-d` may empty the pane — but only down to the last
+    /// *real* line, and point comes with it rather than being left behind or
+    /// pushed onto the rope's phantom trailing line.
+    #[test]
+    fn scroll_past_end_lets_c_d_walk_a_short_file_up_to_its_last_line() {
+        let mut ed = fresh("a\nb\nc\nd\ne\n");
+        ed.viewport_lines = 33;
+        feed(&mut ed, &[Key::Ctrl('d')]);
+        assert_eq!(ed.scroll, ed.buffer.last_line());
+        assert_eq!(ed.buffer.cursor_line_col().0, ed.buffer.last_line());
     }
 
     #[test]
@@ -3776,6 +4010,76 @@ mod tests {
         }
     }
 
+    /// The other direction of the same list, for `project-` only: a name core
+    /// does not offer is Lisp's. `project-make` and `project-clone` are
+    /// `defun`s in `runtime/library.lisp`, and a bare prefix test turned both
+    /// into a verb the app has never heard of.
+    ///
+    /// The other four came the same way and by hand: wave 2 of the migration
+    /// moved `root`, `dired`, `compile` and `test` into
+    /// `runtime/plugins/project.lisp`, and the *only* thing that makes a Lisp
+    /// `project-…` reachable is its absence from `BUILTIN_COMMANDS`. Leaving one
+    /// behind would route the key to a verb `Project::try_run` no longer has,
+    /// which reports "unknown project verb" — so this is the assertion that
+    /// catches a half-finished migration.
+    #[test]
+    fn a_project_name_core_does_not_own_reaches_lisp() {
+        for name in [
+            "project-make",
+            "project-clone",
+            "project-root",
+            "project-dired",
+            "project-compile",
+            "project-test",
+        ] {
+            let mut ed = fresh("hello\n");
+            assert_eq!(
+                ed.run_action(name),
+                vec![EditorCommand::CallLisp(format!("({name})"))],
+                "{name} is Lisp's and was swallowed by the `project-` prefix"
+            );
+        }
+        // ...and the verbs core *does* own still go to the app.
+        assert_eq!(
+            fresh("hello\n").run_action("project-find-file"),
+            vec![EditorCommand::Project("find-file".into())]
+        );
+    }
+
+    /// The two halves of an annotated `M-x` row, which have to agree: the
+    /// candidate on screen carries a docstring and a key, and the command is
+    /// only its first word. Getting that wrong means `M-x` calls a Lisp
+    /// function whose name is the whole sentence, and the history recalls a
+    /// sentence you cannot press Enter on.
+    #[test]
+    fn an_annotated_row_runs_and_is_remembered_as_the_command_alone() {
+        let mut ed = fresh("");
+        // Exactly the shape `%annotated-command` builds: name, padding, the
+        // first line of the docstring, then the key in parentheses.
+        ed.commands = vec!["qzz-thing                Do the thing (SPC q z)".into()];
+        ed.open_prompt(PromptKind::Command);
+        feed(&mut ed, &keys("qzz"));
+        assert_eq!(
+            ed.handle_key(Key::Enter),
+            vec![EditorCommand::CallLisp("(qzz-thing)".into())],
+            "the annotation must not reach the image"
+        );
+
+        // ...and it comes back off `M-p` as something you could press Enter on.
+        ed.open_prompt(PromptKind::Command);
+        feed(&mut ed, &keys("xy"));
+        ed.handle_key(Key::Meta('p'));
+        assert_eq!(ed.prompt.as_ref().unwrap().text, "qzz-thing");
+        // Walking forward off the end gives back what was being typed rather
+        // than stranding you on the oldest entry.
+        ed.handle_key(Key::Meta('n'));
+        assert_eq!(ed.prompt.as_ref().unwrap().text, "xy");
+        // A kind with nothing in it is simply a no-op, not a wrong recall.
+        ed.open_prompt(PromptKind::File);
+        ed.handle_key(Key::Meta('p'));
+        assert_eq!(ed.prompt.as_ref().unwrap().text, "");
+    }
+
     #[test]
     fn prompt_navigation_accepts_both_spellings() {
         let mut ed = fresh("");
@@ -3852,6 +4156,11 @@ mod tests {
         let text: String = (0..100).map(|i| format!("line{i}\n")).collect();
         let mut ed = fresh(&text);
         ed.viewport_lines = 10;
+        // The old clamp, pinned deliberately: `scroll-past-end` moves only the
+        // *limit*, and every other property of a wheel notch — the view moving,
+        // the cursor being dragged no further than it must — has to be
+        // identical either way. The past-the-end limit is tested below.
+        ed.settings.scroll_past_end = false;
 
         // cursor stays put while it is still on screen
         ed.apply(EditorCommand::ScrollLines(3));
@@ -3873,9 +4182,63 @@ mod tests {
     #[test]
     fn scrolling_a_file_shorter_than_the_window_does_nothing() {
         let mut ed = fresh("a\nb\nc");
+        ed.settings.scroll_past_end = false;
         ed.viewport_lines = 40;
         ed.apply(EditorCommand::ScrollLines(5));
         assert_eq!(ed.scroll, 0);
+    }
+
+    /// The feature, in the units it is defined in: the wheel stops with the
+    /// last line on the *top* row and the rest of the pane empty, which is
+    /// vim's `~` filler and Emacs' end of buffer.
+    ///
+    /// Three separate hazards in one test because they are one gesture:
+    /// the limit, point staying inside the document, and the buffer being
+    /// untouched — nothing is inserted to make the empty rows, which is the
+    /// whole point of moving a clamp instead of the text.
+    #[test]
+    fn scroll_past_end_stops_with_the_last_line_on_the_top_row() {
+        let text: String = (0..100).map(|i| format!("line{i}\n")).collect();
+        let mut ed = fresh(&text);
+        ed.viewport_lines = 10;
+        ed.apply(EditorCommand::ScrollLines(10_000));
+
+        assert_eq!(ed.scroll, ed.buffer.last_line());
+        // `len_lines() - 1` is the empty string after the trailing newline. The
+        // clamp naming it would drag point onto a line `G` refuses to visit.
+        assert_eq!(ed.scroll, ed.buffer.len_lines() - 2);
+        assert_eq!(ed.buffer.cursor_line_col().0, ed.buffer.last_line());
+        assert!(ed.buffer.cursor < ed.buffer.len_chars());
+        assert_eq!(ed.buffer.text.to_string(), text);
+    }
+
+    /// Turning it off does not merely stop new scrolling: it puts a view that
+    /// is already out past the end back where the old rule would have it, on
+    /// the spot, because the writer runs through `apply` like everything else.
+    #[test]
+    fn turning_scroll_past_end_off_pulls_the_view_back() {
+        let text: String = (0..100).map(|i| format!("line{i}\n")).collect();
+        let mut ed = fresh(&text);
+        ed.viewport_lines = 10;
+        ed.apply(EditorCommand::ScrollLines(10_000));
+        assert_eq!(ed.scroll, ed.buffer.last_line());
+
+        ed.apply(EditorCommand::SetScrollPastEnd(false));
+        assert_eq!(ed.scroll, ed.buffer.len_lines() - 10);
+        ed.apply(EditorCommand::ScrollLines(10_000));
+        assert_eq!(ed.scroll, ed.buffer.len_lines() - 10);
+    }
+
+    /// A listing is not a document, so there is no past the end of one — the
+    /// same instinct that takes the gutter off a generated buffer.
+    #[test]
+    fn a_generated_buffer_keeps_the_old_clamp() {
+        let text: String = (0..100).map(|i| format!("line{i}\n")).collect();
+        let mut ed = fresh(&text);
+        ed.buffer.kind = BufferKind::Dired;
+        ed.viewport_lines = 10;
+        ed.apply(EditorCommand::ScrollLines(10_000));
+        assert_eq!(ed.scroll, ed.buffer.len_lines() - 10);
     }
 
     #[test]

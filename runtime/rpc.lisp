@@ -70,7 +70,23 @@
 ;;; something ever needs `[[1,2]]', is a wrapper struct — one arm of the COND.
 
 (defun json-string (s)
-  "S as a JSON string literal, quotes and escapes included."
+  "S as a JSON string literal, quotes and escapes included.
+
+One call, and the whole encoding question is somebody else's. It was not always:
+buffer text used to reach the image as UTF-8 **bytes**, one Lisp character per
+byte, while everything crossing the shim was encoded per character on the way
+out — so a string that came from a buffer crossed *twice*, once as
+`%json-quote''s argument and again as `%rpc-send''s, and `😀' went down the wire
+as the six characters of its own UTF-8 spelling re-encoded. rust-analyzer read
+`\"😀😀😀\"' as `ÃÂ°ÃÂ…' and put every column after it on that line eighteen
+places out — a jump that landed on the wrong *symbol*, not merely the wrong
+column. The repair was a `utf8-text' here and a matching one on every string
+`runtime/lsp.lisp' sent, two halves of which neither was sufficient.
+
+`f_query' decodes now, so a buffer hands out characters and this crosses once
+like any other string. serde leaves non-ASCII as itself rather than as
+`\\uXXXX', and `f_json_quote' reads the answer back as characters, so what comes
+out of here is text and not a spelling of text."
   (%json-quote (string s)))
 
 (defun %json-object-p (x)

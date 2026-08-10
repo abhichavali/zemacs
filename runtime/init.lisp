@@ -1,9 +1,22 @@
-;;; zemacs default configuration — Common Lisp.
+;;; zemacs configuration — Common Lisp.
 ;;;;
-;;;; This file is LOADed on startup by the embedded ECL image, which runs on its
-;;;; own thread with its own GC. It is the config file the way ~/.emacs is for
-;;;; Emacs: everything below is ordinary Common Lisp, evaluated at startup, and
-;;;; anything you can express in CL you can express here.
+;;;; This is *your* file. It lives in `~/.zemacs.d/init.lisp'; the copy in the
+;;;; source tree is the default it was seeded from, and the editor stops reading
+;;;; that one the moment yours exists. Edit it with `C-c i', reload it with
+;;;; `SPC h r', and nothing you write here can be overwritten by an upgrade.
+;;;;
+;;;; What is *not* here is the machinery: `set-face', `define-leader',
+;;;; `load-theme', `project-make', `refresh-commands' and the rest live in
+;;;; `library.lisp' beside the editor, which is upgraded with it. So this file
+;;;; stays a list of decisions — which theme, which keys, which modes — and the
+;;;; implementation under those decisions goes on improving without you having to
+;;;; merge anything. The rule for which file a thing belongs in: if changing it
+;;;; would change *your* editor it is config, and if changing it would change
+;;;; *every* zemacs it is library.
+;;;;
+;;;; It is LOADed on startup by the embedded ECL image, which runs on its own
+;;;; thread with its own GC. Everything below is ordinary Common Lisp, evaluated
+;;;; at startup, and anything you can express in CL you can express here.
 ;;;;
 ;;;; If a form in this file signals an error, the error is caught and shown in
 ;;;; the status line — the editor still starts, it just stops loading here.
@@ -60,6 +73,9 @@
 ;;;;   (replace-region beg end text)           atomic; see `surround-region'
 ;;;;   (set-evil-state "normal")
 ;;;;
+;;;; The full reference — the library's own functions included — is in
+;;;; `docs/reference.org', and `SPC h t' is the tutorial.
+;;;;
 ;;;; Lisp runs on its own thread and never blocks redisplay or your typing —
 ;;;; unlike Emacs, where a slow function freezes the editor until it returns. The
 ;;;; cost is that a *sequence* of commands is not atomic: a keystroke can land
@@ -73,196 +89,49 @@
 (in-package :zemacs)
 
 ;;; ---------------------------------------------------------------------------
-;;; Is the editor new enough to read this file?
+;;; The library
 ;;;
-;;; An installed binary keeps reading *this* config out of the checkout it was
-;;; built from — see `scripts/install.sh', which says so and means it — so the
-;;; two drift apart the moment a primitive is added here and the install is not
-;;; re-run. Loading then dies at the first call to something the binary does not
-;;; have, and everything below that line silently never happens.
+;;; `*runtime-dir*' is where the editor keeps its shipped Lisp — themes/, modes/,
+;;; lsp.lisp and `library.lisp' itself. The editor sets it before this file is
+;;; read, out of `$ZEMACS_RUNTIME'; the fallback below is what makes a config
+;;; that is *still* the copy in the source tree work when it is loaded by hand,
+;;; which is how the test suite reads it.
 ;;;
-;;; That failure is nasty out of all proportion to its cause, because what you
-;;; see depends entirely on *where* the file stopped. A missing `zemacs-file'
-;;; kills the config at the scratch-file definition — which is above the
-;;; dashboard and above the keymap, so the logo does not appear and no key is
-;;; bound, and neither symptom mentions a version. The status line does say
-;;; "The function ZEMACS::ZEMACS-FILE is undefined", and that is a sentence
-;;; nobody reads as "your application is out of date".
-;;;
-;;; So: check first, name the cause, say what to do about it. The list is the
-;;; primitives this file needs that a binary might plausibly predate; there is
-;;; no need to list the ones that have always existed.
-(defparameter *required-primitives*
-  '("zemacs-file" "set-face-style" "%dashboard-item")
-  "Host functions this config calls that older builds do not have.")
+;;; It is deliberately not derived from where *this* file lives. A config in
+;;; `~/.zemacs.d/' has no themes/ directory beside it, and looking for one there
+;;; is the bug this variable exists to not have.
 
-(let ((missing (remove-if (lambda (name)
-                            (let ((s (find-symbol (string-upcase name) :zemacs)))
-                              (and s (fboundp s))))
-                          *required-primitives*)))
-  (when missing
-    ;; A message and not an error: the editor is running and mostly usable, and
-    ;; refusing to load the rest of the config would take the theme away too.
-    (message (format nil "zemacs is older than this config — no ~{~a~^, ~}. ~
-                          Run scripts/install.sh, then restart."
-                     missing))))
+(unless (boundp '*runtime-dir*)
+  (defparameter *runtime-dir* nil))
 
-;;; ---------------------------------------------------------------------------
-;;; Themes
-;;;
-;;; A theme is an ordinary Lisp file of `set-background', `set-foreground' and
-;;; `set-syntax-color' calls, so loading one *is* applying it, and loading
-;;; another afterwards switches: every theme sets every face, so nothing is left
-;;; behind from the one before.
-;;;
-;;; Because dired and magit colour themselves out of the same faces as source
-;;; code — a directory is a "type", a size is a "number" — a theme reaches every
-;;; buffer without knowing that dired exists.
+(unless *runtime-dir*
+  (setf *runtime-dir*
+        (and *load-truename*
+             (make-pathname :name nil :type nil :defaults *load-truename*))))
 
-(defparameter *runtime-dir*
-  (when *load-truename*
-    (make-pathname :name nil :type nil :defaults *load-truename*))
-  "The directory this config was loaded from. `*load-truename*' is only bound
-during a load, so it has to be captured here rather than read later.")
+;;; An error rather than a message, and it is the one place in this file that
+;;; deserves one: with no runtime there is no `set-face', no `define-leader' and
+;;; no modes, so every form below would fail in turn and the status line would
+;;; report whichever failed first. Stopping here names the actual cause.
+(unless *runtime-dir*
+  (error "zemacs: cannot find the runtime — set $ZEMACS_RUNTIME to the ~
+          directory holding library.lisp"))
 
-;;; ---------------------------------------------------------------------------
-;;; Where zemacs keeps things
-;;;
-;;; `~/.zemacs.d', the way Emacs spells `~/.emacs.d', and deliberately not under
-;;; `~/.config'. A Lisp machine's directory is somewhere you *live* — the
-;;; scratch file, the REPL transcript and the tutorial's progress are all things
-;;; you open and edit, not settings you visit twice a year — and `SPC f f' into
-;;; `~/.config/zemacs' never stopped feeling like rummaging in a cupboard.
-;;;
-;;; One function rather than the string written out at each site, which is what
-;;; it was: five files across four modes each spelled the directory themselves,
-;;; so moving it meant finding all five.
-;;;
-;;; `zemacs-file' is *not* defined here. It is booted by the editor, in
-;;; `PATHS_FORM' in `crates/lisp/src/shim.c', beside `config_dir' in
-;;; `crates/app/src/main.rs' which has to agree with it — the auto-saves and
-;;; backups the editor writes land next to the files Lisp names. Defining it in
-;;; this file would have made it a thing that only exists once a config has been
-;;; read, and `runtime/lsp.lisp' and half of `runtime/modes/' are loaded without
-;;; one by the test suite. Where the editor keeps its state is a fact about the
-;;; editor rather than a preference, so it comes up with the image.
+(load (merge-pathnames "library.lisp" *runtime-dir*) :verbose nil :print nil)
 
-;;; One face, said once.
-;;;
-;;; `set-syntax-color' takes three floats and `set-face-style' takes two flags,
-;;; and a theme that calls both for all 22 faces is 44 lines of which half say
-;;; nothing. This is the spelling a theme actually wants:
-;;;
-;;;   (set-face "keyword"  '(0.78 0.57 0.94) :bold t)
-;;;   (set-face "comment"  '(0.42 0.46 0.58) :italic t)
-;;;   (set-face "modeline" '(0.16 0.18 0.26))
-;;;
-;;; A Lisp wrapper over two primitives rather than a third primitive, which is
-;;; the standing rule: the editor learned exactly one new verb for weight, and
-;;; the ergonomics are a `defun'. NIL colour styles a face without recolouring
-;;; it, which is how a theme adds weight to a face it is happy with.
-;;;
-;;; Both flags are always sent, not only when true — a theme that leaves `:bold'
-;;; off means *not bold*, and inheriting the last theme's weight is exactly the
-;;; bug the exhaustive face lists exist to prevent.
-;;;
-;;; The slant is also remembered here, in `*face-italic*'. `set-face-style' sets
-;;; weight and slant together and the editor publishes no reader for either, so
-;;; anything that wants to make a face bold *afterwards* — which is exactly what
-;;; `*bold-constructs*' below does — would otherwise straighten a face the theme
-;;; had deliberately slanted. Tokyo Night's italic keywords are the case: forcing
-;;; bold on them without this would silently undo the single thing that theme is
-;;; most recognisable for. ponytail: a `(face-style face)' reader in the editor
-;;; is the honest fix and is perhaps six lines of Rust; a hash table here needs
-;;; none of them and is wrong only if something sets a style behind this
-;;; function's back, which nothing does.
-;;;
-;;; RGB is required rather than `&optional', even though NIL is a legal value
-;;; for it: `&optional' before `&key' is a Common Lisp trap, and this is the
-;;; exact call that springs it. `(set-face "keyword" :bold t)' would bind RGB to
-;;; the keyword `:bold' and then find `t' where a keyword name should be, which
-;;; is a confusing error a long way from the theme file that caused it. Required
-;;; means the mistake is a wrong-number-of-arguments at load time instead.
-(defparameter *face-italic* (make-hash-table :test #'equal)
-  "The slant last asked for, per face name. See `set-face'.")
-
-(defun set-face (name rgb &key bold italic)
-  "Colour and weight the face called NAME.
-RGB is a (R G B) list of floats, or NIL to leave the colour alone."
-  (when rgb (apply #'set-syntax-color name rgb))
-  (setf (gethash name *face-italic*) (and italic t))
-  (set-face-style name (and bold t) (and italic t))
-  name)
-
-;;; Bold constructs.
-;;;
-;;; Almost none of the ported themes bold anything in code, and that is faithful
-;;; rather than lazy: Catppuccin's style guide has no font-style section at all,
-;;; folke's Tokyo Night defaults `styles.keywords` to no weight, and Modus ships
-;;; `modus-themes-bold-constructs' set to nil. Every one of them carries meaning
-;;; in hue, on the assumption that the reader wants the page calm.
-;;;
-;;; That is a taste, and it is a taste about *their* editor rather than about
-;;; this one. So it is a variable here, the way it is a variable in Modus: the
-;;; themes stay honest ports, and the weight the reader wants is applied on top
-;;; of whichever one is loaded. Set it to NIL for the ports exactly as published.
-;;;
-;;; Applied after the theme file rather than inside it, which is why a theme
-;;; needs to know nothing about this: `load-theme' is the only door in.
-(defparameter *bold-constructs* '("keyword" "function" "type")
-  "Faces made bold after any theme loads, whatever that theme asked for.
-NIL for the themes as their authors published them. A short list on purpose —
-a screen where everything is heavy has no emphasis left to give.")
-
-(defun %apply-bold-constructs ()
-  "Re-assert weight on `*bold-constructs*', preserving each face's slant."
-  (dolist (face *bold-constructs*)
-    (set-face-style face t (gethash face *face-italic*))))
-
-(defun load-theme (&optional name)
-  "Load theme NAME from the themes/ directory next to this config.
-
-With no NAME, ask — which is what makes this an `M-x' command as well as the
-function a config calls. Emacs spells it the same way and for the same reason:
-there is one door in, and whether you came through it with the answer already
-in hand is not a second function's worth of difference."
-  (unless name (return-from load-theme (theme)))
-  (let ((path (and *runtime-dir*
-                   (merge-pathnames (format nil "themes/~a.lisp" name)
-                                    *runtime-dir*))))
-    ;; ponytail: themes are found relative to *this file*, so a config copied to
-    ;; ~/.zemacs.d without the themes/ directory finds nothing and says so.
-    ;; A search path is the fix when there is somewhere else to look.
-    (cond ((null path) (message "load-theme: cannot tell where this config lives"))
-          ((probe-file path) (load path :verbose nil :print nil)
-                             (%apply-bold-constructs)
-                             (message (format nil "theme: ~a" name)))
-          (t (message (format nil "no such theme: ~a" name))))))
-
-;;; Which themes exist is a question the *directory* answers, not a list kept in
-;;; step with it by hand. There were three themes and three `defun's, and at
-;;; eleven that trade stops being worth making: a list you have to remember to
-;;; edit is a list that will be wrong, and the failure mode — a theme file that
-;;; is present and unofferable — is invisible.
-(defun theme-names ()
-  "Every theme in the themes/ directory, by name, sorted."
-  (when *runtime-dir*
-    (sort (mapcar #'pathname-name
-                  (directory (merge-pathnames "themes/*.lisp" *runtime-dir*)))
-          #'string<)))
-
-(defun theme ()
-  "Pick a theme. Bound to `SPC t t'."
-  (completing-read "Theme: " (theme-names)
-    (lambda (pick) (when pick (load-theme pick)))))
+;;; LOAD binds *LOAD-TRUENAME* while this file is being read — and rebinds it
+;;; around the nested load above, which is why this comes after rather than
+;;; before. `reload-config' and `edit-config' are the two readers of it.
+(setf *config-file* *load-truename*)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Appearance
 
-(defparameter *font-size* 16
-  "Current point size. Kept here rather than read back from the editor, the
-same way Emacs tracks `text-scale-mode-amount' in a variable.")
-
+;;; `*font-size*' is what `text-scale-increase' steps from, so it is set beside
+;;; the primitive rather than left at the library's default — `set-scale' does
+;;; both, but it also announces itself in the status line, which is not what a
+;;; boot wants.
+(setf *font-size* 16)
 (set-font-size *font-size*)
 (set-line-numbers t)
 
@@ -366,6 +235,10 @@ same way Emacs tracks `text-scale-mode-amount' in a variable.")
 ;;; also, by design, quiet — restraint is the thing it is *for*. Tokyo Night is
 ;;; not trying to be restrained, and a first boot should show what the editor
 ;;; can do rather than how little it is willing to do.
+;;;
+;;; `*bold-constructs*' is the taste applied on top of whichever theme loads:
+;;; `(setf *bold-constructs* nil)' above this line gives you the ports exactly
+;;; as their authors published them.
 (load-theme "tokyo-night")
 
 ;;; Where completing prompts (M-x, find-file, buffer switch) are drawn.
@@ -375,298 +248,15 @@ same way Emacs tracks `text-scale-mode-amount' in a variable.")
 (set-completion-style "center")
 
 ;;; ---------------------------------------------------------------------------
-;;; Your own commands
-;;;
-;;; A "command" is just a zero-argument function in this package. Dashboard
-;;; items and key bindings name commands as strings; anything that is not a
-;;; built-in verb is called here, in the image. That is the whole extension
-;;; mechanism — key bindings and dashboard items need no registration step.
-;;; `M-x' is the exception: it has to know the names *before* you type them, so
-;;; `refresh-commands' below publishes them.
-
-;;; LOAD binds *LOAD-TRUENAME* while this file is being read, so the config can
-;;; remember where it came from and re-read itself later.
-(defvar *config-file* *load-truename*
-  "Truename of the init file that was loaded at startup.")
-
-(defun %eval-file (path)
-  "LOAD PATH, republish the M-x list, and report the outcome in the status line.
-*PACKAGE* is bound to ZEMACS around the LOAD so a file that never says
-`(in-package :zemacs)' — the scratch buffer — can still call `message' and the
-rest of the primitives unqualified."
-  (handler-case
-      (let ((*package* (find-package :zemacs)))
-        (load path :verbose nil :print nil)
-        (refresh-commands)
-        (message (format nil "evaluated ~a" (file-namestring path))))
-    (error (e) (message (format nil "~a: ~a" (file-namestring path) e)))))
-
-(defun reload-config ()
-  "Re-LOAD the init file, picking up edits without restarting the editor."
-  (if *config-file*
-      (%eval-file *config-file*)
-      (message "no config file to reload")))
-
-(defun edit-config ()
-  "Open the init file for editing."
-  (if *config-file*
-      (find-file (namestring *config-file*))
-      (message "no config file to edit")))
-
-(defun lisp-version ()
-  "Prove there is a real Common Lisp in here."
-  (message (format nil "~a ~a — ~d symbol~:p in ZEMACS"
-                   (lisp-implementation-type)
-                   (lisp-implementation-version)
-                   (let ((n 0))
-                     (do-symbols (s (find-package :zemacs)) (declare (ignore s))
-                       (incf n))
-                     n))))
-
-;;; Magnification, the way `text-scale-adjust' works in Emacs.
-
-(defun set-scale (n)
-  (setf *font-size* (max 6 (min 96 n)))
-  (set-font-size *font-size*)
-  (message (format nil "font size ~d" *font-size*)))
-
-(defun text-scale-increase () (set-scale (+ *font-size* 2)))
-(defun text-scale-decrease () (set-scale (- *font-size* 2)))
-(defun text-scale-reset    () (set-scale 22))
-
-;;; ---------------------------------------------------------------------------
-;;; The scratch buffer
-;;;
-;;; Emacs's *scratch* has no file behind it. Ours does, because `find-file' is
-;;; the only primitive that can put the editor in a *different* buffer —
-;;; `insert' would drop a Lisp header into whatever you happened to be editing.
-;;; A real .lisp file also gets syntax highlighting and survives a restart.
-
-(defparameter *scratch-file* (zemacs-file "scratch.lisp")
-  "Where the scratch buffer lives on disk.")
-
-(defun %scratch-text ()
-  "What a fresh scratch file is seeded with."
-  (format nil ";;; *scratch* — ~a ~a
-;;;
-;;; A real Common Lisp buffer. Save it with `SPC f s', then press C-c to
-;;; evaluate the file: errors, and anything you `message', land in the status
-;;; line. Every symbol in the ZEMACS package is in scope unqualified.
-
-(message (format nil \"hello from ~~a\" (lisp-implementation-type)))
-"
-          (lisp-implementation-type)
-          (lisp-implementation-version)))
-
-(defun lisp-scratch ()
-  "Open the scratch buffer, creating it with a header the first time.
-Deliberately not called `scratch': core resolves its own built-in verbs before
-asking the image, so a Lisp function of that name could never be reached from a
-key binding or a dashboard item."
-  (handler-case
-      (progn
-        (ensure-directories-exist *scratch-file*)
-        (unless (probe-file *scratch-file*)
-          (with-open-file (out *scratch-file* :direction :output
-                                              :if-does-not-exist :create
-                                              :external-format :utf-8)
-            (write-string (%scratch-text) out)))
-        (find-file (namestring *scratch-file*)))
-    (error (e) (message (format nil "scratch: ~a" e)))))
-
-;;; ---------------------------------------------------------------------------
-;;; *Messages*
-;;;
-;;; The log has always existed — capped at 500, readable as `(messages)' — and
-;;; nothing showed it. This is the whole of showing it, and there is nothing in
-;;; Rust behind it: `create-buffer' makes a buffer with no file, and unlike
-;;; `find-file' it is applied on the spot, so the very next form writes into the
-;;; buffer it just made rather than into the one you were leaving.
-;;;
-;;; Emacs' `*Messages*' is read-only and appends; this one is an ordinary buffer
-;;; rewritten from the log each time you ask, which is the same thing to look at
-;;; and one form to write.
-
-(defun messages-buffer ()
-  "Show the message log in a buffer, newest at the bottom."
-  (let ((log (messages)))
-    (create-buffer "*Messages*")
-    (replace-region 0 (point-max)
-                    (if log
-                        (format nil "~{~a~%~}" log)
-                        "no messages yet"))
-    (goto-char (point-max))
-    (message (format nil "~a message~:p" (length log)))))
-
-(defun yank-buffer-file-name ()
-  "Put this buffer's path in the register, and say what it copied.
-
-The register is this editor's kill ring: `p' pastes it, and it is what every
-other copy in here writes to. `set-register' takes the text and a `linewise'
-flag, and a path is emphatically not a line — pasting it must land inside the
-line you are on, not open a new one below it.
-
-ponytail: the register and the system clipboard are the same thing here, so
-this reaches other applications only as far as that already does. Nothing to
-add until the two are separated."
-  (let ((path (buffer-file-name)))
-    (if path
-        (progn (set-register path nil) (message path))
-        (message "no file behind this buffer"))))
-
-(defun %newest-file (&rest paths)
-  "The most recently written of PATHS that exists, or NIL."
-  (let ((live (remove-if-not #'probe-file (remove nil paths))))
-    (first (sort live #'> :key #'file-write-date))))
-
-(defun eval-file-dwim ()
-  "Evaluate the Lisp *file* you saved most recently — the scratch buffer or the
-init file — and report what happened.
-
-Note this reads from disk, so it needs a save first. `C-c' does not use it:
-that is the built-in `eval-dwim' verb, which evaluates the *live* buffer text
-(the selection if there is one, else the form under point, else the whole
-buffer) without touching the filesystem. This one is still handy for picking up
-a config edit made in another editor."
-  (let ((path (%newest-file *scratch-file* *config-file*)))
-    (if path
-        (%eval-file path)
-        (message "nothing to evaluate: no scratch file and no config file"))))
-
-;;; ---------------------------------------------------------------------------
-;;; M-x
-;;;
-;;; M-x calls the name you pick as `(name)', with no arguments, so only
-;;; zero-argument functions belong in the list — offering `set-scale' would just
-;;; produce a wrong-number-of-arguments error.
-
-(defparameter *lambda-list-fn* (find-symbol "FUNCTION-LAMBDA-LIST" "EXT")
-  "ECL's introspection entry point, looked up rather than named literally so a
-build without it still reads this file.")
-
-;;; The host primitives are C functions: ECL has no lambda list for them and
-;;; reports "unknown", so the filter below excludes all of them — including the
-;;; zero-argument ones. These few are worth offering anyway.
-(defparameter *extra-commands* '("quit" "show-dashboard")
-  "Names published to M-x on top of what introspection finds.")
-
-(defparameter *hidden-commands*
-  (append (when (boundp '*readers*) (symbol-value '*readers*))
-          ;; `load-theme' is deliberately *not* here: with no argument it asks,
-          ;; so `M-x load-theme' is a real command and not a call that errors.
-          '("make-marker" "point-marker" "theme-names"
-            "buffer-lines" "buffer-names" "beginning-of-line" "end-of-line"
-            ;; ...and one that is worse than useless by hand: called with no
-            ;; argument it means "plain text", so `M-x set-language' picked by a
-            ;; stray fuzzy match silently uncolours the buffer. `kill-buffer' is
-            ;; deliberately *not* here — no-argument means the live buffer,
-            ;; which is exactly what Emacs' `C-x k' does.
-            "set-language"))
-  "Zero-argument by introspection, but not things to run from M-x: they answer a
-question or build a value for other code, and running one by hand does nothing
-you can see. `*readers*' is the reader set the shim interns, taken wholesale so
-this list does not have to be kept in step with it by hand.")
-
-(defun %zero-arg-p (sym)
-  "True when (SYM) is a legal call: no lambda list at all, or nothing but
-&OPTIONAL/&REST/&KEY/&AUX parameters. Unknown arity counts as false — guessing
-here would put a command in the list that errors the moment you run it."
-  (let ((info (and *lambda-list-fn*
-                   (ignore-errors
-                    (multiple-value-list (funcall *lambda-list-fn* sym))))))
-    (and (second info)                  ; second value: was it known?
-         (let ((args (first info)))
-           (or (null args) (member (first args) lambda-list-keywords))))))
-
-(defun refresh-commands ()
-  "Publish the zero-argument functions of this package as M-x candidates.
-Clears first, so reloading the config does not duplicate the list."
-  (clear-commands)
-  (dolist (name *extra-commands*) (register-command name))
-  (do-symbols (s (find-package :zemacs))
-    (let ((name (symbol-name s)))
-      (when (and (eq (symbol-package s) (find-package :zemacs)) ; not CL's
-                 (fboundp s)
-                 (plusp (length name))
-                 (char/= (char name 0) #\%) ; internal helper
-                 (not (member (string-downcase name) *hidden-commands*
-                              :test #'string=))
-                 (%zero-arg-p s))
-        ;; Lowercase is what the user types and what the list displays; ECL
-        ;; stores the name upcased.
-        (register-command (string-downcase name))))))
-
-;;; ---------------------------------------------------------------------------
 ;;; Dashboard
 ;;;
-;;; The banner is plain text; the renderer centres it. Items are (key label
-;;; action) and are matched by pressing the key.
-
-;;; Built rather than pasted: the epigraph is picked per session and the version
-;;; line is read out of the running image, so the screen says something true
-;;; about *this* boot instead of being a picture of one.
-(defparameter *koans*
-  '("the listener is always listening"
-    "no compile, no link, no wait"
-    "(eq 'code 'data)"
-    "parentheses are the shape of thought"
-    "the image remembers"
-    "every function is redefinable, including this one"
-    "λ is not a keyword. λ is the point."
-    "a REPL is a conversation, not a command")
-  "One is chosen at random each boot. `format' the whole banner, not just this,
-so the width stays right whichever line comes up.")
-
-(defun %banner ()
-  "The text under the logo.
-
-Block-capital ASCII used to spell the name here, then letter-spaced type did,
-and now neither does. The name is the one thing on this screen nobody needs
-told: it is in the window title, it is what you typed to get here, and the logo
-above already says which language the application is made of. What is left is
-the four lines that say something you did not already know — what it is for,
-one koan, and which image is actually running.
-
-The art is gone for a second reason worth keeping written down: block-drawing
-characters degrade into the wrong letters in a font that is missing some of
-them, which is a worse first impression than no artwork at all.
-
-No leading whitespace on any line: the dashboard centres each line itself, so
-padding here would shift the block off-centre rather than move it."
-  (let ((koan (nth (random (length *koans*)) *koans*)))
-    (format nil "
-a common lisp machine that edits text
-
-;; ~a
-
-(~a ~a) on ~a
-"
-            koan
-            (string-downcase (lisp-implementation-type))
-            (lisp-implementation-version)
-            (string-downcase (software-type)))))
+;;; The banner is plain text and the renderer centres it; the logo goes above it.
+;;; The *items* are further down, after the keymap, because each row prints the
+;;; leader sequence bound to its command and the table is not complete until the
+;;; bindings have been made.
 
 (dashboard-banner (%banner))
-
-;;; ...and a picture over it. `image-file' answers NIL when it cannot read the
-;;; file, and `dashboard-logo' takes NIL to mean "no logo" — so a checkout
-;;; without the assets directory falls back to the ASCII banner alone instead of
-;;; leaving a hole where a lambda should be. That is the same contract
-;;; `latex-preview' has, for the same reason: an asset is a thing that can be
-;;; missing, and a config must survive it.
-;;;
-;;; Sized in ems, like every other figure, so it grows with the font rather than
-;;; staying a fixed slab of pixels when the display or the point size changes.
-(when *runtime-dir*
-  (dashboard-logo
-   (image-file (merge-pathnames "../assets/Lisp_logo.svg.png" *runtime-dir*) 10)))
-
-;;; The items themselves are built at the *end* of the keys section below, not
-;;; here. Each row shows the leader sequence for its command in a dim column on
-;;; the right — "this is the key you will use once you know the editor" — and
-;;; that sequence is read out of the leader table, which does not exist until
-;;; the bindings have been made. Building the menu before the keymap would print
-;;; a column of blanks.
+(dashboard-default-logo 10)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys
@@ -675,37 +265,9 @@ a common lisp machine that edits text
 ;;; "dashboard". Sequences are space-separated tokens: SPC, C-x, <esc>, <ret>,
 ;;; <tab>, or a literal key. These are consulted before the built-in vim
 ;;; grammar, so config wins.
-
-(defparameter *leader-modes* '("normal" "visual" "visual-line" "visual-block")
-  "Modes with a SPC leader. Insert is excluded — SPC there types a space — and
-so is dashboard, where single letters pick items.")
-
-(defparameter *all-modes*
-  '("normal" "insert" "visual" "visual-line" "visual-block" "dashboard" "magit")
-  "Everywhere a modifier chord should work, including while typing and while a
-selection is up. Listed once so a new mode cannot be quietly left out of half
-the bindings.")
-
-(defun define-key-everywhere (keys command)
-  "Bind KEYS in every mode."
-  (dolist (mode *all-modes*) (define-key mode keys command)))
-
-(defparameter *leader-keys* (make-hash-table :test #'equal)
-  "Command name -> the leader sequence that runs it, for the dashboard to show.
-First binding wins: `switch-buffer' is on both `SPC b b' and `SPC j j', and the
-one worth printing is the one in the group the command belongs to, which is the
-one written first.")
-
-(defun leader-key (command)
-  "The leader sequence bound to COMMAND, or NIL. For display only — nothing
-here makes the binding work, `define-key' below does that."
-  (gethash command *leader-keys*))
-
-(defun define-leader (keys command)
-  "Bind a SPC-prefixed sequence in the modes that have a leader."
-  (unless (gethash command *leader-keys*)
-    (setf (gethash command *leader-keys*) keys))
-  (dolist (mode *leader-modes*) (define-key mode keys command)))
+;;;
+;;; `define-leader' binds a SPC-prefixed sequence in the modes that have a
+;;; leader; `define-key-everywhere' binds a chord in all of them.
 
 ;;; Leader bindings work with a selection up, not just from normal mode.
 (define-leader "SPC f f" "find-file")
@@ -734,6 +296,16 @@ here makes the binding work, `define-key' below does that."
 (define-leader "SPC s l" "search-line")
 (define-leader "SPC s p" "search-project")
 
+;;; avy: `SPC j c' types a character and labels every one of them on screen, so
+;;; two keystrokes land you anywhere the eye can already see. It goes in the
+;;; `SPC j' jump group beside `SPC j j', and *not* on `/', which is what avy's
+;;; own README suggests and what doom binds: `/' is search here, in the editor
+;;; and in the muscle memory of everyone who arrives from vim, and taking it
+;;; would mean rehoming search to buy a key avy does not need. Move it if you
+;;; disagree — the command is the same either way, and search would want `C-s',
+;;; which is already `search-line'.
+(define-leader "SPC j c" "avy-goto-char")
+
 ;;; Projects. The root is found from the *current buffer* — the file on screen
 ;;; is the only honest answer to "which project" when two are open at once —
 ;;; by walking up for a `.git', `Cargo.toml', `package.json' and the like. A
@@ -759,242 +331,18 @@ here makes the binding work, `define-key' below does that."
 (define-key-everywhere "C-M-p" "project-find-file")
 (define-leader "SPC w w" "ace-window")
 
-;;; ---------------------------------------------------------------------------
-;;; A project you do not have yet
-;;;
-;;; The hole beside `SPC p o': that one browses for a project on the disk, and a
-;;; repository you have never cloned is not on the disk. So this is the third
-;;; door in — a URL — and it lands you in exactly the same place the other two
-;;; do, a directory that `project-switch' will remember from now on.
-;;;
-;;; In Lisp and not in `crates/project', because none of it is a fast primitive:
-;;; it is one `git clone', a name derived from a URL, and a `find-file'. The
-;;; Rust side already knows what a project *is*; it does not need to learn git.
-;;;
-;;; `:wait nil' and a poll, which is the shape `math-code.lisp' established and
-;;; for its reason: a clone is seconds to minutes, and the Lisp thread is where
-;;; every keystroke's `after-change-hook' runs. Waiting for git here would stall
-;;; completion and diagnostics for the length of the clone.
-
-(defparameter *project-directory* "~/Code"
-  "Where `project-clone' puts a repository. `~/' is expanded; the directory is
-created if it is not there. Set it in your init to keep your checkouts
-somewhere else.")
-
-(defun %expand-home (path)
-  "PATH with a leading `~/' replaced by the home directory."
-  (if (and (>= (length path) 2) (string= "~/" path :end2 2))
-      (namestring (merge-pathnames (subseq path 2) (user-homedir-pathname)))
-      path))
-
-(defun %project-repo-name (url)
-  "The directory a clone of URL lands in: the last path segment, `.git' off.
-
-Handles both spellings git accepts — `https://host/owner/repo.git' and
-`git@host:owner/repo.git' — because the second's separator is a colon and the
-first's is a slash, and taking the last of either is the whole difference."
-  (let* ((trimmed (string-right-trim "/" url))
-         (cut (position-if (lambda (c) (member c '(#\/ #\:))) trimmed :from-end t))
-         (name (if cut (subseq trimmed (1+ cut)) trimmed))
-         (dot (search ".git" name :from-end t)))
-    (if (and dot (= dot (- (length name) 4))) (subseq name 0 dot) name)))
-
-(defvar *project-clone* nil
-  "The clone in flight, as a plist of :PROCESS :TARGET :URL, or NIL.
-One at a time: two clones would want two messages and there is one echo area.")
-
-(defun project-clone-poll ()
-  "Notice that a clone has finished, and open what it produced.
-
-On `*point-moved-functions*', for `math-code-build-poll''s reason: there is no
-timer in this editor, and the moment the answer becomes interesting is the
-moment you do something. Costs one read of a special variable per movement."
-  (let ((clone *project-clone*))
-    (when (and clone
-               (handler-case
-                   (not (eq :running (ext:external-process-wait
-                                      (getf clone :process) nil)))
-                 ;; A handle we can no longer ask about is a clone we can no
-                 ;; longer follow. The directory test below is the real verdict.
-                 (serious-condition () t)))
-      (let ((target (getf clone :target)))
-        (setf *project-clone* nil)
-        ;; The filesystem and not the exit status, so a clone that half-failed
-        ;; is not announced as a project: git leaves nothing behind when it
-        ;; cannot fetch, and a directory that exists is one you can open.
-        (if (probe-file (merge-pathnames ".git/" target))
-            (progn (message (format nil "cloned into ~a" target))
-                   (find-file target))
-            (message (format nil "clone failed: ~a" (getf clone :url)))))))
-  nil)
-
-;;; `add-hook' and not a PUSHNEW, and this is the site that makes the difference
-;;; visible: `modes.lisp' — where `*point-moved-functions*' is declared — is not
-;;; loaded until much further down this file, so a bare PUSHNEW here would be a
-;;; PUSHNEW on an unbound special, which is an error. `add-hook' comes up with
-;;; the image, below every `load', and binds the list if it is the first to
-;;; mention it.
-(add-hook '*point-moved-functions* 'project-clone-poll)
-
-(defun project-clone ()
-  "Clone a git repository into `*project-directory*' and open it.
-
-The third way into a project, beside `SPC p p' (one you have visited) and
-`SPC p o' (one on the disk). Bound to `SPC p n'."
-  (read-string "Git URL: "
-    (lambda (url)
-      (let ((url (and url (string-trim " " url))))
-        (cond
-          ((or (null url) (zerop (length url))))
-          (*project-clone*
-           (message (format nil "already cloning ~a" (getf *project-clone* :url))))
-          (t
-           (let* ((dir (%expand-home *project-directory*))
-                  (target (merge-pathnames
-                           (format nil "~a/" (%project-repo-name url))
-                           (pathname (format nil "~a/" (string-right-trim "/" dir))))))
-             (cond
-               ((probe-file target)
-                ;; Already here, which is not a failure — it is the answer to
-                ;; the question you asked, one step early.
-                (message (format nil "already cloned: ~a" target))
-                (find-file target))
-               (t
-                (ensure-directories-exist target)
-                (handler-case
-                    ;; `:output nil' is the null device, so there is no pipe to
-                    ;; fill and deadlock on — the same trade `math-code.lisp'
-                    ;; makes, and it costs git's progress bar, which is not
-                    ;; something a one-line echo area could have shown anyway.
-                    (multiple-value-bind (stream code process)
-                        (ext:run-program
-                         "git" (list "clone" url (namestring target))
-                         :input nil :output nil :error nil :wait nil)
-                      (declare (ignore stream code))
-                      (setf *project-clone*
-                            (list :url url :target target :process process))
-                      (message (format nil "cloning ~a into ~a…" url target)))
-                  (serious-condition (e)
-                    (message (format nil "cannot run git: ~a" e))))))))))))
-  nil)
-
+;;; The third door into a project — a git URL — landing you where the other two
+;;; do. `*project-directory*' is where the checkout goes; set it above this line
+;;; to keep your clones somewhere other than `~/Code'.
 (define-leader "SPC p n" "project-clone")
 
-;;; ---------------------------------------------------------------------------
-;;; The recipes in the Makefile
-;;;
-;;; `SPC p c' already runs *the* build — cargo build, npm run build, make — and
-;;; one key for the usual thing is right. But a Makefile is a menu, and the entry
-;;; you want is as often `test' or `fmt' or `deploy' as it is the default. So this
-;;; reads the menu and asks.
-;;;
-;;; In Lisp for `project-clone''s reason: it is a line scanner, a picker and a
-;;; shell command, and not one of the three is hot. Rust already knows how to run
-;;; a program and how to draw a completing prompt; it does not need make's
-;;; grammar as well.
-
-(defun %directory-of (file)
-  "The directory FILE sits in, as a pathname."
-  (make-pathname :name nil :type nil :defaults file))
-
-(defun %makefile-near (start)
-  "The nearest Makefile at or above START, or NIL.
-
-Climbs rather than asking for the project root, and that is the useful answer in
-a monorepo: there is a Makefile per package, and the one you mean is the one
-beside the file you are looking at, not the one at the top of the checkout.
-
-Walks the *directory components* rather than repeatedly taking a pathname's
-parent. Shortening a list is total — `(:absolute \"a\" \"b\")' to `(:absolute)'
-and then to nothing — where climbing by pathname has to decide when it has
-reached the root, and gets there by asking a question the root itself answers
-badly."
-  (let ((parts (pathname-directory (merge-pathnames start))))
-    (loop for n from (length parts) downto 1
-          for dir = (make-pathname :directory (subseq parts 0 n)
-                                   :name nil :type nil)
-          thereis (or (probe-file (merge-pathnames "Makefile" dir))
-                      (probe-file (merge-pathnames "makefile" dir))))))
-
-(defun %makefile-targets (path)
-  "Every target PATH declares, in the order it declares them.
-
-A line scanner rather than an understanding of make, deliberately. A rule starts
-in column zero and carries a colon; a recipe line starts with a tab; everything
-else is a comment, an assignment or a directive. That reads multi-target rules
-correctly and is wrong only about computed names — and a `$(BINS):' names nothing
-a picker could have offered anyway.
-
-Targets beginning with a dot are skipped, which is how `.PHONY' and `.DEFAULT'
-stay out of the list without needing to be known by name: the real targets a
-`.PHONY' line mentions have rules of their own further down."
-  (with-open-file (in path :if-does-not-exist nil)
-    (when in
-      (let ((found '()))
-        (loop for line = (read-line in nil nil)
-              while line
-              do (let* ((colon (position #\: line))
-                        ;; `:=', `::=' and `:::=' all assign. Skipping the run of
-                        ;; colons and asking what follows reads every one of them
-                        ;; — where a fixed-width window after the first colon
-                        ;; reads `:=' and quietly lets `::=' through as a rule.
-                        (after-colons
-                         (and colon (position-if-not (lambda (c) (char= c #\:))
-                                                     line :start colon))))
-                   (when (and colon (plusp colon)
-                              (not (find (char line 0) '(#\Tab #\Space #\#)))
-                              (not (find #\= line :end colon))
-                              (not (and after-colons (char= (char line after-colons) #\=)))
-                              (not (find #\$ line :end colon))
-                              (not (find #\% line :end colon)))
-                     (dolist (name (split-string (subseq line 0 colon) #\Space))
-                       (let ((name (string-trim '(#\Space #\Tab) name)))
-                         (when (and (plusp (length name))
-                                    (char/= (char name 0) #\.)
-                                    (not (member name found :test #'string=)))
-                           (push name found)))))))
-        (nreverse found)))))
-
-(defun %term-line (line)
-  "Type LINE into the terminal session and press Return.
-
-`term-send-key' is the whole channel — the vocabulary `key-bindings' reports,
-travelling the other way — so this arrives exactly as if it had been typed. The
-race it looks like it has is the shell's, and shells are good at it: the PTY
-exists the moment the session does, so characters sent before the prompt is
-drawn sit in its input buffer and are read after."
-  (loop for c across line do (term-send-key (string c)))
-  (term-send-key "<ret>"))
-
-(defun project-make ()
-  "Pick a target out of the nearest Makefile and run it in a terminal.
-
-A terminal rather than `run-process', for the reason that function's own
-docstring gives: a build is minutes, and `run-process' parks the Lisp thread for
-its whole length. Through a shell the output streams as it arrives, `C-c'
-interrupts, and a failure is left on screen where it can be read."
-  (let* ((here (let ((file (buffer-file-name)))
-                 (if file
-                     (%directory-of (pathname file))
-                     *default-pathname-defaults*)))
-         (makefile (%makefile-near here))
-         (dir (and makefile (%directory-of makefile))))
-    (cond
-      ((null makefile) (message "no Makefile here or above"))
-      (t
-       (let ((targets (%makefile-targets makefile)))
-         (if (null targets)
-             (message (format nil "no targets in ~a" makefile))
-             (completing-read
-              "make: " targets
-              (lambda (target)
-                (when (and target (plusp (length target)))
-                  (terminal)
-                  (%term-line (format nil "make -C ~a ~a"
-                                      (namestring dir) target))))))))))
-  nil)
-
+;;; `SPC p c' runs *the* build; this reads the Makefile and asks which target.
+;;; The output pane's whole keymap is `q', which is what every read-only buffer
+;;; in Emacs is dismissed with — the window goes, the buffer and the child stay,
+;;; so a build you dismissed early is still in the switcher when you want to
+;;; know how it ended.
 (define-leader "SPC p m" "project-make")
+(define-key "terminal-output-mode" "q" "delete-window")
 
 ;;; The terminal. A real shell on a real PTY, in a buffer.
 ;;;
@@ -1029,91 +377,11 @@ interrupts, and a failure is left on screen where it can be read."
 (define-key "terminal" "M-v" "terminal-paste")
 (pushnew "terminal-paste" *extra-commands* :test #'string=)
 
-;;; Clickable links in the terminal. A click the child did not ask for used to
-;;; do nothing at all — a shell never turns mouse reporting on — so the row it
-;;; landed on comes here instead. What counts as a link is decided in Lisp
-;;; rather than in Rust, because it is policy and policy is what this file is.
-(defparameter *browse-url-program*
-  #+darwin "open" #+(or linux freebsd) "xdg-open" #-(or darwin linux freebsd) nil
-  "The program handed a URL, or NIL to refuse.
-
-Not a browser name: the point of `open' and `xdg-open' is that the *desktop*
-decides, so an `https:' reaches the browser you actually use, a `file:' reaches
-whatever opens that kind of file, and a `mailto:' reaches your mail client.")
-
-(defun browse-url (url)
-  "Hand URL to the desktop.
-
-`:wait nil' because nothing here wants the browser's exit status and waiting for
-one would park the Lisp thread on a program you are still reading. The URL is
-echoed either way, so a machine with no opener still leaves you something to
-copy."
-  (if *browse-url-program*
-      (progn (ignore-errors
-              (ext:run-program *browse-url-program* (list url)
-                               :wait nil :input nil :output nil :error nil))
-             (message (format nil "opened ~a" url)))
-      (message (format nil "no opener for ~a" url))))
-
-(defparameter *url-schemes* '("http://" "https://" "file://" "mailto:")
-  "Prefixes that make a run of text worth clicking. The policy hook: add one and
-that scheme becomes clickable too.")
-
-(defparameter *url-breaks* '(#\Space #\Tab #\" #\' #\< #\> #\( #\) #\[ #\])
-  "Characters a URL cannot contain, so one printed inside quotes or brackets
-still ends where the eye says it does.")
-
-(defun %url-at (line col)
-  "The URL in LINE that column COL falls inside, or NIL.
-
-A click on the space *after* a link is a click on nothing: without that check
-the run scanned backwards from a delimiter is the link, and half the blank right
-half of a terminal row would open the last URL on the line."
-  (let ((n (length line)))
-    (when (and (< -1 col n) (not (member (char line col) *url-breaks*)))
-      (flet ((break-p (c) (member c *url-breaks*)))
-        (let* ((beg (1+ (or (position-if #'break-p line :end col :from-end t) -1)))
-               (end (or (position-if #'break-p line :start col) n))
-               ;; Trailing punctuation belongs to the sentence, not to the URL.
-               ;; A link at the end of a log line is followed by a period often
-               ;; enough that keeping it would break every one of them.
-               (url (string-right-trim ".,;:!?" (subseq line beg end))))
-          (when (some (lambda (s) (and (<= (length s) (length url))
-                                       (string-equal s url :end2 (length s))))
-                      *url-schemes*)
-            url))))))
-
-(defun %terminal-click (line col &optional uri)
-  "A click the child did not want, on the screen row LINE at column COL.
-
-URI is the OSC 8 link the child hung on that cell, and it wins: `cargo' marks
-its error codes and `ls --hyperlink' marks its filenames that way, so the text
-you clicked is a word and the link behind it is nowhere on the screen. Only when
-there is no such link does the row itself get read for one."
-  (let ((url (or uri (%url-at line col))))
-    (when url (browse-url url))))
-
 ;;; Dired. `SPC f d' opens the directory of the current file; in a listing,
 ;;; the keys are Emacs' own.
 (define-leader "SPC f d" "dired")
 (define-key "dired" "<ret>" "dired-enter")
 (define-key "dired" "-" "dired-up")
-
-;;; Magit's own keys, in the status buffer. `TAB' is the one that makes it a
-;;; buffer rather than a list: on a section it folds, on a file it opens the
-;;; diff. With a diff open, `s' and `u' act on the *hunk* under the cursor —
-;;; staging part of a file is what magit is used for more than anything else.
-(define-key "magit" "<tab>" "magit-toggle")
-(define-key "magit" "c a" "magit-amend")
-(define-key "magit" "f f" "magit-fetch")
-(define-key "magit" "z z" "magit-stash")
-(define-key "magit" "z p" "magit-stash-pop")
-;;; A rebase in flight. Stopping on a conflict is ordinary progress, not an
-;;; error: fix the files, stage them, then `r c'.
-(define-key "magit" "r c" "magit-rebase-continue")
-(define-key "magit" "r s" "magit-rebase-skip")
-(define-key "magit" "r a" "magit-rebase-abort")   ; throws the rebase away
-
 (define-key "dired" "^" "dired-up")
 (define-key "dired" "m" "dired-mark")
 (define-key "dired" "u" "dired-unmark")
@@ -1152,400 +420,6 @@ there is no such link does the row itself get read for one."
 (define-key "dired" "q" "show-dashboard")
 
 ;;; ---------------------------------------------------------------------------
-;;; The dashboard menu
-;;;
-;;; Down here rather than up in the Dashboard section because of the third
-;;; column: every row prints the leader sequence that runs the same command, so
-;;; the startup screen teaches the keymap instead of being a menu you use once
-;;; and then never see the point of again. `leader-key' reads the table
-;;; `define-leader' built, and the table is only complete now.
-;;;
-;;; The sequence is *looked up*, not typed out beside the label. Written twice
-;;; it would be wrong within a month — someone moves `SPC f f' and the dashboard
-;;; goes on advertising the old one, which is the exact failure a printed hint
-;;; is supposed to prevent.
-
-(defun dashboard-item (key label action &optional hint)
-  "Add a row: press KEY to run ACTION, shown as LABEL.
-HINT is the key sequence printed dim on the right; it defaults to the leader
-sequence bound to ACTION, and NIL means none. The editor primitive underneath
-takes four arguments and this takes three or four, which is the only reason
-this exists — see `%dashboard-item'."
-  (%dashboard-item key label action (or hint (leader-key action) "")))
-
-(clear-dashboard-items)
-;; Built-in verbs...
-(dashboard-item #\f "Find file"      "find-file")
-;; ...and functions defined above, on equal footing. `lisp-scratch' rather than
-;; the built-in `scratch' verb, which only drops you in an empty, language-less
-;; buffer nothing can evaluate.
-(dashboard-item #\s "Scratch buffer" "lisp-scratch")
-(dashboard-item #\e "Evaluate Lisp"  "eval-dwim")
-(dashboard-item #\p "Open project"   "project-switch")
-(dashboard-item #\t "Change theme"   "theme")
-(dashboard-item #\c "Edit configuration" "edit-config")
-(dashboard-item #\r "Reload configuration" "reload-config")
-(dashboard-item #\q "Quit" "quit")
-
-;;; ---------------------------------------------------------------------------
-;;; Major and minor modes
-;;;
-;;; A buffer has exactly one major mode, taken from its file (`notes.org' opens
-;;; in `org-mode'), and any number of minor modes on top. `M-x org-mode' sets it
-;;; by hand. Bindings made for a mode name that is not an editing mode belong to
-;;; that major/minor mode and apply only in its buffers — minor modes are
-;;; consulted first, most recently enabled first.
-;;;
-;;; A function named `<mode>-hook' runs whenever the mode is entered. That is
-;;; the only hook the editor itself fires; everything else below — mode-local
-;;; settings that revert, exit hooks, inheritance, minor modes — is built on top
-;;; of it in Lisp, which is where mode machinery belongs in a Lisp machine.
-;;;
-;;;   (define-derived-mode NAME PARENT &body BODY)
-;;;   (define-minor-mode NAME DOC (:on ...) (:off ...))
-;;;   (set-mode-local MODE SETTING VALUE)   reverts when the mode is left
-;;;   (define-mode-key MODE KEYS COMMAND)   inherited by derived modes
-;;;   (add-auto-mode SUFFIX MODE)           pick a mode from the file name
-;;;   (derived-mode-p MODE &optional OF) (minor-mode-p MODE)
-;;;   (enable-minor-mode MODE)              on if off; what a mode hook calls,
-;;;                                         since the mode's own command toggles
-;;;
-;;; ...and the two hooks the editor reports about a buffer, both declared there
-;;; and both joined with `add-hook', which binds the list if nothing has yet:
-;;;
-;;;   (add-hook '*after-change-functions* 'my-function)   the document moved
-;;;   (add-hook '*point-moved-functions*  'my-function)   point moved
-;;;
-;;; Loaded before any mode hook is *defined*, because `define-derived-mode'
-;;; generates `<mode>-hook' — a hand-written one after this point would replace
-;;; the generated one and quietly detach the machinery for that mode.
-
-(when *runtime-dir*
-  (load (merge-pathnames "modes/modes.lisp" *runtime-dir*)
-        :verbose nil :print nil))
-
-;;; Commands that read the editor rather than only configuring it.
-;;;
-;;; `region' answers a (BEG . END) of character offsets, or NIL when nothing is
-;;; selected; `region-text' is the text between them. See the reader list at the
-;;; top of this file for the rest — `point', `line-string', `buffer-name',
-;;; `evil-state' and friends all work the same way.
-;;;
-;;; `replace-region' does the delete and the insert as *one* operation. Doing it
-;;; as `delete-region' then `insert' would also work, but Lisp here runs
-;;; alongside your typing rather than freezing the editor the way Emacs does, so
-;;; a keystroke can land between two separate commands. One call cannot be
-;;; interrupted; two can.
-
-(defun surround-region (left right)
-  "Wrap the selection in LEFT and RIGHT."
-  (let ((r (region)))
-    (if r
-        (replace-region (car r) (cdr r)
-                        (concatenate 'string left (region-text) right))
-        (message "no selection"))))
-
-(defun org-bold () (surround-region "*" "*"))
-(defun org-italic () (surround-region "/" "/"))
-(defun org-code () (surround-region "~" "~"))
-
-;;; Only in org buffers, and only with something selected.
-(define-key "org-mode" "SPC m b" "org-bold")
-(define-key "org-mode" "SPC m i" "org-italic")
-(define-key "org-mode" "SPC m c" "org-code")
-
-;;; `M-RET' — another one of what this line is.
-;;;
-;;; Hand-parsed rather than matched: ECL ships no regexp engine, which is the
-;;; same reason `lsp.lisp' splits strings by hand. A list item is little enough
-;;; grammar that this is shorter than the regexp would have been anyway.
-
-(defun %org-list-prefix (line)
-  "The bullet a new item under LINE should start with, or NIL if LINE is not one.
-
-An ordered item counts on — `3.' is followed by `4.' — and nothing renumbers the
-items *below* the new one. That is org's own behaviour and not a shortcut: org
-renumbers on demand, and doing it here would rewrite lines you cannot see every
-time you pressed the key."
-  (let* ((n (length line))
-         (i (or (position-if-not (lambda (c) (member c '(#\Space #\Tab))) line) n))
-         (indent (subseq line 0 i))
-         (after (lambda (j) (and (< (1+ j) n) (char= (char line (1+ j)) #\Space)))))
-    (cond
-      ;; `-' and `+' anywhere; `*' only when indented, since a `*' in column 0
-      ;; is a heading and org reads it that way too.
-      ((and (< i n) (member (char line i) '(#\- #\+)) (funcall after i))
-       (format nil "~a~a " indent (char line i)))
-      ((and (< i n) (plusp i) (char= (char line i) #\*) (funcall after i))
-       (format nil "~a* " indent))
-      ;; `12.' or `12)', then a space.
-      (t (let ((j (position-if-not #'digit-char-p line :start i)))
-           (when (and j (> j i)
-                      (member (char line j) '(#\. #\)))
-                      (funcall after j))
-             (format nil "~a~d~a " indent
-                     (1+ (parse-integer (subseq line i j)))
-                     (char line j))))))))
-
-(defun org-meta-return ()
-  "A new list item below this one, carrying the same bullet or the next number.
-
-`goto-char' then `insert' rather than `insert-at': `insert' leaves point after
-what it wrote, which is where you are about to type. Then Insert mode, because
-the only reason to ask for a new item is to fill it in.
-
-ponytail: lists only. A heading (`M-RET' on `** foo' making another `** ') is
-one more `cond' arm and a checkbox item (`- [ ] ') is one more, and neither has
-been asked for."
-  (when (derived-mode-p "org-mode")
-    (let ((prefix (%org-list-prefix (line-string))))
-      (if prefix
-          (progn
-            (goto-char (line-end))
-            (insert (format nil "~%~a" prefix))
-            (set-evil-state "insert"))
-          (message "not on a list item")))))
-
-;;; Bound twice, and it has to be. `normal_key' consults a buffer's *major mode*
-;;; keymap; `insert_key' consults only the `insert' one — so a binding made for
-;;; `org-mode' alone would be dead while you were typing the list, which is the
-;;; whole time you want it. The command answers NIL outside an org buffer, so
-;;; the `insert' binding is a dead key everywhere else, exactly as it was before.
-(define-key "org-mode" "M-<ret>" "org-meta-return")
-(define-key "insert" "M-<ret>" "org-meta-return")
-
-;;; ---------------------------------------------------------------------------
-;;; org-latex-preview — begin overlay block
-;;;
-;;; Written here, in Lisp, and that is the point. Rust contributes exactly two
-;;; things it alone can do: `latex-fragments' scans the buffer for `$...$',
-;;; `\[...\]' and `\begin{env}...\end{env}', and `latex-preview' runs one
-;;; fragment through latex -> DVI -> dvipng and answers an image handle. The
-;;; policy — which fragments, what to do with the old ones, what to say
-;;; afterwards — is all below, where you can change it.
-;;;
-;;; An overlay is a range that moves with the text plus a property list, and the
-;;; properties the renderer draws are `face', `background', `display' and
-;;; `image'. Anything else you put on one stays in this image and can be any
-;;; Lisp object at all, which is what `:latex' is being used for here: a mark
-;;; saying "this one is mine", so re-previewing replaces its own overlays and
-;;; leaves anybody else's alone.
-;;;
-;;; A cold render is a few hundred milliseconds *per fragment* and it happens on
-;;; the Lisp thread — so the editor keeps drawing and keeps taking your
-;;; keystrokes while a screenful of equations is typeset, and only the image
-;;; queues behind it. Warm, from the on-disk cache, the whole buffer is
-;;; instant.
-
-(defun org-latex-previews (beg end)
-  "Handles of the preview overlays this file made, overlapping BEG..END."
-  (remove-if-not (lambda (o) (overlay-get o :latex))
-                 (mapcar #'first (overlays-in beg end))))
-
-(defun org-latex-preview-clear ()
-  "Take the previews off, showing the LaTeX source again."
-  (let ((ovs (org-latex-previews (point-min) (point-max))))
-    (mapc #'delete-overlay ovs)
-    (message (format nil "~d preview~:p cleared" (length ovs)))))
-
-(defvar *org-latex-auto* t
-  "Whether org buffers typeset their fragments by themselves.
-
-Turned off by a pass that could not render anything — a machine with no `latex'
-should say so once, not once per equation — and back on by `org-latex-preview'
-succeeding, since asking by hand is how you say you have fixed it.")
-
-(defun %org-latex-draw (fbeg fend)
-  "Typeset the fragment between FBEG and FEND and hang an overlay on it. T when
-LaTeX produced an image, NIL when it could not — which is the answer every
-caller branches on, because it is the difference between `this equation is
-wrong' and `this machine has no latex'."
-  (let ((image (latex-preview (buffer-substring fbeg fend))))
-    (when image
-      (let ((ov (make-overlay fbeg fend)))
-        (when ov
-          (overlay-put ov :latex t)
-          (overlay-put ov 'image image)))
-      t)))
-
-(defun %org-latex-render (beg end)
-  "Preview every fragment between BEG and END, answering how many were drawn, or
-NIL when one of them could not be rendered at all. Stops at the first failure:
-a hundred identical `latex: not found' messages tell you nothing the first did.
-
-Back to front: an overlay adjusts itself across an edit, but nothing here edits,
-and walking backwards keeps the *offsets* from `latex-fragments' valid however
-long the rendering takes."
-  (let ((done 0))
-    (dolist (f (reverse (latex-fragments)) done)
-      (destructuring-bind (fbeg fend display) f
-        (declare (ignore display))
-        (when (and (< fbeg end) (> fend beg))
-          (if (%org-latex-draw fbeg fend)
-              (incf done)
-              ;; NIL out of the DOLIST, which is this function's value.
-              (return nil)))))))
-
-(defun %org-latex-fragment-at-point ()
-  "(BEG . END) of the fragment point is inside, or NIL.
-
-`latex-fragments' scans the whole buffer and there is no reader for \"the one
-here\", but the list it answers is short and already in order — so finding point
-in it is a walk over a handful of pairs rather than a second pass over the text,
-and no new primitive.
-
-Both delimiters count as inside. Point on the closing `$' of `$x^2$' is in that
-equation to anyone who just typed it, and a rule that said otherwise would make
-`C-c r' silently do the whole buffer from the one position you are most likely
-to press it from."
-  (let ((p (point)))
-    (dolist (f (latex-fragments))
-      (destructuring-bind (fbeg fend display) f
-        (declare (ignore display))
-        (when (and (<= fbeg p) (<= p fend))
-          (return (cons fbeg fend)))))))
-
-(defun org-latex-preview ()
-  "Show LaTeX fragments as images: the selection's, the one point is inside, or
-— failing both — the whole buffer's.
-
-The middle case is the one that makes this a command you press rather than one
-you schedule. Inside `$...$' or a `\\begin{...}' block, `C-c r' renders *that*
-equation: a few hundred milliseconds, against a few hundred per fragment for a
-file full of them. It is also what you mean by pressing it there — you are
-looking at one equation, and the buffer is not what you were asking about.
-
-Fragments already previewed are re-done, so this doubles as `refresh' at
-whichever of the three scopes it picked."
-  (let* ((r (or (region) (%org-latex-fragment-at-point)))
-         (beg (if r (car r) (point-min)))
-         (end (if r (cdr r) (point-max))))
-    (mapc #'delete-overlay (org-latex-previews beg end))
-    (let ((done (%org-latex-render beg end)))
-      ;; Asking by hand also *re-arms* the automatic pass: the usual reason a
-      ;; machine had no `latex' is that it has one now.
-      (setf *org-latex-auto* (and done t))
-      (message (if done
-                   (format nil "~d fragment~:p previewed" done)
-                   "latex: nothing previewed — automatic previews off")))))
-
-;;; ---------------------------------------------------------------------------
-;;; ...and previewing without being asked
-;;;
-;;; The command above is the whole mechanism; this is the policy that decides
-;;; when to run it, and the policy is entirely about *cost*. A cold render is a
-;;; few hundred milliseconds per fragment and `latex-fragments' is a pass over
-;;; the buffer, so the one thing this must never do is either of them per
-;;; keystroke.
-;;;
-;;; Two triggers, and between them they are what "first-class inline LaTeX"
-;;; means in practice:
-;;;
-;;;   entering org-mode   — the buffer arrives already typeset. Cold this costs
-;;;                         one render per fragment on the Lisp thread while the
-;;;                         editor keeps taking your keystrokes; warm, from the
-;;;                         on-disk cache, it is instant.
-;;;   leaving the line    — you finish editing `$\alpha$', move off the line,
-;;;   you were editing      and it becomes an image. Which is exactly when you
-;;;                         want it: rendering *while* you type would spend a
-;;;                         latex run on `$\alph', `$\alpha', `$\alpha$' in turn
-;;;                         and flicker an image in and out under the cursor.
-;;;
-;;; The line test is what makes the second one affordable. `after-change-hook'
-;;; only records that something changed and which line it was — two variables,
-;;; no scan — and `point-moved-hook' does the work only once the two disagree.
-;;; Typing therefore costs a comparison per keystroke, and the buffer pass
-;;; happens once per line you edit rather than once per character.
-
-(defvar *org-latex-edited-line* nil
-  "The line an edit last touched, or NIL when nothing is waiting to be typeset.
-NIL is also the whole of the dirty flag: there is no second variable.")
-
-(defun %org-latex-previewed-ranges ()
-  "(BEG . END) of every preview overlay in the buffer, in one query.
-
-`overlays-in' already answers (ID BEG END), so asking once for the whole buffer
-and matching in the image costs one round trip; asking per fragment — which is
-what `org-latex-previews' does — would cost one per equation on a hook."
-  (let ((out nil))
-    (dolist (o (overlays-in (point-min) (point-max)) (nreverse out))
-      (when (overlay-get (first o) :latex)
-        (push (cons (second o) (third o)) out)))))
-
-(defun org-latex-preview-new ()
-  "Typeset the fragments that have no preview yet, quietly.
-
-Two queries for the whole pass — the fragments and the overlays — and then a
-render only for what is genuinely new. That is what makes this cheap enough to
-hang off a hook: a buffer whose equations are all drawn already costs those two
-and no LaTeX at all.
-
-Quietly matters too: a `3 fragments previewed' in the status line every time you
-leave a line would be the editor talking over you. Only a *failure* is worth a
-message, and only the once."
-  (when (and *org-latex-auto* (derived-mode-p 'org-mode))
-    (let ((have (%org-latex-previewed-ranges))
-          (at (point)))
-      (dolist (f (reverse (latex-fragments)))
-        (destructuring-bind (fbeg fend display) f
-          (declare (ignore display))
-          (when (and
-                 ;; Already drawn. Overlap and not containment: an overlay
-                 ;; shifts with the text around it, so a fragment whose source
-                 ;; has grown by a character is still the same equation.
-                 (notany (lambda (r) (and (< (car r) fend) (> (cdr r) fbeg))) have)
-                 ;; ...and not the one point is inside: you are still typing in
-                 ;; it, and `$\alph' is a LaTeX error, not an equation.
-                 (not (and (<= fbeg at) (<= at fend))))
-            (unless (%org-latex-draw fbeg fend)
-              (setf *org-latex-auto* nil)
-              (message "latex: automatic previews off — `SPC m l' to retry")
-              (return)))))))
-  nil)
-
-(defun org-latex-note-change ()
-  "Remember that this line now wants typesetting. On `after-change-hook', so it
-must stay this cheap: one reader and one SETF, no scan."
-  (when (derived-mode-p 'org-mode)
-    (setf *org-latex-edited-line* (line-number))))
-
-(defun org-latex-maybe-preview ()
-  "Typeset the edited line's fragments once point has left it.
-
-On `point-moved-hook'. The guard is two integers, so navigating a buffer nobody
-has edited costs one comparison per keystroke and nothing else."
-  (when (and *org-latex-edited-line*
-             (/= *org-latex-edited-line* (line-number)))
-    (setf *org-latex-edited-line* nil)
-    (org-latex-preview-new))
-  nil)
-
-(add-hook '*after-change-functions* 'org-latex-note-change)
-(add-hook '*point-moved-functions* 'org-latex-maybe-preview)
-
-;;; `C-c r', which is what the TODO asked for and what Emacs muscle memory
-;;; wants. It could not work when this was written: `C-c' is bound whole, to
-;;; `eval-dwim', in every mode, and an exact match used to fire before the
-;;; keymap looked for a longer one. `lisp-mode' needed the same thing for its
-;;; `C-c C-e' family, so `normal_key' now lets a mode-local *prefix* outrank a
-;;; global exact binding — which is this binding's whole requirement. `C-c'
-;;; still evaluates everywhere else, including in org buffers on its own.
-;;;
-;;; `SPC m l' stays, beside the other three org commands, and
-;;; `M-x org-latex-preview' works from anywhere: all of these are ordinary
-;;; zero-argument functions.
-(define-key "org-mode" "C-c r" "org-latex-preview")
-(define-key "org-mode" "C-c R" "org-latex-preview-clear")
-(define-key "org-mode" "SPC m l" "org-latex-preview")
-(define-key "org-mode" "SPC m L" "org-latex-preview-clear")
-;;; --- end overlay block ---
-
-;;; `fundamental-mode', `org-mode' and `rust-mode' used to be hand-written hooks
-;;; here, each having to undo what the others set. `modes.lisp' declares the
-;;; same settings with `set-mode-local', which reverts them on the way out, so
-;;; no mode has to know about any other.
-
-;;; ---------------------------------------------------------------------------
 ;;; Magit
 ;;;
 ;;; `magit-*' are built-in verbs, run by the editor rather than by this image.
@@ -1553,7 +427,6 @@ has edited costs one comparison per keystroke and nothing else."
 ;;; stage, unstage and commit there while still meaning substitute, undo and
 ;;; change everywhere else — a binding is consulted before the built-in grammar,
 ;;; so the motions (j k gg G /) keep working in the status buffer too.
-
 (define-leader "SPC g g" "magit-status")
 (define-leader "SPC g s" "magit-status")
 
@@ -1566,6 +439,20 @@ has edited costs one comparison per keystroke and nothing else."
 (define-key "magit" "F" "magit-pull")
 (define-key "magit" "g r" "magit-refresh")   ; `g' stays a prefix, so `gg' works
 (define-key "magit" "q" "show-dashboard")
+;;; `TAB' is the one that makes it a buffer rather than a list: on a section it
+;;; folds, on a file it opens the diff. With a diff open, `s' and `u' act on the
+;;; *hunk* under the cursor — staging part of a file is what magit is used for
+;;; more than anything else.
+(define-key "magit" "<tab>" "magit-toggle")
+(define-key "magit" "c a" "magit-amend")
+(define-key "magit" "f f" "magit-fetch")
+(define-key "magit" "z z" "magit-stash")
+(define-key "magit" "z p" "magit-stash-pop")
+;;; A rebase in flight. Stopping on a conflict is ordinary progress, not an
+;;; error: fix the files, stage them, then `r c'.
+(define-key "magit" "r c" "magit-rebase-continue")
+(define-key "magit" "r s" "magit-rebase-skip")
+(define-key "magit" "r a" "magit-rebase-abort")   ; throws the rebase away
 
 ;;; C-c stays one binding — `eval-dwim' — and finishes the commit when the
 ;;; buffer is a commit message. Binding C-c to `magit-commit-finish' outright
@@ -1573,12 +460,12 @@ has edited costs one comparison per keystroke and nothing else."
 ;;; its own mode would lose the binding the moment you pressed `i' to type.
 
 ;;; C-c evaluates Lisp, from anywhere. `eval-dwim' is a built-in verb resolved
-;;; by the editor, not a function in this file: it evaluates the live buffer —
+;;; by the editor, not a function in the image: it evaluates the live buffer —
 ;;; the selection if there is one, else the top-level form under point, else the
 ;;; whole buffer — so nothing needs saving first.
 ;;;
 ;;; `C-c C-c' and not a bare `C-c', so that `C-c' is a *prefix* — which is what
-;;; it is in Emacs, and what the whole `C-c &lt;letter&gt;' family below depends on.
+;;; it is in Emacs, and what the whole `C-c <letter>' family below depends on.
 ;;;
 ;;; This is a rule about core, not a preference. `normal_key' looks for an exact
 ;;; global binding *before* it asks whether the sequence is a prefix, so while
@@ -1598,7 +485,7 @@ has edited costs one comparison per keystroke and nothing else."
 ;;; for a second — so `C-c C-c' is unreachable there and a prefix would silently
 ;;; do nothing. Keeping the one-key binding in Insert also keeps the property
 ;;; the paragraph this replaced was describing: `C-c' evaluates rather than
-;;; leaving Insert mode, and `&lt;esc&gt;' and `C-g' are still how you leave.
+;;; leaving Insert mode, and `<esc>' and `C-g' are still how you leave.
 (define-key "insert" "C-c" "eval-dwim")
 
 ;;; The `C-c' family. These are the bindings a hand reaches for without
@@ -1666,62 +553,70 @@ has edited costs one comparison per keystroke and nothing else."
 (define-key-everywhere "M--" "zoom-out")
 (define-key-everywhere "M-0" "zoom-reset")
 
-;;; ---------------------------------------------------------------------------
-;;; Scenes — a page in pixels rather than a grid of cells
-;;;
-;;; `gui.lisp' is the Lisp face of `crates/gui': `block', `text', `run', `image'
-;;; and `rect' build a page, `scene-set' installs it on the live buffer, and a
-;;; `:tag' makes a node clickable. Rust lays it out, wraps its text in a real
-;;; font and routes a click back; *what* is on the page is entirely here.
-;;;
-;;; Loaded before the modes below because a mode that renders a document — the
-;;; first will be `org-frozen-mode' — is a builder written on top of it, and
-;;; before nothing else: it needs only `%do' and the face table, so it can sit
-;;; anywhere above its first caller.
-;;;
-;;; It takes the name `block' back from Common Lisp, which is the one thing in
-;;; this config that shadows a standard symbol. The file says why; the short
-;;; version is that a page is written as `(block :pad 48 ...)' and `cl:block' is
-;;; still there for anyone who wanted the special operator.
+;;; Org markup, only in org buffers and only with something selected.
+(define-key "org-mode" "SPC m b" "org-bold")
+(define-key "org-mode" "SPC m i" "org-italic")
+(define-key "org-mode" "SPC m c" "org-code")
 
-(when *runtime-dir*
-  (handler-case
-      (load (merge-pathnames "gui.lisp" *runtime-dir*) :verbose nil :print nil)
-    (error (e) (message (format nil "gui: not loaded — ~a" e)))))
+;;; LaTeX previews. `C-c r' is what Emacs muscle memory wants, and it works
+;;; because `normal_key' lets a mode-local *prefix* outrank a global exact
+;;; binding — `C-c' still evaluates everywhere else, including in org buffers on
+;;; its own. `SPC m l' is the leader spelling, and `M-x org-latex-preview' works
+;;; from anywhere: all of these are ordinary zero-argument functions.
+;;;
+;;; The commands are in `modes/org-latex.lisp'; a binding names a string and is
+;;; resolved when the key is pressed, so these may be made before it loads.
+(define-key "org-mode" "C-c r" "org-latex-preview")
+(define-key "org-mode" "C-c R" "org-latex-preview-clear")
+(define-key "org-mode" "SPC m l" "org-latex-preview")
+(define-key "org-mode" "SPC m L" "org-latex-preview-clear")
 
 ;;; ---------------------------------------------------------------------------
-;;; Language servers — the eglot equivalent
+;;; The dashboard menu
 ;;;
-;;; `rpc.lisp' is JSON-RPC over a child's stdin and stdout, and knows nothing
-;;; about language servers. `lsp.lisp' is the whole client written on top of it:
-;;; the handshake, document synchronisation, go-to-definition and diagnostics,
-;;; all in Lisp. Rust owns the pipe, the framing and the process, and nothing
-;;; else.
-;;;
-;;; Two servers ship — `pylsp' for Python and `clangd' for C — and a third is
-;;; one line *here*, in your config, with no Rust to rebuild:
-;;;
-;;;   (lsp-register-server 'rust-mode "rust-analyzer")
-;;;   (lsp-register-server 'go-mode "gopls")
-;;;
-;;; A server that is not installed reports in the status line the first time a
-;;; buffer in its mode is touched, and nothing else breaks.
-;;;
-;;; Loaded after `modes.lisp', because the mode registry is what
-;;; `lsp-register-server' names, and after the settings above, because loading
-;;; it installs `after-change-hook' and there is no reason for that to fire
-;;; while the config is still being read.
+;;; Down here rather than up beside the banner because of the third column:
+;;; every row prints the leader sequence that runs the same command, so the
+;;; startup screen teaches the keymap instead of being a menu you use once and
+;;; then never see the point of again. `dashboard-item' reads the table
+;;; `define-leader' built, and the table is only complete now.
 
-(when *runtime-dir*
-  (handler-case
-      (progn
-        (load (merge-pathnames "rpc.lisp" *runtime-dir*) :verbose nil :print nil)
-        (load (merge-pathnames "lsp.lisp" *runtime-dir*) :verbose nil :print nil))
-    (error (e) (message (format nil "lsp: not loaded — ~a" e)))))
+(clear-dashboard-items)
+;; Built-in verbs...
+(dashboard-item #\f "Find file"      "find-file")
+;; ...and functions from the library, on equal footing. `lisp-scratch' rather
+;; than the built-in `scratch' verb, which only drops you in an empty,
+;; language-less buffer nothing can evaluate.
+(dashboard-item #\s "Scratch buffer" "lisp-scratch")
+(dashboard-item #\e "Evaluate Lisp"  "eval-dwim")
+(dashboard-item #\p "Open project"   "project-switch")
+(dashboard-item #\t "Change theme"   "theme")
+(dashboard-item #\c "Edit configuration" "edit-config")
+(dashboard-item #\r "Reload configuration" "reload-config")
+(dashboard-item #\q "Quit" "quit")
+
+;;; ---------------------------------------------------------------------------
+;;; The rest of the runtime
+;;;
+;;; which-key, Common Lisp editing, a REPL, org's markup drawn rather than
+;;; typed, the maths curriculum, the AI harnesses and the tutorial — the whole
+;;; shipped set, in the order `*runtime-modules*' declares. That list is in
+;;; `library.lisp' rather than here on purpose: it is what stops a config you
+;;; wrote a year ago from missing everything added since.
+;;;
+;;; `(setf *runtime-modules* (remove "modes/tutor.lisp" *runtime-modules*))'
+;;; above this line drops one; `(push "my-mode.lisp" (cdr (last ...)))' — or
+;;; simply a `load' of your own after it — adds one.
+;;;
+;;; Loaded here, after the settings and the keymap, because a mode may read
+;;; either: `lsp.lisp' installs `after-change-hook' and there is no reason for
+;;; that to fire while the config is still being read.
+
+(load-runtime-modules)
 
 ;;; `g d' is the vim spelling and wins over the built-in grammar, which is what
 ;;; a binding in this file always does. The `SPC l' family is the leader
-;;; spelling for the rest.
+;;; spelling for the rest. Guarded because a config may have dropped `lsp.lisp'
+;;; from `*runtime-modules*', or the load may have failed and said so.
 (when (fboundp 'lsp-goto-definition)
   (define-key "normal" "g d" "lsp-goto-definition")
   (define-leader "SPC l l" "lsp")
@@ -1754,98 +649,14 @@ has edited costs one comparison per keystroke and nothing else."
   (define-key "insert" "C-y" "lsp-complete-accept")
   (define-key "insert" "C-e" "lsp-complete-abort"))
 
-;;; ---------------------------------------------------------------------------
-;;; which-key, Common Lisp editing, a REPL, and org's markup drawn rather than
-;;; typed
+;;; A third language server is one line, with no Rust to rebuild — `pylsp' and
+;;; `clangd' ship, and the mode registry is what the first argument names:
 ;;;
-;;; Five files, loaded in order because each uses the one before it:
+;;;   (lsp-register-server 'rust-mode "rust-analyzer")
+;;;   (lsp-register-server 'go-mode "gopls")
 ;;;
-;;;   which-key.lisp  what continues the prefix you just pressed, in the status
-;;;                   line — and the same table read the other way round, as the
-;;;                   docstring and key `M-x' now shows beside a command.
-;;;   lisp-mode.lisp  one scanner for the shape of Lisp text, and the motion,
-;;;                   kill, slurp/barf and indentation commands built on it.
-;;;   repl.lisp       `C-c C-e' and friends, evaluating in *this* image and
-;;;                   writing form and value into a transcript buffer.
-;;;   parinfer.lisp   the inverse of that indenter — the indentation says where
-;;;                   the closing parentheses go — on the same scanner.
-;;;   org-modern.lisp `display' overlays: heading stars become bullets, `[X]'
-;;;                   becomes a tick, and `*bold*' shows its asterisks only
-;;;                   while the cursor is in it. Loaded after `lsp.lisp' so it
-;;;                   finds the `after-change-hook' that file installs.
-;;; term-agent:
-;;;   ai.lisp         coding agents — Claude Code, Cursor, opencode — as
-;;;                   ordinary buffers, on the terminal the editor already has.
-;;;                   `C-a' is the menu. The harness list is *data* in that
-;;;                   file, so a fourth tool is one line and no Rust; the resume
-;;;                   flags are each tool's own. It loads last because it uses
-;;;                   `define-leader' and pushes onto `*extra-commands*', which
-;;;                   `refresh-commands' below then publishes.
-;;;
-;;;   org-fold.lisp   code folding's policy half: what an org subtree *is*, and
-;;;                   the `z a' / `z M' / `z R' commands over the one thing Rust
-;;;                   owns — an overlay carrying `fold' makes the lines after
-;;;                   its first stop occupying rows. `*fold-subtree-functions*'
-;;;                   is where another mode joins in.
-;;;
-;;;   org-frozen.lisp org as a *printed page*: `org-frozen-mode', which derives
-;;;                   from `org-mode' and is read-only for real. Drawers,
-;;;                   `#+keyword:' lines and block delimiters stop occupying
-;;;                   rows; `#+TITLE:' is typeset as a title; a `#+begin_src'
-;;;                   body gets a band, a gutter and *its own language's*
-;;;                   highlighting; a table is drawn with aligned columns under a
-;;;                   rule. `SPC m z' toggles it either way. Loaded after
-;;;                   `org-fold.lisp' because it rebinds TAB over that file's
-;;;                   `org-cycle', and before `math.lisp' because a curriculum is
-;;;                   what it was built to display.
-;;;
-;;;   tutor.lisp      `SPC h t' — the tutorial, as a buffer that marks your
-;;;                   homework rather than a page of prose that trusts you.
-;;;                   Stage 1 teaches Common Lisp and checks each answer in a
-;;;                   *child* `ecl' with a timeout, so a student's `(loop)'
-;;;                   costs them the exercise and not the image; Stage 2
-;;;                   teaches the API in this file and checks by watching the
-;;;                   live editor. Last in the list because it uses
-;;;                   `%eval-source' from `repl.lisp' and `executable-find'
-;;;                   from `ai.lisp'.
-;;;
-;;;   math.lisp       a whole maths curriculum as one org file — units,
-;;;                   problems, and a place for your answer, all of it ordinary
-;;;                   org with `#+ZEMACS_*' properties on the headings. The
-;;;                   format is specified in `docs/curriculum.org', precisely
-;;;                   enough to hand to a model as "generate one of these".
-;;;                   Loaded after `org-modern.lisp' because it reads that
-;;;                   file's org helpers and hangs itself off the
-;;;                   `*org-mode-functions*' hook declared there.
-;;;
-;;;   math-code.lisp  the other half of a `programming' problem: its
-;;;                   `#+begin_src python' block tangled to a file beside the
-;;;                   curriculum, a venv built for it in the background, a
-;;;                   window beside the question and one key that runs it in a
-;;;                   terminal. Last of all, because it reads the schema from
-;;;                   `math.lisp' and `executable-find' from `ai.lisp'.
-;;;
-;;;   math-written.lisp
-;;;                   the other half of a `written' problem: a photograph of your
-;;;                   handwriting, dropped in `~/Public/MathSync' by a phone,
-;;;                   transcribed into org with LaTeX by a vision model and
-;;;                   written into the Response of the problem *point is in*.
-;;;                   The watcher is an ECL thread of its own, so it fires with
-;;;                   nobody at the keyboard; everything slow happens on it, and
-;;;                   nothing at all is deleted. `SPC m r' does one by hand.
-;;;                   Beside `math-code.lisp' and for the same reasons.
-;;;
-;;; Loaded here rather than next to `modes.lisp' because they use `define-leader'
-;;; and `define-mode-key', which are defined above this point and not below it.
-(when *runtime-dir*
-  (dolist (file '("modes/which-key.lisp" "modes/show-paren.lisp"
-                  "modes/lisp-mode.lisp" "modes/repl.lisp"
-                  "modes/parinfer.lisp" "modes/org-modern.lisp" "modes/org-fold.lisp"
-                  "modes/org-frozen.lisp"
-                  "modes/math.lisp"
-                  "modes/ai.lisp" "modes/tutor.lisp"
-                  "modes/math-code.lisp" "modes/math-written.lisp"))
-    (load (merge-pathnames file *runtime-dir*) :verbose nil :print nil)))
+;;; A server that is not installed reports in the status line the first time a
+;;; buffer in its mode is touched, and nothing else breaks.
 
 ;;; ---------------------------------------------------------------------------
 

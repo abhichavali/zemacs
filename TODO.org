@@ -61,10 +61,17 @@ stops painting over its neighbour.
 Wide characters were the other half of the old justification and turned out not
 to need this at all: several *cells* is what a tab already was.
 
-Left open, and written down in =docs/boundary.org=: core is not told. =j= over an
-equation is still one buffer line and =viewport_lines= counts text rows, so a
-pane holding one reports a line more than it draws. Same ceiling as "core lays a
-line out without overlays", same upgrade.
+The =viewport_lines= half of this is closed, and the interesting part is that it
+needed nothing from core. =image_tall= is now the one answer =draw_document=,
+=line_rows=, =visible_lines= and =offset_at= all ask, so a pane holding an
+equation reports what it draws and a click below one lands on the line under the
+pointer. See the entry in "Open" below, and =docs/boundary.org=.
+
+=j= over an equation is still one buffer line, and that is the answer rather than
+the debt: the rows a bitmap claims hold no characters, so there is nothing in
+them to land on — Emacs' =next-line= over an image moves one line too. What is
+genuinely still open is sideways: the *cells* a bitmap reserves are pixels over a
+cell width core has not got.
 
 ** DONE A JSON-RPC subprocess layer
 =crates/rpc=: spawn a long-lived child, =Content-Length=-framed JSON on its
@@ -112,6 +119,79 @@ What is still missing is the *message* in the buffer, which wants virtual text:
 =display= replaces the cells it covers, so an inline message would eat the code
 it is about. That is an =after-string= overlay property — a payload in
 =overlay.rs= and a branch in the renderer's line loop. =SPC l e= until then.
+*** DONE hover a diagnostic mark and read what is wrong
+The entry above predicted =after-string= for this and the prediction was for the
+wrong feature. =after-string= is right for an *inline* message — text living
+permanently at the end of the offending line — and it is wrong for a hover twice
+over: it is pinned to the end of a line and the pointer is wherever your hand
+is, and it is on until something takes it off where a hover's whole contract is
+that it is gone when you look away. The inline message is still unbuilt and
+still wants =after-string=. This wanted something else.
+
+*A fourth surface drawn over the frame*, after =ace=, =which-key= and the
+completion popup, and the *second* one measured in pixels — =ContextMenu= was
+already the first, and for the identical reason: a box hung off the pointer has
+no buffer offset for the renderer to convert. So =Editor::tooltip=, one
+=(frame, x, y, text)=, and the two pointer-anchored surfaces now share one rule
+about what happens at an edge.
+
+*The message rides on the overlay*, as =help-echo= — Emacs' name, spelled the
+same. That is the finding worth keeping: it is the one property here that draws
+nothing, and it crosses into Rust anyway, because its reader is the mouse and the
+mouse is on that side. The alternative was core asking the image "what is at line
+40" on hover, which is a round trip on the one path that fires per pixel *and* a
+second derivation of a fact the overlay already carries. Hung on the overlay, the
+message slides with the text and dies with it, so it cannot come to describe the
+wrong line — which is the same argument the mark itself was made an overlay for.
+
+*Motion is the expensive event.* It fires per pixel, and resolving a pixel to a
+buffer line means walking the visible lines through folds, wraps and image rows —
+a cell vector per line. So the walk is behind a cheap question:
+=Renderer::gutter_row=, a pane lookup, one compare against the gutter's right edge
+and one division. A gutter mark is a row tall, so the answer cannot change inside
+one, and the expensive half runs *once per row crossed*. The cache remembers what
+that answered **and whether a box was up when it did** — without the second half,
+a keystroke taking the box down while the pointer sits still leaves it stuck until
+you cross into the next row.
+
+*Retiring it is four places and not a predicate*, which is where this differs from
+the completion popup. =Editor::completion()= can be a predicate because "is point
+still in that word" is a question about the editor. Nothing about the editor can
+answer "is the pointer still on the mark" — so: motion sets or clears it, a
+keystroke clears it beside the context menu in =handle_key=, a click and the wheel
+clear it because both move the text under a pointer that has not moved, and
+=WindowEvent::MouseLeave= clears it because walking off the edge of the frame
+produces no further motion to notice with.
+
+*Only the gutter.* Hovering the offending *span* is a different hit test and does
+not fall out, because the diagnostic overlay deliberately covers the whole line —
+so a text hit test would fire on every column of every marked line as the pointer
+crossed the buffer. It wants a second overlay on the error's own range, which is
+=lsp.lisp='s to make; the Rust side would then be =click_target= plus the same
+=help_echo_at=. Where there is no gutter there is nothing to hover, and that
+falls out rather than being handled: =gutter_row= asks the same =gutter_w= the
+draw loop asks before painting a mark, so "there is a mark here" and "there is
+something to hover here" cannot come apart. Worth recording that this is not the
+same set as =set-no-gutter-modes= names — an =org-mode= buffer opened out of the
+shipped config draws line numbers and a diagnostic mark despite being on that
+list, which is a separate thing to chase; the hover follows what is *drawn*, so
+it was right in a case the design note would have got wrong.
+
+The hit strip is the gutter's columns plus one =PAD= of air, and not everything
+left of the text, which was the first cut and was visibly wrong in org: a buffer
+with a =text-width= is centred, so its left margin is a third of the window and
+the box appeared for a pointer resting nowhere near a mark. =offset_at= is more
+generous — it clamps a click in the margin to column zero — and that generosity
+belongs to a gesture you aimed.
+
+The chain is tested in =crates/app/tests/control.rs= rather than in
+=crates/lisp/tests/=, and that is forced rather than chosen: half of this chain is
+arithmetic between a font and a rectangle, and a headless =Editor= has no
+renderer, so a test up there could assert that the message reaches the overlay and
+not one thing about hovering it. Which needed a way to move a pointer over the
+wire — the =mouse= op, in pixels, through the same =App::hover= the SDL arm calls.
+Verified against a real =pylsp= by hand as well: four diagnostics on one line from
+=mypy= and =ruff= at once, and the newest wins, exactly as the glyph already did.
 *** DONE AI mode with multi-agent support
 Not the JSON-RPC route in the end, and that is the finding: Claude Code, Cursor
 and opencode are all *terminal* programs, and the editor already runs terminal
@@ -191,9 +271,14 @@ before this.
 
 Left open: with an *operator* pending, =dj= is still two whole buffer lines, which
 is what vim does and what the tests assert — Emacs' =evil-next-visual-line= is an
-exclusive motion and adopting that changes what =dj= means. And a =display= overlay
-is not applied when core lays a line out, so =j= down a line carrying one can land
-a character off.
+exclusive motion and adopting that changes what =dj= means.
+
+A =display= overlay used to be listed here too — it was not applied when core laid
+a line out, so =j= down a heading landed a character off. That is closed:
+=display::line_cells= is the one layout both sides ask, bullet and checkbox
+included. An overlay carrying only an *image* is the remainder, and only
+sideways: its cells are pixels over a cell width core has not got, so =j= onto a
+line with an inline =$x_1$= is still off by the fragment's source width.
 
 ** DONE Free the Option key for unicode
 =mac-option-modifier 'none= is set: Option is deliberately kept for composing
@@ -324,7 +409,50 @@ switching to it rather than before. The upgrade is an
 is still allowed and still silent; that is Emacs' "has changed since visited;
 save anyway?" and it belongs with the confirmation flow the destructive git
 verbs are waiting on.
-** TODO =M-x= with arguments — it calls =(name)= and so offers zero-arg only
+** DONE =M-x= with arguments — it calls =(name)= and so offers zero-arg only
+=M-x= still calls =(name)=, and that turned out to be the thing to leave alone. The
+answer was already in the tree, written by hand: =load-theme= took its argument
+=&optional= and *asked* when it was missing, which is what Emacs' =load-theme= does
+and what made it the one argument-taking command you could reach. Generalising
+that one line is the whole feature — =(interactive NAME SPEC...)= in
+=runtime/library.lisp= replaces the symbol's function with a wrapper that
+dispatches on whether it was given any arguments, and asks for the rest.
+
+Nothing in Rust changed, and that is the result worth recording rather than the
+feature. Three designs were tried against core first — arguments typed on the
+=M-x= line, a =(%run-command "name")= dispatcher, a candidate list that carried
+arity — and each of them wanted core to know something about Lisp. The wrapper
+wants nothing from core at all, which is also why a *key binding* to a declared
+command asks: both arrive as =(name)=, so there was never a second path to teach.
+
+Two things fell out that were not obvious from the entry:
+
+- =refresh-commands= needed one clause, not a rewrite. A declared command is
+  offered because =(get sym 'interactive)= says so — asked as a property rather
+  than by re-introspecting, since the wrapper's lambda list is =(&rest args)= and
+  whether ECL describes a closure it did not compile is not a thing to bet the
+  =M-x= list on.
+- =*hidden-commands*= shrank by exactly one entry, and the entry says why that is
+  the honest number: everything else on that list is a *reader* — =theme-names=,
+  =buffer-lines=, =point-marker= — which is zero-argument and useless by hand for
+  reasons arity was never the cause of. =set-language= was the only name hidden
+  because its zero-argument call *meant* something wrong, and asking is the fix.
+
+Now reachable, none of which could be run before: =set-scale=, =set-language=,
+=lsp-register-server= (two prompts), and =load-theme= from a key as well as from
+=M-x=. =set-font-size= deliberately stays unreachable — it is the primitive under
+=set-scale= and sets the size without updating =*font-size*=, so running it by hand
+leaves the next =text-scale-increase= stepping from a stale number. The command is
+=set-scale=; the primitive is not a command.
+
+The bug the test suite could not have found: =read-string= answers the *prompt id*,
+and =eval-string= echoes the value of the last form it evaluated, so the first
+version put a bare =1= in the status line the instant =M-x load-theme= opened its
+question. Every headless assertion passed through it: a status line is not a
+value anything returns, so nothing was looking. It was found by driving the real
+editor through =docs/control-mode.md= and reading the status line back, and the
+assertion that would have caught it is now in
+=crates/lisp/tests/interactive.rs=.
 ** DONE Confirmation before destructive git verbs
 =r a= was bound *today* and discarded a whole rebase silently. It now asks.
 
@@ -347,14 +475,115 @@ exactly the prompts where a reflexive =y= is the failure mode). The parked
 command comes back wrapped in =EditorCommand::Confirmed=, which is what lets one
 site both ask the question and recognise its own answer instead of every
 guarded command needing a twin variant that skips the check.
+** DONE Scrolling past the end of the document
+The view stops with the last line on the *bottom* row, so the end of a file is
+always read at the foot of the pane. Emacs, vim and VSCode all let it keep going
+into empty rows instead; vim even draws =~= in them.
+
+It looked like it wanted row arithmetic and it wanted the opposite. The tempting
+reading — "how far past the end" is a number of *rows*, and a fold costs none
+while an image buys three, so the limit has to be computed the way
+=visible_lines= computes one — would have put a second row-counting rule in the
+tree, which is exactly the disagreement the image work had just finished
+deleting. The limit that is actually right is =buffer.last_line()=: the last line
+on the *top* row, which is what vim and Emacs both stop at, and which is a count
+of lines and therefore not a row count at all. =Editor::max_scroll= is nine
+lines, the two writers of a scroll offset ask it, and *the renderer needed no
+change whatever* — the draw loop and =offset_at= have always stopped at
+=len_lines()=, so the empty rows, the gutter that numbers none of them and the
+click that lands at =point-max= all fell out of code that was already there.
+
+Two things were load-bearing and neither is obvious. =last_line()= rather than
+=len_lines() - 1=, because =scroll_lines= *drags point to =scroll== and the rope
+counts the empty string after a trailing newline: name that line in the clamp and
+point ends up on a line =G= refuses to visit. And generated buffers keep the old
+clamp, because a dired listing has no past-the-end to scroll into — measured
+against =/usr/bin=, 921 lines in a 37-row pane, stopping at 884.
+
+=(set-scroll-past-end nil)= turns it off, and turning it off pulls a view that is
+already out there straight back, because the writer goes through =apply= like
+everything else and =apply= ends in the clamp. Left open: the fold ceiling one
+entry up — the limit is a buffer line, so a fold over the end of the file is
+scrolled into and draws nothing. The old clamp did that too, one screenful
+earlier.
 
 * PACKAGES WITH NO EQUIVALENT
-** TODO avy
-Bound to =/= in the config, so the primary jump key currently does the wrong
-thing. Overlays now exist, so this is pure Lisp: an overlay per candidate with
-a =display= of its label and a =face=, the target hung off it as an ordinary Lisp
-property, then read one key and jump. Watch the ceiling first — overlays are a
-linearly scanned =Vec=, and one per hit is exactly what that was sized against.
+** DONE avy
+=runtime/modes/avy.lisp=, and the entry above was wrong about the two things it
+was most confident of. =/= was never bound in the config at all — it is core's
+vim search and always was — so nothing had to be rehomed; and the ceiling it
+warned about is not where this lands.
+
+*The whole feature is reading one keystroke*, and everything else is a scan and
+some overlays. Three answers were already in the tree and each one records why it
+was wrong for the next:
+
+- =read-string= / =completing-read= open a *prompt*, and a prompt draws a
+  minibuffer and owns the keyboard. avy's gesture is one key pressed against the
+  *document*, which is which-key's objection and corfu's, unchanged.
+- =ace-window= does read one key, in =dispatch_key=, and *resolves it itself* into
+  a =WindowId= core owns. A jump target is a buffer offset hung off an overlay,
+  which lives in the image — so core resolving one means core keeping a second
+  copy of a label table Lisp already has, and the two disagreeing is exactly the
+  half-cleared screenful of labels this feature must never leave.
+- A transient keymap in Lisp — bind the label letters, enable, disable — is the
+  lazy answer, needs no Rust at all, and is wrong on the one case that matters: a
+  keymap catches the keys that are *in* it, so a key that is not a label falls
+  through and edits the buffer with the labels still up. "Anything else cancels"
+  is not something a keymap can say.
+
+So one field and three lines: =Editor::grab_key=, an =Option<String>= naming the
+Lisp function the next keystroke goes to, =take=n in =dispatch_key= beside ace's
+arm. Core draws nothing — the labels are ordinary =display= overlays and the
+renderer has never heard the word avy — and it resolves nothing either. **The key
+that is not a label arrives too**, spelled the way =key-bindings= spells one, and
+that is the whole of why cancelling is total rather than something the Lisp has
+to remember. A *function name* rather than a bool, at the same cost in bytes,
+because core is not the layer that knows what a label means; =which_key= and
+=completion= carry feature names because core *draws* those, and this draws
+nothing.
+
+*The ceiling was measured and it is not close.* The renderer walks the whole
+overlay =Vec= per drawn line, five times over — display substitutions, line style,
+runs, and the two fold questions. At 45 drawn lines one scan costs 0.03 ms per
+frame at 24 overlays, 0.09 ms at 1024, 0.33 ms at 4096 and 1.19 ms at 16384: flat
+noise until about a thousand, then linear at ≈7×10⁻⁵ ms per overlay per frame per
+scan. avy's whole frame is under a hundredth of a millisecond. It stays there
+because candidates are scoped to the *visible* region — =window-scroll= and
+=window-height= are already readers — and capped at =(length *avy-keys*)=, which is
+not an arbitrary cap: an unlabelled candidate is not a candidate. The interval
+tree =overlay.rs= owes is still owed, to something that labels a whole buffer.
+
+*Bound to =SPC j c=*, in the =SPC j= jump group beside =SPC j j=, and deliberately
+not to =/=. avy's own README suggests =/= and doom binds it; here =/= is search, in
+the editor and in the muscle memory of everyone arriving from vim, and taking it
+would mean rehoming search to buy a key avy does not need. Nothing was displaced.
+
+Policy is two =defparameter=s in the register =*ai-harnesses*= and =*bold-constructs*=
+are written in: =*avy-keys*= is the label alphabet *and* the cap, and =*avy-scope*=
+is =:word= or =:char=. Line starts are the third rule avy has and are deliberately
+not a third value — =avy-goto-line= reads no character at all, so it is a
+different gesture rather than this one's policy, and it is this file with the
+first =grab-key= taken out.
+
+=crates/lisp/tests/avy.rs= drives the chain against the shipped =init.lisp=: the
+binding reaching the module, =grab-key= landing in core, the keystroke coming back
+as =(avy-pick "b")= instead of moving back a word, one overlay per word start with
+its label as =display=, the second key landing on the *labelled* offset rather than
+the first, and three cancels — =Esc=, a letter that is no label, and a search with
+nothing on screen — each leaving zero overlays, point unmoved and the keyboard
+released.
+
+Left open, and named rather than built: nothing is on =*after-change-functions*=,
+so an edit arriving from outside the keyboard while the labels are up slides them
+(the two lines that fix it are in the file, declined for now because they put a
+hook on every edit forever to guard a window one keystroke wide). More candidates
+than letters are reported and unreachable rather than chunked into two-key
+labels, which =grab-key= would make easy — it is a third turn of the same state
+machine. And =screen= in the control harness renders raw rope lines with no
+overlays applied at all, so it cannot show a label, a fold or an org bullet; that
+is =control.rs='s ceiling rather than this feature's, and =display::line_cells= is
+the fix whenever it is worth one.
 ** DONE which-key
 =runtime/modes/which-key.lisp=, off =(key-bindings)= — a reader, so there is no
 shadow keymap to go stale. The one thing Lisp could not see was *that a prefix
@@ -459,9 +688,16 @@ prefix, never a wrong offset.
 
 Left open, and named rather than built: =hover= and =signatureHelp=, which are the
 same round trip and want a *transient paragraph* near point — neither the echo
-area nor a box you navigate. =textEdit= and snippets are declined in the
-capabilities so nothing arrives with =$1= in it. =isIncomplete= is ignored, so a
-server that truncated its answer is not asked again.
+area nor a box you navigate. The *paragraph* now exists: =Editor::tooltip= is
+exactly that surface, built for the diagnostic hover, and it wraps its own prose.
+What those two still need is the other half — a position, and the round trip. A
+=Tooltip= is anchored in pixels because a pointer has no offset; =hover= and
+=signatureHelp= are anchored at *point*, which does, so either they hand the
+renderer the caret the way the completion popup does (=point_popup= already flips
+the box above the caret when it will not fit below) or they are simply set from
+=self.caret=. Neither wants a new surface. =textEdit= and snippets are declined in
+the capabilities so nothing arrives with =$1= in it. =isIncomplete= is ignored, so
+a server that truncated its answer is not asked again.
 ** DONE orderless — space-separated matching
 The filter was subsequence-only. Now the query splits on spaces and every
 component has to match on its own, in any order, so =buffer switch= finds
@@ -527,12 +763,54 @@ in =docs/reference.org=.
 
 Left open: two-state rather than org's three (opening a headline opens
 everything under it), and =Window::scroll= is still a buffer line, so scrolling
-onto a folded line lands on the first drawn one after it.
-** TODO treesit-fold — fold by tree-sitter node rather than by indentation
-The Rust hole is done and so is the org policy; what is missing is a *reader*
-answering the syntax node at point, which is one arm of =query.rs= over the tree
-=crates/syntax= already has. Then =(push (cons "rust-mode" 'treesit-node-at-point)
-*fold-subtree-functions*)= and there is nothing else to write.
+onto a folded line lands on the first drawn one after it. That last one is the
+only face of the row-height ceiling still standing — a fold costs no row, an
+image buys several, and both are counted honestly now; what a *scroll position*
+cannot express is a row *inside* a line. It is deliberately not bundled with the
+image work: (line, row) is a change to =Window=, to every =EditorCommand= that
+writes a scroll, and to core's clamp, where counting the rows right was one
+function in the renderer.
+** DONE treesit-fold — fold by tree-sitter node rather than by indentation
+This entry predicted the shape wrong twice, and both mistakes were the same
+mistake: it assumed the reader would be told which language and which mode it
+was answering for.
+
+*Not an arm of =query.rs=.* =query.rs= lives in =zemacs-core=, and =zemacs-syntax=
+depends *on* core — so a reader that parses cannot go there without inverting the
+dependency, the same wall the =project-root= reader ran into further down this
+file. It went in =ask_here= in =crates/lisp/src/lib.rs= instead, beside
+=latex-fragments=, which had already paid for the route: the =%query= envelope is
+still a name and two integers answering a string, and Lisp cannot tell that the
+answer came from a different file.
+
+*And no =*fold-subtree-functions*= entry at all.* =(push (cons "rust-mode" …))=
+would have been one line per language forever. The parser is the *fallback*
+instead — a mode with no entry falls through to =tree-sitter-subtree-at-point= —
+so every grammar in the build folds and the alist stays down to org, which is in
+it because org has no grammar here and a headline is not a syntax node.
+
+=fold-ranges= answers every named node spanning more than one line, in **lines**
+(a fold hides whole lines, so asking in rows saves converting bytes to
+characters), outermost first. Picking among the nested ranges is the entire
+policy and it is two =loop=s in =runtime/modes/org-fold.lisp=: the last range
+covering point is the innermost, and a range starting after the previous one's
+end is a new top-level one. No =folds.scm=; the imprecision that buys is a =z a=
+landing on something smaller than you meant, never a wrong fold.
+
+The one bug this really had was in the word "line". A tree-sitter end position is
+where the cursor stops, not where the last character is, so a node that eats its
+own newline — every =line_comment= in tree-sitter-rust — ended at column 0 of the
+following row and looked two rows tall. =fold-all= on a commented file folded
+each comment over its neighbour. Found by folding =crates/core/src/marker.rs= in
+the running editor, not by a test: the ten-line =//!= header collapsed to five,
+and 134 ranges became 64 once =end_row= stopped counting a row nothing is
+written on.
+
+Left open: =fold-ranges= re-parses the whole buffer on each call while the
+highlighter next door is doing an incremental parse of the same text. It runs on
+the Lisp thread and nothing waits on it, so the ceiling is a big file and a
+held-down =z a=; the upgrade is reaching that =Session='s tree, which today lives
+on the worker thread with no way to ask it a second question.
 ** TODO org-roam (+ org-roam-ui)
 ** DONE org-modern bullets
 =runtime/modes/org-modern.lisp=, a minor mode on =display= overlays. Heading
@@ -701,9 +979,43 @@ which is one lock, one undo step and no gap. ~replace-all~ is exactly that.
 The table in ~docs/threading.org~ is the documentation this row wanted.
 
 * WIRING — built but not connected
-** TODO TRAMP into =find-file= / =save-file= / dired
-=crates/tramp= is finished and tested against a real sshd. =tramp::parse= is
-the hook: =None= means local, and it is a 5-byte prefix check.
+** DONE TRAMP into =find-file= / =save-file= / dired
+=(find-file "/ssh:user@host#2222:/etc/nginx.conf")= opens a buffer, =(save-file)=
+writes it back, =(dired "/ssh:host:/etc")= lists the directory, and =RET= on a
+line in that listing comes back round through =find-file=. A remote file that is
+not there yet opens empty and is created by the first save, which is the only
+way to make one. Proved end to end against a real =sshd=: read, edit, atomic
+write, create, list, =..= and =RET=.
+
+=tramp::parse= is the hook it said it was — =None= is every local name and costs
+one =memcmp= against =/ssh:= — so the routing is a branch in three functions:
+=open_file=, =save_file= and =Dired::refresh_keeping_line=. The listing converter
+is twenty lines into =dired::Entry=, and =dired::sort_entries= became =pub= so a
+directory does not read differently depending on which machine it is on.
+
+What it is *not* is synchronous. An ssh round trip is up to =tramp::TIMEOUT=
+against a host that has gone away, and the main thread holds the editor lock
+that every Lisp primitive waits on — so nothing touches the network on the call.
+=Remote= in =app/main.rs= owns =tramp::Worker=, =housekeep= polls it, and the
+effect lands several frames later instead of one. The thread is not spawned
+until the first =/ssh:= name of the session, so a user who never types one pays
+the =memcmp= and nothing else.
+
+The interesting half is what a remote buffer deliberately gives up, and
+[[file:docs/boundary.org][boundary.org]] carries it: auto-revert is off (the sweep is four =stat=s a second
+per open file), numbered backups are not taken (a whole transfer per save — the
+*tearing* promise survives, since the remote write is temp-then-=mv=), and the
+changed-on-disk save guard never fires. Auto-save is the one that stayed: the
+crash copy is local, under the usual mangled name, and it is offered back on the
+next open because the =stat= that opening does already carries the host's mtime.
+A buffer stays =modified= until the host confirms the write, which is the whole
+difference between "sent" and "written".
+
+Still open: a remote dired listing is read-only — =rename=, =copy=, =delete=,
+=x=, =+= and =C-c n= refuse by name rather than acting on a local path that
+happens to be spelled like a host. =tramp= has =rename=, =delete= and =mkdir=
+already, so that is three more turns of the same crank. No remote completion in
+the file prompt, and no symlink targets in a remote listing.
 ** TODO The rest of the Magit surface
 Library has =plan_last=/=plan_onto= (rebase todo composition), branch
 create/checkout/delete, cherry-pick, revert, reset variants, hunk discard.
@@ -789,9 +1101,68 @@ string, two integers. Adding a command is one =match= arm plus a one-line
 Remaining ceiling: the shim reads answers as a *base* string, so
 =(length (buffer-string))= counts bytes on a non-ASCII buffer.
 ** TODO Wave 2 — rewrite the app plugins as =runtime/plugins/*.lisp=
-=magit.rs=, =dired.rs=, =project.rs=, =term.rs= glue are ~1100 lines of pure
-policy over Rust primitives, none of it per-frame. Delete the Rust as each
-one lands.
+=runtime/plugins/project.lisp= is the first, and the survey that produced it says
+the entry above was wrong about the size of this and wrong about its shape.
+
+*The count.* The four files are 3094 lines, of which 935 are tests: 2159 lines of
+code, not 1100. But almost none of it is policy. Counting a line as policy when a
+config could plausibly want it different:
+
+| File        | Code | Policy | What the rest is                                          |
+|-------------+------+--------+-----------------------------------------------------------|
+| =magit.rs=    |  364 |    ~60 | one-line calls into =zemacs-git=, a line map, a face table  |
+| =dired.rs=    |  671 |    ~90 | the same over =zemacs-dired=, plus the whole TRAMP crank     |
+| =project.rs=  |  220 |    ~55 | a cached walk of the tree, and two prompts core seeds      |
+| =term.rs=     |  904 |    ~70 | PTYs, per-frame grid sync, key routing, session lifetime   |
+
+So ~275 lines of policy under 1900 lines of primitive, and the two are *braided*
+rather than stacked. Every verb table here reads like policy and is a dispatcher:
+=stage= is four lines that end in =git::stage_hunk=, =delete= is four that end in
+=dired::delete=. Rewriting the four lines in Lisp needs a primitive for the fifth,
+so the Rust grows by more than the Lisp saves. That is the house rule about a
+Lisp version being longer, and it fires on almost every arm in all four files.
+
+*What did move.* =project-root=, =project-dired=, =project-compile= and
+=project-test= — a climb of the directory tree and a table, once per command.
+=Marker::commands= in =crates/project= was a =match= saying =cargo build= for a
+=Cargo.toml=, so changing what =SPC p c= runs meant recompiling the editor; it is
+now =*project-builders*=, and a zig project is one =PUSH= in an init. That is the
+test this wave should sort by, and it is the only place in the four files where
+it came back yes.
+
+Deleted with it: =Project::build=/=test=/=build_marker=, =Marker::commands=,
+=Marker::label=, =project::Command=, =Term::send= (its one caller was
+=main.rs= typing =cargo build= into whatever shell was open) and four Rust tests,
+whose assertions are =crates/lisp/tests/project_plugin.rs=. The compile now opens
+an =output:= pane with the root as its working directory, the way =project-make=
+already did, instead of typing into a shell that could be anywhere.
+
+*What stays, with a reason each.*
+
+- =project-find-file= / =find-dir= / =forget= — a walk of the whole tree behind a
+  cache that has to answer between two keystrokes.
+- =project-switch= / =project-open= — both need a prompt *seeded* with candidates
+  core owns, and no primitive seeds one. Recorded in =docs/boundary.org=.
+- =magit= and =dired='s confirmation guards — and this is the finding worth
+  keeping. The guard is a funnel: three doors arrive as one =EditorCommand::Git=,
+  so one check covers all three. Move it into a Lisp =magit-rebase-abort= and
+  =(magit "rebase-abort")= walks past it, because that spelling is the command and
+  not the name. Keeping the property in Lisp needs core to *ask the image* on the
+  way through, i.e. every git verb blocking on a Lisp round trip, which is the one
+  thing =threading.org= promises never happens. A question that decides whether a
+  command runs is Rust's; a question whose answer is data is =read-string='s.
+- All of =term.rs= but the verb table, and all of =dired.rs='s remote half — a
+  PTY, a reader thread, an ssh worker and a per-frame grid are the definition of
+  the other side of the boundary.
+
+*What is left of this wave*, honestly stated: not much, and none of it is
+=*.lisp= files. =magit='s =commit_template= / =strip_comments= / =summarize= are
+real policy (~40 lines) but =commit-finish= reads the buffer and calls
+=git::commit= in one Rust breath, and splitting that needs a verb spelling that
+carries a message. =dired='s =mkdir= / =create-file= are reachable from Lisp today
+(=read-string= plus =ensure-directories-exist=) and would split dired's verbs
+across two homes for ~35 lines. Both are worth doing when something else forces
+the primitive; neither is worth doing for its own sake.
 ** TODO Wave 3 — the command loop and the evil grammar
 =evil.rs= is ~2400 lines of policy running once per keystroke, so it is
 affordable in Lisp and would make modal editing user-redefinable. It is also
@@ -832,7 +1203,7 @@ is finished.
 - [X] Dired
 - [X] Terminal — real PTY, scrollback, app-cursor keys, mouse reporting
 - [X] project.el equivalent
-- [X] TRAMP over SSH (library; wiring still open above)
+- [X] TRAMP over SSH — =find-file=, =save-file= and dired on =/ssh:host:/path=
 - [X] Custom mode hooks — major/minor modes with settings that revert, in Lisp
 - [X] Lisp reads *and* writes editor state, without blocking the command loop
 - [X] Markers, with all rope mutation funnelled through one =splice=
@@ -893,42 +1264,85 @@ is finished.
          burned and rotated. Code reads ~$OPENROUTER_API_KEY~ or
          ~~/.zemacs.d/openrouter-key~; no key is in a tracked file.
 
-** PAUSED zemacs-tutor — the split-pane redesign
+** DONE zemacs-tutor — the split-pane redesign, and the sweep is a test now
 
-   The first build (24 lessons, 69 exercises, child-~ecl~ sandbox for stage 1,
-   live image for stage 2) is complete and passing. The *redesign* to a
-   Codecademy-style layout — org instruction on the left, ~*tutor-lisp*~ on the
-   right, always opening at the table of contents — is substantially in:
-   ~tutor-contents~, ~tutor-next-exercise~, ~tutor-previous-exercise~,
-   ~tutor-open-at-point~, ~tutor-show-scratch~ and the ~split-window-right~
-   gesture all exist in ~runtime/modes/tutor.lisp~ (3357 lines).
+   The redesign is in and the sweep that was paused mid-flight no longer needs
+   anybody to remember it. Every exercise now carries an ~:answer~ beside its
+   ~:template~ — one answer that is right, never shown to the student — and
+   ~%tutor-audit~ runs the pair against the ~:check~: the answer must pass and
+   the template must not. ~crates/lisp/tests/tutor.rs~ calls it and insists on
+   NIL, so all 69 exercises are marked twice on every ~cargo test~.
 
-   - [ ] Stopped **during the stage-2 exercise sweep** — the check that every
-         exercise's reference answer passes *and* its shipped template fails.
-         That sweep is what caught seven real defects in the first build (two
-         templates that were the answer, a check satisfied by the wrong
-         function), so it is not optional. Re-run it over the new API.
-   - [ ] ~crates/lisp/tests/tutor.rs~ has been rewritten for the new shape
-         (~the_tutor_opens_two_panes_at_the_contents_and_marks_what_you_write~)
-         and passes; confirm it covers next/previous moving *both* panes.
+   - [X] The stage-2 exercise sweep, over the new API and the old. The reason it
+         is a test rather than a run is the reason it was paused half-done in the
+         first place: a sweep somebody runs by hand is a sweep that rots. It
+         costs about nine seconds — ninety child ~ecl~s at seventy milliseconds
+         each — which is cheap enough to run by default and was worth not hiding
+         behind ~#[ignore]~.
+   - [X] ~tutor.rs~ covers next/previous moving *both* panes. It covered ~next~
+         on both (selection, answer pane, point in the lesson) and ~previous~ on
+         the selection alone; the other two assertions are added. The directions
+         take different branches in ~%tutor-step~ when there is no selection to
+         count from, so -1 was never free.
+   - [X] Four lessons were teaching things that had stopped being true, all of
+         them prose the value-checks cannot see: the overlay lesson still said
+         *five* properties are drawn (it is twelve now — ~scale~, ~weight~,
+         ~slant~, ~line-background~, ~line-prefix~, ~gutter~ and ~help-echo~
+         since) and still described the framed answer areas the split-pane
+         redesign deleted; the modes lesson listed five claimable settings of
+         seven and pointed at a ~tutor-mode~ that no longer exists, the tutor
+         having become two minor modes; the commands lesson said "there is no
+         ~interactive~ declaration", which stopped being true the day
+         ~library.lisp~ grew one; and the M-x exercise sent the student to
+         ~init.lisp~ for ~refresh-commands~, which the config split had moved.
    - [ ] Stage 3 is still a deliberate one-screen placeholder.
+   - [ ] One order-dependence the sweep deliberately cannot see, marked
+         ~ponytail:~ beside ~%tutor-audit-run~: it puts the scratch buffer back
+         before every run, so it never meets ~readers~ 1, whose template answers
+         the whole buffer and is therefore right once ~writers~ 2 has left the
+         buffer one line long. Nobody working forwards meets it either.
 
-** Found while they ran — not theirs, not fixed                      :bug:
+** Found while they ran — not theirs, and now fixed                  :bug:
 
-   - [ ] **Non-ASCII does not survive Rust → Lisp.** ~(message "λ")~ from a
-         keybinding reaches the status line as ~Î»~: the form arrives as UTF-8
-         bytes, ECL's reader parses them as Latin-1, and ~dup_utf8~ re-encodes.
-         Loading a *file* is fine, which is why org's ~◉~ bullets are correct.
-         Reaches an accented answer to ~read-string~ and any path with a
-         non-ASCII component. **Not fixed on purpose**: Lisp deliberately holds
-         buffer text as UTF-8 *bytes* (~buffer-string~, ~%byte-index~,
-         ~%char-index~, ~search-forward~), so decoding eval'd source into real
-         character strings makes it incomparable with buffer text and breaks
-         every search — confirmed, ~(search-forward "γ" 0)~ returns NIL. The
-         coherent fix is moving the whole model to character strings and deleting
-         the two index conversions, which is the ceiling ~f_query~ in ~shim.c~
-         already writes up. A test asserting only "some character is non-ASCII"
-         passes on double-encoded text, which is how this hid.
+   - [X] **Non-ASCII does not survive Rust → Lisp.** ~(message "λ")~ from a
+         keybinding reached the status line as ~Î»~: the form arrived as UTF-8
+         bytes, ECL's reader parsed them as Latin-1, and ~dup_utf8~ re-encoded.
+         Loading a *file* was fine, which is why org's ~◉~ bullets were correct
+         and why this hid for so long. It reached an accented answer to
+         ~read-string~ and any path with a non-ASCII component.
+
+         The entry said it could not be fixed locally and that was right: Lisp
+         held buffer text as UTF-8 *bytes*, so decoding eval'd source alone makes
+         it incomparable with buffer text and ~(search-forward "γ" 0)~ answers
+         NIL — which is also what a search answers when it finds nothing, so the
+         breakage is silent. **Both halves moved together.**
+
+         ~utf8_string~ in ~shim.c~ decodes every string arriving from Rust —
+         ~f_query~, ~f_highlight~, ~f_json_quote~, ~zemacs_eval~,
+         ~zemacs_load_init~ — and ~dup_utf8~'s fast path narrowed from "a base
+         string" to "an *ASCII* base string", so ~(code-char 233)~ is encoded
+         rather than copied out as a byte that is not UTF-8. Above the shim,
+         **Lisp holds characters**: ~%byte-index~ and ~%char-index~ are deleted
+         along with their thirty-odd callers in ~lisp-mode.lisp~,
+         ~org-modern.lisp~, ~parinfer.lisp~ and ~lsp.lisp~; ~search-forward~ and
+         ~search-backward~ are a bare ~cl:search~; ~utf8-text~ is deleted along
+         with its callers in ~org-frozen.lisp~, ~math.lisp~, ~lsp.lisp~ and
+         ~rpc.lisp~; and ~(length (buffer-string))~ is ~(point-max)~.
+
+         ~crates/lisp/tests/utf8.rs~ was the test that pinned the bug in place —
+         it asserted the mojibake byte-exactly — and now asserts correctness just
+         as exactly, on both doors and on a ~search-forward~ that only passes if
+         they agree. ~crates/lisp/tests/eval.rs~ carried the "NOT asserted here,
+         because it is not true" note and now asserts it on the real config path.
+         Driven headless through ~scripts/zemacs_ctl.py~ as well: ~(message "λ")~
+         is one character, ~(search-forward "γ" 0)~ is 4, and a ~read-string~
+         answered ~café~ comes back four characters long.
+
+         Two things stayed byte-shaped and both are honest. ~lsp-path-uri~ /
+         ~lsp-uri-path~ count bytes because a percent-escape *names* a byte —
+         ECL's own ~ext:string-to-octets~ does the work. And a UTF-16 conversion
+         survives in ~lsp.lisp~ because LSP asks for one; everything that existed
+         only to undo the byte model, including ~%lsp-char-start~, is gone.
 
 * Landed since — org-frozen, and what the audit turned up            :done:
 
@@ -983,12 +1397,33 @@ is finished.
 
 ** Open — each needs a decision, not a patch                          :bug:
 
-   - [ ] **Inline images: `offset_at` and `visible_lines` do not count an image's
-         rows, `draw_document` does.** Click a line below a display equation and
-         point lands one or two lines high; scrolling clamps against a row count
-         larger than what is drawn. Closing it means handing core the overlay
-         list so it can lay a line out the way the renderer does — a
-         ~boundary.org~ decision.
+   - [X] **Inline images: `offset_at` and `visible_lines` do not count an image's
+         rows, `draw_document` does.** This was written down as a ~boundary.org~
+         decision — hand core the overlay list, or a cell width, or a per-line
+         row count — and it was none of them. **The boundary did not move.** All
+         four functions that spend a row are in ~crates/render~, and the one that
+         *draws* grew a line to hold its bitmap while the three that *count* did
+         not. The renderer disagreed with itself; core was reading the right
+         channel and being told the wrong number down it, because
+         ~viewport_lines~ is what ~visible_lines~ answers.
+
+         So: ~image_tall~ is the one function, asked by ~draw_document~,
+         ~line_rows~, ~visible_lines~ and ~offset_at~ alike. ~Editor::has_images~
+         (one ~is_empty~) keeps a session that has typeset nothing from paying
+         for the extra scan, and ~image~ joined ~reshapes_lines~ — without it a
+         *truncating* pane took the fast path and reported its full height
+         whatever was on screen.
+
+         Measured in the running editor over the control harness: a 68-line file
+         with one ~$$…$$~ in a 37-row pane. ~(window-height)~ answered 36 with
+         the fragment as source *and* 36 with it typeset, while drawing 34. It
+         answers 34 now, which is the number the last gutter line agrees with.
+
+         Left open, and named where it lives: the *cells* an image reserves are
+         still the renderer's alone (~ceil(width / cell_w)~), so core's
+         ~line_cells~ counts a fragment's source text and ~j~ onto a line with an
+         inline ~$x_1$~ lands off by the difference. That is the column half, and
+         it is the one that really does want a cell width parked on the ~Editor~.
    - [ ] **`(line-numbers-p)` is half a reader** — it answers the editor-wide
          default, but the gutter is now per buffer, so a mode asking "am I
          showing numbers?" gets the wrong answer on the no-gutter list. Decide
@@ -1010,11 +1445,14 @@ is finished.
          the sample, because a test that only asks "is some character non-ASCII"
          passes on double-encoded text.
 
-         Still raw, both deliberately, because each desynchronises a pair:
-         org link *targets* (decoding one without ~%org-heading-position~, which
-         matches ~[[*Heading]]~ against raw ~%org-lines~ text, breaks the match),
-         and ~math-src-block~'s ~:body~ (~math-code.lisp~ tangles it to a file,
-         so the fix changes that file's behaviour and its tests).
+         Two things were left raw, both deliberately, because each
+         desynchronised a pair: org link *targets* (decoding one without
+         ~%org-heading-position~, which matched ~[[*Heading]]~ against raw
+         ~%org-lines~ text, breaks the match), and ~math-src-block~'s ~:body~
+         (~math-code.lisp~ tangles it to a file). Both closed themselves when the
+         model moved to characters — there is no raw side left for either pair to
+         desynchronise from, and ~%math-code-write~'s ~:external-format :utf-8~
+         went from double-encoding a body to spelling it correctly.
    - [ ] ~prune_images~ is not called after an edit that kills an overlay, so an
          image whose text was deleted lingers until the next explicit overlay
          delete. Bounded in practice, not unbounded. Needs a policy on where the

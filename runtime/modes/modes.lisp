@@ -40,103 +40,22 @@
 (in-package :zemacs)
 
 ;;; ---------------------------------------------------------------------------
-;;; Text out of a buffer
-;;;
-;;; Nothing whatever to do with modes, and here anyway, because *every mode*
-;;; needs it and this is the earliest file every mode already loads:
-;;; `define-derived-mode' lives below, so a mode file that had not loaded this
-;;; one could not have declared itself in the first place. `init.lisp' pulls it
-;;; in above `gui.lisp' and above every file in this directory, and the mode
-;;; tests in `crates/lisp/tests/' each load it as their first line, so a decoder
-;;; defined here is in scope in both places without anything having to be
-;;; arranged.
-;;;
-;;; There were two copies before this one — `%org-frozen-text' in
-;;; `org-frozen.lisp' and `utf8-text' in `gui.lisp', the same body written twice
-;;; because each file needed it before the other could be depended on — and two
-;;; more modes wanted a third. Rejected homes, both of which look right:
-;;;
-;;;   `gui.lisp'   loads early enough, and is where the surviving copy was. But
-;;;                it is the *scene* API, and `org-modern.lisp' draws overlays on
-;;;                the cell grid and builds no scene at all; making it depend on
-;;;                the page builders for a decoder it needs for text is a
-;;;                dependency pointing the wrong way. `init.lisp' also loads that
-;;;                file inside a HANDLER-CASE, so a machine that could not build
-;;;                a page would silently lose the ability to read its own buffer.
-;;;   `init.lisp'  loads first of all, and is the config — which is exactly the
-;;;                problem: half the tests here load a mode file against a bare
-;;;                image and never read a config at all.
-
-(defun utf8-text (bytes)
-  "BYTES — buffer text, one character per UTF-8 byte — as the characters it
-actually spells.
-
-`(buffer-string)', `(line-string 3)', `(buffer-substring beg end)' and every
-other reader answer a `(SIMPLE-ARRAY CHARACTER)' in which `—' is *three*
-characters, each under 256. That is the model `f_query' in
-`crates/lisp/src/shim.c' writes up, and it is what makes `search-forward'
-compare a pattern against buffer text and what `%byte-index' and `%char-index'
-convert between. Going the other way, `dup_utf8' encodes a *character* string,
-one UTF-8 sequence per character — right for a literal a `load'ed file gave it,
-and exactly wrong for text that came out of a buffer: three already-encoded
-bytes go back as six, and an em dash is drawn as the Latin-1 reading of its own
-encoding. So decode anything the buffer gave you before handing it back, whether
-that is to `run', to `message', to an overlay's `display' or to `insert'.
-
-**In Lisp and not in Rust**, and that is the part to read before improving it.
-Decoding eval'd source in the shim makes those strings incomparable with buffer
-text and breaks every search — `(search-forward \"γ\" 0)' then answers NIL, which
-was measured and not guessed. Making the model coherent means moving buffer text
-to characters as well and deleting the two index conversions, which is the
-ceiling `f_query' already writes up and is a change to the boundary rather than a
-repair to a caller. Until somebody makes it, this is the repair, and it belongs
-at the *edge*: one call where text leaves the buffer, and characters everywhere
-above it.
-
-ASCII is returned unchanged and untouched — the same object, not a copy — which
-is both the fast path and the common one: a document with no accent in it never
-allocates here.
-
-An invalid or truncated sequence is passed through one character at a time
-rather than replaced or dropped. What reads this is a renderer, and text it
-cannot make sense of should still be visible, because the alternative is a page
-that silently disagrees with the file behind it."
-  (let ((n (length bytes)))
-    (if (every (lambda (c) (< (char-code c) 128)) bytes)
-        bytes
-        (with-output-to-string (out)
-          (let ((i 0))
-            (loop while (< i n)
-                  do (let* ((b (char-code (char bytes i)))
-                            (len (cond ((< b #x80) 1)
-                                       ((< b #xC0) 0) ; a stray continuation byte
-                                       ((< b #xE0) 2)
-                                       ((< b #xF0) 3)
-                                       (t 4)))
-                            (code (cond ((< b #x80) b)
-                                        ((< b #xE0) (logand b #x1F))
-                                        ((< b #xF0) (logand b #x0F))
-                                        (t (logand b #x07)))))
-                       (cond
-                         ((or (zerop len) (> (+ i len) n))
-                          (write-char (char bytes i) out)
-                          (incf i))
-                         (t
-                          (loop for k from 1 below len
-                                do (setf code
-                                         (logior (ash code 6)
-                                                 (logand (char-code (char bytes (+ i k)))
-                                                         #x3F))))
-                          (write-char (code-char code) out)
-                          (incf i len))))))))))
-
-;;; ---------------------------------------------------------------------------
 ;;; Splitting a string, and running a program
 ;;;
-;;; Here for exactly the reason `utf8-text' is above, and worth spelling out
-;;; once rather than three times: these are not about modes, they are about
-;;; things several modes each need, and this is the earliest file every one of
-;;; them already loads.
+;;; Not about modes, and here anyway, because several modes each need them and
+;;; this is the earliest file every one of them already loads:
+;;; `define-derived-mode' lives below, so a mode file that had not loaded this
+;;; one could not have declared itself in the first place. `library.lisp' pulls
+;;; it in at its very top — above `gui.lisp' and above every file in this
+;;; directory — and the mode tests in `crates/lisp/tests/' each load it as their
+;;; first line, so a helper defined here is in scope in both places without
+;;; anything having to be arranged.
+;;;
+;;; `utf8-text' used to head this section, for exactly that reason: buffer text
+;;; arrived as UTF-8 *bytes* and every mode had to decode it before handing any
+;;; of it back. It is gone — `f_query' in `crates/lisp/src/shim.c' decodes now,
+;;; once, for everybody — and with it the whole class of bug where one mode
+;;; remembered and another did not.
 ;;;
 ;;; What they replace is the copy per file. `split-string' was written out twice
 ;;; — `%lsp-split' and `%ai-split', identical down to the docstring.
@@ -199,7 +118,7 @@ that wrote to both, and each caller here knows its program does not: curl's
 is really bounding — nothing else in the image is evaluated meanwhile. A
 program that can take minutes wants `:wait nil' and a poll on
 `*point-moved-functions*' instead, which is why `project-clone-poll' in
-`init.lisp' and `math-code-build-poll' in `math-code.lisp' are deliberately
+`library.lisp' and `math-code-build-poll' in `math-code.lisp' are deliberately
 *not* written in terms of this: a clone or a venv build would stall every
 keystroke's `after-change-hook' for its whole length."
   (handler-case
@@ -313,7 +232,12 @@ it does in Emacs, and passing OF makes it a question about a mode you name."
     (relative-line-numbers set-relative-line-numbers nil)
     (tab-width             set-tab-width             4)
     (text-width            set-text-width            0)
-    (font-size             set-font-size             18))
+    (font-size             set-font-size             18)
+    ;; T because the editor starts with it on — see `Settings::scroll_past_end'.
+    ;; Claimable like any other, which is what a mode showing a *generated*
+    ;; document in an ordinary buffer wants: core exempts the generated *kinds*
+    ;; on its own, and a listing rendered into a plain buffer is not one of them.
+    (scroll-past-end       set-scroll-past-end       t))
   "The settings a mode may claim: (NAME PRIMITIVE DEFAULT). DEFAULT is what the
 editor itself starts with, and is where a setting lands when a mode releases it
 and nothing has ever set it globally.")
@@ -413,12 +337,13 @@ is measured against. DEFVAR: a config reload must not forget where we are.")
   "The body of every `X-hook' this file generates: NAME has just become the
 major mode of the live buffer.
 
-ponytail: switching *buffers* does not go through here, because the editor
-reports no hook for it — so the settings on screen follow the last mode
-*entered* rather than the buffer you are looking at. Two buffers in the same
-mode, or opening a file, are both fine; flipping between an org buffer and a
-rust one with C-M-j is not. The fix is a hook on the buffer switch, which is a
-line in core, not a line here."
+This function owns *entering* a mode: the departing mode's exit hook, the
+bodies, the auto-mode dispatch, and the claims that come with them. Switching
+buffers enters no mode — the buffer was already in the one it is in, and its
+body ran when it got there — so that half is `buffer-switch-hook' below, which
+re-resolves the claims and does nothing else. Between them the editor's two
+reports about which mode's settings should be on screen are covered, and
+neither fires for the other's event."
   (let ((previous *major-mode*))
     (unless (equal previous name)
       ;; Recorded before the exit hook runs, so a hook that switches modes
@@ -621,18 +546,20 @@ binds in its buffers only, and minor modes are consulted before the major one."
        ,mode)))
 
 ;;; ---------------------------------------------------------------------------
-;;; The two things the editor reports about a buffer
+;;; The three things the editor reports about a buffer
 ;;;
 ;;; `after-change-hook' says the *document* moved — you typed, or Lisp wrote
 ;;; into the buffer. `point-moved-hook' says *point* did — you pressed `j', or
-;;; `w', or clicked, or switched buffers. The application queues them the same
-;;; way, through `pending_hooks' and behind the same `fboundp' guard, so an
-;;; image that defines neither pays nothing for either.
+;;; `w', or clicked. `buffer-switch-hook' says a *different buffer* is on screen
+;;; — the switcher, a split you moved focus into, a file you opened that was
+;;; already open. The application queues all three the same way, through
+;;; `pending_hooks' and behind the same `fboundp' guard, so an image that defines
+;;; none of them pays nothing for any.
 ;;;
 ;;; Both live here, and the first of them only arrived on the second attempt.
 ;;; `after-change-hook' was declared in `lsp.lisp' because the LSP client was
 ;;; the only thing that wanted it, and by the time `org-modern.lisp',
-;;; `show-paren.lisp', `org-frozen.lisp', `math-code.lisp' and `init.lisp'
+;;; `show-paren.lisp', `org-frozen.lisp', `math-code.lisp' and `org-latex.lisp'
 ;;; wanted it too there were *two* copies of the dispatcher — the second one
 ;;; wrapped in `(unless (fboundp ...))' so that whichever file loaded first won
 ;;; — and a defensive DEFVAR in every file that pushed onto either list. That is
@@ -655,8 +582,11 @@ binds in its buffers only, and minor modes are consulted before the major one."
 (defvar *point-moved-functions* nil
   "Functions called with no arguments after point moves in the live buffer.")
 
-;;; IGNORE-ERRORS per function, in both: one config's broken hook must cost you
-;;; that hook rather than the next one in the list, and must not turn every
+(defvar *buffer-switch-functions* nil
+  "Functions called with no arguments after the buffer on screen changes.")
+
+;;; IGNORE-ERRORS per function, in all three: one config's broken hook must cost
+;;; you that hook rather than the next one in the list, and must not turn every
 ;;; keystroke into a backtrace.
 
 (unless (fboundp 'after-change-hook)
@@ -666,6 +596,35 @@ binds in its buffers only, and minor modes are consulted before the major one."
 (unless (fboundp 'point-moved-hook)
   (defun point-moved-hook ()
     (dolist (f *point-moved-functions*) (ignore-errors (funcall f)))))
+
+(unless (fboundp 'buffer-switch-hook)
+  (defun buffer-switch-hook ()
+    "The other half of `%enter-major-mode', and the whole of what a buffer
+switch has to do: the settings a mode claims are global in the editor, so the
+mode of the buffer you are now looking at is the one they must be resolved
+from. Before this hook existed they followed the last mode *entered*, and
+visiting a single `.rs' file cost every org buffer its wrapping and its measure
+for the rest of the session.
+
+Two lines because `%effective-setting' already recomputes from the bottom up
+and `minor-modes' already answers from the live buffer — the only thing that
+was ever stale is `*major-mode*', and the only thing needed is the truth.
+
+No exit hook and no mode bodies, unlike an entry, and that is the decision
+rather than an omission: a switch enters no mode. The buffer was already in the
+mode it is in and its body ran when it got there, so re-running it would fire
+`org-mode-exit-hook' every time you glanced at another file and would re-do
+each mode's entry work per glance. `%enter-major-mode' still owns all of that
+and still fires when a buffer's mode actually changes underneath you.
+
+Rejected: hanging the resync on `*point-moved-functions*', which the editor
+already runs on a buffer switch. It runs on every keystroke as well — the one
+thing the list above says not to do — and it is driven by point *moving*, so
+two buffers whose cursors sit at the same offset would switch between each
+other in silence."
+    (setf *major-mode* (%mode-name (major-mode)))
+    (%refresh-settings)
+    (dolist (f *buffer-switch-functions*) (ignore-errors (funcall f)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The modes we ship live next door.

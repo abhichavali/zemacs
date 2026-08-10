@@ -1,6 +1,6 @@
 //! Headless proof of `runtime/modes/tutor.lisp` — the two-pane tutorial.
 //!
-//! Four claims, and none can be checked without running the real image against
+//! Five claims, and none can be checked without running the real image against
 //! a real [`Editor`]:
 //!
 //! 1. the file **loads out of the shipped config** and the lesson data is
@@ -34,8 +34,14 @@ use zemacs_core::{Editor, Shared};
 
 const PATIENCE: Duration = Duration::from_secs(30);
 
-fn wait<T>(shared: &Shared, what: &str, f: impl Fn(&Editor) -> Option<T>) -> T {
-    let deadline = Instant::now() + PATIENCE;
+/// The exercise sweep is the one assertion here whose *success* takes seconds:
+/// it marks 69 exercises twice over and ninety of those are a `fork`+`exec` of
+/// `ecl`. Given a deadline of its own rather than raising everybody's, so that a
+/// genuinely stuck assertion elsewhere still reports in thirty.
+const AUDIT_PATIENCE: Duration = Duration::from_secs(180);
+
+fn wait<T>(shared: &Shared, patience: Duration, what: &str, f: impl Fn(&Editor) -> Option<T>) -> T {
+    let deadline = Instant::now() + patience;
     loop {
         if let Some(v) = f(&shared.lock().unwrap()) {
             return v;
@@ -50,7 +56,7 @@ fn wait<T>(shared: &Shared, what: &str, f: impl Fn(&Editor) -> Option<T>) -> T {
 }
 
 fn wait_message(shared: &Shared, what: &str, pred: impl Fn(&str) -> bool) {
-    wait(shared, what, |ed| ed.messages.iter().any(|m| pred(m)).then_some(()));
+    wait(shared, PATIENCE, what, |ed| ed.messages.iter().any(|m| pred(m)).then_some(()));
 }
 
 /// Stand in for the application's main loop: hand every pending mode hook to
@@ -182,7 +188,7 @@ fn the_tutor_opens_two_panes_at_the_contents_and_marks_what_you_write() {
     // The pane is *org-mode*, not a bespoke mode of the tutor's own — that is
     // the whole presentation, and everything that makes the lesson look right
     // hangs off it.
-    wait(&shared, "the instruction pane to be an org buffer", |ed| {
+    wait(&shared, PATIENCE, "the instruction pane to be an org buffer", |ed| {
         (ed.buffer.major_mode == "org-mode").then_some(())
     });
     says(&shared, &lisp, "minor", "(and (minor-mode-p 'tutor-lesson) t)", "T");
@@ -265,8 +271,29 @@ fn the_tutor_opens_two_panes_at_the_contents_and_marks_what_you_write() {
         "(and (search \"Exercise 2\" (line-string)) t)",
         "T",
     );
+    // ...and previous is asserted on all three the same way, rather than on the
+    // selection alone. `%tutor-step' is one function taking a delta, so it is
+    // tempting to believe -1 for free — but the two directions take *different*
+    // branches when there is no selection to count from, and a `previous' that
+    // moved the selection and left the answer pane on the exercise after it is
+    // exactly the bug this layout can have and a one-pane tutor could not.
     lisp.eval("(tutor-previous-exercise)".into());
     says(&shared, &lisp, "prev", "*tutor-current*", "(cl reader 0)");
+    says(
+        &shared,
+        &lisp,
+        "prev-template",
+        "(let ((a (%tutor-read-answer)))
+           (and (search \"(+ 1 2)\" a) (not (search \"(1 2 3)\" a)) t))",
+        "T",
+    );
+    says(
+        &shared,
+        &lisp,
+        "prev-point",
+        "(and (search \"Exercise 1\" (line-string)) t)",
+        "T",
+    );
 
     // --- claim 4: a right answer passes, a wrong one does not ---------------
     //
@@ -369,7 +396,7 @@ fn the_tutor_opens_two_panes_at_the_contents_and_marks_what_you_write() {
     wait_message(&shared, "the live-image answer to pass", |m| {
         m.contains("exercise 3 passed")
     });
-    wait(&shared, "the editor to have actually resized", |ed| {
+    wait(&shared, PATIENCE, "the editor to have actually resized", |ed| {
         (ed.settings.font_size == 30.0).then_some(())
     });
     lisp.eval("(set-font-size 22)".into());
@@ -401,6 +428,30 @@ fn the_tutor_opens_two_panes_at_the_contents_and_marks_what_you_write() {
         &format!("(and (search \"placeholder\" {LESSON_TEXT}) t)"),
         "T",
     );
+
+    // --- every exercise, both ways ------------------------------------------
+    //
+    // The claim above is about the *machinery*: three exercises prove that a
+    // right answer passes and a wrong one does not. This is about the sixty-nine
+    // lessons, and it is a different claim — that each one's reference answer
+    // still passes its own check, and each one's shipped template still fails
+    // it. The first half catches a lesson teaching an API the editor has moved
+    // on from; the second catches an exercise that hands itself in, which the
+    // first build of the file shipped twice.
+    //
+    // Last, and deliberately: the sweep runs Stage 2 for real, so by the time it
+    // finishes the editor has a font size of 30, four new key bindings and a
+    // mode called `tutor-demo-mode'. Anything asserted after it would be
+    // asserting about an editor the sweep had rearranged.
+    //
+    // `%tutor-audit' answers a list of complaints, so the failure message *is*
+    // the list of what is wrong — with `stage/lesson/N' on the front of each, N
+    // counted from one the way the status line counts it.
+    lisp.eval("(message (format nil \"audit= ~a\" (%tutor-audit)))".into());
+    let complaints = wait(&shared, AUDIT_PATIENCE, "the exercise sweep", |ed| {
+        ed.messages.iter().find_map(|m| m.strip_prefix("audit= ")).map(str::to_owned)
+    });
+    assert_eq!(complaints, "NIL", "the exercise sweep is not happy");
 
     let _ = std::fs::remove_file(&progress);
 }

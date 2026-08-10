@@ -244,6 +244,7 @@ pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
         "text-width" => ed.settings.text_width.to_string(),
         "line-numbers-p" => boolean(ed.settings.line_numbers),
         "relative-line-numbers-p" => boolean(ed.settings.relative_line_numbers),
+        "scroll-past-end-p" => boolean(ed.settings.scroll_past_end),
         "modeline-relief" => ed.settings.modeline_relief.to_string(),
         "modeline-pad" => ed.settings.modeline_pad.to_string(),
         "line-overflow" => string(match ed.settings.line_overflow {

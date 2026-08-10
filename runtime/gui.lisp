@@ -36,17 +36,16 @@
 ;;;; program computed — `(apply #'block :pad 48 (mapcar #'%paragraph lines))' —
 ;;;; and a macro would have made the one case that matters the awkward one.
 ;;;;
-;;;; ** Strings are characters here, not bytes
+;;;; ** Strings are characters, everywhere, and nothing here has to arrange it
 ;;;;
-;;;; The one sharp edge, and it will cut the first document with an em dash in
-;;;; it. Lisp holds buffer text as UTF-8 *bytes*, one character per byte — that
-;;;; is what `f_query' in `shim.c' writes up and what makes `search-forward'
-;;;; work — while the encoder that carries this file's output back to Rust
-;;;; encodes each character as UTF-8. Hand it bytes and they are encoded twice:
-;;;; `—' arrives as `â€"' and the page is wrong in a way no assertion about the
-;;;; tree would notice. So decode buffer text with `utf8-text' before it goes
-;;;; into a `run'. A literal in a file you `load'ed is already characters and
-;;;; needs nothing.
+;;;; This was the one sharp edge in the file, and it is worth knowing what it
+;;;; was. Lisp held buffer text as UTF-8 *bytes*, one character per byte, while
+;;;; the encoder carrying this file's output back to Rust encoded each character
+;;;; as UTF-8 — so text taken out of a buffer and put into a `run' was encoded
+;;;; twice, `—' arrived as `â€"', and the page was wrong in a way no assertion
+;;;; about the tree would have noticed. Every caller had to remember to decode.
+;;;; The shim decodes now (`crates/lisp/src/shim.c'), a buffer answers
+;;;; characters, and a `run' takes whatever the document says.
 ;;;;
 ;;;; ** A click is an integer
 ;;;;
@@ -294,8 +293,8 @@ everywhere. On a machine with no proportional font at all the page comes out in
 the coding font — worse looking, entirely legible, and never a page that will
 not draw.
 
-STRING must be *characters*. If it came out of the buffer it is bytes — see
-`utf8-text'."
+STRING is measured and drawn one character at a time, which is what every
+string in the image now is — buffer text included."
   (%scene-form "run"
                '(:size %scene-int :bold %scene-bool :italic %scene-bool
                  :family %scene-word :face %scene-face :tag %scene-tag-id)
@@ -344,16 +343,6 @@ paints nothing and is a spacer."
 Of the parent's *content* box — inside its padding — so a child at `(pct 100)'
 fills the room its parent left it and does not overhang."
   (format nil "(pct ~d)" (round n)))
-
-;;; ---------------------------------------------------------------------------
-;;; Text out of a buffer
-;;;
-;;; `utf8-text' was written out here, and again in `modes/org-frozen.lisp' — one
-;;; decoder spelled twice, agreeing by luck. It is in `modes/modes.lisp' now,
-;;; which `init.lisp' loads above this file and which every mode loads anyway.
-;;; Nothing in *this* file calls it, so the move costs this file no dependency at
-;;; all; it is the callers above — the ones putting buffer text in a `run' — that
-;;; need it in scope, and they all sit below both files.
 
 ;;; ---------------------------------------------------------------------------
 ;;; What a click means

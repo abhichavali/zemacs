@@ -207,20 +207,21 @@ wants its =(in-package :zemacs)= at the top for its own sake.
 
 * Text encoding
 
-Every offset in the API — =(point)=, =(region)=, =buffer-substring=, =goto-char=,
-=search-forward= — is a *character* index. Those are always consistent with each
-other and with the editor, so arithmetic on them is safe.
+**Lisp holds characters.** =λ= is one Lisp character whether it arrived in a
+=load=ed file, in a form the editor queued for evaluation, or in the answer to
+=(buffer-string)=. UTF-8 exists only in the =char *= between the two languages:
+=utf8_string= in =crates/lisp/src/shim.c= decodes everything arriving from Rust
+and =dup_utf8= encodes everything going back, and nothing in =runtime/= knows it
+is there.
 
-What is not safe is =cl:length= of buffer text. Strings cross the C boundary as
-UTF-8 bytes in an ECL *base* string, so:
+So there is one unit and no conversions. Every offset in the API — =(point)=,
+=(region)=, =buffer-substring=, =goto-char=, =search-forward= — is a character
+index; =(length (buffer-string))= is =(point-max)=; and a non-ASCII literal
+written in a config, typed into =M-x=, or bound to a key matches non-ASCII buffer
+text, because both are the same kind of string.
 
-- round-trips are byte-exact: text read out and written back is unchanged,
-  emoji included;
-- but =(length (buffer-string))= counts *bytes* on a non-ASCII buffer. Use
-  =(point-max)= for the character count;
-- and a non-ASCII *literal in a =load=ed file* is an extended string, which will
-  not match non-ASCII buffer text. =(search-forward "café")= from =init.lisp= finds
-  nothing in a buffer that contains =café=. ASCII patterns are unaffected.
-
-This is a documented shortcut with a named upgrade path, not an oversight: see
-[[file:boundary.org][boundary.org]].
+It was bytes until recently, and the failure that ended it is worth knowing
+because it was invisible: ECL's reader parses a byte string as Latin-1, so
+=(message "λ")= from a keybinding reached the status line as =Î»= while the same
+form in a =load=ed file was fine. See "The shim returns bytes, not characters" in
+[[file:boundary.org][boundary.org]] for why both halves had to move at once.

@@ -173,15 +173,21 @@ fn lisp_editing_and_the_repl_are_built_in_lisp() {
 
     // --- M-x annotations -----------------------------------------------------
     //
-    // The candidate carries its docstring and its key inside a Lisp block
-    // comment, which is why core needs to know nothing about a second column:
-    // `(demo-command #| ... |#)` is still a call to `demo-command`.
+    // The candidate carries the first line of its docstring and, in
+    // parentheses, the key that runs it. Plain prose, not the Lisp block
+    // comment this used to hide inside: core takes the command to be the first
+    // word of the row (see `Prompt::submitted`), so the rest is free to be
+    // read rather than parsed.
     let candidate = wait(&shared, "an annotated M-x candidate", |ed| {
         ed.commands.iter().find(|c| c.starts_with("demo-command")).cloned()
     });
     assert!(
-        candidate.contains("#| Do the demo thing.   SPC x d |#"),
-        "the annotation is doc then key: {candidate:?}"
+        candidate.contains("Do the demo thing. (SPC x d)"),
+        "the annotation is doc then key in parens: {candidate:?}"
+    );
+    assert!(
+        !candidate.contains("#|") && !candidate.contains("|#"),
+        "no block comment on screen: {candidate:?}"
     );
 
     // --- structure -----------------------------------------------------------

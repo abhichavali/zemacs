@@ -31,6 +31,18 @@ use zemacs_term::{Command, Input, Mouse, Screen, Terminal};
 /// Replaced on the first frame; the child only sees the real size.
 const INITIAL: (usize, usize) = (80, 24);
 
+/// How a `run:`-family verb starts a child, which is the whole of what the
+/// three spellings differ by.
+#[derive(Clone, Copy, PartialEq)]
+enum Start {
+    /// A fresh session every press. Two agents side by side is the point.
+    New,
+    /// Replace the session of that name. A program is a thing you run *again*.
+    Reuse,
+    /// One command's output, in a pane, with the editor keeping the keyboard.
+    Output,
+}
+
 /// One live child and the buffer showing it.
 struct Session {
     /// The handle everything routes by. A buffer that has been killed is how a
@@ -49,17 +61,30 @@ struct Session {
     /// than per app: stepping out of one agent to yank a path must not stop the
     /// other one from printing.
     frozen: bool,
+    /// A compilation pane rather than a session you talk to: the output of one
+    /// command, which the editor never hands the keyboard to and therefore
+    /// never freezes. `q` closes the window over it — see `terminal-output-mode`
+    /// in `runtime/init.lisp`, which is the keymap this flag exists to select.
+    output: bool,
 }
 
 #[derive(Default)]
 pub struct Term {
     sessions: Vec<Session>,
+    /// The `:!` commands still running, each waiting to deliver its one line.
+    /// Not a [`Session`]: a session is a PTY and a buffer, and the whole point
+    /// of the bang is that it leaves neither behind — see [`Term::shell`].
+    bangs: Vec<std::sync::mpsc::Receiver<String>>,
 }
 
 impl Term {
     /// True while any session is alive, so the app knows to pump them.
+    ///
+    /// A running bang counts, and that is the only reason `housekeep` needs no
+    /// line of its own: it already polls on this answer, so a bang with no
+    /// session beside it still gets `sync` called until it has reported.
     pub fn is_live(&self) -> bool {
-        !self.sessions.is_empty()
+        !self.sessions.is_empty() || !self.bangs.is_empty()
     }
 
     /// Every session's buffer, so the app can measure the pane each one is
@@ -91,7 +116,7 @@ impl Term {
             // session if there is one, start it if there is not.
             "open" => self.open(editor),
             // Always a fresh one, however many are already running.
-            "new" => self.spawn(editor, "*terminal*", None, true),
+            "new" => self.spawn(editor, "*terminal*", None, Start::New),
             "close" => self.close(editor),
             "restart" => self.restart(editor),
             "next" => self.cycle(editor, 1),
@@ -115,14 +140,19 @@ impl Term {
             // you run *again*: edit, run, read, edit, and a session per press
             // would pile up dead children in the switcher within a minute, all
             // but the last finished and none named distinguishably.
+            // `output:` is `rerun:` with the keyboard kept: a build is
+            // something you *read*, not something you type at, so the pane
+            // opens beside what you were working on and `q` dismisses it.
             other => match (
                 other.strip_prefix("run:"),
                 other.strip_prefix("rerun:"),
+                other.strip_prefix("output:"),
                 other.strip_prefix("shell:"),
             ) {
-                (Some(rest), _, _) => self.run_harness(editor, rest, false),
-                (_, Some(rest), _) => self.run_harness(editor, rest, true),
-                (_, _, Some(line)) => self.shell(editor, line),
+                (Some(rest), ..) => self.run_harness(editor, rest, Start::New),
+                (_, Some(rest), ..) => self.run_harness(editor, rest, Start::Reuse),
+                (_, _, Some(rest), _) => self.run_harness(editor, rest, Start::Output),
+                (.., Some(line)) => self.shell(editor, line),
                 _ => editor.apply(EditorCommand::Message(format!(
                     "unknown terminal verb: {other}"
                 ))),
@@ -138,7 +168,7 @@ impl Term {
     /// it, and quoting is a fifteen-line function against a new `EditorCommand`
     /// variant and a new envelope. Nothing is *executed* by a shell; the quotes
     /// only decide where one argument ends and the next begins.
-    fn run_harness(&mut self, editor: &mut Editor, rest: &str, reuse: bool) {
+    fn run_harness(&mut self, editor: &mut Editor, rest: &str, start: Start) {
         let Some((name, line)) = rest.split_once(':') else {
             editor.apply(EditorCommand::Message(format!(
                 "terminal: run needs NAME:COMMAND, got {rest:?}"
@@ -155,30 +185,117 @@ impl Term {
         let command = Command::new(program, words.collect());
         let buffer = format!("*{name}*");
 
+        let existing = self.sessions.iter().position(|s| s.name == buffer);
+
+        // The pane is the whole point of `output:`: a build you have to switch
+        // buffers to read is a build you do not read. Split only when this
+        // output is not already on screen — pressing the key twice must not
+        // keep halving the frame, and a pane dismissed with `q` has to come
+        // back in one of its own rather than taking over whatever you moved on
+        // to reading.
+        if start == Start::Output {
+            let onscreen = existing.is_some_and(|i| {
+                let id = self.sessions[i].buffer;
+                (editor.frames.iter()).any(|f| f.windows.iter().any(|w| w.buffer == id))
+            });
+            if !onscreen {
+                editor.apply(EditorCommand::SplitWindow(
+                    zemacs_core::frame::Split::Columns,
+                ));
+            }
+        }
+
         // The command is rewritten before restarting rather than reusing the
         // stored one, because this is a *run*, not the resume `restart` was
         // written for: the script it points at may have been regenerated, and
         // re-running the previous command would silently execute the old one.
-        if reuse {
-            if let Some(i) = self.sessions.iter().position(|s| s.name == buffer) {
+        if start != Start::New {
+            if let Some(i) = existing {
                 self.show(editor, i);
                 self.sessions[i].inner.set_command(command);
                 self.restart(editor);
                 return;
             }
         }
-        self.spawn(editor, &buffer, Some(command), true);
+        self.spawn(editor, &buffer, Some(command), start);
     }
 
     /// `shell:COMMAND` — what evil's `:!cmd` becomes.
     ///
-    /// Typed at the shell rather than spawned, which is the same trade the
-    /// project's `compile` verb makes and for the same reason: a [`Command`]
-    /// here is word-split by [`words`] and never runs a pipeline, while the
-    /// child already has a terminal to print into and a cwd you chose.
+    /// Run and *reported*, not opened. `:!` is a thing you want done — `git add
+    /// -A`, `make`, `chmod +x` — and leaving a terminal buffer behind for each
+    /// one is how the buffer list becomes something you stop reading. The shell
+    /// is still one keystroke away when the command is a thing you want to sit
+    /// in front of; this is for the other kind.
+    ///
+    /// Through `$SHELL -c` rather than [`Command`], which is word-split by
+    /// [`words`] and never runs a pipeline: `:!sed s/a/b/ < in | wc -l` is a
+    /// *shell line*, and the whole point of the bang is that it is.
+    ///
+    /// A thread and a channel rather than a `try_wait` loop over the child,
+    /// because the output is wanted: an unread pipe fills at about 64k and the
+    /// command then blocks forever waiting for a reader that is busy drawing
+    /// frames. `wait_with_output` already reads both pipes correctly, so the
+    /// laziest way to have it is to let it block somewhere that is not here.
+    ///
+    /// Fired again while one is running, both run — `:!make` and then `:!git
+    /// status` is a thing to want, and a bang that refused would be a bang you
+    /// have to wait out. The echo area holds one line, so the second report to
+    /// land is the one on screen; both are in `*Messages*`, which is what that
+    /// log is for.
     fn shell(&mut self, editor: &mut Editor, line: &str) {
-        self.open(editor);
-        self.send(editor, format!("{line}\r").into_bytes());
+        let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Said before the command has said anything, because the frame comes
+        // back instantly now and a `:!make` that answered with nothing at all
+        // would look like a bang that did not fire.
+        editor.apply(EditorCommand::Message(format!("running {line}…")));
+        let line = line.to_string();
+        std::thread::spawn(move || {
+            let msg = match std::process::Command::new(sh).arg("-c").arg(&line).output() {
+                Err(e) => format!("{line}: {e}"),
+                Ok(out) => {
+                    // stderr only when there is no stdout: a command that
+                    // printed both is being read for what it produced, and the
+                    // echo area has room for one of them.
+                    let text = match out.stdout.is_empty() {
+                        true => String::from_utf8_lossy(&out.stderr).into_owned(),
+                        false => String::from_utf8_lossy(&out.stdout).into_owned(),
+                    };
+                    echo_line(text.trim(), out.status)
+                }
+            };
+            // The receiver is gone only if the editor is, and then there is
+            // nobody left to tell.
+            let _ = tx.send(msg);
+        });
+        // ponytail: nothing hangs up on the child when the editor quits, so
+        // `:!sleep 300` outlives it — the same thing a shell's `&` does. Keeping
+        // the `Child` to kill on drop is the upgrade, and it costs the thread
+        // the `wait_with_output` that makes this ten lines.
+        self.bangs.push(rx);
+    }
+
+    /// Report every `:!` that has finished since the last frame.
+    ///
+    /// Called from [`Term::sync`] rather than from its own hook in `housekeep`,
+    /// because `is_live` already keeps that call coming for as long as a bang
+    /// is outstanding.
+    fn reap_bangs(&mut self, editor: &mut Editor) {
+        let mut done = Vec::new();
+        self.bangs.retain(|rx| match rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Ok(msg) => {
+                done.push(msg);
+                false
+            }
+            // A sender dropped without sending is a panicked thread: there is
+            // nothing to report and nothing left to wait for.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        for msg in done {
+            editor.apply(EditorCommand::Message(msg));
+        }
     }
 
     fn open(&mut self, editor: &mut Editor) {
@@ -188,15 +305,14 @@ impl Term {
             self.show(editor, i);
             return;
         }
-        self.spawn(editor, "*terminal*", None, true);
+        self.spawn(editor, "*terminal*", None, Start::New);
     }
 
-    /// Start a child, give it a buffer, and hand it the keyboard.
-    ///
-    /// `focus` is always true today; it is an argument because a background
-    /// session is the obvious next thing to want and this is the one line that
-    /// would change.
-    fn spawn(&mut self, editor: &mut Editor, name: &str, command: Option<Command>, focus: bool) {
+    /// Start a child, give it a buffer, and hand over the keyboard — to the
+    /// child, or, for an output pane, to nobody: the editor keeps it, which is
+    /// what makes `q` and every other Normal-mode key reach the editor while a
+    /// build is still printing.
+    fn spawn(&mut self, editor: &mut Editor, name: &str, command: Option<Command>, start: Start) {
         // Start where the current file is, the way `M-x shell` does — a
         // terminal that opens in the wrong directory is a terminal you
         // immediately have to `cd` in, and an *agent* in the wrong directory
@@ -235,16 +351,22 @@ impl Term {
         };
         let name = self.unique_name(name);
         let buffer = editor.show_named(BufferKind::Terminal, Some(&name), "");
+        let output = start == Start::Output;
         self.sessions.push(Session {
             buffer,
             name,
             cwd,
             inner,
             frozen: false,
+            output,
         });
-        if focus {
-            editor.apply(EditorCommand::SetMode(Mode::Terminal));
-        }
+        // Explicitly, both ways: `show_named` takes the mode from the buffer
+        // *kind*, and a `Terminal` buffer means `Mode::Terminal`. An output
+        // pane has to undo that or the first `q` would be typed at make.
+        editor.apply(EditorCommand::SetMode(match output {
+            true => Mode::Normal,
+            false => Mode::Terminal,
+        }));
     }
 
     /// `*claude*`, then `*claude*<2>` — Emacs' own disambiguation, and the
@@ -271,10 +393,14 @@ impl Term {
         // keeps showing a frozen scrollback and nothing typed ever appears.
         session.frozen = false;
         let (kind, name) = (BufferKind::Terminal, session.name.clone());
+        let output = session.output;
         // Empty text: `sync` puts the real grid in on the very next frame, and
         // writing the stale flattening here would flash the previous screenful.
         editor.show_named(kind, Some(&name), "");
-        editor.apply(EditorCommand::SetMode(Mode::Terminal));
+        editor.apply(EditorCommand::SetMode(match output {
+            true => Mode::Normal,
+            false => Mode::Terminal,
+        }));
     }
 
     /// Walk to the next or previous session. Wraps, and with one session is a
@@ -326,12 +452,13 @@ impl Term {
         let Some(i) = self.current(editor) else {
             return;
         };
-        let (name, cwd, command) = {
+        let (name, cwd, command, output) = {
             let session = &self.sessions[i];
             (
                 session.name.clone(),
                 session.cwd.clone(),
                 session.inner.command().cloned(),
+                session.output,
             )
         };
         let (cols, rows) = self.sessions[i].inner.size();
@@ -340,7 +467,10 @@ impl Term {
                 self.sessions[i].inner = fresh;
                 self.sessions[i].frozen = false;
                 editor.show_named(BufferKind::Terminal, Some(&name), "");
-                editor.apply(EditorCommand::SetMode(Mode::Terminal));
+                editor.apply(EditorCommand::SetMode(match output {
+                    true => Mode::Normal,
+                    false => Mode::Terminal,
+                }));
                 editor.apply(EditorCommand::Message(format!("restarted {name}")));
             }
             // The old child is already gone at this point only if the spawn
@@ -349,14 +479,13 @@ impl Term {
         }
     }
 
-    /// Type something at the live session. Used to run a project's build
-    /// command, which is then a command in a terminal like any other rather
-    /// than a second process-spawning path whose output nobody can see.
-    pub fn send(&self, editor: &Editor, bytes: Vec<u8>) {
-        if let Some(i) = self.current(editor) {
-            self.sessions[i].inner.send(bytes);
-        }
-    }
+    // `send` — type a line at the live session — went with `project-compile`.
+    // It had one caller: `main.rs` typing `cargo build\r` into whatever shell
+    // happened to be open. `runtime/plugins/project.lisp` asks for an *output
+    // pane* instead (`output:compile:…`), which is a child of its own with the
+    // project root as its working directory, so there is nothing left to type
+    // into somebody else's shell. `paste` below is the one remaining way bytes
+    // the user did not press reach a child, and it is the register.
 
     /// Send a keystroke to the child. Returns false when the key is not one a
     /// terminal can carry, which is how the splits keep working inside it.
@@ -385,12 +514,26 @@ impl Term {
             // an agent's input box, and in the editor's own Insert mode.
             Key::MetaLeft => Input::AltLeft,
             Key::MetaRight => Input::AltRight,
+            // A shifted arrow or Enter is sent as the plain one, which is what a
+            // child saw before shift was a modifier at all: `Input` speaks the
+            // VT sequences a terminal has, and there is no `ESC [1;2D` in it —
+            // so the alternative was `⇧⏎` silently doing nothing in a shell.
+            Key::ShiftEnter => Input::Enter,
+            Key::ShiftLeft => Input::Left,
+            Key::ShiftRight => Input::Right,
+            Key::ShiftUp => Input::Up,
+            Key::ShiftDown => Input::Down,
             // `C-M-x` and the two split keys belong to the editor. Leaving them
             // unhandled is what lets `C-<ret>` still split a window while a
-            // child has the keyboard.
-            Key::CtrlMeta(_) | Key::CtrlEnter | Key::CtrlMetaEnter | Key::MetaEnter => {
-                return false
-            }
+            // child has the keyboard — and the `M-S-` keys join them because
+            // they are org's, and a shell has no reading of them at all.
+            Key::CtrlMeta(_)
+            | Key::CtrlEnter
+            | Key::CtrlMetaEnter
+            | Key::MetaEnter
+            | Key::MetaShiftEnter
+            | Key::MetaShiftLeft
+            | Key::MetaShiftRight => return false,
         };
         self.sessions[i].inner.input(input);
         true
@@ -452,7 +595,9 @@ impl Term {
     }
 
     /// Resize every session to the pane it is shown in, drain each child's
-    /// requests, and refresh the live one's buffer text.
+    /// requests, refresh the live one's buffer text — and report any `:!` that
+    /// finished, which has no session and no pane but the same need to be
+    /// looked at once a frame.
     ///
     /// Called every frame. `poll` is the part that must not be skipped, and it
     /// must not be skipped *per session*: a program asking the terminal how big
@@ -462,16 +607,26 @@ impl Term {
     /// `sizes` is `(buffer, cols, rows)` per session, measured by the app —
     /// core owns no geometry and this crate owns no renderer.
     pub fn sync(&mut self, editor: &mut Editor, sizes: &[(BufferId, usize, usize)]) {
+        self.reap_bangs(editor);
         self.reap(editor);
 
-        let mut exited: Vec<(String, Option<i32>)> = Vec::new();
+        let mut exited: Vec<(String, Option<i32>, String)> = Vec::new();
         self.sessions.retain_mut(|session| {
             if let Some((_, cols, rows)) = sizes.iter().find(|(id, ..)| *id == session.buffer) {
                 session.inner.resize(*cols, *rows);
             }
             session.inner.poll();
             if session.inner.exited() {
-                exited.push((session.name.clone(), session.inner.exit_status()));
+                // The scrollback, taken here because this is the last moment it
+                // exists — the refresh below runs only while a session is still
+                // in the list, so without this the buffer keeps whatever the
+                // previous frame happened to leave and a build loses the last
+                // lines it printed. On a failure those are the error.
+                exited.push((
+                    session.name.clone(),
+                    session.inner.exit_status(),
+                    session.inner.history_text(),
+                ));
                 return false;
             }
             true
@@ -479,8 +634,8 @@ impl Term {
 
         // Report and freeze *after* the retain, so the borrow of `self` is over
         // before the editor is touched.
-        for (name, status) in exited {
-            self.retire(editor, &name, status);
+        for (name, status, text) in exited {
+            self.retire(editor, &name, status, &text);
         }
 
         // Only the live session's buffer is refreshed. A parked one keeps the
@@ -503,7 +658,13 @@ impl Term {
         //
         // The mode is the half the user can see, in the modeline and in what the
         // keys do, so the mode is the half that decides.
-        self.sessions[i].frozen = editor.mode != Mode::Terminal;
+        //
+        // An output pane is the one session that is never frozen. Freezing
+        // means "you stepped out to read the scrollback", and this pane was
+        // never stepped into — the editor has had the keyboard since the child
+        // started, so the rule above would stop the refresh the pane exists for
+        // and leave a build printing into a buffer nobody redraws.
+        self.sessions[i].frozen = !self.sessions[i].output && editor.mode != Mode::Terminal;
         if self.sessions[i].frozen {
             return;
         }
@@ -529,7 +690,9 @@ impl Term {
         // neither happens here, because a generated buffer is never loaded and
         // routing this through `apply` would put a status line under every
         // frame of the agent's output.
-        let want = if self.sessions[i].inner.command().is_some() {
+        let want = if self.sessions[i].output {
+            "terminal-output-mode"
+        } else if self.sessions[i].inner.command().is_some() {
             "ai-mode"
         } else {
             "terminal-mode"
@@ -543,7 +706,7 @@ impl Term {
     /// A child that exited on its own. Its buffer keeps the last screenful —
     /// which is usually the error — and becomes an ordinary read-only buffer
     /// you can search and yank from until you kill it.
-    fn retire(&mut self, editor: &mut Editor, name: &str, status: Option<i32>) {
+    fn retire(&mut self, editor: &mut Editor, name: &str, status: Option<i32>, text: &str) {
         let how = match status {
             Some(0) | None => String::new(),
             // 127 is the shell's "command not found", and the one exit code
@@ -554,9 +717,18 @@ impl Term {
         };
         editor.apply(EditorCommand::Message(format!("{name} exited{how}")));
         if editor.buffer.given_name.as_deref() == Some(name) {
+            // The final scrollback goes in here rather than being left to the
+            // refresh below, which no longer runs for a session that is gone.
+            editor.show_named(BufferKind::Terminal, Some(name), text);
             editor.apply(EditorCommand::SetMode(Mode::Normal));
         }
     }
+
+    // ponytail: only into the buffer that is *current*. `show_named` is the one
+    // way to write buffer text and it switches to what it writes, so doing this
+    // unconditionally would have a background agent's death steal the window
+    // out from under you. A pane you were not looking at keeps the flattening
+    // its last visible frame left; a by-id text setter in core is the upgrade.
 
     /// Drop sessions whose buffer has been killed.
     ///
@@ -707,9 +879,115 @@ fn words(line: &str) -> Vec<String> {
     out
 }
 
+/// A command's output as the one line the echo area has room for.
+///
+/// The first line, plus a count of what is not being shown — so `:!wc -l *` is
+/// answered in place, and `:!ls` says how much it is not showing rather than
+/// pretending the first name was all of it. `Editor::status_line` is a single
+/// line, so a newline in here would be drawn as a box.
+///
+/// Silence means it worked, which is the shell's own convention, and the exit
+/// code is the only news when it did not.
+fn echo_line(text: &str, status: std::process::ExitStatus) -> String {
+    let code = match status.success() {
+        true => String::new(),
+        false => format!(" [exit {}]", status.code().unwrap_or(-1)),
+    };
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or("done");
+    match lines.count() {
+        0 => format!("{first}{code}"),
+        n => format!("{first}{code} (+{n} lines)"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `:!` leaves behind now that it leaves no buffer behind: one line,
+    /// honest about how much it is not showing, and quiet when there is nothing
+    /// to say.
+    #[test]
+    fn a_bang_is_reported_in_one_line() {
+        let run = |line: &str| {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(line)
+                .output()
+                .unwrap();
+            let text = match out.stdout.is_empty() {
+                true => String::from_utf8_lossy(&out.stderr).into_owned(),
+                false => String::from_utf8_lossy(&out.stdout).into_owned(),
+            };
+            echo_line(text.trim(), out.status)
+        };
+
+        // A pipeline, which is the reason `:!` goes through a shell at all.
+        assert_eq!(run("printf 'a\\nb\\nc\\n' | wc -l | tr -d ' '"), "3");
+        // More than fits: the first line, and the count of what does not.
+        assert_eq!(run("printf 'a\\nb\\nc\\n'"), "a (+2 lines)");
+        // Silence is success — the shell's own convention.
+        assert_eq!(run("true"), "done");
+        // ...and failure says so even when nothing was printed.
+        assert_eq!(run("exit 3"), "done [exit 3]");
+        assert_eq!(run("echo boom; exit 1"), "boom [exit 1]");
+    }
+
+    /// ...and it is reported from a *later* frame than the one that asked for
+    /// it, which is the whole of "`:!make` no longer freezes the editor".
+    ///
+    /// `sleep 1` and not a smaller number: the claim is that `run` returned
+    /// while the command was still running, and a command that can finish
+    /// inside the assertion proves nothing. The second bang is the answer to
+    /// "what if one is fired while another is running" — both run, both report,
+    /// and the fast one lands first because finishing is what decides.
+    #[test]
+    fn a_bang_does_not_block_the_frame_and_reports_when_it_lands() {
+        use std::time::{Duration, Instant};
+
+        let mut ed = Editor::new();
+        let mut term = Term::default();
+        let start = Instant::now();
+        term.run(&mut ed, "shell:sleep 1; echo slow");
+        term.run(&mut ed, "shell:echo fast");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "the bang blocked the caller for {:?}",
+            start.elapsed()
+        );
+        // The one thing that keeps `housekeep` calling `sync` at all.
+        assert!(term.is_live(), "a running bang has to be polled");
+        // Both outstanding at once, which is the whole of "two bangs run
+        // concurrently" — and asserted *structurally* rather than by racing
+        // `echo` against `sleep 1`. This test used to check that the reports
+        // arrived in the order `["fast", "slow"]`, which is true whenever the
+        // machine is idle and false whenever it is not: under a loaded parallel
+        // run, spawning the second thread can lose to a one-second sleep. Two
+        // separate agents hit that flake before it was written this way.
+        assert_eq!(term.bangs.len(), 2, "a bang must not wait for its sibling");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while term.is_live() {
+            assert!(Instant::now() < deadline, "the bangs never reported");
+            term.sync(&mut ed, &[]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut reported: Vec<&str> = ed
+            .messages
+            .iter()
+            .filter(|m| !m.starts_with("running "))
+            .map(String::as_str)
+            .collect();
+        reported.sort_unstable();
+        assert_eq!(reported, ["fast", "slow"], "{:?}", ed.messages);
+        // Whichever landed last owns the echo area — which of the two that is
+        // is a fact about the machine, not about the editor.
+        assert!(ed.status == "slow" || ed.status == "fast", "{:?}", ed.status);
+        // No buffer, no window, no session — the point of the bang.
+        assert!(term.sessions.is_empty());
+        assert_eq!(ed.buffer_names(), Editor::new().buffer_names());
+    }
 
     #[test]
     fn a_command_line_splits_the_way_a_shell_splits_one() {
@@ -831,6 +1109,44 @@ mod tests {
         term.run(&mut ed, "run:gaussian:cat");
         let names: Vec<&str> = term.sessions.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["*gaussian*", "*independence*", "*gaussian*<2>"]);
+    }
+
+    /// `output:` is `rerun:` with the three differences that make it a
+    /// compilation pane rather than a session: a window of its own, the
+    /// keyboard left with the editor, and a major mode `q` can be bound in.
+    ///
+    /// The mode assertion is the one that would break silently. Every other
+    /// path into a terminal buffer sets `Mode::Terminal` from the buffer
+    /// *kind*, so an output pane that forgot to undo that would look right and
+    /// type the first `q` at make.
+    #[test]
+    fn an_output_pane_keeps_the_keyboard_and_opens_beside_you() {
+        let mut ed = Editor::new();
+        let mut term = Term::default();
+        assert_eq!(ed.frame().windows.len(), 1);
+
+        term.run(&mut ed, "output:make:cat");
+        assert_eq!(ed.buffer.name(), "*make*");
+        assert_eq!(ed.mode, Mode::Normal, "the child must not get the keyboard");
+        assert_eq!(ed.frame().windows.len(), 2, "it opens in a split");
+        assert!(term.sessions[0].output);
+
+        // Already on screen, so a second press re-runs into the same pane
+        // instead of halving the frame again.
+        let first = term.sessions[0].buffer;
+        term.run(&mut ed, "output:make:cat");
+        assert_eq!(term.sessions.len(), 1);
+        assert_eq!(term.sessions[0].buffer, first);
+        assert_eq!(ed.frame().windows.len(), 2);
+        assert_eq!(ed.mode, Mode::Normal);
+
+        // Dismissed with `q` — the window goes, the session stays — and the
+        // next press has to build a new window rather than taking over the one
+        // you moved on to.
+        ed.apply(EditorCommand::CloseWindow);
+        assert_eq!(ed.frame().windows.len(), 1);
+        term.run(&mut ed, "output:make:cat");
+        assert_eq!(ed.frame().windows.len(), 2);
     }
 
     /// The whole route a command name takes, because the halves are tested

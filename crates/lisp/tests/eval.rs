@@ -284,26 +284,25 @@ fn init_lisp_drives_editor_commands() {
         assert!(style.italic, "re-asserting weight straightened an italic face");
     }
 
-    // NOT asserted here, because it is not true: a non-ASCII string in a form
-    // handed to `zemacs_eval` does *not* survive to the editor. It arrives as a
-    // base string of UTF-8 bytes, ECL's reader parses those bytes as Latin-1
-    // characters, and `dup_utf8` then encodes each of those back into UTF-8 — so
-    // `(message "λ")` from a keybinding reaches the status line as `Î»`.
+    // A non-ASCII string in a form handed to `zemacs_eval` survives to the
+    // editor, which for a long time it did not: the source arrived as a base
+    // string of UTF-8 bytes, ECL's reader parsed those bytes as Latin-1
+    // characters and `dup_utf8` encoded each of them back, so `(message "λ")`
+    // from a keybinding reached the status line as `Î»`. Loading a *file* was
+    // always fine — `load` decodes through the stream's external format, which
+    // is why org's `◉` bullets were right — and that is what hid it.
     //
-    // The previous assertion here was "the banner contains a non-ASCII
-    // character", which double-encoded text satisfies, so this went unnoticed.
-    // The path that *is* correct is loading a file: `load` decodes through the
-    // stream's external format, which is why org's `◉` bullets are right.
-    //
-    // Not fixed here because the fix is not local. Lisp deliberately holds text
-    // as UTF-8 *bytes* — `buffer-string` returns them, `%byte-index` and
-    // `%char-index` convert between the two counts, and `search-forward`
-    // compares a pattern against them — so decoding eval'd source into real
-    // characters makes it incomparable with buffer text and breaks every search.
-    // Making it coherent means moving the whole model to character strings and
-    // deleting the two index conversions, which is the ceiling `f_query` in
-    // `shim.c` already writes up. Reaches: an accented answer to `read-string`,
-    // a path with a non-ASCII component, any form built by Rust.
+    // Asserted **exactly**, and that matters more than it looks: the assertion
+    // this replaces was "the banner contains a non-ASCII character", which
+    // double-encoded text satisfies, and which is how the bug shipped.
+    // `crates/lisp/tests/utf8.rs` is where the whole boundary is pinned; this is
+    // the one line of it that belongs on the real config path.
+    {
+        let at = mark(&shared);
+        lisp.eval("(zemacs:message \"\u{3bb}\")".into());
+        let got = wait(&shared, "the lambda", |ed| ed.messages.get(at..)?.first().cloned());
+        assert_eq!(got, "\u{3bb}", "a form from Rust is read as characters");
+    }
 
     // --- the link a terminal click lands on ---
     //
@@ -356,12 +355,22 @@ fn init_lisp_drives_editor_commands() {
         heads.contains(&"text-scale-increase"),
         "a zero-argument command must be offered; got {names:?}"
     );
-    // M-x calls `(name)`, so anything needing an argument would only ever error.
-    // ECL reports no lambda list for the C primitives, which is why `set-font-size`
-    // (a primitive taking one argument) stays out.
+    // M-x still calls `(name)`, so a command needing an argument is offered only
+    // when `(name)` is a legal call — which for `set-scale` means the
+    // `interactive` declaration in `runtime/library.lisp`, whose wrapper asks for
+    // the argument and then calls. See `crates/lisp/tests/interactive.rs`.
     assert!(
-        !heads.contains(&"set-font-size") && !heads.contains(&"set-scale"),
-        "commands taking arguments must not be offered; got {names:?}"
+        heads.contains(&"set-scale") && heads.contains(&"set-language"),
+        "a command that declares how to get its arguments must be offered; got {names:?}"
+    );
+    // `set-font-size` is the primitive under `set-scale` and is deliberately left
+    // out: it sets the size without updating `*font-size*`, so running it by hand
+    // would leave the next `text-scale-increase` stepping from a stale number.
+    // Nothing declares it, and ECL reports no lambda list for a C function, so
+    // both halves of the filter agree about it.
+    assert!(
+        !heads.contains(&"set-font-size"),
+        "an undeclared command taking arguments must not be offered; got {names:?}"
     );
     assert!(
         !heads.iter().any(|n| n.starts_with('%')),

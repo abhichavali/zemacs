@@ -165,41 +165,34 @@ past — so these stay bare and core goes on deduplicating them as it always did
   (let ((nl (position #\Newline s)))
     (if nl (subseq s 0 nl) s)))
 
-(defun %comment-safe (s)
-  "S with the one character that could close the block comment early taken out.
-A `|' in a docstring is rare; a candidate that stops reading half way through
-is not the kind of thing to leave to luck."
-  (remove #\| s))
-
 (defun command-annotation (name)
   "NAME's docstring and the key it is bound to, as one line, or NIL when it has
-neither and there is nothing worth saying."
+neither and there is nothing worth saying.
+
+The key goes in parentheses after the summary, which is the order marginalia
+puts them in and the order they are read in: what the command *is* first, how to
+reach it second."
   (let* ((symbol (find-symbol (string-upcase name) :zemacs))
          (doc (and symbol (fboundp symbol)
                    (ignore-errors (documentation symbol 'function))))
          (key (second (first (where-is name)))))
-    (cond ((and doc key) (format nil "~a   ~a" (%comment-safe (%first-line doc)) key))
-          (doc (%comment-safe (%first-line doc)))
-          (key key))))
+    (cond ((and doc key) (format nil "~a (~a)" (%first-line doc) key))
+          (doc (%first-line doc))
+          (key (format nil "(~a)" key)))))
 
 (defun %annotated-command (name)
-  "NAME as M-x should list it: the name, then its annotation inside a Lisp
-block comment. `(name #| doc  KEY |#)' is a legal call to NAME, which is what
-core will make of the candidate, so the annotation costs the minibuffer nothing
-and the command still runs."
+  "NAME as M-x should list it: the name, padded, then its annotation.
+
+Plain text, not a `#| … |#' block comment. The comment was here because core
+made a Lisp call out of the whole candidate and the annotation had to survive
+being read as source — which meant `#|' and `|#' on screen, in a list whose job
+is to be read. Core now takes the first word of the candidate as the command
+name (see `accept_prompt'), so the rest of the row is free to be prose."
   (let ((note (and (not (member name *core-annotated-commands* :test #'string=))
                    (command-annotation name))))
     (if note
-        (format nil "~va #| ~a |#" *annotation-column* name note)
+        (format nil "~va ~a" *annotation-column* name note)
         name)))
-
-;;; ponytail: core resolves `magit-', `dired-', `project-', `terminal-' and
-;;; `-mode' by *prefix* before it falls through to the image, and an annotated
-;;; candidate no longer looks like any of them. Nothing shipped is affected —
-;;; those verbs are core's own and are published by core, unannotated — but a
-;;; config defining a Lisp `project-foo' would find `M-x' running it as a Lisp
-;;; call rather than as a project verb, which is what it wanted anyway. The fix,
-;;; if it ever bites, is one `split` in `accept_prompt'.
 
 (defvar *raw-register-command* (fdefinition 'register-command)
   "`register-command' as the shim defined it. DEFVAR and not DEFPARAMETER: a

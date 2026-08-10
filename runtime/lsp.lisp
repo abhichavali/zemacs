@@ -28,19 +28,36 @@
 ;;;; What the editor tells us, and what it costs
 ;;;;
 ;;;; One signal: `after-change-hook', which the application fires whenever the
-;;;; document's revision moves. It carries no *delta*, so
-;;;; `textDocument/didChange' sends the **whole buffer** every time.
+;;;; document's revision moves. It carries no *delta*, so this file keeps a
+;;;; **shadow copy** of every open document — the text the server was last sent —
+;;;; and `textDocument/didChange' names the one run that differs between the
+;;;; shadow and the buffer, as a range in the shadow's own coordinates. A server
+;;;; that offers only full sync still gets the whole document; that negotiation
+;;;; is in `%lsp-initialized', and getting it backwards is the expensive mistake,
+;;;; because a full-sync server handed a range takes the range's *text* as the
+;;;; entire file and the damage surfaces much later as nonsense completions.
 ;;;;
-;;;; ponytail: full text rather than incremental sync. The delta this used to say
-;;;; did not exist now does — `after-edit-hook' carries (START OLD-END NEW-END
-;;;; TEXT) — so what is left is the work of turning it into a `contentChanges'
-;;;; range, plus the bookkeeping to fall back to a full send whenever an edit is
-;;;; missed. Until somebody does that this costs one buffer copy per revision,
-;;;; which is what Emacs paid for years and is not felt below a few hundred KB.
-;;;; The completion popup below deliberately does *not* use the delta either, and
-;;;; says why where it reads the buffer.
+;;;; The shadow is exactly what the server has *by construction*: it is written
+;;;; in the same breath as the notification carrying it, and never from anywhere
+;;;; else. So the one text this client can send wrongly — the buffer moving
+;;;; between the two reads in `lsp-ensure' — repairs itself on the next keystroke
+;;;; rather than desynchronising the session, which is the failure incremental
+;;;; sync is otherwise famous for.
 ;;;;
-;;;; The escaping of that copy is the one thing that is *not* in Lisp
+;;;; ponytail: the buffer is still *read* whole every keystroke.
+;;;; `after-edit-hook' carries (START OLD-END NEW-END TEXT) and would save that
+;;;; read, and it is deliberately not used: the image evaluates it a turn or more
+;;;; later (`docs/threading.org') and the record names no *buffer*, so a delta
+;;;; produced while you were in one file arrives while you are in another and
+;;;; nothing on this side can tell — `(buffer-file-name)' is as late as the hook
+;;;; is. Applying it to the wrong shadow is precisely the corruption the
+;;;; paragraph above exists to rule out, so the read stays. Ceiling: one
+;;;; `buffer-string' per revision, which is a memcpy and a READ and is not felt
+;;;; below a few hundred KB — the whole *document* no longer goes down the pipe,
+;;;; which was the cost that mattered. Upgrade path: the buffer's path in the
+;;;; record, one argument in `after_edit_form' in `crates/app/src/main.rs'.
+;;;;
+;;;; The escaping of what does go out is the one thing that is *not* in Lisp
 ;;;; (`%json-quote'), because doing it a character at a time in the image on
 ;;;; every keystroke is exactly the case the boundary rule exists for.
 
@@ -59,10 +76,13 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Paths and URIs
 ;;;
-;;; Every string that crosses the shim is UTF-8 *bytes* in a base string, so
-;;; percent-encoding one character at a time is byte-level encoding and comes
-;;; out right — which is the one place that convention is a help rather than a
-;;; ceiling.
+;;; **The one place in the image that still counts bytes**, and it has to: a
+;;; percent-escape names a byte, so `é' in a path is `%C3%A9' and not `%E9'.
+;;; Everything else — the buffer, a form arriving from a keybinding, a server's
+;;; reply — is characters; see the model note at the top of
+;;; `crates/lisp/src/shim.c'. `ext:string-to-octets' and `ext:octets-to-string'
+;;; are the codec, because ECL ships one and a hand-rolled pair here would be a
+;;; third copy of arithmetic the shim already does correctly.
 
 (defun %uri-unreserved-p (code)
   "True for the bytes a `file:' URI may carry literally: ASCII letters and
@@ -74,34 +94,43 @@ digits, `-._~' and the separator itself."
   "PATH as a `file:' URI, percent-encoded."
   (with-output-to-string (out)
     (write-string "file://" out)
-    (loop for ch across (string path)
-          for code = (char-code ch)
-          do (if (%uri-unreserved-p code)
-                 (write-char ch out)
-                 (format out "%~2,'0X" code)))))
+    (loop for byte across (ext:string-to-octets (string path)
+                                                :external-format :utf-8)
+          do (if (%uri-unreserved-p byte)
+                 (write-char (code-char byte) out)
+                 (format out "%~2,'0X" byte)))))
 
 (defun lsp-uri-path (uri)
   "The filesystem path inside a `file:' URI, or NIL for anything else — a
 server is allowed to answer with a location in a jar, and jumping to one is not
 something this editor can do.
 
-Built as a base string on purpose: a decoded `%C3%A9' is the byte 0xC3, and only
-a base string carries bytes back across the shim unchanged."
+The escapes are gathered as *bytes* and decoded in one go at the end, which is
+the only order that works: `%C3%A9' is two escapes and one character, so
+decoding each escape where it stands would answer with the Latin-1 reading of
+its own encoding — the mojibake this whole boundary exists to prevent. A
+character sitting in the URI unescaped, which is malformed and does happen,
+contributes its own UTF-8 and so survives the round trip too."
   (when (and (stringp uri) (>= (length uri) 7) (string= "file://" uri :end2 7))
     (let* ((raw (subseq uri 7))
            (n (length raw))
-           (out (make-array n :element-type 'base-char :fill-pointer 0))
+           (out (make-array n :element-type '(unsigned-byte 8)
+                              :adjustable t :fill-pointer 0))
            (i 0))
       (loop while (< i n)
             do (let ((ch (char raw i)))
-                 (cond ((and (char= ch #\%) (<= (+ i 3) n))
-                        (let ((v (ignore-errors
-                                  (parse-integer raw :start (1+ i) :end (+ i 3)
-                                                     :radix 16))))
-                          (cond (v (vector-push (code-char v) out) (incf i 3))
-                                (t (vector-push ch out) (incf i)))))
-                       (t (vector-push ch out) (incf i)))))
-      (subseq out 0 (fill-pointer out)))))
+                 (cond ((and (char= ch #\%) (<= (+ i 3) n)
+                             (let ((v (ignore-errors
+                                       (parse-integer raw :start (1+ i)
+                                                          :end (+ i 3)
+                                                          :radix 16))))
+                               (when v (vector-push-extend v out) (incf i 3)))))
+                       (t (loop for b across (ext:string-to-octets
+                                              (string ch) :external-format :utf-8)
+                                do (vector-push-extend b out))
+                          (incf i)))))
+      (ext:octets-to-string (coerce out '(vector (unsigned-byte 8)))
+                            :external-format :utf-8))))
 
 (defun %file-directory (path)
   "PATH's directory, trailing slash included."
@@ -168,6 +197,21 @@ would `probe-file' its way to the root of the disk. A project that grows a
         (list :program (string program) :args args))
   (%lsp-mode-name mode))
 
+;;; Two arguments, asked one after the other — the case that made a collector
+;;; worth writing rather than nesting the callbacks by hand. Spelled as a call to
+;;; `%interactive' behind an `fboundp' guard rather than as the `interactive'
+;;; macro, because this file is loaded on its own by the LSP tests and by anyone
+;;; who wants the client without the standard library; an undefined macro at the
+;;; top level would take the rest of the file with it. Same escape hatch the math
+;;; modes use for `*hidden-commands*'.
+(when (fboundp '%interactive)
+  (funcall '%interactive 'lsp-register-server
+           ;; The mode names we already know a language id for. Not a closed set
+           ;; — nothing is required to match, so registering for a mode that is
+           ;; not in the table is still a matter of typing it.
+           (list (cons "Mode: " (lambda () (mapcar #'car *lsp-language-ids*)))
+                 (cons "Program: " :string))))
+
 (defvar *lsp-language-ids*
   '(("python-mode" . "python") ("c-mode" . "c") ("rust-mode" . "rust")
     ("javascript-mode" . "javascript") ("json-mode" . "json")
@@ -182,6 +226,79 @@ the table only holds the exceptions.")
         (if i (subseq mode 0 i) mode))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Columns
+;;;
+;;; Two units meet in this file and only one of them is the editor's. LSP counts
+;;; a column in **UTF-16 code units**; the editor counts *characters*
+;;; (`(point)', `(column)'), and so does the text, everywhere, in both languages.
+;;; The two agree exactly across the whole BMP — `café' is four of each — so an
+;;; accent never moves a column.
+;;;
+;;; What moves one is a character **outside** the BMP: an emoji is one character
+;;; and a *surrogate pair*, so a string literal with three of them in it put
+;;; every position later on that line three columns to the left, and a jump asked
+;;; about the wrong symbol or about none.
+;;;
+;;; There was a third unit until recently — buffer text arrived as UTF-8 bytes,
+;;; one Lisp character per byte — and it is worth knowing it is gone, because
+;;; half the arithmetic below existed only to undo it: `%lsp-char-start' snapped
+;;; a `mismatch' back off the middle of an `é', and every scan here stepped over
+;;; continuation bytes. The shim decodes now (`crates/lisp/src/shim.c'), the
+;;; editor's offsets and Lisp's indices are the same integers, and what is left
+;;; is the one conversion LSP actually asks for.
+;;;
+;;; Both directions are needed and both are here. Outgoing is a character column
+;;; on the line point is on; incoming is a code-unit column on a line of a file
+;;; that is very often *not* the buffer on screen, which is what the shadow copy
+;;; below is measured against — the same string the server is talking about.
+;;;
+;;; In Lisp and not as a reader in `query.rs', which was the upgrade path written
+;;; down for this and turns out to be the wrong half: a `didChange' range is a
+;;; position in the document the server *has*, not the one the editor has, and
+;;; core cannot see that string. A reader would have covered point and left the
+;;; ranges needing this code anyway, and one conversion written twice is how the
+;;; highlight ends up disagreeing with the jump.
+
+(defun %lsp-utf16-length (text &key (start 0) (end (length text)))
+  "How many UTF-16 code units TEXT[START:END) is.
+
+Not simply `(- end start)' because of the astral plane: a character at #x10000
+or above — an emoji — is spelled by UTF-16 as a *surrogate pair* and counts
+twice. Everything else counts once."
+  (loop for i from start below end
+        sum (if (>= (char-code (char text i)) #x10000) 2 1)))
+
+(defun %lsp-utf16-column (text chars)
+  "The UTF-16 column CHARS characters into the line TEXT."
+  (%lsp-utf16-length text :end chars))
+
+(defun %lsp-char-column (text units)
+  "The character column UNITS UTF-16 code units into the line TEXT — the
+inverse of `%lsp-utf16-column'.
+
+Stops at the end of the line rather than running past it: a server may name a
+column one past the last character, and every column past *that* is the same
+answer. A unit landing inside a surrogate pair rounds up to the whole character,
+which is the only answer an editor with no half-characters can give."
+  (let ((chars 0) (u 0) (n (length text)))
+    (loop while (and (< chars n) (< u units))
+          do (incf u (if (>= (char-code (char text chars)) #x10000) 2 1))
+             (incf chars))
+    chars))
+
+(defun %lsp-point-position ()
+  "Point as an LSP `Position'. LSP counts lines from 0 and `line-number' from 1."
+  (jobj "line" (1- (line-number))
+        "character" (%lsp-utf16-column (line-string) (column))))
+
+(defun %lsp-position-in (text at)
+  "The LSP `Position' of the character offset AT in TEXT, a whole document."
+  (let ((bol (let ((nl (position #\Newline text :end at :from-end t)))
+               (if nl (1+ nl) 0))))
+    (jobj "line" (count #\Newline text :end at)
+          "character" (%lsp-utf16-length text :start bol :end at))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Sessions
 ;;;
 ;;; One per (mode, project root) pair, which is eglot's rule and the right one:
@@ -189,11 +306,25 @@ the table only holds the exceptions.")
 ;;; same project want one.
 
 (defvar *lsp-sessions* (make-hash-table :test #'equal)
-  "KEY -> a plist: :conn :mode :root :state :queue :opened :versions.
-:state is :STARTING until `initialized' has gone out, then :READY.")
+  "KEY -> a plist: :conn :mode :root :state :queue :opened :versions :sync.
+:state is :STARTING until `initialized' has gone out, then :READY. :sync is what
+the server said about `didChange' and is NIL — meaning full text, the safe half
+— until it has said it.")
 
 (defvar *lsp-conn-keys* (make-hash-table)
   "CONN -> KEY, so an incoming message can find its session.")
+
+(defvar *lsp-shadow* (make-hash-table :test #'equal)
+  "PATH -> the document the server has, character for character.
+
+Written only where a notification carrying that text is sent, which is what makes
+it true rather than hopeful: not a cache of the buffer, a record of what went
+down the pipe. It is what a `didChange' range is measured against and what an
+incoming diagnostic's column is measured against — see \"Document
+synchronisation\" for both. Keyed by path and not per session because
+`lsp-ensure' only ever synchronises the *live* buffer, so one path is one
+server's document at a time; it lives up here because `%lsp-forget' drops it
+along with the rest of a session's state.")
 
 (defun %lsp-key (mode root) (concatenate 'string mode " " root))
 (defun %lsp-get (key prop) (getf (gethash key *lsp-sessions*) prop))
@@ -211,12 +342,11 @@ the table only holds the exceptions.")
 ;;; here is something this editor can actually do, and a capability you claim
 ;;; and do not honour is a server sending you work you throw away.
 ;;;
-;;; ponytail: no `positionEncoding' negotiation. LSP counts a column in UTF-16
-;;; code units and this editor counts characters, so the two agree exactly on
-;;; ASCII and disagree on a line with an accent before the cursor. Negotiating
-;;; `utf-8' would only trade one mismatch (code units) for another (bytes); the
-;;; real fix is a reader that answers a line's UTF-16 length, which is a line in
-;;; `query.rs' and worth adding when a non-ASCII source file misplaces a jump.
+;;; No `positionEncoding' either, and that is now a claim rather than a gap: the
+;;; protocol's default is UTF-16 and every column crossing this file is
+;;; converted to it — see "Columns", below. The only other spelling every server
+;;; offers is `utf-8', which in LSP means *bytes*, so negotiating would trade one
+;;; conversion for another and buy nothing.
 (defun %lsp-capabilities ()
   (jobj "general" (jobj "markdown" (jobj "parser" "none"))
         "textDocument"
@@ -230,6 +360,16 @@ the table only holds the exceptions.")
               ;; declined and the server sends us plain text it has finished
               ;; filling in.
               ;;
+              ;; `resolveSupport' is declined by being **absent**, and that is
+              ;; not a style choice. It is the one field here that is an *object*
+              ;; in the protocol (`{"properties": [...]}'), so a `false' is not a
+              ;; refusal but a type error — and a strict server refuses the whole
+              ;; handshake over it rather than the one capability. rust-analyzer
+              ;; does exactly that: "invalid type: boolean `false`, expected
+              ;; struct CompletionItemCapabilityResolveSupport", and then exits,
+              ;; which is why registering it used to buy you a dead session and
+              ;; no completions at all. Absent already means unsupported.
+              ;;
               ;; `documentationFormat' is the one claim that is now a *request*:
               ;; there is a panel beside the popup to put a docstring in, so ask
               ;; for one. Plaintext first, because that is the order of
@@ -240,7 +380,6 @@ the table only holds the exceptions.")
               (jobj "completionItem"
                     (jobj "snippetSupport" :false
                           "insertReplaceSupport" :false
-                          "resolveSupport" :false
                           "documentationFormat" (jarr "plaintext" "markdown"))
                     "contextSupport" t)
               "publishDiagnostics" (jobj "relatedInformation" :false))
@@ -280,10 +419,10 @@ session KEY, or NIL if the program could not be started."
   "The reply to `initialize'. Nothing may be sent to a server before
 `initialized' goes out, which is why everything until now was queued.
 
-RESULT is read for exactly one thing — whether the server completes at all.
-Everything else it advertises we either already assumed or do not implement, and
-a client that inspected capabilities it never acts on would be writing down its
-own wishes."
+RESULT is read for exactly two things — whether the server completes at all, and
+what shape of `didChange' it will accept. Everything else it advertises we either
+already assumed or do not implement, and a client that inspected capabilities it
+never acts on would be writing down its own wishes."
   (let ((conn (%lsp-get key :conn)))
     (cond
       (error
@@ -301,6 +440,20 @@ own wishes."
        ;; MethodNotFound, and a popup that produced an error message on every
        ;; word typed would be worse than one that never appears.
        (%lsp-set key :completion (and (jget result "capabilities" "completionProvider") t))
+       ;; `textDocumentSync' is either the number itself or an object with a
+       ;; `change' in it, and both spellings are shipped — `jget' on an integer
+       ;; answers NIL, so asking for the field is safe either way. 2 is
+       ;; Incremental and is the *only* value that may be sent a range; 1, 0 and
+       ;; a server that says nothing all get the whole document, which is what
+       ;; every server got until now. Erring towards full is the whole reason
+       ;; this is a test for one value rather than for the absence of another: a
+       ;; full-sync server handed a range is a corruption that shows up much
+       ;; later, where a range-capable server handed full text is merely slow.
+       (%lsp-set key :sync
+                 (let ((sync (jget result "capabilities" "textDocumentSync")))
+                   (if (eql 2 (if (integerp sync) sync (jget sync "change")))
+                       :incremental
+                       :full)))
        (%lsp-set key :state :ready)
        ;; In order: the didOpen that started all this has to precede the
        ;; didChanges that piled up behind it.
@@ -327,6 +480,7 @@ buffer had become."
 died or never came up."
   (let ((conn (%lsp-get key :conn)))
     (when conn (remhash conn *lsp-conn-keys*))
+    (dolist (path (%lsp-get key :opened)) (remhash path *lsp-shadow*))
     (remhash key *lsp-sessions*)))
 
 ;;; ---------------------------------------------------------------------------
@@ -341,22 +495,87 @@ them to be monotonic per document."
               (cons (cons path v) (remove path table :key #'car :test #'string=)))
     v))
 
+(defun %lsp-content-change (old new)
+  "One `contentChanges' entry turning OLD into NEW, or NIL when they are equal.
+Both are whole documents; the range is in OLD's coordinates, because those are
+the ones the server has.
+
+Common prefix and common suffix, which is what an edit in a text editor looks
+like from the outside — one contiguous run replaced. Not the *minimal* edit:
+retyping a word that happens to share its middle sends the whole word. It does
+not have to be minimal, only true, and `mismatch' from each end is two compiled
+scans where a real diff would be interpreted Lisp on every keystroke.
+
+Both ends used to be snapped to a character boundary by `%lsp-char-start',
+because both documents were UTF-8 bytes and a prefix comparison stopped *inside*
+the `é' whose accent you had just changed — a range naming half a codepoint is
+one a server is entitled to do anything at all with. Both are characters now, so
+a `mismatch' can only stop between two of them, and the helper is gone."
+  (let ((head (mismatch old new)))
+    (when head
+      (let* ((lo (length old))
+             (ln (length new))
+             ;; From the other end, capped so the suffix can never reach back
+             ;; over the prefix — `aa' becoming `aaa' matches at both ends.
+             (tail (min (- lo (or (mismatch old new :from-end t) 0))
+                        (- (min lo ln) head)))
+             (old-end (- lo tail)))
+        (jobj "range" (jobj "start" (%lsp-position-in old head)
+                            "end" (%lsp-position-in old old-end))
+              "text" (subseq new head (- ln (- lo old-end))))))))
+
+;;; Nothing in this file encodes anything, and saying so is the point of this
+;;; note, because for a while the opposite was the rule. Buffer text was one Lisp
+;;; character per UTF-8 byte and `dup_utf8' encoded a character string on the way
+;;; out, so a document handed straight to `%json-quote' was encoded twice and
+;;; then a third time by `%rpc-send'. Every server was told a non-ASCII file
+;;; contained mojibake: rust-analyzer, handed `😀', reported the literal's
+;;; value as `ÃÂ°ÃÂ…' and put every column after it on that line
+;;; **eighteen** places out. The repair was a `utf8-text' on every string leaving
+;;; this file, plus a second one inside `json-string', two halves of which
+;;; neither was sufficient, and a paragraph here saying nothing may ever drop
+;;; either.
+;;;
+;;; Both are gone. `f_query' in `crates/lisp/src/shim.c' decodes what the editor
+;;; answers and `dup_utf8' encodes what goes back, once each, so the shadow, the
+;;; buffer and the strings a server sends are all the same kind of string. The
+;;; shadow is stored exactly as it was sent, every `subseq' below names
+;;; characters, and the one unit still converted is UTF-16 — which LSP asks for
+;;; and nothing else in this editor has ever counted in.
+;;;
+;;; `crates/lisp/tests/lsp_sync.rs' is where the wire bytes are pinned against a
+;;; real emoji, and it is the test that fails if any of this is undone.
+
 (defun %lsp-did-open (key path)
-  (%lsp-send key "textDocument/didOpen"
-             (jobj "textDocument"
-                   (jobj "uri" (lsp-path-uri path)
-                         "languageId" (lsp-language-id (%lsp-get key :mode))
-                         "version" (%lsp-version key path)
-                         "text" (buffer-string))))
-  (%lsp-set key :opened (cons path (%lsp-get key :opened))))
+  (let ((text (buffer-string)))
+    (setf (gethash path *lsp-shadow*) text)
+    (%lsp-send key "textDocument/didOpen"
+               (jobj "textDocument"
+                     (jobj "uri" (lsp-path-uri path)
+                           "languageId" (lsp-language-id (%lsp-get key :mode))
+                           "version" (%lsp-version key path)
+                           "text" text)))
+    (%lsp-set key :opened (cons path (%lsp-get key :opened)))))
 
 (defun %lsp-did-change (key path)
-  (%lsp-send key "textDocument/didChange"
-             (jobj "textDocument" (jobj "uri" (lsp-path-uri path)
-                                        "version" (%lsp-version key path))
-                   ;; One change covering everything. See the ponytail note at
-                   ;; the top of this file for why it is not a range.
-                   "contentChanges" (jarr (jobj "text" (buffer-string))))))
+  "Send what changed in PATH — a range when the server accepts one, and the whole
+document when it does not or when there is no shadow to measure against yet.
+
+Nothing goes out when the text is unchanged. `after-change-hook' fires when the
+*revision* moves, and a buffer switch, a mode change or a minor-mode toggle moves
+it without touching a character — those used to cost a whole document each."
+  (let ((new (buffer-string))
+        (old (gethash path *lsp-shadow*)))
+    (unless (equal old new)
+      (setf (gethash path *lsp-shadow*) new)
+      (%lsp-send key "textDocument/didChange"
+                 (jobj "textDocument" (jobj "uri" (lsp-path-uri path)
+                                            "version" (%lsp-version key path))
+                       "contentChanges"
+                       (jarr (or (and old
+                                      (eq (%lsp-get key :sync) :incremental)
+                                      (%lsp-content-change old new))
+                                 (jobj "text" new))))))))
 
 (defun lsp-ensure ()
   "Make sure the live buffer's server is running and has the buffer's text.
@@ -396,9 +615,10 @@ and a mode with no server registered all fall out on the first test."
 ;;;
 ;;; ponytail: no text in the didSave, and the save itself lands a frame later
 ;;; (see `docs/threading.org'), so a server that re-reads from disk on save sees
-;;; the file one turn stale. Harmless here because full-text didChange has
-;;; already given it the current buffer; it would stop being harmless the day
-;;; sync goes incremental.
+;;; the file one turn stale. Harmless here because `didChange' has already given
+;;; it the current buffer — an argument that survived sync going incremental,
+;;; since what changed is the *shape* of that notification and not how current
+;;; it leaves the server.
 (defvar *lsp-save-advised* nil)
 (unless *lsp-save-advised*
   (setf *lsp-save-advised* t)
@@ -419,7 +639,9 @@ and a mode with no server registered all fall out on the first test."
 (defvar *lsp-diagnostics* (make-hash-table :test #'equal)
   "Absolute path -> a list of (LINE COLUMN SEVERITY MESSAGE SOURCE).
 LINE is 1-based, agreeing with `line-number'; COLUMN is 0-based, agreeing with
-`column'. SEVERITY is 1 error, 2 warning, 3 information, 4 hint.")
+`column' — the server counts it in UTF-16 code units and it is converted on the
+way in, so this promise is now kept on a line with an emoji in it as well.
+SEVERITY is 1 error, 2 warning, 3 information, 4 hint.")
 
 ;;; ---------------------------------------------------------------------------
 ;;; THE OVERLAY SEAM.
@@ -450,11 +672,39 @@ LINE is 1-based, agreeing with `line-number'; COLUMN is 0-based, agreeing with
 (defun lsp-severity-name (n)
   (case n (1 "error") (2 "warning") (3 "info") (4 "hint") (t "note")))
 
+;;; Diagnostics arrive for whatever the server has looked at, which for a
+;;; workspace-wide analyser is mostly *not* the buffer on screen — so their
+;;; columns cannot be converted against `line-string'. The shadow copy is the
+;;; right ruler and the only one available: it is the very document the server
+;;; measured. Split once per publish rather than once per diagnostic, because a
+;;; file with a hundred problems in it would otherwise walk itself a hundred
+;;; times.
+(defun %lsp-shadow-lines (path)
+  "PATH's document as a vector of lines, or NIL when there is no shadow of it."
+  (let ((text (and path (gethash path *lsp-shadow*))))
+    (when text (coerce (split-string text #\Newline) 'vector))))
+
+(defun %lsp-diagnostic-column (lines line character)
+  "CHARACTER, which the server counts in UTF-16 code units, as a character column
+on 0-based LINE of LINES.
+
+Left alone when there is nothing to measure against — a diagnostic for a file
+this client never opened, which is a thing servers do. An ASCII line is the same
+number either way, so the untouched answer is the old behaviour rather than a
+new wrong one; zeroing it would be worse than both."
+  (if lines
+      (%lsp-char-column (if (< line (length lines)) (aref lines line) "") character)
+      character))
+
 (defun %lsp-publish-diagnostics (params)
   (let* ((path (lsp-uri-path (jget params "uri")))
+         (lines (%lsp-shadow-lines path))
          (rows (loop for d in (jget params "diagnostics")
-                     collect (list (1+ (or (jget d "range" "start" "line") 0))
-                                   (or (jget d "range" "start" "character") 0)
+                     for line = (or (jget d "range" "start" "line") 0)
+                     collect (list (1+ line)
+                                   (%lsp-diagnostic-column
+                                    lines line
+                                    (or (jget d "range" "start" "character") 0))
                                    (or (jget d "severity") 1)
                                    (or (jget d "message") "")
                                    (or (jget d "source") "")))))
@@ -471,18 +721,23 @@ LINE is 1-based, agreeing with `line-number'; COLUMN is 0-based, agreeing with
     (message (cond ((null rows) "lsp: no diagnostics")
                    (t (format nil "lsp: ~d error~:p, ~d warning~:p" errors warnings))))))
 
+(defun %lsp-diagnostic-text (d)
+  "One diagnostic as a line of prose: severity, message, and the server that said
+so. The one spelling of a diagnostic there is — the echo area reads it out of
+`lsp-diagnostics-at-point' and the pointer reads it off the overlay's
+`help-echo', and a keyboard and a mouse asking the same question have to get the
+same answer back."
+  (format nil "~a: ~a~@[ [~a]~]"
+          (lsp-severity-name (third d))
+          (fourth d)
+          (and (plusp (length (fifth d))) (fifth d))))
+
 (defun lsp-diagnostics-at-point ()
   "Echo the diagnostics on the cursor's line."
   (let* ((line (line-number))
          (here (remove-if-not (lambda (d) (eql (first d) line)) (lsp-diagnostics))))
     (if here
-        (message (format nil "~{~a~^ | ~}"
-                         (mapcar (lambda (d)
-                                   (format nil "~a: ~a~@[ [~a]~]"
-                                           (lsp-severity-name (third d))
-                                           (fourth d)
-                                           (and (plusp (length (fifth d))) (fifth d))))
-                                 here)))
+        (message (format nil "~{~a~^ | ~}" (mapcar #'%lsp-diagnostic-text here)))
         (message "no diagnostic on this line"))))
 
 ;;; ---------------------------------------------------------------------------
@@ -515,10 +770,27 @@ LINE is 1-based, agreeing with `line-number'; COLUMN is 0-based, agreeing with
 ;;; waiting for the server to answer again, which on a slow server is most of a
 ;;; second of the marks pointing at the wrong lines.
 ;;;
-;;; ponytail: the *message* is still `SPC l e'. Putting it in the buffer wants
-;;; virtual text — a string drawn after a line's end without covering anything —
-;;; and `display' is emphatically not that: it replaces the cells it covers, so
-;;; an inline message would eat the code it is about. The upgrade path is an
+;;; The *message* is on the same overlay, as `help-echo', and the pointer resting
+;;; on the mark is what asks for it. That is deliberately not the `after-string'
+;;; this note used to predict, and the correction is worth keeping: an
+;;; `after-string' pins text to the end of a line and stays until something takes
+;;; it off, which is right for an *inline* message — the feature that note was
+;;; actually describing, still unbuilt — and wrong for a hover, which belongs at
+;;; the pointer and is gone the moment you look away. See `Tooltip' in
+;;; `crates/core/src/lib.rs' for the whole of that argument.
+;;;
+;;; Nothing about the hover is in this file beyond the string: the pointer is in
+;;; Rust, the hit test is against the same gutter the mark was drawn in, and no
+;;; motion event ever reaches the image. Which is also why the message travels on
+;;; the overlay rather than being looked up in `*lsp-diagnostics*' when asked —
+;;; the overlay slides with the text and dies with it, so it cannot come to
+;;; describe the wrong line, and asking Lisp per pixel is not a thing that could
+;;; be afforded.
+;;;
+;;; ponytail: the *inline* message is still `SPC l e' and still wants virtual
+;;; text — a string drawn after a line's end without covering anything — which
+;;; `display' is emphatically not: it replaces the cells it covers, so an inline
+;;; message would eat the code it is about. The upgrade path is still an
 ;;; `after-string' overlay property, which is a payload in `overlay.rs' and a
 ;;; branch in the renderer's line loop.
 
@@ -540,9 +812,12 @@ list would strand a mark in every file you looked at and never take it off.")
 (defvar *lsp-drawn-in* nil
   "The path `%lsp-draw-diagnostics' last painted. See `%lsp-redraw-on-switch'.")
 
-(defun %lsp-diagnostic-overlay (line severity)
-  "Mark LINE with SEVERITY's glyph. NIL if there is nothing there to mark."
-  (let* ((beg (line-start line))
+(defun %lsp-diagnostic-overlay (d)
+  "Mark D's line with its severity glyph, carrying its message. NIL if there is
+nothing there to mark."
+  (let* ((line (first d))
+         (severity (third d))
+         (beg (line-start line))
          ;; The line's own text, so the overlay is *about* what the server
          ;; complained on and dies with it. An empty line has none and
          ;; `make-overlay' answers NIL for an empty range, so fall back to the
@@ -555,6 +830,10 @@ list would strand a mark in every file you looked at and never take it off.")
     (when ov
       (overlay-put ov 'gutter
                    (or (cdr (assoc severity *lsp-diagnostic-marks*)) "?"))
+      ;; What the pointer resting on that mark says. The same string `SPC l e'
+      ;; echoes, from the same function, because the shape of the mark tells you
+      ;; only *that* something is wrong and both of these tell you what.
+      (overlay-put ov 'help-echo (%lsp-diagnostic-text d))
       ;; Not read by the renderer — it is how these are told from anyone else's
       ;; overlays, the way `folds-in' tells folds from org's bullets.
       (overlay-put ov 'lsp-diagnostic severity))
@@ -572,7 +851,7 @@ look at it — which is `%lsp-redraw-on-switch', below."
     (setf (gethash path *lsp-diagnostic-overlays*)
           (when *lsp-diagnostic-marks*
             (loop for d in (lsp-diagnostics path)
-                  for ov = (%lsp-diagnostic-overlay (first d) (third d))
+                  for ov = (%lsp-diagnostic-overlay d)
                   when ov collect ov)))
     (setf *lsp-drawn-in* path)
     nil))
@@ -623,11 +902,12 @@ exists yet."
         (with-open-file (out *lsp-diagnostics-file*
                              :direction :output :if-exists :supersede
                              :if-does-not-exist :create
-                             ;; The strings here are UTF-8 bytes in base strings
-                             ;; (see `docs/boundary.org'); latin-1 writes each
-                             ;; one out as the byte it already is, where utf-8
-                             ;; would encode it a second time.
-                             :external-format :latin-1)
+                             ;; Characters, like everything else in the image, so
+                             ;; the encoder that spells them is the one the file
+                             ;; is read back with. This was `:latin-1' for as
+                             ;; long as these strings were already-encoded bytes
+                             ;; and utf-8 would have encoded them a second time.
+                             :external-format :utf-8)
           (if rows
               (dolist (r rows) (write-line r out))
               (write-line "no diagnostics" out)))
@@ -737,8 +1017,7 @@ cursor in the buffer being left."
         (rpc-request
          (%lsp-get key :conn) "textDocument/definition"
          (jobj "textDocument" (jobj "uri" (lsp-path-uri path))
-               ;; LSP counts lines from 0 and `line-number' from 1.
-               "position" (jobj "line" (1- (line-number)) "character" (column)))
+               "position" (%lsp-point-position))
          (lambda (result error)
            (cond (error (message (format nil "lsp: ~a" (jget error "message"))))
                  ((null result) (message "lsp: no definition found"))
@@ -779,8 +1058,9 @@ cursor in the buffer being left."
 ;;;    would hand us (START OLD-END NEW-END TEXT), and that describes an edit
 ;;;    which may already be two edits old by the time we run — whereas a read of
 ;;;    the buffer at hook time is current by construction. A delta is the right
-;;;    signal for something reconstructing a *history* (incremental didChange
-;;;    wants it); it is the wrong one for a question about the present.
+;;;    signal for something reconstructing a *history* — incremental didChange is
+;;;    exactly that, and cannot use it either, for the reason at the top of this
+;;;    file; it is the wrong one for a question about the present.
 ;;;
 ;;; 2. *The server is a subprocess.* The reply is validated against the buffer
 ;;;    as it is **when it arrives** rather than as it was when we asked — same
@@ -841,30 +1121,22 @@ suggestion, and you are better off typing another character.")
   :SHOWN   the ones matching the prefix now, same shape, capped
   :INDEX   which of :SHOWN is highlighted")
 
-;;; Word characters, and **ASCII on purpose** — which is the one thing in this
-;;; section that has to be read before it is changed.
+;;; Word characters, and **ASCII on purpose** — but for a smaller reason than it
+;;; used to be.
 ;;;
-;;; Buffer text reaches Lisp as UTF-8 *bytes*, one character per byte
-;;; (`docs/boundary.org'), while `(point)' counts real characters. Scanning back
-;;; over bytes to find where a word starts therefore gives an offset in the wrong
-;;; unit — except that every byte of a multi-byte sequence is >= #x80, so a scan
-;;; that stops at the first non-ASCII byte has counted bytes that are each
-;;; exactly one character. The anchor is correct on any line, in any encoding,
-;;; without decoding anything.
+;;; It was a correctness argument once. Buffer text reached Lisp as UTF-8 bytes
+;;; while `(point)' counted characters, so scanning back over the text to find
+;;; where a word starts answered in the wrong unit — except that every byte of a
+;;; multi-byte sequence is >= #x80, so a scan stopping at the first non-ASCII
+;;; byte had counted bytes that were each exactly one character. The two units
+;;; are one now, and the scan below would be correct over any alphabet at all.
 ;;;
-;;; `utf8-text' is the alternative and is not needed here: decoding to count
-;;; would then leave the prefix in *characters* while the server's candidates
-;;; arrive in bytes like everything else across the shim, and the comparison
-;;; would be between two different alphabets. Bytes on both sides, ASCII where it
-;;; matters, and the candidate goes back into the buffer as the bytes it arrived
-;;; as.
-;;;
-;;; ponytail: a word containing a non-ASCII letter — `naïve', a Greek variable in
-;;; a Python file — has its prefix start after that letter, so the popup filters
-;;; on `ve' rather than on `naïve'. A shorter prefix, never a wrong offset, so
-;;; the worst case is a longer list. Upgrade path is the one `f_query' already
-;;; writes up: move buffer text to characters and delete the two index
-;;; conversions.
+;;; ponytail: it still stops at the first non-ASCII letter, so `naïve' filters on
+;;; `ve' and a Greek variable in a Python file filters on nothing. A shorter
+;;; prefix, never a wrong offset, so the worst case is a longer list. The upgrade
+;;; is a real word-constituent test — `alpha-char-p' plus the connector
+;;; punctuation an identifier may carry — and it is now a one-line change here
+;;; rather than a change to the boundary.
 
 (defun %lsp-word-char-p (ch)
   "True for the ASCII characters an identifier is made of."
@@ -874,8 +1146,7 @@ suggestion, and you are better off typing another character.")
 (defun %lsp-completion-prefix ()
   "(AT . PREFIX) for the word point sits at the end of, or NIL when it does not.
 
-AT is a character offset and PREFIX is the buffer's own bytes — see the note
-above for why those two units can be mixed here and nowhere else."
+AT is a character offset, as is everything else here."
   (let* ((beg (line-start))
          (p (point))
          (text (buffer-substring beg p))
@@ -979,8 +1250,9 @@ convert its line/character pair through `line-start', and pass that range to
 ;;; about *words*, not cells, and a greedy fill on spaces is right at any font.
 ;;;
 ;;; ponytail: wrapped on ASCII spaces and counted in characters, so a CJK
-;;; docstring wraps late — the same byte-versus-cell approximation the prefix
-;;; scan above is written up for, and with the same upgrade path. A markdown
+;;; docstring wraps *early* — a character there is two cells wide, and only the
+;;; renderer knows that. The upgrade is a width reader beside `highlight', which
+;;; is the same answer the `line-overflow' code wants. A markdown
 ;;; docstring is shown as its source: no renderer, and fences and backticks read
 ;;; well enough that stripping them would lose more than it hides.
 
@@ -1126,11 +1398,7 @@ are in flight is the one stale state worth spending a frame of emptiness on."
        (rpc-request
         (%lsp-get key :conn) "textDocument/completion"
         (jobj "textDocument" (jobj "uri" (lsp-path-uri path))
-              ;; LSP counts lines from 0 and `line-number' from 1. The column is
-              ;; the same approximation `lsp-goto-definition' makes and is
-              ;; written up on `%lsp-capabilities': characters where LSP wants
-              ;; UTF-16 units, exact on ASCII.
-              "position" (jobj "line" (1- (line-number)) "character" (column))
+              "position" (%lsp-point-position)
               ;; 1 is `Invoked' — this client has no trigger characters, since
               ;; deciding to complete is a rule in this file rather than a
               ;; property of the server.

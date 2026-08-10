@@ -351,29 +351,23 @@ certainly saying."
 ;;; ---------------------------------------------------------------------------
 ;;; Buffer text on its way back out
 ;;;
-;;; **Every string this file takes out of the buffer goes through `utf8-text'
-;;; first.** That is one function and one bug, and the bug is worth the words
-;;; because it is invisible: the page is drawn correctly right up until somebody
-;;; puts an em dash in the title — which the curriculum in `examples/math/' does,
-;;; in its first line.
+;;; Nothing in this file decodes anything, and it is worth a paragraph to say why
+;;; that used to be false. Buffer text arrived as UTF-8 bytes and **every string
+;;; this file took out of the buffer went through `utf8-text' first** — one
+;;; function, one rule, and a bug that stayed invisible until somebody put an em
+;;; dash in a title, which the curriculum in `examples/math/' does in its first
+;;; line.
 ;;;
-;;; The decoder itself is in `modes/modes.lisp', with the byte model written up
-;;; on its docstring. It was written out here first, and copied into `gui.lisp'
-;;; when that file needed it before this one existed; two copies of a decoder
-;;; that agreed by luck is the thing that got lifted, not this file's rule.
-;;;
-;;; The scene made the rule *mandatory* rather than merely correct, and that is
-;;; the one way the port raised the stakes. Every string a scene hands over is
-;;; measured by `Measure::advance' in a real font, so bytes reaching it are not
-;;; merely drawn wrong — they are three characters wide where the document has
-;;; one, and every wrap, every column width and every centred line is computed
+;;; The scene made that rule *mandatory* rather than merely tidy, and that is the
+;;; one way the port raised the stakes: every string a scene hands over is
+;;; measured by `Measure::advance' in a real font, so bytes reaching it were not
+;;; merely drawn wrong — they were three characters wide where the document has
+;;; one, and every wrap, every column width and every centred line was computed
 ;;; from the wrong number.
 ;;;
-;;; So this file decodes **once, per line, at the top of the builder** — see
-;;; `%org-frozen-line' — and everything downstream, the emphasis scanner, the
-;;; table's column arithmetic, the slices handed to `run', works in characters.
-;;; That is simpler than what the overlay version did, which had to keep byte
-;;; indices to hand `make-overlay' and converted with `%char-index' at every use.
+;;; The shim decodes now, once, for the whole image (`crates/lisp/src/shim.c'),
+;;; so the emphasis scanner, the table's column arithmetic and the slices handed
+;;; to `run' all count what the document says without anybody arranging it.
 
 ;;; `%org-frozen-repeat' used to live here: N copies of a character, with a
 ;;; comment about `:element-type 'character' because a base string cannot hold
@@ -458,12 +452,10 @@ the whitespace in front of it, or NIL.
 The whitespace goes with the tags deliberately: a heading's text ends before it,
 and the page has no use for either.
 
-The function did not change and its *contract* did. It used to answer a byte
-index, because `line-string' hands out UTF-8 bytes and every caller converted
-with `%char-index' to reach `make-overlay'. A scene has no buffer offsets at
-all, so the builder decodes each line before it reads it and this answers an
-index into that decoded string — which is what `subseq' wants, and is the same
-arithmetic either way, since a tag alphabet is ASCII."
+An index into the line's own text, which is what `subseq' wants — and, since
+buffer text is characters, also what `make-overlay' would take. It answered a
+byte index for as long as `line-string' handed out UTF-8, and the arithmetic is
+the same either way because a tag alphabet is ASCII."
   (let ((e (length line)))
     (loop while (and (plusp e) (%org-blank-p (char line (1- e)))) do (decf e))
     (let ((s (position-if #'%org-blank-p line :end e :from-end t)))
@@ -621,9 +613,9 @@ meant it to stop produces a document that is wrong somewhere you cannot see."
 ;;;   - **a run set in its own size.** `Overlay::scale' is a line property; a
 ;;;     `run' has its own.
 ;;;
-;;; Everything here works on **decoded** text — see `%org-frozen-line'. Offsets
-;;; are therefore character offsets into a character string, and there is no
-;;; `%char-index' anywhere below this line.
+;;; Every offset here is a character offset into a character string, which is
+;;; what the buffer hands out and what a `subseq' of it counts in. There is no
+;;; conversion anywhere below this line and there is nothing left to convert.
 
 (defun %org-frozen-merge (base extra)
   "BASE, a plist of `run' keywords, with everything EXTRA also names replaced.
@@ -800,7 +792,7 @@ making, since nothing clips and a cell too narrow wraps."
 ;;;
 ;;; **The bit that decides which was already computed and already thrown away.**
 ;;; `latex-fragments' answers (START END DISPLAY) and every caller in the tree
-;;; ignores the third element: `(declare (ignore display))' at init.lisp:832 and
+;;; ignores the third element: `(declare (ignore display))' in `org-latex.lisp' and
 ;;; at the old `%org-frozen-latex' here. An overlay had no use for it — a bitmap
 ;;; over a range is a bitmap over a range — and a scene has nothing *but* that
 ;;; use for it.
@@ -868,20 +860,20 @@ instead of a hole where one was."
 Answers (values INLINE DISPLAY):
 
   INLINE   a vector parallel to V — per line, ((BEG END SOURCE) ...) in indices
-           into that line's own *decoded* text, in order.
+           into that line's own text, in order.
   DISPLAY  ((FIRST LAST SOURCE) ...), the line ranges a display equation owns
            whole, in document order.
 
 One pass over the fragments beside one pass over the lines, because both are in
 order — the cursor into V is never rewound.
 
-No `buffer-substring' anywhere, and that is not thrift. `buffer-substring'
-answers UTF-8 *bytes*, so a fragment holding `\\text{café}' would reach TeX
-twice-encoded — the same bug `utf8-text' exists to prevent, one layer further
-down, where it would come back as a wrongly-typeset equation rather than as a
-wrong glyph. The line vector is already decoded and its lines are consecutive,
-so joining the lines a fragment lies on with a newline reproduces the buffer's
-own offsets exactly and the source is a `subseq'.
+No `buffer-substring' anywhere, and that is thrift rather than correctness now:
+the line vector is already in hand and its lines are consecutive, so joining the
+lines a fragment lies on with a newline reproduces the buffer's own offsets
+exactly and the source is a `subseq' — no second trip across the boundary per
+fragment. It was correctness while `buffer-substring' answered UTF-8 bytes and a
+fragment holding `\\text{café}' reached TeX twice-encoded, coming back as a
+wrongly-typeset equation rather than as a wrong glyph.
 
 A block is opaque to `latex-fragments' — `opaque_ranges' in
 `crates/syntax/src/org.rs' covers every `#+begin_'/`#+end_' pair and every
@@ -1139,9 +1131,8 @@ The plist:
   :KIND    always :HEADING today. Present so a second kind of node can be
            hooked later without every caller having to be found and changed.
   :LEVEL   the heading's level — 1 for `*', 2 for `**'.
-  :TEXT    its text, decoded to real characters, with the tag run removed and
-           the surrounding whitespace trimmed. Characters and not bytes: see
-           `utf8-text', and do not undo it.
+  :TEXT    its text, with the tag run removed and the surrounding whitespace
+           trimmed.
   :TAGS    its `:a:b:' tags as a list of strings, or NIL.
   :LINE    the 0-based index of the line in the buffer.
   :BEGIN   character offset of the line's first character, which is what
@@ -1186,11 +1177,12 @@ it.")
 ;;; in one form and swapped in whole.
 
 (defun %org-frozen-line (v i)
-  "Line I of V, decoded, with its indentation left alone.
+  "Line I of V, with its indentation left alone.
 
-The one place buffer text becomes characters, and every reader below this point
-depends on it having happened exactly once."
-  (utf8-text (first (aref v i))))
+Named rather than spelled out at each of its several dozen uses because it was
+the one place buffer text became characters — `(utf8-text (first (aref v i)))' —
+for as long as that was something this file had to do."
+  (first (aref v i)))
 
 (defun %org-frozen-line-pieces (text frags &optional (from 0) (to (length text)))
   "TEXT between FROM and TO as pieces, with FRAGS spliced in as equations.
@@ -1377,16 +1369,13 @@ it announces, and the emphasis inside a heading is drawn instead of skipped."
 ;;; `*org-frozen-table-pad*''s, where the whole approximation lives.
 
 (defun %org-frozen-cells (line)
-  "The `|'-delimited cells of a table row, as decoded strings with their padding
-already trimmed off.
+  "The `|'-delimited cells of a table row, with their padding already trimmed
+off.
 
-Trimmed and decoded here rather than by the caller because *every* caller wants
-both: a column's width is the width of its content in characters, and the
-content is what gets redrawn. Whatever whitespace the author used to align it by
-hand is exactly the thing this mode is replacing.
-
-Decoding here is also why `%org-frozen-table-node' is the one builder that reads
-a *raw* line: handing this an already-decoded one would decode an em dash twice."
+Trimmed here rather than by the caller because *every* caller wants it: a
+column's width is the width of its content, and the content is what gets
+redrawn. Whatever whitespace the author used to align it by hand is exactly the
+thing this mode is replacing."
   (let ((bars (loop for i from 0 below (length line)
                     when (char= (char line i) #\|) collect i)))
     (loop for (a b) on bars
@@ -1394,7 +1383,7 @@ a *raw* line: handing this an already-decoded one would decode an em dash twice.
           collect (let ((s (1+ a)) (e b))
                     (loop while (and (< s e) (%org-blank-p (char line s))) do (incf s))
                     (loop while (and (< s e) (%org-blank-p (char line (1- e)))) do (decf e))
-                    (utf8-text (subseq line s e))))))
+                    (subseq line s e)))))
 
 (defun %org-frozen-rule-row-p (line)
   "True when LINE is a table's rule row — `|---+---|' and its spellings.
@@ -1426,10 +1415,6 @@ The rule row is a `rect', not a run of `─'. The header is everything above the
 first rule, and only when there is one: a table with no rule has no header, it
 has rows — and the header is *weight*, not colour, because the rule under it
 already says where it ends."
-  ;; The *raw* line, uniquely in this file: `%org-frozen-cells' decodes each
-  ;; cell for itself — it has to, since a column's width is its content's width
-  ;; in characters — and handing it a line this builder had already decoded
-  ;; would decode an em dash twice and read its own output as UTF-8.
   (let* ((rows (loop for i from from to to collect (first (aref v i))))
          (cellsets (mapcar (lambda (r) (mapcar #'%org-frozen-pieces
                                                (%org-frozen-cells r)))
@@ -1859,9 +1844,16 @@ while this document is still frozen in this one. The exit hook has to be able to
 tell \"the user left frozen mode\" from \"the user opened something else\", and
 the buffer's identity is the only thing that answers it.
 
-The ceiling underneath is `modes.lisp''s own and is written up there: there is
-no buffer-switch hook, so nothing here can be per-buffer in the way it should
-be. Freeze two documents at once and the second one to be entered owns this.")
+The ceiling underneath is `modes.lisp''s own and is written up there: a mode is
+a single global, so nothing here can be per-buffer in the way it should be.
+Freeze two documents at once and the second one to be entered owns this.
+
+Half of that ceiling has since lifted — there *is* a buffer switch hook now,
+`*buffer-switch-functions*', added so that settings claimed by a mode follow the
+buffer on screen. This variable could be retired in favour of it. It has not
+been, because the exit hook's question is not \"which buffer is live\" but \"did
+the user leave frozen mode or merely look away\", and answering that from the
+switch hook is a rewrite of this file's state machine rather than a deletion.")
 
 (defun org-frozen-mode-exit-hook ()
   "Leaving the mode puts the document back: the page comes down and the buffer

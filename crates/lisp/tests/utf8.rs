@@ -1,27 +1,33 @@
-//! The buffer boundary: `utf8-text` in `runtime/modes/modes.lisp`, and the two
-//! modes that were still crossing it without one.
+//! The text boundary: **Lisp holds characters**, on both sides of the shim.
 //!
-//! Lisp holds buffer text as UTF-8 **bytes**, one Lisp character per byte, while
-//! everything going the other way — `message`, an overlay's `display`, a scene's
-//! `run` — is encoded as UTF-8 per *character* on its way out. Text taken out of
-//! a buffer and handed straight back is therefore encoded twice, and `café`
-//! comes home as `cafÃ©`.
+//! `λ` is one Lisp character whether it arrived in a `load`ed file, in a form
+//! Rust queued for evaluation, or in the answer to `(buffer-string)`. UTF-8
+//! exists only in the `char *` between the two languages, encoded by `dup_utf8`
+//! and decoded by `utf8_string` in `crates/lisp/src/shim.c`, and nothing in
+//! `runtime/` knows it is there.
+//!
+//! It was bytes until recently — every reader answered a base string of UTF-8
+//! bytes, `%byte-index` and `%char-index` converted between the two counts, and
+//! `utf8-text` in `modes.lisp` decoded at each of the dozen places text left a
+//! buffer. This file asserted that model, byte for byte, and so pinned its one
+//! genuine failure in place: ECL's reader parses a byte string as Latin-1, so
+//! `(message "λ")` from a keybinding reached the status line as `Î»` while the
+//! same form in a file was fine.
 //!
 //! **Every assertion here is byte-exact against a known sample, and that is the
 //! whole point of the file.** A test asserting "some character in the answer is
 //! non-ASCII" passes on double-encoded text — `Ã©` is two non-ASCII characters —
-//! so it would have watched this bug ship. What is compared below is a Rust
+//! so it would have watched the bug ship. What is compared below is a Rust
 //! `String` that came out of the image against a Rust literal in this file, and
-//! the *undecoded* answer is asserted too: it must equal the mojibake computed
-//! byte for byte from the sample, which is what says the decode is doing work
-//! rather than the sample being ASCII by accident.
+//! the mojibake is computed from the sample and asserted *absent*.
 //!
-//! Nothing here is spelled as a non-ASCII literal inside an `eval`ed form. A
-//! form evaluated from Rust arrives as source in the same byte model, so `"—"`
-//! written into one is already three characters and a test using it would be
-//! asserting against mojibake it introduced itself. Non-ASCII goes in through
-//! the *buffer*, which is where it comes from in real life, and comes back out
-//! through `message`, which encodes properly.
+//! **The two halves have to move together, and the file is arranged to say so.**
+//! A form arriving from Rust and text arriving from the editor are two different
+//! doors, and decoding one alone makes the strings incomparable — which is what
+//! the `search-forward` block in the middle is for. It looks for a literal that
+//! came through one door in a buffer that came through the other, and it is the
+//! assertion that fails on a half-done fix. Nothing else would: `search` simply
+//! answers NIL, so the failure is silent everywhere except here.
 //!
 //! Deliberately a single `#[test]`, as in every file beside it: `cl_boot`
 //! initialises a process-wide Lisp image, so there is exactly one `spawn` per
@@ -84,7 +90,9 @@ fn says(shared: &Shared, lisp: &zemacs_lisp::Lisp, form: &str, want: &str) {
 /// its UTF-8 read as a character in its own right.
 ///
 /// Computed rather than written out, so the expectation cannot drift from the
-/// sample and cannot be quietly typo'd into something that matches.
+/// sample and cannot be quietly typo'd into something that matches. It is what
+/// every assertion below is asserted *against* — being right and being
+/// `twice_encoded(SAMPLE)` are the two answers this boundary has ever given.
 fn twice_encoded(sample: &str) -> String {
     sample.bytes().map(|b| b as char).collect()
 }
@@ -153,20 +161,21 @@ const MARKUP: &str = "\
 Some *caf\u{e9}* text and a [[https://x/a/b][d\u{e9}j\u{e0} vu]].
 ";
 
+/// A buffer to look a Greek letter up in. `γ` is two bytes and one character,
+/// and its offset is 4 either way you count the ASCII in front of it.
+const GREEK: &str = "let \u{3b3} = 1\n";
+
 #[test]
-fn buffer_text_handed_back_to_the_editor_is_decoded_first() {
-    // `modes.lisp` alone first, and the message in between is the assertion that
-    // the decoder is *where every mode can reach it*. Half the tests in this
-    // directory load a mode file against a bare image and never read a config,
-    // so "it works under a full `init.lisp`" — which `org_frozen.rs` proves —
-    // is not the same statement.
+fn text_crossing_the_shim_is_characters_in_both_directions() {
+    // `modes.lisp` alone first, then the two modes that read documents. Half the
+    // tests in this directory load a mode file against a bare image and never
+    // read a config, which is why this one does too.
     let init = std::env::temp_dir().join("zemacs_test_utf8_init.lisp");
     std::fs::write(
         &init,
         format!(
             r#"(in-package :zemacs)
 (load {:?} :verbose nil :print nil)
-(message (format nil "decoder: ~a" (if (fboundp 'utf8-text) "yes" "no")))
 (load {:?} :verbose nil :print nil)
 (load {:?} :verbose nil :print nil)
 (message "utf8 test init loaded")
@@ -188,31 +197,45 @@ fn buffer_text_handed_back_to_the_editor_is_decoded_first() {
     {
         let seen = shared.lock().unwrap().messages.clone();
         assert!(
-            seen.iter().any(|m| m == "decoder: yes"),
-            "`utf8-text' must come with `modes.lisp', before any mode file: {seen:#?}"
-        );
-        assert!(
             !seen.iter().any(|m| m.contains("error")),
             "the runtime files must load cleanly; got {seen:#?}"
         );
     }
 
-    // --- the decoder itself, byte for byte ----------------------------------
-    load(&shared, SAMPLE, 0);
-    let decoded = asks(&shared, &lisp, "(utf8-text (line-string 1))");
-    assert_eq!(decoded, SAMPLE, "the line comes back saying what the file says");
-
-    // ...and the same line without the decode, which is the failure this exists
-    // to name. Asserted exactly, not merely as "different": a test happy with
-    // any difference would also be happy with a decoder that dropped the
-    // accented characters instead of double-encoding them.
-    let raw = asks(&shared, &lisp, "(line-string 1)");
-    assert_eq!(
-        raw,
-        twice_encoded(SAMPLE),
-        "undecoded buffer text is its own UTF-8 read one byte at a time"
+    // --- door one: a form arriving from Rust --------------------------------
+    //
+    // The reproducer, and the smallest statement of the whole bug: this exact
+    // form from a keybinding put `Î»` in the status line, because the source
+    // crossed as a base string and ECL's reader read its two UTF-8 bytes as two
+    // Latin-1 characters. Nothing is loaded and nothing is in a buffer — the
+    // path is Rust, the shim, READ, and `message` straight back out.
+    let lambda = asks(&shared, &lisp, "\"\u{3bb}\"");
+    assert_eq!(lambda, "\u{3bb}", "a literal in an eval'd form is what it says");
+    assert_ne!(
+        lambda,
+        twice_encoded("\u{3bb}"),
+        "and specifically not the Latin-1 reading of its own encoding"
     );
-    assert_ne!(raw, decoded, "the sample must not be ASCII by accident");
+    says(&shared, &lisp, "(length \"\u{3bb}\")", "1");
+    says(&shared, &lisp, "(char-code (char \"\u{3bb}\" 0))", "955");
+    // Four bytes as well as two, since the arithmetic differs per length.
+    says(&shared, &lisp, "(char-code (char \"\u{1d53d}\" 0))", "120125");
+    // The whole sample through the same door, byte-exact. Quoted by hand rather
+    // than with `{:?}`: Rust's debug format spells a combining accent `\u{301}`,
+    // which is not an escape Lisp's reader knows.
+    let round_trip = asks(&shared, &lisp, &format!("\"{SAMPLE}\""));
+    assert_eq!(round_trip, SAMPLE, "source in, the same source out");
+
+    // --- door two: text the editor answered ---------------------------------
+    load(&shared, SAMPLE, 0);
+    let line = asks(&shared, &lisp, "(line-string 1)");
+    assert_eq!(line, SAMPLE, "the line comes back saying what the file says");
+    assert_ne!(
+        line,
+        twice_encoded(SAMPLE),
+        "and not its own UTF-8 read one byte at a time, which is what it was"
+    );
+    assert_ne!(SAMPLE, twice_encoded(SAMPLE), "the sample is not ASCII by accident");
 
     // Lengths, which is the half of the bug that is not about glyphs: a scene
     // measures every string in a real font, so bytes are three characters wide
@@ -220,30 +243,44 @@ fn buffer_text_handed_back_to_the_editor_is_decoded_first() {
     says(
         &shared,
         &lisp,
-        "(length (utf8-text (line-string 1)))",
+        "(length (line-string 1))",
         &SAMPLE.chars().count().to_string(),
     );
+    // The editor's offsets and Lisp's indices are now the same integers, which
+    // is the property that let `%byte-index` and `%char-index` be deleted. This
+    // is exactly the assertion that fails if `f_query` stops decoding.
+    says(&shared, &lisp, "(= (length (buffer-string)) (point-max))", "T");
+
+    // --- the two doors meeting, which is the point of the whole change ------
+    //
+    // A pattern read out of a form, looked for in text read out of the editor.
+    // Decode one door and not the other and this answers NIL — which it did,
+    // measured and not guessed, and which is why the fix could not be local.
+    load(&shared, GREEK, 3);
+    says(&shared, &lisp, "(search-forward \"\u{3b3}\" 0)", "4");
+    says(&shared, &lisp, "(search-backward \"\u{3b3}\" (point-max))", "4");
+    // ...and the offset means what `goto-char` means by it.
     says(
         &shared,
         &lisp,
-        "(length (line-string 1))",
-        &SAMPLE.len().to_string(),
+        "(progn (goto-char (search-forward \"\u{3b3}\" 0)) (point))",
+        "4",
     );
-
-    // ASCII is the identity — the same object, not a copy. The fast path is what
-    // makes it affordable to call this on every line of a document.
-    says(&shared, &lisp, r#"(let ((s "abc")) (if (eq s (utf8-text s)) t nil))"#, "T");
-    // A truncated or stray sequence is passed through one character at a time
-    // rather than dropped or replaced: a renderer showing nothing is a page that
-    // silently disagrees with the file behind it.
-    says(&shared, &lisp, "(length (utf8-text (string (code-char 200))))", "1");
-    says(&shared, &lisp, "(length (utf8-text (string (code-char 128))))", "1");
+    // The other direction over the same boundary: a character typed in from a
+    // form lands in the buffer as itself and is found there afterwards.
+    says(
+        &shared,
+        &lisp,
+        "(progn (goto-char (point-max)) (insert \"\u{2014}\u{1d53d}\") \
+                (format nil \"~a ~a\" (search-forward \"\u{1d53d}\" 0) (point-max)))",
+        &format!("{} {}", GREEK.chars().count() + 1, GREEK.chars().count() + 2),
+    );
 
     // --- org-modern: what a substitution draws ------------------------------
     //
-    // Both paths that hand buffer text back as a `display` string. Before the
-    // decode these came out as `cafÃ©` and `dÃ©jÃ  vu`, which is the accented
-    // link description reported from a real document.
+    // Both paths that hand buffer text back as a `display` string. Before this
+    // these came out as `cafÃ©` and `dÃ©jÃ  vu`, which is the accented link
+    // description reported from a real document.
     load(&shared, MARKUP, 1);
     lisp.eval("(progn (goto-char (point-max)) (org-mode-hook))".into());
     says(&shared, &lisp, "(if (minor-mode-p 'org-modern) t nil)", "T");
@@ -283,9 +320,9 @@ fn buffer_text_handed_back_to_the_editor_is_decoded_first() {
         "caf\u{e9}",
     );
     // The offsets are unchanged by any of it: they are characters and always
-    // were, and a decode that had been applied a layer too low would have moved
-    // them. `:begin` is the first star of the unit heading, which is the line
-    // after a two-line preamble and a blank.
+    // were, and a decode applied a layer too low would have moved them. `:begin`
+    // is the first star of the unit heading, which is the line after a two-line
+    // preamble and a blank.
     let unit_begin: usize = CURRICULUM
         .find("* Unidad")
         .map(|b| CURRICULUM[..b].chars().count())

@@ -53,7 +53,8 @@ use sdl3::surface::Surface;
 use sdl3::ttf::{Font, Hinting, Sdl3TtfContext};
 use sdl3::video::WindowContext;
 use zemacs_core::display::{
-    char_cells, expand_line, str_cells, visual_col, wrap_breaks, wrap_row_of, wrap_row_range,
+    char_cells, display_subs, expand_line, str_cells, substitute, visual_col, wrap_breaks,
+    wrap_row_of, wrap_row_range,
 };
 use zemacs_core::modeline;
 use zemacs_core::{
@@ -561,7 +562,10 @@ impl Renderer {
                     let doc = doc_rect(pane, status_h, measure_px(set, cell_w));
                     let text_w = doc.w - gutter_w(buf, set, cell_w);
                     let cols = visible_cols(text_w, cell_w);
-                    Some((visible_lines(buf, scroll, rows, text_w, cell_w, set), cols))
+                    // The same `Metrics` the draw pass builds for this pane, so
+                    // the count and the drawing spend rows on the same lines.
+                    let m = Metrics { editor, cell_w, line_h, ascent: self.ascent };
+                    Some((visible_lines(m, buf, scroll, rows, text_w, set), cols))
                 });
             // `cols` goes back too, and it is not decoration: `j` and `k` move
             // by *visual* line, and where a visual line breaks is this number.
@@ -688,6 +692,11 @@ impl Renderer {
             // opened is the most recent thing you asked for.
             self.draw_context_menu(editor, area.w, area.h);
         }
+        // ...and the hover box is outside that block, because it is the one
+        // surface here that belongs to a frame the keyboard is *not* in: pointing
+        // at a window does not focus it, so a mark hovered in a second frame has
+        // to draw in that second frame. `Tooltip::frame` is what says which.
+        self.draw_tooltip(editor, frame_index, area.w, area.h);
 
         Ok(())
     }
@@ -698,6 +707,71 @@ impl Renderer {
     pub fn present(&mut self) {
         self.canvas.present();
         self.shown = Some(self.drawn);
+    }
+
+    /// The window's current pixels, written to `path` as a PNG.
+    ///
+    /// **This presents.** Do not call [`Renderer::present`] first — call this
+    /// *instead* of it, on the frame you want a picture of. `read_pixels` reads
+    /// the backbuffer, and a present is a swap: afterwards the buffer holding
+    /// the frame you just showed is not the one you can read. What you get back
+    /// is whatever the driver left in the new backbuffer — the frame before
+    /// last on a double-buffered GL context, undefined on Metal, and on a
+    /// tiling compositor often a clear colour. So the read happens here, before
+    /// the swap, and the swap happens here too: the file and the screen come
+    /// from the same buffer by construction rather than by the caller getting
+    /// two calls in the right order.
+    ///
+    /// Alpha is dropped. The backbuffer's alpha channel is whatever the last
+    /// `set_draw_color` left, not coverage, and a screenshot saved with it
+    /// opens as a transparent rectangle in every viewer that honours it.
+    ///
+    /// Verified headless: under `SDL_VIDEODRIVER=dummy` the only render backend
+    /// SDL will build is `"software"`, whose target is an ordinary memory
+    /// surface — so the readback is the real frame, exact to the byte, and this
+    /// is a working screenshot with no display attached. An accelerated backend
+    /// that will not read back errors out naming itself, so a parent process
+    /// gets a reason instead of a black rectangle it cannot distinguish from a
+    /// hung editor.
+    pub fn save_png(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        // `read_pixels` flushes the command list on its way in, so this sees the
+        // frame `render` queued even though nothing has touched the GPU yet.
+        let shot = self.canvas.read_pixels(None).map_err(|e| {
+            anyhow::anyhow!(
+                "the {} backend refused a pixel readback ({e}); \
+                 screenshot the window some other way",
+                self.backend()
+            )
+        })?;
+        // RGB24 is memory order R,G,B on every endianness — which is PNG's row
+        // format, so the convert is the whole of the pixel work.
+        let shot = shot
+            .convert_format(PixelFormat::RGB24)
+            .map_err(|e| anyhow::anyhow!("convert the readback to RGB: {e}"))?;
+        let (w, h) = (shot.width(), shot.height());
+        if w == 0 || h == 0 {
+            anyhow::bail!(
+                "the {} backend read back a {w}x{h} frame; there is nothing to save",
+                self.backend()
+            );
+        }
+        // Surface rows are padded to `pitch`; PNG rows are not.
+        let row = w as usize * 3;
+        let rgb = shot.with_lock(|px| {
+            let pitch = shot.pitch() as usize;
+            let mut out = Vec::with_capacity(row * h as usize);
+            for y in 0..h as usize {
+                out.extend_from_slice(&px[y * pitch..y * pitch + row]);
+            }
+            out
+        });
+        let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+        let mut enc = png::Encoder::new(file, w, h);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()?.write_image_data(&rgb)?;
+        self.present();
+        Ok(())
     }
 
     /// Throw the frame just drawn away instead of putting it on screen.
@@ -821,18 +895,75 @@ impl Renderer {
         // is the one way this could disagree with what was drawn, since the draw
         // loop and this function are otherwise the same arithmetic twice.
         let zoom = win.zoom.max(100);
-        let at = offset_at(
-            buf,
-            win,
-            &editor.settings,
-            area_of(p.rect),
-            status_h,
-            scaled(self.line_h, zoom),
-            scaled(self.cell_w, zoom),
-            x,
-            y,
-        );
+        let m = Metrics {
+            editor,
+            cell_w: scaled(self.cell_w, zoom),
+            line_h: scaled(self.line_h, zoom),
+            ascent: self.ascent,
+        };
+        let at = offset_at(m, buf, win, &editor.settings, area_of(p.rect), status_h, x, y);
         Some((p.window, at))
+    }
+
+    /// The gutter row under the pointer: which pane's, and which **visual row**
+    /// of it. `None` when the pointer is not over a gutter at all.
+    ///
+    /// Three ways to be over nothing, and the third is the one worth stating:
+    /// outside every pane; outside the gutter's own columns; or in a buffer that
+    /// draws no gutter at all — a dashboard, a terminal, anything
+    /// `set-no-gutter-modes` covers. There is no margin there to hover, so there
+    /// is honestly no answer, and a mark could not have been drawn there either.
+    /// That last part is the design and not a coincidence: this asks the same
+    /// [`gutter_w`] the draw loop asks before it paints an [`Overlay::gutter`],
+    /// so "there is a mark here" and "there is something to hover here" cannot
+    /// come apart — including in a buffer whose config turns the gutter on when
+    /// you did not expect it to.
+    ///
+    /// **Deliberately not the buffer line**, which is what every caller actually
+    /// wants. Finding the line means walking the visible lines through folds,
+    /// wraps and image rows — [`offset_at`], which [`Renderer::click_target`]
+    /// already does — and this question is asked on *every pixel* of pointer
+    /// movement. A row is the unit a gutter mark is drawn in, so a caller caches
+    /// its answer against this and pays for the walk once per row crossed rather
+    /// than once per pixel. What is left per pixel is finding the pane, one
+    /// compare against the gutter's right edge and one division.
+    ///
+    /// The strip is the gutter's columns plus the [`PAD`] of air immediately left
+    /// of them, which in an ordinary pane is everything from its edge. It is
+    /// deliberately *not* everything left of the text: a buffer with a
+    /// `text-width` is centred, so its left margin can be a third of the window,
+    /// and treating all of that as gutter would pop a box for a pointer resting
+    /// nowhere near a mark. [`offset_at`] is more generous — it clamps `want_x`
+    /// at zero, so a click out there lands on column zero — and that generosity
+    /// is right for a gesture you aimed and wrong for one you did not.
+    pub fn gutter_row(
+        &self,
+        editor: &Editor,
+        frame_index: usize,
+        x: i32,
+        y: i32,
+    ) -> Option<(zemacs_core::frame::WindowId, usize)> {
+        let area = area_rect(area_of(self.content_area()));
+        let status_h = modeline_h(self.line_h, &editor.settings);
+        let frame = editor.frames.get(frame_index)?;
+        let p = frame.panes(area).into_iter().find(|p| p.rect.contains(x, y))?;
+        let win = frame.window(p.window)?;
+        let buf = editor.buffer_by_id(win.buffer)?;
+
+        // The pane's own units, for `click_target`'s reason: a zoomed window
+        // measures its gutter in wider cells and its rows in taller ones, and an
+        // answer in the body's units would drift a row further off the further
+        // down the pane you point.
+        let zoom = win.zoom.max(100);
+        let (cell_w, line_h) = (scaled(self.cell_w, zoom), scaled(self.line_h, zoom));
+        let pane = area_of(p.rect);
+        let doc = doc_rect(pane, status_h, measure_px(&editor.settings, cell_w));
+        let gutter = gutter_w(buf, &editor.settings, cell_w);
+        if gutter == 0 || x < doc.x - PAD || x >= doc.x + gutter {
+            return None;
+        }
+        let row = ((y - doc.y) / line_h.max(1)) as usize;
+        (y >= doc.y && row < doc_lines(pane, status_h, line_h)).then_some((p.window, row))
     }
 
     /// The grid a terminal pane can actually show, in cells, for a child that
@@ -883,6 +1014,10 @@ impl Renderer {
         // unzoomed pane measures in exactly the numbers it always did.
         let zoom = win.zoom.max(100);
         let (cell_w, line_h) = (scaled(self.cell_w, zoom), scaled(self.line_h, zoom));
+        // This pane's units plus the image store, in the shape the three
+        // counting functions take them — the same values they are handed by
+        // `render` and `click_target`, so all four spend rows identically.
+        let metrics = Metrics { editor, cell_w, line_h, ascent: self.ascent };
         let doc = doc_rect(pane, status_h, measure_px(set, cell_w));
         let (cur_line, cur_col) = line_col(buf, win.cursor);
         // The selection and the highlight spans both describe `editor.buffer`
@@ -1013,38 +1148,41 @@ impl Renderer {
             let mut images: Vec<(usize, zemacs_core::ImageId)> = Vec::new();
             // Rows this line must own whatever its text says — the one thing in
             // the renderer that makes a row's height variable. See `need` below.
-            let mut tall = 1usize;
+            //
+            // Asked of [`image_tall`] rather than accumulated in the loop below,
+            // which is where it used to be: `line_rows`, `visible_lines` and
+            // `offset_at` had no way to ask, so they counted a line's text rows
+            // and the draw pass counted more. One function, four callers, and
+            // they can no longer drift apart.
+            let tall = image_tall(metrics, buf, line);
             if !ov_runs.is_empty() {
+                // Images first, `display` strings after, and the order is the
+                // rule rather than a tidy-up: [`substitute`] gives the earliest
+                // start the range, and the sort below is stable, so an overlay
+                // carrying both draws as an image — while one whose bitmap has
+                // not been rasterised yet still falls back to its string.
                 let mut subs: Vec<(usize, usize, String)> = Vec::new();
                 for &(s, e, o) in &ov_runs {
-                    // An image is the more specific claim, so an overlay
-                    // carrying both never shows its `display` string.
-                    let image = o.image.and_then(|i| editor.image(i).map(|img| (i, img)));
-                    let text = match (&image, &o.display) {
-                        (None, None) => continue, // a face-only overlay hides nothing
-                        _ if o.start < start => String::new(), // continuation row
-                        (Some((id, img)), _) => {
-                            images.push((s, *id));
-                            // A tall image grows the line it starts on rather
-                            // than painting over the text below it. A *multi*-
-                            // line fragment already owns one blank row per
-                            // further source line it covers — the arm above is
-                            // what blanked them — so only the shortfall is
-                            // charged here. That is why `\begin{equation}`,
-                            // whose three source lines usually already hold it,
-                            // looks exactly as it did, while a `$$…$$` written
-                            // on one line stops overwriting its neighbour.
-                            let last = buf.text.char_to_line(o.end.saturating_sub(1));
-                            let blanked = last.saturating_sub(line);
-                            let want =
-                                image_rows(img.height, img.depth, line_h, self.ascent);
-                            tall = tall.max(want.saturating_sub(blanked).max(1));
-                            " ".repeat(image_cells(img.width, lb.cw))
-                        }
-                        (None, Some(d)) => d.clone(),
+                    let Some((id, img)) = o.image.and_then(|i| editor.image(i).map(|g| (i, g)))
+                    else {
+                        continue; // no bitmap: `display_subs` below has the say
                     };
-                    subs.push((s, e, text));
+                    if o.start < start {
+                        // A continuation row of a multi-line fragment: blank,
+                        // and no blit — the bitmap belongs to the first row.
+                        subs.push((s, e, String::new()));
+                        continue;
+                    }
+                    images.push((s, id));
+                    subs.push((s, e, " ".repeat(image_cells(img.width, lb.cw))));
                 }
+                // The half core also computes, from the same list, so that the
+                // cells `j` counted and the cells drawn here are the same cells.
+                subs.extend(display_subs(
+                    ov_runs.iter().map(|&(_, _, o)| o),
+                    start,
+                    end,
+                ));
                 if !subs.is_empty() {
                     subs.sort_by_key(|&(s, _, _)| s);
                     cells = substitute(&cells, &subs);
@@ -1088,12 +1226,18 @@ impl Renderer {
             // equation, or a 2× heading, at the foot of a short pane. Upgrade
             // path: a scroll position of (line, row).
             //
-            // ponytail: `visible_lines` and `cursor_pane_row` count a scale and
-            // a fold but still not an *image*, so a pane showing a display
-            // equation reports a line or two more than it draws. That one is
-            // core's ceiling as much as this file's — core lays a line out with
-            // no overlays at all, see boundary.org — and closing it is handing
-            // both of them the overlay list this loop is already walking.
+            // `tall` is `image_tall`, which `line_rows` and `offset_at` now ask
+            // too — so `need` here, the row count `scroll` clamps against and the
+            // row a click lands on are the same arithmetic in three places
+            // instead of one place and two approximations of it.
+            //
+            // ponytail: the *cells* an image reserves are still counted by the
+            // renderer alone — `image_cells` above is a pixel width over a cell
+            // width, and core's `Editor::line_cells` counts the fragment's source
+            // text instead. Ceiling: `j` onto a line carrying an inline `$x_1$`
+            // lands off by the difference. Rows were the half that mattered,
+            // because rows are what `scroll` and a click are counted in; columns
+            // want the cell width parked on the editor beside `wrap_cols`.
             // Where this line breaks, once, for every question below: the row
             // count, the cursor's row and column, and the range each row draws.
             // Truncation is the degenerate list — one row holding everything —
@@ -1624,7 +1768,7 @@ impl Renderer {
             return;
         };
         let style = editor.settings.completion_style;
-        if !p.kind.completes() || style == CompletionStyle::Minibuffer {
+        if !p.completes() || style == CompletionStyle::Minibuffer {
             return;
         }
 
@@ -2087,6 +2231,46 @@ impl Renderer {
         }
         let i = ((y - b.y - PADV) / self.line_h.max(1)) as usize;
         (i < menu.items.len()).then_some(i)
+    }
+
+    // --- the hover box --------------------------------------------------------
+
+    /// What the pointer is resting on, in a box beside it — a diagnostic's
+    /// message when you hover the mark in the gutter.
+    ///
+    /// The fourth body of this shape, after [`Renderer::draw_completion`],
+    /// [`Renderer::draw_which_key`] and [`Renderer::draw_completion_at_point`],
+    /// and by far the smallest, because it is the only one with **nothing to
+    /// select**: no rows, no highlight, no scrollbar, no input line. That is not
+    /// a coincidence — a hover box you can navigate is a box that has taken the
+    /// keyboard, and the keyboard already has [`Renderer::draw_completion`] for
+    /// that. What it shares is [`Popup`], [`wrap_text`] and `draw_str`.
+    ///
+    /// No border accent and a flatter panel than the completion popup: this
+    /// appears without being asked for, and a box that arrives under your hand
+    /// uninvited should read as an annotation rather than as a dialog.
+    fn draw_tooltip(&mut self, editor: &Editor, frame_index: usize, w: i32, h: i32) {
+        let Some(tip) = editor.tooltip.as_ref().filter(|t| t.frame == frame_index) else {
+            return;
+        };
+        let cols = (((w - 2 * PAD) / self.cell_w.max(1)).max(1) as usize).min(TOOLTIP_COLS);
+        let rows = wrap_text(tip.text.trim(), cols);
+        if rows.is_empty() {
+            return;
+        }
+        let b = tooltip_box(&rows, (tip.x, tip.y), w, h, self.cell_w, self.line_h);
+        if b.rows == 0 {
+            return;
+        }
+
+        let (bg, fg) = (editor.settings.background, editor.settings.foreground);
+        self.drop_shadow(b.x, b.y, b.w, b.h);
+        self.fill(b.x, b.y, b.w, b.h, rgb(mix(bg, fg, 0.13)));
+        self.stroke(b.x, b.y, b.w, b.h, rgb(mix(bg, fg, 0.30)));
+        for (i, row) in rows.iter().take(b.rows).enumerate() {
+            let ry = b.y + PADV + i as i32 * self.line_h;
+            self.draw_str(row, b.x + PAD, ry, rgb(mix(bg, fg, 0.88)));
+        }
     }
 
     /// A translucent smear under a floating box, so it reads as being *over* the
@@ -2801,13 +2985,47 @@ fn open_face(path: &std::path::Path, key: FaceKey) -> anyhow::Result<Face> {
 /// print rather than a panic in the middle of a frame.
 fn ttf() -> anyhow::Result<&'static Sdl3TtfContext> {
     static TTF: OnceLock<Sdl3TtfContext> = OnceLock::new();
-    match TTF.get() {
-        Some(ctx) => Ok(ctx),
-        None => {
-            let ctx = sdl3::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
-            Ok(TTF.get_or_init(move || ctx))
-        }
+
+    // The fast path, and the only one taken after the first font is opened.
+    if let Some(ctx) = TTF.get() {
+        return Ok(ctx);
     }
+
+    // ...and the slow one is behind a lock, because `sdl3::ttf::init` must not be
+    // called by two threads at once. This is not defensiveness about a C library
+    // in the abstract; it is a specific bug in a specific function.
+    // `Sdl3TtfContext::new` reads:
+    //
+    //     if TTF_COUNT.fetch_add(1, Relaxed) == 0 { TTF_Init(); }
+    //     Ok(Self)
+    //
+    // so the *second* caller bumps the count, sees it was not zero, and returns
+    // `Ok` immediately — without waiting for the first caller's `TTF_Init` to
+    // finish. It then loads a font against a library that is still starting up,
+    // and `load_font` fails. That is what
+    // `the_prose_face_opens_and_sets_the_same_words_unlike_the_mono_one` was
+    // catching about one run in six under a loaded suite, and it was catching
+    // something real: two frames opening their first face at once is the same
+    // race, with a blank window instead of a red test.
+    //
+    // A `Mutex` and not `OnceLock::get_or_init`, because the init is *fallible*
+    // and that closure cannot carry an error — a font that will not open has to
+    // stay an error the application prints, which is the whole point of the
+    // paragraph above this function. `get_or_try_init` is the shape this wants
+    // and it is still unstable.
+    //
+    // The lock is also what makes the `get_or_init` below always the first: the
+    // losing thread would otherwise have its context *dropped*, and dropping one
+    // decrements the same count and calls `TTF_Quit` when it reaches zero.
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // Re-checked under the lock: whoever held it before us may have done the work.
+    if let Some(ctx) = TTF.get() {
+        return Ok(ctx);
+    }
+    let ctx = sdl3::ttf::init().map_err(|e| anyhow::anyhow!("SDL_ttf init: {e}"))?;
+    Ok(TTF.get_or_init(move || ctx))
 }
 
 /// FNV-1a's constants, and tags that keep one kind of draw call from colliding
@@ -3194,6 +3412,32 @@ fn candidate_runs(
     }
 }
 
+/// The pane facts a row count needs and a `Buffer` cannot carry: the em box
+/// this pane measures in, and the editor the bitmaps live in.
+///
+/// One struct rather than three more arguments on each of [`offset_at`],
+/// [`visible_lines`] and [`line_rows`], because all three want the *same*
+/// three and a pane that handed one of them a different set is precisely the
+/// disagreement this bundle exists to make impossible. It is a parameter list,
+/// not an abstraction: no methods, `Copy`, and every field is read exactly
+/// once.
+///
+/// `cell_w` and `line_h` are this pane's own — a zoomed window measures in
+/// bigger ones — while `ascent` is the body's, which is what
+/// [`Renderer::draw_document`] has always passed [`image_rows`]. ponytail: so
+/// in a *zoomed* pane the rows an image claims are counted against a taller row
+/// and a shorter ascent than [`Renderer::draw_image`] then places it with.
+/// Ceiling: a LaTeX preview in a window somebody has zoomed, a row too tall.
+/// Upgrade path: a per-pane ascent, which means asking the face cache for the
+/// zoomed body face rather than reading `self.ascent`.
+#[derive(Clone, Copy)]
+struct Metrics<'a> {
+    editor: &'a Editor,
+    cell_w: i32,
+    line_h: i32,
+    ascent: i32,
+}
+
 /// The buffer offset a pixel in `pane` points at.
 ///
 /// The pure half of [`Renderer::click_target`], split out so it can be tested
@@ -3203,21 +3447,23 @@ fn candidate_runs(
 ///
 /// The loop is the drawing loop's twin and has to stay one: rows are spent on
 /// lines in the same order, a folded line is skipped without spending a row,
-/// and a wrapped line spends the same number the draw pass gives it. Anything
-/// else and the click lands on a character other than the one under the
-/// pointer.
+/// a wrapped line spends the same number the draw pass gives it, and a line
+/// carrying a tall image spends the rows that image claimed. Anything else and
+/// the click lands on a character other than the one under the pointer — which
+/// is what it did under every display equation in the file, by one row per row
+/// the bitmap had grown its line by.
 #[allow(clippy::too_many_arguments)]
 fn offset_at(
+    m: Metrics,
     buf: &Buffer,
     win: &Window,
     set: &Settings,
     pane: Area,
     status_h: i32,
-    line_h: i32,
-    cell_w: i32,
     x: i32,
     y: i32,
 ) -> usize {
+    let (cell_w, line_h) = (m.cell_w, m.line_h);
     let doc = doc_rect(pane, status_h, measure_px(set, cell_w));
     let gutter = gutter_w(buf, set, cell_w);
     let text_w = doc.w - gutter;
@@ -3252,7 +3498,7 @@ fn offset_at(
         } else {
             1
         };
-        let height = visual * b.tall;
+        let height = (visual * b.tall).max(image_tall(m, buf, line));
         if want_row < row + height {
             // Clamped at `cols` on the right, and it is the margin outside a
             // centred measure that made it matter: without it, a pointer out in
@@ -3267,7 +3513,14 @@ fn offset_at(
             // cells and 漢 is one character across two, so this last step is
             // the whole reason clicking a wide glyph lands on it rather than
             // beside it.
-            let cell = ((want_row - row) / b.tall.max(1)) * b.cols + want_col;
+            //
+            // Clamped to the visual rows the line's *text* has, which only bites
+            // on the rows an image grew the line by: those hold no characters at
+            // all — the draw loop stops at `drawn_rows` — so a pointer in the
+            // white space beside a display equation belongs on the row the
+            // equation's own source is on rather than one line past it.
+            let vr = ((want_row - row) / b.tall.max(1)).min(visual - 1);
+            let cell = vr * b.cols + want_col;
             let src = match cells.get(cell) {
                 Some(&(_, i)) => i,
                 // Past the end of the line: the position after the last
@@ -3557,23 +3810,100 @@ fn point_popup(
     Popup { x, y, w: box_w, h: box_h, rows }
 }
 
-/// Where the right-click menu sits, clamped into the window.
+/// Where a box hung off the pointer sits, clamped into the window.
 ///
 /// Flipped rather than shoved when it would run off the bottom or the right: a
-/// menu whose top-left corner is the pointer is the convention, and near an edge
+/// box whose top-left corner is the pointer is the convention, and near an edge
 /// every platform hangs it the other way rather than sliding it out from under
 /// your hand.
 ///
-/// A free function, like [`point_popup`], so the geometry can be tested with no
-/// window open — and so the drawing and the hit test provably agree, which is
-/// the bug ("I clicked New Window and got a split") worth designing out.
+/// Shared by the two surfaces anchored to the pointer instead of to the
+/// document — the right-click menu and the hover box — so the two cannot come to
+/// disagree about what an edge does. A free function, like [`point_popup`], so
+/// the geometry can be tested with no window open.
+fn pointer_origin(at: (i32, i32), box_w: i32, box_h: i32, w: i32, h: i32) -> (i32, i32) {
+    let (px, py) = at;
+    (
+        if px + box_w <= w { px } else { (px - box_w).max(0) },
+        if py + box_h <= h { py } else { (py - box_h).max(0) },
+    )
+}
+
+/// Where the right-click menu sits.
+///
+/// Shared by the drawing and the hit test rather than each doing the
+/// arithmetic, which is the bug ("I clicked New Window and got a split") worth
+/// designing out.
 fn context_menu_box(menu: &ContextMenu, w: i32, h: i32, cell_w: i32, line_h: i32) -> Popup {
     let cols = menu.items.iter().map(|(l, _)| str_cells(l)).max().unwrap_or(0);
     let box_w = cols as i32 * cell_w + 2 * PAD;
     let box_h = 2 * PADV + menu.items.len() as i32 * line_h;
-    let x = if menu.x + box_w <= w { menu.x } else { (menu.x - box_w).max(0) };
-    let y = if menu.y + box_h <= h { menu.y } else { (menu.y - box_h).max(0) };
+    let (x, y) = pointer_origin((menu.x, menu.y), box_w, box_h, w, h);
     Popup { x, y, w: box_w, h: box_h, rows: menu.items.len() }
+}
+
+/// Where the hover box sits, and how many of `rows` it was sized for.
+///
+/// Offset from the pointer by [`TOOLTIP_GAP`] rather than hung off it exactly,
+/// which is the one place this differs from [`context_menu_box`] and is the
+/// difference between the two gestures: you *aimed* at a menu, so its first row
+/// belongs under your hand, and you did not aim at this — so it must not appear
+/// beneath the cursor arrow that summoned it, where the arrow would sit on the
+/// first word.
+///
+/// `rows` can come back short, and can come back `0`, which the caller draws as
+/// nothing at all — a message longer than the window is clipped rather than
+/// allowed to grow a box taller than what it is annotating.
+fn tooltip_box(
+    rows: &[String],
+    at: (i32, i32),
+    w: i32,
+    h: i32,
+    cell_w: i32,
+    line_h: i32,
+) -> Popup {
+    let cols = rows.iter().map(|r| str_cells(r)).max().unwrap_or(0).max(1);
+    let box_w = (cols as i32 * cell_w + 2 * PAD).min(w.max(1));
+    let fits = ((h - 2 * PADV) / line_h.max(1)).max(0) as usize;
+    let rows = rows.len().min(POPUP_ROWS).min(fits);
+    let box_h = 2 * PADV + rows as i32 * line_h;
+    let (x, y) = pointer_origin(
+        (at.0 + TOOLTIP_GAP, at.1 + TOOLTIP_GAP),
+        box_w,
+        box_h,
+        w,
+        h,
+    );
+    Popup { x, y, w: box_w, h: box_h, rows }
+}
+
+/// `text` broken into rows of at most `cols` cells: on its own newlines first —
+/// a server that sent two paragraphs meant two — and then on spaces.
+///
+/// A word longer than the box is **cut**, not allowed to widen it. That is most
+/// of what a compiler puts in a diagnostic (a path, a mangled type), and a box
+/// wider than the window has stopped floating over the code and started
+/// replacing it — [`POINT_POPUP_COLS`]' argument, one surface along.
+fn wrap_text(text: &str, cols: usize) -> Vec<String> {
+    let cols = cols.max(1);
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut row = String::new();
+        for word in para.split_whitespace() {
+            let word = truncate(word, cols);
+            if !row.is_empty() && str_cells(&row) + 1 + str_cells(&word) > cols {
+                out.push(std::mem::take(&mut row));
+            }
+            if !row.is_empty() {
+                row.push(' ');
+            }
+            row.push_str(&word);
+        }
+        // Pushed even when empty, so a blank line between paragraphs survives as
+        // one — the only vertical punctuation a box with no headings has.
+        out.push(row);
+    }
+    out
 }
 
 /// Widest a completion popup gets, in cells. A candidate is an identifier;
@@ -3596,6 +3926,16 @@ const SCROLLBAR_W: i32 = 2;
 /// candidate is a word.
 const DOC_POPUP_COLS: usize = 56;
 const DOC_GAP: i32 = 6;
+
+/// Widest the hover box gets, in cells. Wider than a candidate and narrower than
+/// a docstring: a diagnostic is one sentence of prose, and a line of prose past
+/// about this is measurably harder to read than the same words wrapped.
+const TOOLTIP_COLS: usize = 60;
+
+/// How far down and right of the pointer the hover box starts — clear of the
+/// cursor arrow, which is roughly this tall and would otherwise sit on the first
+/// word of the message it just asked for.
+const TOOLTIP_GAP: i32 = 14;
 
 /// One candidate, split into the three things drawn in three columns.
 ///
@@ -3864,23 +4204,24 @@ fn lines_in_rows(
 /// the iterator is lazy and the count stops as soon as the pane is full — so a
 /// 10k-line file costs one screenful, same as drawing it.
 fn visible_lines(
+    m: Metrics,
     buf: &Buffer,
     scroll: usize,
     rows: usize,
     text_w: i32,
-    cell_w: i32,
     set: &Settings,
 ) -> usize {
     let wrap = set.line_overflow == LineOverflow::Wrap;
     // Truncation with nothing folded and nothing typeset is one row per line,
     // and the general path below would agree with it more slowly. A fold, a
-    // scale and a prefix each break that identity — the first by removing rows,
-    // the second by claiming extra ones, the third by narrowing the line into an
-    // earlier wrap — which is why this is not simply the overflow mode.
+    // scale, a prefix and an image each break that identity — the first by
+    // removing rows, the second and fourth by claiming extra ones, the third by
+    // narrowing the line into an earlier wrap — which is why this is not simply
+    // the overflow mode.
     if !wrap && !buf.overlays().iter().any(reshapes_lines) {
         return rows;
     }
-    let rows_of = |l| line_rows(buf, l, text_w, cell_w, wrap, set.tab_width);
+    let rows_of = |l| line_rows(m, buf, l, text_w, wrap, set.tab_width);
     // The second range is walked only when the file ends before the pane is
     // full, and then only far enough to fill it — see [`lines_in_rows`], which is
     // where the reason it counts lines rather than rows is written down.
@@ -3893,25 +4234,32 @@ fn visible_lines(
 
 /// Whether an overlay can make a line occupy a different number of rows than its
 /// text alone would. The one predicate [`visible_lines`] skips its whole slow
-/// path on, so anything added to [`LineBox`] belongs here too.
+/// path on, so anything added to [`LineBox`] belongs here too — and so does
+/// `image`, which is not in [`LineBox`] at all but claims rows just the same
+/// (see [`image_tall`]). Leaving it out is what let a truncating pane holding a
+/// display equation take the fast path and report the pane's full height.
 fn reshapes_lines(o: &Overlay) -> bool {
-    o.fold || o.scale.is_some() || o.line_prefix.is_some()
+    o.fold || o.scale.is_some() || o.line_prefix.is_some() || o.image.is_some()
 }
 
 /// Display rows buffer line `l` occupies: none at all when a fold is hiding it,
 /// one when the pane truncates body-size text, and its wrapped height times its
-/// type size otherwise.
+/// type size otherwise — never fewer than an image on it claimed.
 ///
 /// The counting twin of the drawing loop, and the reason folding is a *line*
 /// mechanism rather than another overlay payload: everything else an overlay
 /// carries replaces cells with cells, and this is a height of zero. A scale is
 /// the same mechanism pointing the other way — a height of two or three — which
 /// is why both are resolved here and not in two places.
+///
+/// The final `max` is [`Renderer::draw_document`]'s `need`, spelled the same
+/// way, and it is the whole of what used to make a pane report more lines than
+/// it drew: the draw loop grew a line to hold its equation and this did not.
 fn line_rows(
+    m: Metrics,
     buf: &Buffer,
     l: usize,
     text_w: i32,
-    cell_w: i32,
     wrap: bool,
     tab_width: usize,
 ) -> usize {
@@ -3922,13 +4270,13 @@ fn line_rows(
     let b = line_box(
         &line_style(buf.overlays(), start, start + buf.line_len(l)),
         text_w,
-        cell_w,
+        m.cell_w,
     );
     let visual = match wrap {
         true => wrap_breaks(&line_cells(buf, l, tab_width), b.cols).len(),
         false => 1,
     };
-    visual * b.tall
+    (visual * b.tall).max(image_tall(m, buf, l))
 }
 
 /// Visual rows of a line the draw loop actually walks, given the `fits` display
@@ -3957,9 +4305,17 @@ fn drawn_rows(fits: usize, tall: usize, text_rows: usize) -> usize {
 /// The cells of buffer line `l`. The renderer's one entry into
 /// [`zemacs_core::display`], and the same call `Editor::line_cells` makes — `j`
 /// and the glyph it lands on have to be laid out by the same function.
+///
+/// Overlays included, which is what a click and a row count both need: a heading
+/// whose stars became one bullet is shorter than its text, so the character
+/// under the pointer and the row a wrapped line ends on are both decided after
+/// the substitution. The draw loop does not come through here only because it
+/// also has images, which need a cell width in pixels.
 fn line_cells(buf: &Buffer, l: usize, tab_width: usize) -> Vec<(char, usize)> {
     let start = buf.line_start(l);
-    expand_line(&buf.slice_string(start, start + buf.line_len(l)), tab_width)
+    let end = start + buf.line_len(l);
+    let text = buf.slice_string(start, end);
+    zemacs_core::display::line_cells(&text, tab_width, buf.overlays(), start, end)
 }
 
 
@@ -4019,7 +4375,12 @@ fn gutter_digits(buf: &Buffer) -> usize {
 /// `(set-no-gutter-modes '("org-mode" …))` — those two disagree on every org
 /// buffer, which reserved no columns and then printed the numbers into the first
 /// three of the text.
-fn gutter_on(buf: &Buffer, set: &Settings) -> bool {
+/// `pub` for a third caller that does not draw: `--control`'s `screen` renders
+/// the panes as text and has to agree with the two loops here about whether
+/// there is a number column, or it reports a gutter the editor is not showing.
+/// Exported rather than restated for the reason the paragraph above gives — the
+/// last time this rule existed in two places they disagreed on every org buffer.
+pub fn gutter_on(buf: &Buffer, set: &Settings) -> bool {
     match buf.kind {
         BufferKind::Dashboard | BufferKind::Terminal => false,
         _ => buf.line_numbers.unwrap_or(set.line_numbers),
@@ -4242,45 +4603,55 @@ fn image_rows(height: u32, depth: u32, line_h: i32, ascent: i32) -> usize {
     1 + (above.max(0) as usize).div_ceil(line_h.max(1) as usize)
 }
 
-/// Replace the cells of each `(start, end, text)` — line-relative *source* char
-/// offsets — with `text`'s characters, all attributed to `start`.
+/// Display rows buffer line `l` must own because of the bitmaps on it — one
+/// when there are none, which is every line of every file nobody has typeset.
 ///
-/// Attributing them to `start` is what keeps everything else working unchanged:
-/// [`visual_col`] still finds a column for a cursor inside the hidden range, the
-/// highlight cursor still walks monotonically, and wrapping counts the cells
-/// that are actually drawn.
+/// **The one answer, asked by all four loops that spend rows.** It was written
+/// out inside [`Renderer::draw_document`] and nowhere else, so the draw pass
+/// grew a line to hold a display equation while [`line_rows`], [`visible_lines`]
+/// and [`offset_at`] still charged it the rows its text alone needed. What that
+/// cost: a click below an equation landed a row or two high, and the pane
+/// reported a `viewport_lines` bigger than what it drew — which is the number
+/// core clamps `scroll` against, so the view could run past the end of the file.
 ///
-/// `subs` must be sorted by `start`. Overlapping substitutions are not
-/// composable and are not composed — the one that starts first wins and the rest
-/// are dropped. In practice they never overlap: LaTeX fragments are disjoint by
-/// construction, and so are bullets.
-fn substitute(cells: &[(char, usize)], subs: &[(usize, usize, String)]) -> Vec<(char, usize)> {
-    let mut out = Vec::with_capacity(cells.len());
-    let (mut i, mut si) = (0usize, 0usize);
-    while i < cells.len() {
-        let src = cells[i].1;
-        while si < subs.len() && subs[si].1 <= src {
-            si += 1;
-        }
-        match subs.get(si) {
-            Some((s, e, text)) if *s <= src => {
-                out.extend(text.chars().map(|c| (c, *s)));
-                while i < cells.len() && cells[i].1 < *e {
-                    i += 1;
-                }
-                let e = *e;
-                si += 1;
-                while si < subs.len() && subs[si].0 < e {
-                    si += 1; // started inside the one just applied
-                }
-            }
-            _ => {
-                out.push(cells[i]);
-                i += 1;
-            }
-        }
+/// The two rules are the draw loop's own and are copied rather than re-derived.
+/// An overlay *starting* on an earlier line contributes nothing here: its bitmap
+/// belongs to that line, and this one is one of the blank rows it already bought.
+/// And a fragment spanning several source lines is charged only the shortfall,
+/// because those later lines are blank rows it owns — which is why
+/// `\begin{equation}` is unchanged and a one-line `$$…$$` is not.
+///
+/// ponytail: a linear scan of the buffer's overlays per line, on top of the
+/// three [`line_rows`] already makes (`fold_hiding`, `line_style`,
+/// `line_cells`). Measured in `docs/boundary.org`: ≈7×10⁻⁵ ms per overlay per
+/// frame per scan, so a fourth is 0.03 ms a frame at the two dozen overlays a
+/// config makes by hand and 0.2 ms at the few thousand org-modern makes for a
+/// long file. The `has_images` guard is what keeps that off every session that
+/// has never rasterised anything, which is nearly all of them; the real upgrade
+/// path is the one that crate names — an overlay list sorted by `start`, so a
+/// line is binary-searched instead of scanned.
+fn image_tall(m: Metrics, buf: &Buffer, l: usize) -> usize {
+    if !m.editor.has_images() {
+        return 1;
     }
-    out
+    let start = buf.line_start(l);
+    let end = start + buf.line_len(l);
+    let mut tall = 1usize;
+    for o in buf.overlays().iter().filter(|o| o.end > start && o.start < end) {
+        // A continuation row: the bitmap is the earlier line's, and this row is
+        // one of the blank ones the substitution left behind.
+        if o.start < start {
+            continue;
+        }
+        let Some(img) = o.image.and_then(|i| m.editor.image(i)) else {
+            continue; // no bitmap yet — the `display` string has the say, and it
+                      // is text, so `line_cells` has already counted it
+        };
+        let blanked = buf.text.char_to_line(o.end.saturating_sub(1)).saturating_sub(l);
+        let want = image_rows(img.height, img.depth, m.line_h, m.ascent);
+        tall = tall.max(want.saturating_sub(blanked).max(1));
+    }
+    tall
 }
 
 /// Highlight runs covering `[start, end)`, clipped to it and rebased to
@@ -4987,6 +5358,77 @@ impl Renderer {
 mod tests {
     use super::*;
 
+    /// A headless screenshot is either a real PNG or a legible refusal, never a
+    /// black rectangle the parent process cannot tell from a hung editor.
+    ///
+    /// Ignored because it opens a window: it needs `SDL_VIDEODRIVER` set before
+    /// SDL initialises, which is process-wide, and the other tests in here share
+    /// the process. Run it alone:
+    ///
+    /// ```text
+    /// cargo test -p zemacs-render -- --ignored --test-threads=1 headless
+    /// ```
+    #[test]
+    #[ignore]
+    fn a_headless_screenshot_is_a_png_or_says_why_not() {
+        std::env::set_var("SDL_VIDEODRIVER", "dummy");
+        let sdl = sdl3::init().expect("SDL init under the dummy video driver");
+        let mut r = Renderer::new(&sdl, "zemacs-screenshot-test", 320, 200)
+            .expect("a dummy-driver window");
+        let path = std::env::temp_dir().join("zemacs-save-png-test.png");
+        let _ = std::fs::remove_file(&path);
+        // A colour nothing else would produce, so a pass means the file holds
+        // the pixels we drew. Without this the Ok branch is satisfied by any
+        // decodable PNG — including an all-zero buffer, which is exactly the
+        // "black rectangle" failure this test is named after.
+        let want = [200u8, 40, 90];
+        r.fill(
+            0,
+            0,
+            320,
+            200,
+            Color::RGB(want[0], want[1], want[2]),
+        );
+        match r.save_png(&path) {
+            Ok(()) => {
+                let bytes = std::fs::read(&path).expect("the file save_png claimed to write");
+                assert_eq!(
+                    &bytes[..8],
+                    b"\x89PNG\r\n\x1a\n",
+                    "wrote something that is not a PNG on backend {}",
+                    r.backend()
+                );
+                // Decode it: a header alone would pass even if the row loop
+                // miscounted `pitch` and truncated the image data.
+                let mut reader = png::Decoder::new(std::io::Cursor::new(&bytes))
+                    .read_info()
+                    .expect("a decodable PNG");
+                let mut px = vec![0; reader.output_buffer_size().unwrap()];
+                let info = reader.next_frame(&mut px).expect("a full frame of pixels");
+                assert!(info.width > 0 && info.height > 0);
+                assert_eq!(
+                    &px[..3],
+                    &want,
+                    "backend {} read back the wrong pixels — a screenshot that \
+                     decodes but does not show the frame is the worst outcome, \
+                     because nothing downstream can tell",
+                    r.backend()
+                );
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) => {
+                // The contract the caller falls back on: the message names the
+                // backend that would not cooperate.
+                let msg = e.to_string();
+                assert!(
+                    msg.contains(&r.backend()),
+                    "refusal must name the backend, got: {msg}"
+                );
+                assert!(!path.exists(), "left a half-written file behind: {msg}");
+            }
+        }
+    }
+
     fn span(start: usize, end: usize, kind: HlKind) -> Span {
         Span { start, end, kind }
     }
@@ -5125,6 +5567,7 @@ mod tests {
             line_background: None,
             line_prefix: None,
             gutter: None,
+            help_echo: None,
             fold: false,
         }
     }
@@ -5225,6 +5668,23 @@ mod tests {
         assert_eq!(overlay_face(&[], 0), (None, None));
     }
 
+    /// A pane's [`Metrics`] for the three counting functions, in the 20/15 em
+    /// box every image test below measures in: a row 20 pixels tall offering 15
+    /// of them above the baseline, roughly a 14pt monospace face.
+    ///
+    /// `line_h` and `ascent` reach nothing but [`image_rows`], so a buffer with
+    /// nothing rasterised counts exactly the same rows whatever they are — which
+    /// is why the tests that predate images pass an `Editor::new()` and ignore
+    /// them.
+    fn pane_metrics(ed: &Editor, cell_w: i32) -> Metrics<'_> {
+        Metrics { editor: ed, cell_w, line_h: 20, ascent: 15 }
+    }
+
+    /// The same, in the `LH`/`CW` cell the click tests point into.
+    fn click_metrics(ed: &Editor) -> Metrics<'_> {
+        Metrics { editor: ed, cell_w: CW, line_h: LH, ascent: LH * 3 / 4 }
+    }
+
     #[test]
     fn an_image_reserves_at_least_one_cell() {
         assert_eq!(image_cells(0, 10), 1);
@@ -5283,6 +5743,209 @@ mod tests {
         }
     }
 
+    /// An org buffer with a display equation typeset on line 1: 55 pixels tall
+    /// with no depth, which in the 20/15 em box [`pane_metrics`] measures in is
+    /// three rows.
+    fn typeset(source: &str, height: u32, over: (usize, usize)) -> Editor {
+        let mut ed = Editor::new();
+        ed.buffer = Buffer::from_str(source);
+        ed.buffer.line_numbers = Some(false); // no gutter: a column is a column
+        ed.add_image(1, zemacs_core::Image { width: 40, height, depth: 0, rgba: Vec::new() });
+        let ov = ed.make_overlay(over.0, over.1);
+        ed.apply(zemacs_core::EditorCommand::Overlay(
+            zemacs_core::OverlayEdit::Image(ov, Some(1)),
+        ));
+        ed
+    }
+
+    /// The counting side of an inline image, which is the half that was missing:
+    /// the draw loop grew a line to hold its equation and [`line_rows`] charged
+    /// it the rows its *text* needed, so the pane advertised a `viewport_lines`
+    /// bigger than what it drew — and that is the number core clamps `scroll`
+    /// against, so the view could run off the end of the file.
+    ///
+    /// The sibling of `a_scaled_line_claims_whole_extra_rows` and of
+    /// `a_folded_line_occupies_no_row_but_is_still_a_line`: a fold is a height of
+    /// zero, a scale is a height of two, and a display equation is a height its
+    /// text has no opinion about at all.
+    #[test]
+    fn a_display_equation_is_counted_by_the_rows_it_grew_its_line_by() {
+        let set = Settings { line_numbers: false, ..Settings::default() };
+        let text = "intro\n$$x^2$$\nafter\ntail\n";
+        // The fragment is line 1, chars 6..13.
+        let ed = typeset(text, 55, (6, 13));
+        let m = pane_metrics(&ed, 1);
+        let plain = Buffer::from_str(text);
+
+        // 55 pixels over a 15-pixel ascent and a 20-pixel row: one row for the
+        // baseline and two claimed upward.
+        assert_eq!(image_tall(m, &ed.buffer, 1), 3);
+        assert_eq!(line_rows(m, &ed.buffer, 1, 40, false, 4), 3);
+        // ...and only that line. Its neighbours are one row each, as before.
+        assert_eq!(line_rows(m, &ed.buffer, 0, 40, false, 4), 1);
+        assert_eq!(line_rows(m, &ed.buffer, 2, 40, false, 4), 1);
+
+        // The number core clamps `scroll` against. Five rows of pane hold five
+        // plain lines and three of these, because the equation eats three of the
+        // five — so `len_lines - viewport_lines` stops the view two lines
+        // earlier, which is where the last line is actually on screen.
+        assert_eq!(visible_lines(m, &plain, 0, 5, 40, &set), 5);
+        assert_eq!(visible_lines(m, &ed.buffer, 0, 5, 40, &set), 3);
+        // A pane that cannot hold the equation at all still counts it as a line,
+        // exactly as a line taller than the pane always has, or scrolling would
+        // stop dead on it.
+        assert_eq!(visible_lines(m, &ed.buffer, 1, 2, 40, &set), 1);
+
+        // The fast path in `visible_lines` must not swallow this: truncation with
+        // an image on a line is *not* one row per line, and skipping the walk is
+        // what made the count the pane's full height regardless.
+        assert!(ed.buffer.overlays().iter().any(reshapes_lines));
+
+        // A fragment spanning several source lines is charged only the shortfall,
+        // because the substitution already blanked one row per line it covers.
+        // `\begin{equation}` is the case: three source lines, three rows wanted,
+        // nothing extra to buy.
+        let eq = typeset("intro\n\\begin{equation}\nx^2\n\\end{equation}\nafter\n", 55, (6, 40));
+        let m = pane_metrics(&eq, 1);
+        assert_eq!(image_tall(m, &eq.buffer, 1), 1, "two blank rows already bought");
+        // ...and the continuation lines claim nothing of their own: the bitmap
+        // belongs to the line it starts on.
+        assert_eq!(image_tall(m, &eq.buffer, 2), 1);
+        assert_eq!(image_tall(m, &eq.buffer, 3), 1);
+
+        // No bitmap yet — the fragment has been marked and not rasterised — is a
+        // line of ordinary text, which is what `display_subs` in core already
+        // counts. Nothing claims a row it is not going to draw in.
+        let mut cold = Editor::new();
+        cold.buffer = Buffer::from_str(text);
+        let ov = cold.make_overlay(6, 13);
+        cold.apply(zemacs_core::EditorCommand::Overlay(
+            zemacs_core::OverlayEdit::Image(ov, Some(1)),
+        ));
+        assert_eq!(image_tall(pane_metrics(&cold, 1), &cold.buffer, 1), 1);
+    }
+
+    /// The symptom, end to end: click the line under a display equation and
+    /// point lands on *that* line.
+    ///
+    /// [`offset_at`] is the draw loop's twin and it spent one row on a line the
+    /// draw loop spent three on, so every line below an equation was two rows
+    /// out of step — click "after" and point landed on "intro", or on nothing at
+    /// all past the end of the file.
+    #[test]
+    fn a_click_below_a_display_equation_lands_on_the_line_below_it() {
+        let set = Settings { line_numbers: false, ..Settings::default() };
+        let pane = Area { x: 0, y: 0, w: 40 * CW, h: 9 * LH + 2 * PAD };
+        // 60 pixels in the LH/CW box `click_metrics` uses is three rows, the
+        // same shape as the test above.
+        let ed = typeset("intro\n$$x^2$$\nafter\n", 60, (6, 13));
+        let buf = &ed.buffer;
+        let m = click_metrics(&ed);
+        assert_eq!(image_tall(m, buf, 1), 3);
+        let win = Window {
+            id: 0,
+            buffer: buf.id,
+            cursor: 0,
+            scroll: 0,
+            viewport_lines: 8,
+            wrap_cols: 0,
+            zoom: 100,
+        };
+        let doc = doc_rect(pane, STATUS, 0);
+        let hit = |row: i32, col: i32| {
+            offset_at(m, buf, &win, &set, pane, STATUS,
+                      doc.x + col * CW + CW / 2, doc.y + row * LH + LH / 2)
+        };
+
+        // Row 0 is "intro" and rows 1, 2 and 3 are all the equation's line: the
+        // draw loop grew it to hold the bitmap, so those rows belong to it and
+        // to nothing else.
+        assert_eq!(hit(0, 0), 0);
+        for row in 1..=3 {
+            let at = hit(row, 0);
+            assert_eq!(buf.text.char_to_line(at), 1, "row {row} is the equation's");
+        }
+        // ...and "after" begins on row 4. This is the assertion that failed:
+        // without the image counted it began on row 2, so a click on the line
+        // the eye reads as "after" answered two lines above it.
+        assert_eq!(hit(4, 0), buf.line_start(2), "'a' of after");
+        assert_eq!(hit(4, 3), buf.line_start(2) + 3, "'e' of after");
+        // Below the last line is still the end of the buffer, not a row inside
+        // the equation.
+        assert_eq!(hit(7, 0), buf.len_chars());
+    }
+
+    /// The rows past the end of the document: where they begin, and that a
+    /// click in one of them is `point-max`.
+    ///
+    /// `scroll-past-end` is a *clamp* in core and nothing else — the renderer
+    /// needed no change, because the draw loop and [`offset_at`] both stop at
+    /// `len_lines()` and always have, so the rows below the last line hold no
+    /// text and the gutter numbers none of them. That is the claim worth
+    /// pinning, and it is pinned against the two things that changed a line's
+    /// row count today: the first empty row has to sit under the *last drawn
+    /// row*, which is three rows down a line carrying an equation and no rows
+    /// down a line a fold is hiding. Count either wrong and the first "empty"
+    /// row is a row the document still owns — which is the bug the image work
+    /// fixed, one row-count later.
+    #[test]
+    fn the_rows_past_the_end_begin_under_the_last_drawn_row() {
+        let set = Settings { line_numbers: false, ..Settings::default() };
+        let pane = Area { x: 0, y: 0, w: 40 * CW, h: 9 * LH + 2 * PAD };
+        // No trailing newline, so `last_line` is the rope's last line too and
+        // the numbers below are about the file rather than about the phantom.
+        let mut ed = typeset("intro\n$$x^2$$\nafter\nhead\nhidden\ntail", 60, (6, 13));
+        // Fold "hidden" under "head", so line 4 spans a line and costs no row.
+        let (head, hidden) = (ed.buffer.line_start(3), ed.buffer.line_start(4));
+        let id = ed.make_overlay(head, hidden + 1);
+        ed.apply(zemacs_core::EditorCommand::Overlay(
+            zemacs_core::OverlayEdit::Fold(id, true),
+        ));
+
+        let buf = &ed.buffer;
+        let m = click_metrics(&ed);
+        assert_eq!(image_tall(m, buf, 1), 3, "the equation's line is three rows");
+        assert_eq!(line_rows(m, buf, 4, 40 * CW, false, 4), 0, "folded away");
+
+        let win = Window {
+            id: 0,
+            buffer: buf.id,
+            cursor: 0,
+            scroll: 0,
+            viewport_lines: 8,
+            wrap_cols: 0,
+            zoom: 100,
+        };
+        let doc = doc_rect(pane, STATUS, 0);
+        let hit = |win: &Window, row: i32| {
+            offset_at(m, buf, win, &set, pane, STATUS,
+                      doc.x + CW / 2, doc.y + row * LH + LH / 2)
+        };
+        let line_of = |at: usize| buf.text.char_to_line(at);
+
+        // Row 0 is "intro", rows 1-3 the equation, row 4 "after", row 5 "head"
+        // — and row 6 is "tail", because the folded line between them is spent
+        // as a line and not as a row.
+        assert_eq!(line_of(hit(&win, 4)), 2, "after");
+        assert_eq!(line_of(hit(&win, 5)), 3, "head");
+        assert_eq!(line_of(hit(&win, 6)), 5, "tail — the fold cost no row");
+        // ...so row 7 is the first row past the end of the document, and a
+        // click in it is the end of the buffer, exactly as a click under a
+        // short file already was.
+        assert_eq!(hit(&win, 7), buf.len_chars(), "point-max");
+        assert_eq!(hit(&win, 8), buf.len_chars());
+
+        // And scrolled all the way out, which is where core's new clamp stops:
+        // the last line on the top row, every row under it empty. Nothing here
+        // knows about the setting — it is the same loop, given a scroll offset
+        // that used to be unreachable.
+        let out = Window { scroll: buf.last_line(), ..win };
+        assert_eq!(line_of(hit(&out, 0)), 5, "tail, alone on the top row");
+        for row in 1..=8 {
+            assert_eq!(hit(&out, row), buf.len_chars(), "row {row} is past the end");
+        }
+    }
+
     /// A folded line occupies no row, which is the one thing an overlay could
     /// not say before: every other payload swaps cells for cells, and this makes
     /// rows stop existing.
@@ -5296,24 +5959,26 @@ mod tests {
         let text = "a\nb\nc\nd\ne\nf\n";
         let set = Settings::default(); // truncating, one row per drawn line
         let plain = Buffer::from_str(text);
+        let mut ed = Editor::new();
+        let m = pane_metrics(&ed, 1);
         // Four rows of pane, nothing folded: four lines.
-        assert_eq!(visible_lines(&plain, 0, 4, 20, 1, &set), 4);
+        assert_eq!(visible_lines(m, &plain, 0, 4, 20, &set), 4);
 
         // Fold "b" and "c" under "a" — chars 0..5 of "a\nb\nc\n…".
-        let mut ed = Editor::new();
         ed.buffer = Buffer::from_str(text);
         let id = ed.make_overlay(0, 5);
         ed.apply(zemacs_core::EditorCommand::Overlay(
             zemacs_core::OverlayEdit::Fold(id, true),
         ));
+        let m = pane_metrics(&ed, 1);
         // Six buffer lines now fit in four rows: a, (b), (c), d, e, f — the two
         // hidden ones cost nothing and are still counted, so `scroll` can step
         // past them.
-        assert_eq!(visible_lines(&ed.buffer, 0, 4, 20, 1, &set), 6);
+        assert_eq!(visible_lines(m, &ed.buffer, 0, 4, 20, &set), 6);
         // The contrast, in a two-row pane: two lines without the fold, four
         // with it, because two of the four are free.
-        assert_eq!(visible_lines(&plain, 0, 2, 20, 1, &set), 2);
-        assert_eq!(visible_lines(&ed.buffer, 0, 2, 20, 1, &set), 4);
+        assert_eq!(visible_lines(m, &plain, 0, 2, 20, &set), 2);
+        assert_eq!(visible_lines(m, &ed.buffer, 0, 2, 20, &set), 4);
         // The head line is drawn, the two under it are not, the rest are.
         let folded = |l: usize| fold_hiding(ed.buffer.overlays(), ed.buffer.line_start(l));
         assert_eq!((folded(0), folded(1), folded(2), folded(3)),
@@ -5516,23 +6181,25 @@ mod tests {
         // A hundred pixels of text at a ten-pixel cell. Four rows of pane: the
         // heading eats two of them, so three buffer lines are on screen where
         // four were.
-        assert_eq!(visible_lines(&plain, 0, 4, 100, 10, &set), 4);
-        assert_eq!(visible_lines(&ed.buffer, 0, 4, 100, 10, &set), 3);
+        let m = pane_metrics(&ed, 10);
+        assert_eq!(visible_lines(m, &plain, 0, 4, 100, &set), 4);
+        assert_eq!(visible_lines(m, &ed.buffer, 0, 4, 100, &set), 3);
         // ...and everything below it has moved down by the row it took: the
         // rows spent before line 1 are 1 without the scale and 2 with it.
-        let spent = |b: &Buffer| line_rows(b, 0, 100, 10, false, set.tab_width);
+        let spent = |b: &Buffer| line_rows(m, b, 0, 100, false, set.tab_width);
         assert_eq!(spent(&plain), 1);
         assert_eq!(spent(&ed.buffer), 2);
         // Per line, not per buffer: only the line the overlay touches grew.
-        assert_eq!(line_rows(&ed.buffer, 0, 100, 10, false, 4), 2);
-        assert_eq!(line_rows(&ed.buffer, 1, 100, 10, false, 4), 1);
+        assert_eq!(line_rows(m, &ed.buffer, 0, 100, false, 4), 2);
+        assert_eq!(line_rows(m, &ed.buffer, 1, 100, false, 4), 1);
         // A scale of exactly body size is not a scale, so the fast path in
         // `visible_lines` is still allowed to skip the whole walk.
         ed.apply(zemacs_core::EditorCommand::Overlay(
             zemacs_core::OverlayEdit::Scale(id, Some(100)),
         ));
         assert!(!ed.buffer.overlays().iter().any(reshapes_lines));
-        assert_eq!(visible_lines(&ed.buffer, 0, 4, 100, 10, &set), 4);
+        let m = pane_metrics(&ed, 10);
+        assert_eq!(visible_lines(m, &ed.buffer, 0, 4, 100, &set), 4);
     }
 
     /// A click on a typeset line reads *that line's* grid. The draw loop and
@@ -5563,9 +6230,10 @@ mod tests {
             zoom: 100,
         };
         let doc = doc_rect(pane, STATUS, 0);
+        let m = click_metrics(&ed);
         // A pixel, rather than a column: which column it is, is the question.
         let hit = |row: i32, px: i32| {
-            offset_at(buf, &win, &set, pane, STATUS, LH, CW,
+            offset_at(m, buf, &win, &set, pane, STATUS,
                       doc.x + px, doc.y + row * LH + LH / 2)
         };
 
@@ -5739,7 +6407,8 @@ mod tests {
             line_overflow: LineOverflow::Wrap,
             ..Settings::default()
         };
-        visible_lines(&Buffer::from_str(text), 0, rows, cols as i32, 1, &set)
+        let ed = Editor::new();
+        visible_lines(pane_metrics(&ed, 1), &Buffer::from_str(text), 0, rows, cols as i32, &set)
     }
 
     #[test]
@@ -5984,27 +6653,29 @@ mod tests {
             line_overflow: LineOverflow::Truncate,
             ..Settings::default()
         };
+        let ed = Editor::new();
+        let m = pane_metrics(&ed, 1);
         // Truncated, every line is one row, so the answer is the pane's height
         // whatever the buffer looks like.
-        assert_eq!(visible_lines(&buf, 0, 20, 10, 1, &set), 20);
+        assert_eq!(visible_lines(m, &buf, 0, 20, 10, &set), 20);
         set.line_overflow = LineOverflow::Wrap;
         // 100 cells in a 10-column pane is 10 rows for the first line alone,
         // then three one-row lines: 13 rows of content and nothing above the
         // view to fill the rest of the pane with, so four lines is the whole
         // answer. Core reads `len_lines - 4` and pins the view to the top,
         // which is where a file shorter than its pane belongs.
-        assert_eq!(visible_lines(&buf, 0, 20, 10, 1, &set), 4);
+        assert_eq!(visible_lines(m, &buf, 0, 20, 10, &set), 4);
         // Scrolled off the top, the seventeen spare rows are filled by walking
         // *back* over the long line — which costs ten rows and buys one line.
         // The old count said 20 here, one line per empty row, and that is the
         // arithmetic that sent the view up past the end of a taller file.
-        assert_eq!(visible_lines(&buf, 1, 20, 10, 1, &set), 4);
+        assert_eq!(visible_lines(m, &buf, 1, 20, 10, &set), 4);
         // Tall enough to matter: the long line alone fills a 5-row pane, and
         // the count must not drop to zero or scrolling stops dead.
-        assert_eq!(visible_lines(&buf, 0, 5, 10, 1, &set), 1);
-        assert_eq!(visible_lines(&buf, 0, 0, 10, 1, &set), 0);
+        assert_eq!(visible_lines(m, &buf, 0, 5, 10, &set), 1);
+        assert_eq!(visible_lines(m, &buf, 0, 0, 10, &set), 0);
         // A pane with no columns must not hang: every line is one row.
-        assert_eq!(visible_lines(&buf, 0, 5, 0, 1, &set), 4);
+        assert_eq!(visible_lines(m, &buf, 0, 5, 0, &set), 4);
     }
 
     // --- the gutter -------------------------------------------------------
@@ -6080,11 +6751,13 @@ mod tests {
         };
         let doc = doc_rect(pane, STATUS, 0);
         let gutter = gutter_w(&buf, &set, CW);
+        let ed = Editor::new();
+        let m = click_metrics(&ed);
         // The centre of the cell at (row, col), which is where a pointer is.
         let hit = |row: i32, col: i32| {
             let x = doc.x + gutter + col * CW + CW / 2;
             let y = doc.y + row * LH + LH / 2;
-            offset_at(&buf, &win, &set, pane, STATUS, LH, CW, x, y)
+            offset_at(m, &buf, &win, &set, pane, STATUS, x, y)
         };
 
         assert_eq!(hit(0, 0), 0, "first character of the file");
@@ -6094,7 +6767,7 @@ mod tests {
         assert_eq!(hit(0, 30), 5);
         // A click in the gutter is column zero of that row, not a negative one.
         assert_eq!(
-            offset_at(&buf, &win, &set, pane, STATUS, LH, CW, doc.x, doc.y + LH / 2),
+            offset_at(m, &buf, &win, &set, pane, STATUS, doc.x, doc.y + LH / 2),
             0
         );
 
@@ -6117,7 +6790,7 @@ mod tests {
         // Scrolling moves what the top row shows, and nothing else.
         let scrolled = Window { scroll: 2, ..win };
         assert_eq!(
-            offset_at(&buf, &scrolled, &set, pane, STATUS, LH, CW,
+            offset_at(m, &buf, &scrolled, &set, pane, STATUS,
                       doc.x + gutter + CW / 2, doc.y + LH / 2),
             line2
         );
@@ -6149,8 +6822,10 @@ mod tests {
             zoom: 100,
         };
         let doc = doc_rect(pane, STATUS, 0);
+        let ed = Editor::new();
+        let m = click_metrics(&ed);
         let hit = |row: i32, col: i32| {
-            offset_at(&buf, &win, &set, pane, STATUS, LH, CW,
+            offset_at(m, &buf, &win, &set, pane, STATUS,
                       doc.x + col * CW + CW / 2, doc.y + row * LH + LH / 2)
         };
 
@@ -6199,8 +6874,10 @@ mod tests {
         assert_eq!(doc.w, 20 * CW, "the measure is the text column's width");
         assert_eq!(doc.x, PAD + 20 * CW, "...and it is centred in the pane");
 
+        let ed = Editor::new();
+        let m = click_metrics(&ed);
         let hit = |col: i32| {
-            offset_at(&buf, &win, &set, pane, STATUS, LH, CW,
+            offset_at(m, &buf, &win, &set, pane, STATUS,
                       doc.x + col * CW + CW / 2, doc.y + LH / 2)
         };
         assert_eq!(hit(0), 0, "the first character, twenty columns in");
@@ -6208,7 +6885,7 @@ mod tests {
         // Left of the measure is column zero of that row, exactly as a click in
         // the gutter is: the margin is chrome, not text you can point into.
         assert_eq!(
-            offset_at(&buf, &win, &set, pane, STATUS, LH, CW, pane.x, doc.y + LH / 2),
+            offset_at(m, &buf, &win, &set, pane, STATUS, pane.x, doc.y + LH / 2),
             0
         );
         // Right of it, the margin is not text: the pointer is clamped to one
@@ -6217,7 +6894,7 @@ mod tests {
         // the truncation marker, so character 20 is exactly what that marker
         // stands for — the first of the tail it is hiding.
         assert_eq!(
-            offset_at(&buf, &win, &set, pane, STATUS, LH, CW,
+            offset_at(m, &buf, &win, &set, pane, STATUS,
                       pane.x + pane.w - 1, doc.y + LH / 2),
             20
         );
@@ -6227,7 +6904,7 @@ mod tests {
         // and that `doc_rect` is the only thing that made them.
         let full = Settings { text_width: 0, ..set };
         assert_eq!(
-            offset_at(&buf, &win, &full, pane, STATUS, LH, CW,
+            offset_at(m, &buf, &win, &full, pane, STATUS,
                       doc.x + CW / 2, doc.y + LH / 2),
             20
         );
@@ -6444,7 +7121,8 @@ mod tests {
         // the line, whatever is on it.
         let mut buf = Buffer::from_str(&"x".repeat(cols + 1));
         buf.line_numbers = Some(false);
-        assert_eq!(line_rows(&buf, 0, cols as i32 * CW, CW, false, 4), 1);
+        let ed = Editor::new();
+        assert_eq!(line_rows(click_metrics(&ed), &buf, 0, cols as i32 * CW, false, 4), 1);
 
         // Wrapping is untouched: there the text really does own those rows, and
         // `take` was never the thing bounding them.
@@ -7088,6 +7766,40 @@ mod truncate_invariant {
                 );
             }
         }
+    }
+
+    /// The hover box's line breaking, which is the only loop in that surface and
+    /// the only part of it that can be wrong without being invisible: a row over
+    /// budget draws off the right edge of a box already sized against these
+    /// answers.
+    #[test]
+    fn wrapped_prose_never_exceeds_the_box() {
+        let cases = [
+            "",
+            "short",
+            "error: expected `;`, found `}` [probe]",
+            // The case the box exists for: one long word, which cannot be broken
+            // between and must not be allowed to widen anything.
+            "/a/very/long/path/that/is/one/word/with/no/spaces/in/it/at/all.rs",
+            "two\nparagraphs\n\nwith a gap",
+            "漢字 漢字漢字 a🙂b",
+            "   leading and trailing   ",
+        ];
+        for s in cases {
+            for cols in 1..24usize {
+                for row in wrap_text(s, cols) {
+                    assert!(
+                        str_cells(&row) <= cols,
+                        "wrap_text({s:?}, {cols}) produced {row:?}, {} cells",
+                        str_cells(&row),
+                    );
+                }
+            }
+        }
+        // Nothing is dropped, and a blank line survives as one — the only
+        // vertical punctuation the box has.
+        assert_eq!(wrap_text("a b c", 3), ["a b", "c"]);
+        assert_eq!(wrap_text("one\n\ntwo", 40), ["one", "", "two"]);
     }
 }
 
@@ -7809,10 +8521,14 @@ mod window_zoom {
         };
         let doc = doc_rect(pane, STATUS, 0);
         let gutter = gutter_w(&buf, &set, cw);
+        let ed = Editor::new();
+        // The pane's own cell and row, the body's ascent — what `click_target`
+        // builds for a zoomed window.
+        let m = Metrics { editor: &ed, cell_w: cw, line_h: lh, ascent: LH * 3 / 4 };
         let hit = |row: i32, col: i32| {
             let x = doc.x + gutter + col * cw + cw / 2;
             let y = doc.y + row * lh + lh / 2;
-            offset_at(&buf, &win, &set, pane, STATUS, lh, cw, x, y)
+            offset_at(m, &buf, &win, &set, pane, STATUS, x, y)
         };
         assert_eq!(hit(0, 0), 0);
         assert_eq!(hit(0, 3), 3, "'h' of alpha");

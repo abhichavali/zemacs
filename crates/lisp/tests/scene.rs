@@ -307,25 +307,29 @@ fn a_page_built_in_lisp_reaches_the_buffer_and_its_clicks_come_back() {
         ed.buffer.scene.is_none().then_some(())
     });
 
-    // --- text out of a buffer, which is where this breaks ------------------
+    // --- text out of a buffer, which is where this used to break ------------
     //
-    // The em dash is not decoration. Lisp holds buffer text as UTF-8 *bytes*,
-    // one character per byte, and the encoder carrying a page back to Rust
-    // encodes each character as UTF-8 — so buffer text handed straight to `run`
-    // is encoded twice and the page disagrees with the file behind it.
-    // `utf8-text` is the decode, and this is the pair of assertions that says
-    // what it buys and what it costs to forget it.
+    // The em dash is not decoration. Buffer text reached the image as UTF-8
+    // *bytes*, one Lisp character per byte, while the encoder carrying a page
+    // back to Rust encoded each character as UTF-8 — so buffer text handed
+    // straight to `run` was encoded twice and the page disagreed with the file
+    // behind it. Every caller had to remember `utf8-text`; the shim decodes now
+    // and none of them do.
+    //
+    // Both sources of a string are asserted, and they are the two halves that
+    // had to move together: text the *editor* answered, and a literal in a form
+    // *evaluated from Rust*. Fix either alone and the two become incomparable.
     {
         let mut ed = shared.lock().unwrap();
         ed.buffer = Buffer::from_str("a \u{2014} dash\n");
     }
-    let (decoded, raw) = page(
+    let (from_buffer, from_source) = page(
         &shared,
         &lisp,
-        r#"(scene-set
-             (block
-               (text (run (utf8-text (line-string 1))))
-               (text (run (line-string 1)))))"#,
+        "(scene-set\n\
+        \x20  (block\n\
+        \x20    (text (run (line-string 1)))\n\
+        \x20    (text (run \"one \u{2014} two \u{3bb}\"))))",
         |scene| {
             let b = block_of(root(scene)).clone();
             let one = |i| match &runs_of(child(scene, &b, i))[0] {
@@ -335,28 +339,14 @@ fn a_page_built_in_lisp_reaches_the_buffer_and_its_clicks_come_back() {
             (one(0), one(1))
         },
     );
-    assert_eq!(decoded, "a \u{2014} dash", "utf8-text is what makes a page true");
-    assert_ne!(raw, decoded);
-    assert!(
-        raw.starts_with("a \u{e2}"),
-        "the undecoded path is the Latin-1 reading of the dash's own encoding, \
-         which is the failure `utf8-text` exists to name; got {raw:?}"
+    assert_eq!(
+        from_buffer, "a \u{2014} dash",
+        "a line goes into a run as the document spells it"
     );
-    // A literal in a file that was `load`ed is already characters and needs
-    // nothing — which is the other half of the rule, and the reason `utf8-text`
-    // cannot simply be folded into `run`: nothing can tell the two apart by
-    // looking at them.
-    let literal = page(
-        &shared,
-        &lisp,
-        r#"(scene-set (text (run (format nil "one ~a two ~a" (code-char 8212)
-                                                             (code-char 955)))))"#,
-        |scene| match &runs_of(root(scene))[0] {
-            Run::Text { text, .. } => text.clone(),
-            other => panic!("expected a text run, found {other:?}"),
-        },
+    assert_eq!(
+        from_source, "one \u{2014} two \u{3bb}",
+        "and so does a literal in a form that arrived from Rust"
     );
-    assert_eq!(literal, "one \u{2014} two \u{3bb}");
 
     // --- a click is an integer, and the integer names a closure ------------
     let first = page(

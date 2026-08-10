@@ -201,7 +201,7 @@ disagreement above, and is refused."
                (max 1 from) (min to (length starts)))))
 
 (defun %parinfer-replace (text a b new shift)
-  "Put NEW in place of TEXT's bytes A..B, and put point back on its own line,
+  "Put NEW in place of TEXT's A..B, and put point back on its own line,
 SHIFT columns over from where it was.
 
 Text that did not move is not written at all, so a command that changes nothing
@@ -213,7 +213,7 @@ costs no undo step and fires no `after-change-hook'."
     ;; nothing: `eval-string' echoes the value of the last form, and a bare `T'
     ;; in the status line is noise on a key you press repeatedly.
     (t (let ((line (line-number)) (col (column)))
-         (replace-region (%char-index text a) (%char-index text b) new)
+         (replace-region a b new)
          ;; The replacement covers every marker inside it, so `save-excursion'
          ;; would come back to the start of the span rather than to the cursor.
          ;; Line and column survive it, and the only thing that moved the column
@@ -248,7 +248,7 @@ picked any other way could not be."
          (classes (%lisp-classes text))
          (starts (%line-starts text))
          (lines (length starts))
-         (here (%byte-index text (point)))
+         (here (point))
          (top (%toplevel-form text classes (min (length text) (1+ here)))))
     (cond
       ((null top) (message "no top-level form here"))

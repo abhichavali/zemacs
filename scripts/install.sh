@@ -17,12 +17,17 @@
 # points at a path, not at an application, and there is no way from here to ask
 # the Dock which path it kept.
 #
-# The config is not copied anywhere. `resolve_init_path` looks at $ZEMACS_INIT,
-# then ~/.zemacs.d/init.lisp, then the runtime/ directory of the tree this
-# binary was built from — an absolute path baked in at compile time. So an
-# installed binary keeps reading this checkout's config, which is what you want
-# on the machine you develop on and the one thing that breaks if you later move
-# the checkout. The last line says which file it will read.
+# The config is not copied by this script — the *editor* copies it, once, the
+# first time it runs: `seed_user_init` puts runtime/init.lisp at
+# ~/.zemacs.d/init.lisp if that file is not already there, and never touches it
+# again. So your config is yours, and re-running this script cannot overwrite it.
+#
+# The *runtime* is a different matter and is not copied at all. library.lisp,
+# themes/ and modes/ are read from the runtime/ directory of the tree this binary
+# was built from — an absolute path baked in at compile time, overridable with
+# $ZEMACS_RUNTIME. So an installed binary keeps reading this checkout's library,
+# which is what you want on the machine you develop on and the one thing that
+# breaks if you later move the checkout. The last lines say which files it reads.
 set -eu
 
 prefix=${PREFIX:-$HOME/.local}
@@ -95,5 +100,6 @@ fi
 if [ -f "$HOME/.zemacs.d/init.lisp" ]; then
     echo "config:   $HOME/.zemacs.d/init.lisp"
 else
-    echo "config:   $root/runtime/init.lisp (set ZEMACS_INIT to override)"
+    echo "config:   $HOME/.zemacs.d/init.lisp (seeded on first run; \$ZEMACS_INIT overrides)"
 fi
+echo "runtime:  $root/runtime (set ZEMACS_RUNTIME to override)"

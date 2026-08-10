@@ -141,6 +141,9 @@ pub fn highlight(lang: &str, text: &str) -> Vec<Span> {
 /// Unnamed nodes are skipped, so a bare `{ … }` delimiter pair is not a fold of
 /// its own beside the block it delimits.
 ///
+/// "Spanning more than one line" is measured with [`end_row`] and not with the
+/// node's own end row, which is a *cursor* and not a character — see there.
+///
 /// Unknown language, no grammar, or a parse failure yields an empty `Vec` — the
 /// crate's "never fail loudly" rule, and the caller has one thing to check.
 pub fn fold_ranges(lang: &str, text: &str) -> Vec<(usize, usize)> {
@@ -176,7 +179,7 @@ pub fn fold_ranges(lang: &str, text: &str) -> Vec<(usize, usize)> {
             // filtered for the outermost ones.
             if down && depth > 0 {
                 let node = cursor.node();
-                let (a, b) = (node.start_position().row, node.end_position().row);
+                let (a, b) = (node.start_position().row, end_row(&node));
                 if node.is_named() && b > a {
                     out.push((a + 1, b + 1));
                 }
@@ -196,6 +199,30 @@ pub fn fold_ranges(lang: &str, text: &str) -> Vec<(usize, usize)> {
             down = false;
         }
     })
+}
+
+/// The last row a node actually puts a character on.
+///
+/// A tree-sitter end position is where the cursor stops, not where the last
+/// character is, so a node that swallows its own trailing newline — which is
+/// every `line_comment` in tree-sitter-rust, doc comments included — ends at
+/// column 0 of the *following* row while occupying none of it. Taking that row
+/// at face value made every single-line `//` comment look two rows tall, so
+/// `fold-all` on any commented file folded each comment over its innocent
+/// neighbour: a fold that hides a line having nothing to do with the thing you
+/// folded, which is the one failure the "every named node" rule promised not to
+/// have. Found by folding `crates/core/src/marker.rs` in the running editor,
+/// where ten lines of `//!` header collapsed into five.
+///
+/// Costs nothing anywhere else: a node ending at `}` ends after it, at column 1
+/// or more, and keeps its row.
+fn end_row(node: &tree_sitter::Node) -> usize {
+    let end = node.end_position();
+    if end.column == 0 {
+        end.row.saturating_sub(1)
+    } else {
+        end.row
+    }
 }
 
 /// Flatten a tree's captures into sorted, non-overlapping **byte** spans.
@@ -419,24 +446,33 @@ struct Parsed {
     tree: Tree,
 }
 
+/// How many documents keep a tree.
+///
+/// It used to be one, on the argument that only the live buffer is ever
+/// highlighted. That stopped being true the moment a parked buffer could be
+/// reverted under the editor and want colour back: a single slot meant the
+/// parked file's parse evicted the tree of the buffer being typed into, so an
+/// agent rewriting six files bought six full reparses of the file in front of
+/// you — the one path a user actually feels.
+///
+/// ponytail: a hard cap and a `Vec`, not a `HashMap` with a real LRU. Four is
+/// the live buffer plus the couple you are switching between, a linear scan of
+/// four is cheaper than hashing, and the seventh open file costs one full parse
+/// when it is next looked at. The upgrade, if a big project ever makes that
+/// felt, is a *byte* budget rather than a count — what this holds is the text,
+/// so four small files and four large ones are not the same amount of memory.
+const TREES: usize = 4;
+
 /// A parser that remembers, so a keystroke costs a reparse of what changed
 /// rather than of the file.
 ///
-/// One document at a time, and that is deliberate: only the *live* buffer is
-/// ever highlighted — a parked one keeps the spans it had — so a second tree
-/// would only ever earn its memory across a buffer switch, and a switch already
-/// throws nothing away. The first parse after a switch is the full parse that
-/// used to happen on every keystroke.
-///
-/// ponytail: switching back and forth between two large files therefore
-/// reparses each time. The ceiling is a pair of files big enough for that to be
-/// felt, which is the same few hundred KB every other ceiling in this crate
-/// sits at; the upgrade is a small LRU of [`Parsed`] keyed by [`BufferId`],
-/// which is a `HashMap` and an eviction rule and no new idea.
+/// Newest parse at the back of `parsed`: every reparse lifts its entry out and
+/// pushes it again, so the front is the least recently parsed and dropping it
+/// is an LRU with no bookkeeping at all.
 pub struct Session {
     parser: Parser,
     cursor: QueryCursor,
-    parsed: Option<Parsed>,
+    parsed: Vec<Parsed>,
 }
 
 impl Default for Session {
@@ -450,7 +486,7 @@ impl Session {
         Self {
             parser: Parser::new(),
             cursor: QueryCursor::new(),
-            parsed: None,
+            parsed: Vec::new(),
         }
     }
 
@@ -473,16 +509,20 @@ impl Session {
         text: &str,
         edits: Option<&[Change]>,
     ) -> Vec<Span> {
+        // This document's own entry, lifted out at the top so that every way
+        // out below — org, an unknown language, a grammar that will not load, a
+        // parse that fails — leaves behind no tree claiming to describe text it
+        // was not built from. It goes back at the bottom or not at all.
+        let mine = buffer
+            .and_then(|id| self.parsed.iter().position(|p| p.buffer == id))
+            .map(|i| self.parsed.remove(i));
         if lang == "org" {
-            self.parsed = None; // hand-rolled scanner, no tree to keep
-            return org::highlight(text);
+            return org::highlight(text); // hand-rolled scanner, no tree to keep
         }
         let Some(config) = config(lang) else {
-            self.parsed = None;
             return Vec::new();
         };
         if self.parser.set_language(&config.language).is_err() {
-            self.parsed = None;
             return Vec::new();
         }
         // A tree may only be reused for the same document in the same
@@ -490,21 +530,18 @@ impl Session {
         // Anything else is a different text, and handing tree-sitter an old
         // tree that does not describe it is the one way to get a *wrong* parse
         // rather than a slow one.
-        let old = match self.parsed.take() {
-            Some(mut old) if Some(old.buffer) == buffer && old.lang == lang => {
-                edits.map(|edits| {
-                    // One `InputEdit` for the whole run rather than one each:
-                    // the intermediate texts are gone, and only the two ends
-                    // are here to convert offsets against. A wider edit than
-                    // strictly happened costs a wider reparse and nothing else.
-                    if let Some(change) = Change::coalesce(edits) {
-                        old.tree.edit(&input_edit(&old.text, text, change));
-                    }
-                    old.tree
-                })
-            }
-            _ => None,
-        };
+        let old = mine.filter(|p| p.lang == lang).and_then(|mut old| {
+            edits.map(|edits| {
+                // One `InputEdit` for the whole run rather than one each:
+                // the intermediate texts are gone, and only the two ends
+                // are here to convert offsets against. A wider edit than
+                // strictly happened costs a wider reparse and nothing else.
+                if let Some(change) = Change::coalesce(edits) {
+                    old.tree.edit(&input_edit(&old.text, text, change));
+                }
+                old.tree
+            })
+        });
         let Some(tree) = self.parser.parse(text, old.as_ref()) else {
             return Vec::new();
         };
@@ -517,7 +554,10 @@ impl Session {
         let mut out = spans(config, &mut self.cursor, &tree, text);
         to_char_offsets(text, &mut out);
         if let Some(buffer) = buffer {
-            self.parsed = Some(Parsed {
+            if self.parsed.len() == TREES {
+                self.parsed.remove(0); // the least recently parsed; see [`TREES`]
+            }
+            self.parsed.push(Parsed {
                 buffer,
                 lang: lang.to_string(),
                 text: text.to_string(),
@@ -595,22 +635,30 @@ fn locate<const N: usize>(text: &str, wanted: [usize; N]) -> [(usize, Point); N]
 /// [`Worker::request`] hands over a snapshot and returns immediately,
 /// [`Worker::poll`] picks up whatever has finished.
 ///
-/// The queue is *coalescing*: a burst of keystrokes produces one parse of the
-/// newest text, not one parse per key. Without that, a fast typist outruns the
-/// parser and the backlog never drains.
+/// The queue is *coalescing per buffer*: a burst of keystrokes produces one
+/// parse of the newest text, not one parse per key. Without that, a fast typist
+/// outruns the parser and the backlog never drains. Per *buffer* and not
+/// globally, because more than one document is now in flight — the live one
+/// being typed into, and any parked one a revert has just rewritten — and a
+/// single slot meant the second of those was thrown away for the first.
 pub struct Worker {
     requests: crossbeam_channel::Sender<Request>,
-    results: crossbeam_channel::Receiver<(u64, Vec<Span>)>,
+    results: crossbeam_channel::Receiver<Done>,
 }
 
 /// One buffer snapshot to highlight, and how it differs from the last one.
 pub struct Request {
-    /// What the editor's revision counter said when `text` was taken. Comes
-    /// back with the spans so a caller can drop an answer the buffer has
-    /// already moved past.
-    pub revision: u64,
-    /// Which document this is. The worker keeps one tree, and this is how it
-    /// knows the tree is not about some other file.
+    /// What the *buffer's* change count said when `text` was taken. Comes back
+    /// with the spans so a caller can drop an answer that buffer has already
+    /// moved past.
+    ///
+    /// The buffer's own counter and not the editor's revision, which is what
+    /// this used to be: a revision is global, so a keystroke in the live buffer
+    /// moved it and invalidated a parked buffer's perfectly good parse — which
+    /// is the same "colourless parked buffer" bug from the other end.
+    pub seen: u64,
+    /// Which document this is: which tree to reuse, and which buffer the spans
+    /// are about when they come back.
     pub buffer: BufferId,
     pub lang: String,
     pub text: String,
@@ -619,25 +667,40 @@ pub struct Request {
     pub edits: Option<Vec<Change>>,
 }
 
-/// Fold a request that is about to be dropped for a newer one into it.
+/// A finished parse, and enough to tell whether it still describes its buffer.
+pub struct Done {
+    pub buffer: BufferId,
+    /// [`Request::seen`], handed straight back.
+    pub seen: u64,
+    /// What it was parsed *as*. The other way a result goes stale, and the one
+    /// a change count cannot see: `set-language` moves no text at all, so
+    /// without this the old grammar's spans would land on the new mode's buffer
+    /// for as long as it takes the re-request to come back.
+    pub lang: String,
+    pub spans: Vec<Span>,
+}
+
+/// Put `req` in the pending set, folding it into whatever was already waiting
+/// for that buffer, newest at the back.
 ///
 /// Dropping the older request drops its `text`, which is stale and unwanted.
 /// It must **not** drop its `edits`: the tree the worker is holding predates
 /// both, so the newer request's edits alone would describe a jump the tree
 /// never took. A list with a hole in it is worse than no list, so a run that
-/// cannot be joined end to end — a different buffer, a different language, or
-/// either side already resigned — collapses to `None` and a full parse.
-fn coalesce_requests(old: Request, mut new: Request) -> Request {
-    new.edits = match (old.edits, new.edits) {
-        (Some(mut before), Some(after))
-            if old.buffer == new.buffer && old.lang == new.lang =>
-        {
-            before.extend(after);
-            Some(before)
-        }
-        _ => None,
-    };
-    new
+/// cannot be joined end to end — a different language, or either side already
+/// resigned — collapses to `None` and a full parse.
+fn queue(pending: &mut Vec<Request>, mut req: Request) {
+    if let Some(i) = pending.iter().position(|p| p.buffer == req.buffer) {
+        let old = pending.remove(i);
+        req.edits = match (old.edits, req.edits) {
+            (Some(mut before), Some(after)) if old.lang == req.lang => {
+                before.extend(after);
+                Some(before)
+            }
+            _ => None,
+        };
+    }
+    pending.push(req);
 }
 
 /// Spawn the highlighting thread. It exits when the [`Worker`] is dropped.
@@ -648,18 +711,43 @@ pub fn spawn_worker() -> Worker {
         .name("zemacs-syntax".into())
         .spawn(move || {
             let mut session = Session::new();
-            while let Ok(mut req) = req_rx.recv() {
-                // Everything queued behind the newest request is already stale.
-                while let Ok(newer) = req_rx.try_recv() {
-                    req = coalesce_requests(req, newer);
+            // At most one pending parse per buffer. ponytail: the ceiling is
+            // therefore the number of open buffers — a whole directory
+            // reverting at once is that many parses and no more, because a
+            // second request for a file folds into the first rather than
+            // queueing behind it. No hard cap below that, because capping would
+            // need a rule for which buffer loses its colour and there is no
+            // honest one; the upgrade if a thousand-buffer project ever appears
+            // is to drop parked requests, never the live one.
+            let mut pending: Vec<Request> = Vec::new();
+            loop {
+                if pending.is_empty() {
+                    match req_rx.recv() {
+                        Ok(req) => queue(&mut pending, req),
+                        Err(_) => break, // the worker was dropped
+                    }
                 }
-                let spans = session.highlight(
-                    Some(req.buffer),
-                    &req.lang,
-                    &req.text,
-                    req.edits.as_deref(),
-                );
-                if res_tx.send((req.revision, spans)).is_err() {
+                while let Ok(req) = req_rx.try_recv() {
+                    queue(&mut pending, req);
+                }
+                // Newest first, and that is the whole latency argument: the
+                // newest request is the keystroke somebody is waiting on, and
+                // the parked buffers behind it are files that changed on disk
+                // while nobody was looking. Oldest-first would put a
+                // directory's worth of reverts in front of the character just
+                // typed. Continuous typing can starve the parked ones, which is
+                // the right way round — they stay colourless while you are
+                // busy, and are coloured the moment you pause.
+                let req = pending.pop().expect("filled just above");
+                let spans =
+                    session.highlight(Some(req.buffer), &req.lang, &req.text, req.edits.as_deref());
+                let done = Done {
+                    buffer: req.buffer,
+                    seen: req.seen,
+                    lang: req.lang,
+                    spans,
+                };
+                if res_tx.send(done).is_err() {
                     break;
                 }
             }
@@ -677,14 +765,16 @@ impl Worker {
         let _ = self.requests.send(req);
     }
 
-    /// The most recent finished result, or `None`. Older results waiting behind
-    /// it are dropped — the caller only ever wants the newest.
-    pub fn poll(&self) -> Option<(u64, Vec<Span>)> {
-        let mut latest = self.results.try_recv().ok()?;
-        while let Ok(newer) = self.results.try_recv() {
-            latest = newer;
-        }
-        Some(latest)
+    /// One finished parse, or `None`. Call it until it answers `None`.
+    ///
+    /// It used to keep only the newest result and drop the rest, which was
+    /// right when the live buffer was the only thing ever parsed and wrong the
+    /// moment it was not: the live buffer finishing would throw away the parked
+    /// buffer's colours on the way past. Two results for the *same* buffer
+    /// still arrive in the order they were parsed, so a caller applying each in
+    /// turn ends on the newest anyway.
+    pub fn poll(&self) -> Option<Done> {
+        self.results.try_recv().ok()
     }
 }
 
@@ -766,6 +856,51 @@ mod tests {
         assert_eq!(first(src, &spans, HlKind::Comment), "// café");
         // and the byte-offset answers really are different, so this test bites
         assert!(src.len() > src.chars().count());
+    }
+
+    /// The contract `runtime/modes/org-fold.lisp` reads: outermost first, so the
+    /// innermost range covering a line is the *last* match and the top-level ones
+    /// are those no earlier range covers. Both of its loops are one integer of
+    /// state that this ordering is the whole justification for.
+    #[test]
+    fn fold_ranges_are_outermost_first_and_skip_the_root() {
+        //          1              2                3     4  5              6
+        let src = "fn one() {\n    let a = 1;\n    let b = 2;\n}\n\nfn two() {\n}\n";
+        let r = fold_ranges("rust", src);
+        assert_eq!(r.first(), Some(&(1, 4)), "the first function, outermost first");
+        assert!(r.contains(&(6, 7)), "and the second one: {r:?}");
+        // The root spans the file; folding it would hide everything and swallow
+        // every other range a caller filtered for the outermost ones.
+        assert!(!r.contains(&(1, 7)), "the root is not a fold: {r:?}");
+        // Nested ranges are offered too — the caller picks. `one`'s block has the
+        // same extent as `one`, which is why `fold-all` drops what it covers.
+        assert!(r.iter().filter(|&&x| x == (1, 4)).count() >= 2, "{r:?}");
+    }
+
+    /// A one-line `//` comment is not a fold, and the reason it ever looked like
+    /// one is [`end_row`]: tree-sitter-rust's `line_comment` eats its own newline
+    /// and so ends at column 0 of the next row. Before this, `fold-all` on a file
+    /// with a `//!` header folded each header line over the one below it.
+    #[test]
+    fn a_one_line_comment_is_not_a_two_line_node() {
+        let src = "//! one\n//! two\n//! three\nfn f() {\n    // trailing\n}\n";
+        let r = fold_ranges("rust", src);
+        assert!(r.iter().all(|&(a, b)| a >= 4 && b >= 4), "comments folded: {r:?}");
+        assert!(r.contains(&(4, 6)), "the function still folds: {r:?}");
+        // A comment that really is several lines still is one.
+        assert!(fold_ranges("rust", "/* a\n b */\nfn f() {}\n").contains(&(1, 2)));
+    }
+
+    /// Every way out of the reader answers "no folds" rather than failing, which
+    /// is what lets Lisp treat the empty list as "nothing structural here".
+    #[test]
+    fn a_language_with_no_grammar_folds_nothing() {
+        assert!(fold_ranges("cobol", "IDENTIFICATION DIVISION.\n").is_empty());
+        // org has a hand-rolled highlighter and no tree at all.
+        assert!(fold_ranges("org", "* one\nbody\n").is_empty());
+        assert!(fold_ranges("rust", "").is_empty());
+        // Nonsense in the right language: a parse with errors still answers.
+        let _ = fold_ranges("rust", "fn ((( {{{ unterminated\n\n\n");
     }
 
     #[test]

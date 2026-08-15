@@ -99,6 +99,17 @@ static HOST: OnceLock<Host> = OnceLock::new();
 fn with_editor<T>(f: impl FnOnce(&mut Editor) -> T) -> Option<T> {
     let host = HOST.get()?;
     let mut guard = host.editor.lock().unwrap_or_else(|e| e.into_inner());
+    // Every primitive, including the readers. This is the *only* signal the
+    // draw loop gets that the image touched the editor — the Lisp thread
+    // reaches it through this mutex and raises no window event, so a change
+    // made here would otherwise sit undrawn until something else happened.
+    //
+    // Bumping on a read too, which over-counts: `(point)` in a mode hook costs
+    // one frame that was going to be drawn anyway, and telling reads from
+    // writes here would mean two functions and a judgement call at every call
+    // site. See [`Editor::generation`] for why the error is taken in this
+    // direction.
+    guard.touch();
     Some(f(&mut guard))
 }
 
@@ -164,6 +175,21 @@ fn ask_here(name: &str) -> Option<String> {
             };
             Some(format!("({})", rows.join(" ")))
         }
+        // The projects visited before, newest first — what `project-switch'
+        // offers. A *reader* and not a `prompt-source` like the file and
+        // directory lists beside it, and the difference is length: this is a few
+        // dozen paths off a persisted list, so it can cross the shim as a Lisp
+        // list and the picker over it is an ordinary `completing-read`. That
+        // buys the thing the source verb cannot — Lisp can see the list is
+        // *empty* and hand over to `project-open` instead of opening a picker
+        // onto nothing.
+        "project-recent" => {
+            let rows: Vec<String> = zemacs_project::recent()
+                .iter()
+                .map(|p| zemacs_core::query::lisp_string(&p.to_string_lossy()))
+                .collect();
+            Some(format!("({})", rows.join(" ")))
+        }
         _ => None,
     }
 }
@@ -214,6 +240,14 @@ pub extern "C" fn rs_set_syntax_color(face: *const c_char, r: c_double, g: c_dou
 pub extern "C" fn rs_set_face_style(face: *const c_char, bold: c_int, italic: c_int) {
     let face = unsafe { str_or_empty(face) };
     emit(EditorCommand::SetFaceStyle(face, bold != 0, italic != 0));
+}
+
+/// Forget every face. `load-theme` sends this before it loads a theme file, so
+/// a face the incoming theme does not name falls back to the renderer's own
+/// ratio rather than to whatever the outgoing theme happened to say.
+#[no_mangle]
+pub extern "C" fn rs_reset_faces() {
+    emit(EditorCommand::ResetFaces);
 }
 
 #[no_mangle]
@@ -877,15 +911,84 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
         "scroll-past-end" => EditorCommand::SetScrollPastEnd(a != 0),
 
         // `read-string` and `completing-read`. `a` is the continuation id the
-        // image parked its closure under, `b` says whether to draw a candidate
-        // box, and the candidates themselves follow one at a time: the write
-        // envelope carries a single string, and a list is many.
+        // image parked its closure under, and the candidates themselves follow
+        // one at a time: the write envelope carries a single string, and a list
+        // is many.
+        //
+        // `b` counts up rather than being a bool, because the two questions it
+        // answers are nested: 0 is a plain read, 1 draws a candidate box, and 2
+        // does that *and* reports the highlight back as it moves. Previewing
+        // without completing is not a state — there would be no highlight —
+        // which is exactly why one number says both and no second field is
+        // needed in the envelope.
         "read-from-minibuffer" => EditorCommand::ReadFromMinibuffer {
             id: a.max(0) as u64,
             label: arg,
-            completing: b != 0,
+            completing: b >= 1,
+            previewing: b >= 2,
         },
         "prompt-item" => EditorCommand::PromptItem(arg),
+        // The same list in one crossing instead of N. `completing-read` uses
+        // this one; `prompt-item` stays because a command that discovers its
+        // candidates one at a time should not have to join them first.
+        "prompt-items" => EditorCommand::PromptItems(arg),
+
+        // --- seeding a prompt Lisp did not fill ------------------------------
+        //
+        // The three verbs that let a Lisp command drive a picker whose
+        // *candidates* are core's or the app's — `docs/boundary.org` recorded
+        // the absence of exactly these as the reason half of `project.rs` could
+        // not move. Between them they are why `project-find-file`,
+        // `project-find-dir`, `project-switch` and `project-open` are now
+        // `defun`s in `runtime/plugins/project.lisp`.
+        "prompt-text" => EditorCommand::SetPromptText(arg),
+        "prompt-label" => EditorCommand::SetPromptLabel(arg),
+        // `"SOURCE ARGUMENT"`. The app splits it, because the app is what owns
+        // the lists — see [`EditorCommand::PromptSource`].
+        "prompt-source" => EditorCommand::PromptSource(arg),
+
+        // The body font, by path. A string fits the `%do` envelope, so this
+        // needs no C primitive of its own the way `set-font-size` does — the
+        // *size* is a float and a float is what does not fit.
+        //
+        // Empty means "back to the built-in search", which is the only spelling
+        // available: the envelope carries a string and has no NIL.
+        "font-path" => EditorCommand::SetFontPath((!arg.is_empty()).then_some(arg)),
+        "list-fonts" => EditorCommand::ListFonts,
+
+        // --- the modeline ----------------------------------------------------
+        //
+        // One segment of the strip's format. `a` and `b` are cramped on purpose
+        // — the envelope carries a string and two integers, and the alternative
+        // was a C primitive taking five arguments, which `docs/boundary.org`
+        // prices at five places that can drift. `modeline-segment` in
+        // `runtime/library.lisp` is the door, and nobody outside it sees this.
+        //
+        //   a: bit 0 the side (0 left, 1 right), bit 1 bold, bit 2 filled
+        //   b: the face — `-1` the strip's own, `-2` the *mode's*, else an index
+        //      into `face-list`, which is the same vocabulary an overlay takes.
+        // What, at the end of a line, means the next one is inside something.
+        // A table and not a parser, because this is read on the Enter key — see
+        // [`Settings::indent_openers`].
+        "indent-openers" => EditorCommand::SetIndentOpeners(arg),
+
+        "modeline-clear" => EditorCommand::Modeline(None),
+        "modeline-segment" => EditorCommand::Modeline(Some((
+            a & 1 != 0,
+            zemacs_core::modeline::Spec {
+                template: arg,
+                face: match b {
+                    -2 => zemacs_core::modeline::Face::Mode,
+                    i if i >= 0 => match HlKind::ALL.get(i as usize) {
+                        Some(&k) => zemacs_core::modeline::Face::Named(k),
+                        None => zemacs_core::modeline::Face::Default,
+                    },
+                    _ => zemacs_core::modeline::Face::Default,
+                },
+                bold: a & 2 != 0,
+                filled: a & 4 != 0,
+            },
+        ))),
 
         // One row of the which-key panel, empty string to clear it — the same
         // one-string-at-a-time shape `prompt-item` has, and for the same reason.

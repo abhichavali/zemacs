@@ -231,6 +231,11 @@ it does in Emacs, and passing OF makes it a question about a mode you name."
     (line-numbers          set-line-numbers          t)
     (relative-line-numbers set-relative-line-numbers nil)
     (tab-width             set-tab-width             4)
+    ;; What opens a block, for auto-indent on `Enter'. NIL is "only copy the
+    ;; previous line's indentation", which is the right answer for prose and for
+    ;; a language nobody has taught this about — a `Notes:' that indented the
+    ;; next line would be worse than nothing clever at all.
+    (indent-openers        set-indent-openers        nil)
     (text-width            set-text-width            0)
     (font-size             set-font-size             18)
     ;; T because the editor starts with it on — see `Settings::scroll_past_end'.

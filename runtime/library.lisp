@@ -229,19 +229,37 @@ one argument and a lot at three.
 Cancelling stops here and K is never called, so a command that was going to ask
 three questions and got one answer does *nothing*. Collecting the arguments and
 then running the command once is the same rule `docs/threading.org' states for
-edits: build the whole answer first, apply it in one go."
+edits: build the whole answer first, apply it in one go.
+
+A spec that named a `:preview' form gets consult's live preview, and the whole
+of what makes one is `APPLY-WITH' below: running the command with the
+highlighted candidate in the slot being asked for. K *is* the command, so a
+preview costs no second description of what the command does and cannot drift
+from it — `load-theme' previews by loading the theme, which is the only
+definition of \"show me that theme\" there could be.
+
+BEFORE is what the `:preview' form answered at the moment the prompt opened,
+and cancelling applies it again. Escape has to be a round trip or a preview is a
+trap rather than a preview."
   (if (null specs)
       (funcall k (nreverse acc))
-      (let* ((label (or (car (first specs)) (first prompts)))
-             (source (cdr (first specs)))
+      (let* ((spec (first specs))
+             (label (or (first spec) (first prompts)))
+             (source (second spec))
+             (was (third spec))
              (more-specs (rest specs))
              (more-prompts (rest prompts))
+             (apply-with (lambda (v) (funcall k (append (reverse acc) (list v)))))
+             ;; Last argument only: with more questions still to come the other
+             ;; arguments are not known yet, so there is nothing to apply.
+             (before (and was (null more-specs) (functionp source) (funcall was)))
              (step (lambda (answer)
                      (let ((v (%interactive-value answer source)))
-                       (when v
-                         (%read-args more-prompts more-specs (cons v acc) k))))))
+                       (cond (v (%read-args more-prompts more-specs (cons v acc) k))
+                             (before (funcall apply-with before)))))))
         (if (functionp source)
-            (completing-read label (funcall source) step)
+            (completing-read label (funcall source) step
+                             (and before apply-with))
             (read-string label step)))))
 
 (defun %interactive (sym specs)
@@ -292,6 +310,13 @@ tests load it without the library."
 Any of the three may be written `(LABEL SPEC)' to say what the prompt should
 read; without a LABEL it is the parameter's own name.
 
+A candidate spec may add `:preview FORM' — `(LABEL SPEC :preview FORM)' — which
+turns the prompt into a live one: scrolling the list *runs the command* on the
+highlighted candidate, so you see the theme rather than its name. FORM is
+evaluated when the prompt opens and must answer what is showing *now*, because
+that is what cancelling puts back. Only the last argument of a command can
+preview; there is nothing to run while other arguments are still unknown.
+
 Put it directly under the `defun'. It captures the function that is there when
 it runs, so the two travel together — a config reload re-reads the `defun' and
 then re-wraps the fresh definition, in that order, which is what keeps a reload
@@ -300,11 +325,17 @@ from stacking wrappers on wrappers."
     ',name
     (list ,@(mapcar (lambda (s)
                       (let* ((label (and (consp s) (stringp (car s)) (car s)))
-                             (src (if label (second s) s)))
+                             (tail (if label (rest s) (list s)))
+                             (src (first tail))
+                             (was (getf (rest tail) :preview)))
                         ;; A keyword stays a keyword; anything else is a form to
                         ;; evaluate *when the prompt opens* and not now, so
-                        ;; `(theme-names)' re-reads the directory each time.
-                        `(cons ,label ,(if (keywordp src) src `(lambda () ,src)))))
+                        ;; `(theme-names)' re-reads the directory each time. The
+                        ;; preview form is deferred for the same reason and read
+                        ;; at the same moment.
+                        `(list ,label
+                               ,(if (keywordp src) src `(lambda () ,src))
+                               ,(and was `(lambda () ,was)))))
                     specs))))
 
 ;;; ---------------------------------------------------------------------------
@@ -387,10 +418,47 @@ RGB is a (R G B) list of floats, or NIL to leave the colour alone."
 NIL for the themes as their authors published them. A short list on purpose —
 a screen where everything is heavy has no emphasis left to give.")
 
+(defparameter *current-theme* nil
+  "The theme that is showing, or NIL before the config has loaded one.
+
+Tracked here rather than asked of the editor because there is nothing to ask: a
+theme *is* a file of `set-background' and `set-syntax-color' calls, so once it
+has run there is no name left anywhere — only the colours it set. `load-theme'
+is the one door in, which is what makes one variable beside it sufficient.
+
+Its reason for existing is the preview on `load-theme's prompt: scrolling the
+theme list loads each theme in turn, and cancelling has to put back the one you
+started with.")
+
 (defun %apply-bold-constructs ()
   "Re-assert weight on `*bold-constructs*', preserving each face's slant."
   (dolist (face *bold-constructs*)
     (set-face-style face t (gethash face *face-italic*))))
+
+;;; Why a theme change starts by throwing everything away.
+;;;
+;;; A theme is a pile of assignments into a table, so a face the incoming theme
+;;; does not mention keeps the *outgoing* theme's answer. For the 22 faces about
+;;; text that is closed by making the pile total — every shipped theme names all
+;;; 22, and `crates/lisp/tests/themes.rs' fails the build if one does not.
+;;;
+;;; The UI faces cannot be closed that way, because they are deliberately
+;;; optional: `cursor', `region', `popup' and the rest fall back to the ratios
+;;; the renderer was mixing before they existed, which is what let eleven themes
+;;; become cursor-themeable without one of them being edited. An optional face
+;;; is exactly the face a test cannot insist on — so the bleed is stopped at the
+;;; other end instead. Empty the table, then load; anything the new theme is
+;;; silent about falls through to a ratio of *its own* ground and body colour,
+;;; which is right no matter what was showing a moment ago.
+;;;
+;;; `*face-italic*' goes with it. It shadows a slant the editor publishes no
+;;; reader for (see `set-face'), so a stale entry here is the same bug wearing a
+;;; Lisp hat: `*bold-constructs*' would re-slant a face the new theme left
+;;; upright, because the hash still remembered the old one asking for it.
+(defun %forget-faces ()
+  "Drop every face colour and style, here and in the editor."
+  (clrhash *face-italic*)
+  (reset-faces))
 
 (defun load-theme (name)
   "Load theme NAME from the shipped themes/ directory.
@@ -406,8 +474,10 @@ which is the hand-written version of the same thing — and was the precedent th
 declaration was generalised out of."
   (let ((path (runtime-file (format nil "themes/~a.lisp" name))))
     (cond ((null path) (message "load-theme: cannot tell where the runtime lives"))
-          ((probe-file path) (load path :verbose nil :print nil)
+          ((probe-file path) (%forget-faces)
+                             (load path :verbose nil :print nil)
                              (%apply-bold-constructs)
+                             (setf *current-theme* (string name))
                              (message (format nil "theme: ~a" name)))
           (t (message (format nil "no such theme: ~a" name))))))
 
@@ -422,7 +492,9 @@ declaration was generalised out of."
     (when glob
       (sort (mapcar #'pathname-name (directory glob)) #'string<))))
 
-(interactive load-theme ("Theme: " (theme-names)))
+;; Previewing, which is the whole of what makes a theme list usable: eleven names
+;; tell you nothing about eleven themes. Escape puts back the one that was on.
+(interactive load-theme ("Theme: " (theme-names) :preview *current-theme*))
 
 (defun theme ()
   "Pick a theme. Bound to `SPC t t'.
@@ -447,6 +519,87 @@ asked for — which is what `set-scale' is for.")
   (setf *font-size* (max 6 (min 96 n)))
   (set-font-size *font-size*)
   (message (format nil "font size ~d" *font-size*)))
+
+;;; ---------------------------------------------------------------------------
+;;; The font itself, as opposed to its size.
+;;;
+;;; Which fonts exist is the one question here Lisp cannot answer: it takes a
+;;; font library to tell a monospace face from a proportional one, and guessing
+;;; from the filename offers you Helvetica and hides Iosevka. So the editor is
+;;; asked — `(%do "list-fonts")' — and answers on a later turn by calling
+;;; `%fonts-listed' with the pairs. Everything after that is here.
+
+(defparameter *fonts* nil
+  "`(FAMILY . PATH)' for every monospace font installed, or NIL before the
+editor has been asked. Filled by `%fonts-listed'.")
+
+(defparameter *current-font* nil
+  "The family showing now, or NIL for whichever one the editor picked at
+startup. What `choose-font's preview puts back when you cancel.")
+
+(defparameter *font-prompt* nil
+  "The thunk waiting on the scan, when something asked before the list existed.
+
+One slot and not a queue: what waits is a prompt, and there is one of those. A
+second `M-x choose-font' before the first has drawn replaces it, which is what
+the editor does with the prompt itself.")
+
+(defun %fonts-listed (pairs)
+  "Called by the editor with the scan it was asked for. See `list-fonts'."
+  (setf *fonts* pairs)
+  (let ((then (shiftf *font-prompt* nil)))
+    (when then (funcall then)))
+  nil)
+
+(defun list-fonts (&optional then)
+  "Answer the installed monospace families, asking the editor if need be.
+
+THEN is called once the list is in hand — immediately when it already was, and
+on a later turn of the Lisp queue when the editor had to be asked. That is the
+same continuation shape `read-string' has and for the same reason: nothing here
+may block the image (`docs/threading.org').
+
+The scan costs a few hundred file opens, so it is done once a session. `(setf
+*fonts* nil)' forces a fresh one after installing a font."
+  (cond (*fonts* (when then (funcall then)) (mapcar #'car *fonts*))
+        (t (setf *font-prompt* then)
+           (%do "list-fonts" "" 0 0)
+           nil)))
+
+(defun set-font (family)
+  "Set the body font to FAMILY, one of `list-fonts'.
+
+The editor is handed a *path*: it has no font library to resolve a name with,
+and the name-to-path table is the scan this file already holds. NIL goes back to
+whichever font the editor finds for itself, which is what an empty path means."
+  (if (null family)
+      (progn (setf *current-font* nil) (%do "font-path" "" 0 0))
+      (let ((hit (assoc (string family) *fonts* :test #'string-equal)))
+        (cond ((null hit) (message (format nil "no such font: ~a" family)))
+              (t (setf *current-font* (car hit))
+                 (%do "font-path" (cdr hit) 0 0)
+                 (message (format nil "font: ~a" (car hit))))))))
+
+(defun choose-font ()
+  "Scroll the installed monospace fonts, with the editor set in each as you go.
+
+`M-x choose-font'. The preview is the point — a list of font names is exactly as
+useful as a list of theme names, which is to say not at all — so this is
+`load-theme's prompt with a different list behind it, and Escape puts back the
+font you were using.
+
+Hand-written rather than declared with `interactive' `:preview' because the
+list has to be *fetched* before the prompt can open, and `interactive' evaluates
+its source form at that moment and expects the answer there and then."
+  (list-fonts
+   (lambda ()
+     (let ((before *current-font*))
+       (completing-read "Font: " (mapcar #'car *fonts*)
+                        (lambda (answer)
+                          (set-font (or answer before)))
+                        (lambda (candidate)
+                          (when candidate (set-font candidate)))))))
+  nil)
 
 ;;; `set-font-size' is deliberately *not* declared interactive, though it is the
 ;;; primitive and this is the wrapper. It sets the size and nothing else, so an
@@ -778,6 +931,118 @@ on advertising the old one, which is the exact failure a printed hint is
 supposed to prevent. It follows that the items must be built *after* the
 bindings; a menu built first prints a column of blanks."
   (%dashboard-item key label action (or hint (leader-key action) "")))
+
+;;; ---------------------------------------------------------------------------
+;;; The modeline
+;;;
+;;; What the strip says is a list of little templates set from here; the editor
+;;; expands them per pane per frame. That division is the point: a callback per
+;;; frame is what makes a slow `mode-line-format' in Emacs make the whole editor
+;;; feel slow, and `docs/threading.org' is a document about never doing that. So
+;;; the *shape* is yours and costs nothing, and the expansion is a scan of a few
+;;; dozen bytes in Rust.
+;;;
+;;; The codes, which `crates/core/src/modeline.rs' documents in full:
+;;;
+;;;   %m  the modal state, active pane only    %M  the major mode, as a word
+;;;   %b  the buffer's name                    %n  the minor modes
+;;;   %f  its path                             %l  the line, %c the column
+;;;   %+  ● when there are unsaved changes     %p  Top / Bot / All / a percentage
+;;;   %r  ◈ when it is read-only               %P  unix permissions
+;;;   %s  the last message, active pane only   %%  a literal %
+;;;   %k  the half-typed key sequence
+;;;
+;;; **A segment whose codes all come back empty is dropped whole**, which is the
+;;; whole of the conditional logic and is why no code needs an `if' around it:
+;;; `"  %P"' carries its own two spaces and leaves with them on a buffer that has
+;;; no file behind it.
+
+(defun %face-number (face)
+  "FACE as the editor spells one on the modeline.
+
+NIL is the strip's own colour, `:mode' is *the colour of the mode you are in* —
+the one face that cannot be named ahead of time, since it is a different one in
+each state — and anything else is a name from `face-list', the same vocabulary
+an overlay takes."
+  (cond ((null face) -1)
+        ((eq face :mode) -2)
+        ((integerp face) face)
+        (t (or (position (string-downcase (string face)) (face-list)
+                         :test #'string=)
+               (error "modeline: no such face: ~a" face)))))
+
+(defun clear-modeline ()
+  "Take both sides of the modeline down, to build one from scratch."
+  (%do "modeline-clear" nil 0 0)
+  nil)
+
+(defun modeline-segment (side template &key face bold filled)
+  "Add TEMPLATE to the modeline's SIDE — `:left' or `:right'.
+
+FACE is a name from `face-list', `:mode', or NIL for the strip's own colour.
+BOLD stacks with whatever weight the theme gave that face rather than replacing
+it: the flag is the modeline's *structural* emphasis — the buffer name is bold
+because it is the buffer name — while the theme's is a claim about the face, and
+both are true at once.
+
+FILLED paints the face as a block behind the text and knocks the text out to the
+strip's colour. It is what makes the mode indicator a shape rather than a word:
+a colour chosen to be legible *on* the bar is by construction not legible *as*
+the bar, so the ink has to swap to the ground it is now sitting on."
+  (%do "modeline-segment" (string template)
+       (logior (if (eq side :right) 1 0)
+               (if bold 2 0)
+               (if filled 4 0))
+       (%face-number face))
+  nil)
+
+(defun default-modeline ()
+  "Build the strip the editor ships with.
+
+Here rather than in `init.lisp' because this file is loaded from the *runtime*
+directory whatever config is running, and that one is the copy in your
+`~/.zemacs.d/' the moment it exists — so a config written before the modeline
+became configurable would otherwise boot into the two-segment fallback the
+editor keeps for a headless session. Your init runs after this and may
+`clear-modeline' and say something else entirely; that is the whole point."
+  (clear-modeline)
+
+  ;; Left: what you are doing, and to what.
+  ;;
+  ;; The pill first, in the colour of the state, because modal editing's one
+  ;; recurring cost is losing track of which mode you are in and the thing that
+  ;; fixes it is a shape at the left edge that is a different colour in each —
+  ;; recognisable at the edge of vision, which coloured text on a dark strip is
+  ;; not. The spaces are its padding: the strip is a character grid, so a pill is
+  ;; as wide as its label and the label carries its own margin.
+  (modeline-segment :left " %m " :face :mode :bold t :filled t)
+  (modeline-segment :left "  %b" :bold t)
+  ;; `warning' rather than bold for the dot. Bold is a near-white in most themes
+  ;; — the same near-white the buffer name beside it is already set in — so the
+  ;; one mark on the strip meaning "you have work that is not on disk" was drawn
+  ;; in the colour of everything around it.
+  (modeline-segment :left " %+" :face "warning")
+  (modeline-segment :left " %r" :face "comment")
+  ;; The message and the half-typed key sequence, both transient, both on the
+  ;; left after the file — pushing the position around as they come and go is
+  ;; exactly what the right-hand group avoids.
+  (modeline-segment :left "  %s" :face "comment")
+  (modeline-segment :left "  %k" :face "constant" :bold t)
+
+  ;; Right: what this buffer is, and where in it you are.
+  (modeline-segment :right "%P  " :face "comment")
+  (modeline-segment :right "%M  " :face "type")
+  (modeline-segment :right "%n" :face "comment")
+  (modeline-segment :right "%l:%c" :bold t)
+  ;; The other bookend. Where you are in the file is the one fact on the right
+  ;; that is about *reading* rather than about the buffer's identity, and a block
+  ;; at the far edge gives the strip two ends instead of one — the mode at the
+  ;; left, the position at the right, and everything that is merely information
+  ;; laid out flat between them.
+  (modeline-segment :right "  %p " :face "accent" :bold t :filled t)
+  nil)
+
+(default-modeline)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys
@@ -1237,10 +1502,22 @@ there is no such link does the row itself get read for one."
 (defparameter *runtime-modules*
   '("plugins/project.lisp"
     "gui.lisp" "rpc.lisp" "lsp.lisp"
+    ;; Above `lsp.lisp' would be tidier and is wrong: `xref-show' is called from
+    ;; there and `xref.lisp' calls nothing back, so the only ordering that
+    ;; matters is that both are loaded before a key is pressed.
+    "modes/xref.lisp"
     "modes/which-key.lisp" "modes/show-paren.lisp" "modes/avy.lisp"
+    "modes/magit.lisp"
     "modes/lisp-mode.lisp" "modes/repl.lisp" "modes/parinfer.lisp"
     "modes/org-latex.lisp" "modes/org-modern.lisp" "modes/org-fold.lisp"
-    "modes/org-structure.lisp" "modes/org-frozen.lisp"
+    ;; ...and `org-table.lisp' after both of them, because its three keys are
+    ;; dispatchers that hand TAB, S-TAB and RET on to `org-cycle',
+    ;; `org-global-cycle' and `org-open-at-point' when point is not in a table.
+    ;; Loading it first would leave the bindings it displaces displaced.
+    "modes/org-structure.lisp" "modes/org-table.lisp"
+    ;; ...and the agenda after the table, because it is a scanner over
+    ;; `xref-show' and reads `*org-todo-keywords*' out of `org-modern.lisp'.
+    "modes/org-agenda.lisp" "modes/org-frozen.lisp"
     "modes/math.lisp" "modes/ai.lisp" "modes/tutor.lisp"
     "modes/math-code.lisp" "modes/math-written.lisp")
   "The shipped runtime, in load order. `modes/modes.lisp' is not here: it comes

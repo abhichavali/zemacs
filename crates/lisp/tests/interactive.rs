@@ -144,7 +144,8 @@ fn m_x_asks_for_the_arguments_a_command_declares() {
     // only way `runtime-file` can find themes/ and modes/.
     std::env::set_var("ZEMACS_RUNTIME", &runtime);
 
-    let init = std::env::temp_dir().join("zemacs_test_interactive_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_interactive_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(
@@ -256,6 +257,55 @@ fn m_x_asks_for_the_arguments_a_command_declares() {
         let ed = shared.lock().unwrap();
         assert!(ed.prompt.is_none(), "an argument given is an argument not asked for");
     }
+
+    // --- the live preview ----------------------------------------------------
+    //
+    // Scrolling the theme list loads each theme as the highlight reaches it, so
+    // you are choosing between *themes* rather than between eleven names. The
+    // proof that it is really applied rather than only reported is that the
+    // command itself is what runs: `load-theme` is the only thing that can emit
+    // `theme: X`, and it is not reached until an answer is accepted.
+    //
+    // "dracula" is showing, from the direct call above.
+    execute_command(&shared, &lisp, "load-theme");
+    wait_asking(&shared, "Theme: ", true);
+    // The candidates arrive one `PromptItem` at a time, so the prompt exists
+    // for a moment with nothing in it and `C-n` would have nothing to move to.
+    wait(&shared, "the candidates", |ed| {
+        ed.prompt.as_ref().filter(|p| p.items.len() > 3).map(|_| ())
+    });
+
+    // Nothing is previewed by *opening* — the buffer switcher does not either,
+    // and a picker that changed your theme the instant it appeared would be
+    // doing it before you asked for anything.
+    feed(&shared, &lisp, &[Key::Ctrl('n')]);
+    let first = {
+        let ed = shared.lock().unwrap();
+        assert!(ed.prompt.is_some(), "a preview must not close the prompt");
+        ed.prompt.as_ref().unwrap().current().unwrap().to_string()
+    };
+    wait_message(&shared, "the highlighted theme, loaded", |m| {
+        m == format!("theme: {first}")
+    });
+
+    // ...and the next one down loads in turn, which is what "as I scroll" means.
+    feed(&shared, &lisp, &[Key::Ctrl('n')]);
+    let second = {
+        let ed = shared.lock().unwrap();
+        ed.prompt.as_ref().unwrap().current().unwrap().to_string()
+    };
+    assert_ne!(first, second, "C-n moved the highlight");
+    wait_message(&shared, "the next theme, loaded", |m| {
+        m == format!("theme: {second}")
+    });
+
+    // Escape puts back what was showing when the prompt opened. Without this a
+    // preview is a trap: browsing the list would silently change your theme.
+    feed(&shared, &lisp, &[Key::Esc]);
+    wait(&shared, "the prompt closing", |ed| ed.prompt.is_none().then_some(()));
+    wait_message(&shared, "the theme restored", |m| m == "theme: dracula");
+    says(&shared, &lisp, "*current-theme*", "dracula");
+    says(&shared, &lisp, "(hash-table-count *prompt-previews*)", "0");
 
     // --- the `:number` source ------------------------------------------------
     //

@@ -27,7 +27,7 @@ use sdl3::mouse::{Cursor, MouseButton, MouseWheelDirection, SystemCursor};
 
 use zemacs_core::frame::{Divider, Split};
 use zemacs_core::{
-    BufferId, Change, Editor, EditorCommand, Frame, Key, PromptKind, Rect, WindowId,
+    BufferId, BufferKind, Change, Editor, EditorCommand, Frame, Key, PromptKind, Rect, WindowId,
 };
 use zemacs_lisp::Lisp;
 use zemacs_render::Renderer;
@@ -66,6 +66,12 @@ struct Drag {
 #[derive(Default)]
 struct Mouse {
     drag: Option<Drag>,
+    /// The press landed in a terminal and the child did not take it, so this
+    /// gesture is dragging out a text selection rather than being reported to
+    /// whatever is running. Latched at the press: a drag has to keep meaning
+    /// what it meant when it started, even if the child turns mouse reporting
+    /// on halfway through it.
+    selecting: bool,
 }
 
 impl Mouse {
@@ -105,8 +111,12 @@ impl Mouse {
         }
     }
 
-    fn release(&mut self) {
+    /// Every gesture ends here, including the ones that ended somewhere the
+    /// press did not start — a drag out of a terminal and into another pane
+    /// would otherwise leave `selecting` latched for the next press.
+    fn release(&mut self) -> bool {
         self.drag = None;
+        std::mem::take(&mut self.selecting)
     }
 }
 
@@ -414,6 +424,51 @@ fn after_edit_form(editor: &Editor, told: &mut Option<(BufferId, u64)>) -> Optio
     ))
 }
 
+/// Queue `point-moved-hook` if point is somewhere it has not been reported
+/// from, and remember where that is.
+///
+/// The other signal the image gets about a buffer, and the twin of
+/// [`after_edit_form`]: the *cursor* moved. Without it a config only ever hears
+/// about a buffer when the document changes, which is the wrong half for
+/// anything whose job is to react to where you are looking — org's markup would
+/// reveal itself as you typed and stay hidden as you navigated, because `j` and
+/// `w` change no text at all.
+///
+/// Queued rather than called, through the same `pending_hooks` and the same
+/// `fboundp` guard, so it costs nothing until something defines
+/// `point-moved-hook` — `runtime/modes/modes.lisp` does. It is appended to
+/// whatever core already put there, so a switch reaches a config as
+/// `buffer-switch-hook` then `point-moved-hook`: the mode's global settings are
+/// re-resolved before anything re-renders against them, which is the order a
+/// config that has both wants and the one it has always seen.
+///
+/// **A buffer and an offset, because an offset alone is not a position.** The
+/// question being asked is "is the text under point the text that was under
+/// point", and `buffer.cursor` on its own only answers it for a switch that
+/// happens to land somewhere else. Offset 0 is where two freshly opened files
+/// both sit, and where a jump out to a generated buffer and back leaves you, and
+/// every one of those switches used to be silent — the equation preview,
+/// org-appear and show-paren went on rendering the buffer you had left.
+///
+/// A generated buffer is excluded rather than merely skipped, and `last` is
+/// deliberately left standing when it is: a terminal rewrites itself as fast as
+/// the shell prints and no config can act on it anyway, and holding the position
+/// keeps the return trip honest — coming back to the same offset in the same
+/// file after a detour through one really is no move at all.
+///
+/// ponytail: the previous position is remembered here but never *carried* to the
+/// image, so a config that wants to act on the range you left — re-rendering the
+/// equation you just stepped out of, say — still has to remember it in the
+/// image. The upgrade is what [`after_edit_form`] already does for the document:
+/// build the call here, where the lock is held, rather than queueing a name.
+fn queue_point_moved(editor: &mut Editor, last: &mut Option<(BufferId, usize)>) {
+    let now = (editor.buffer.id, editor.buffer.cursor);
+    if *last != Some(now) && !editor.buffer.kind.is_generated() {
+        *last = Some(now);
+        editor.pending_hooks.push("point-moved-hook".into());
+    }
+}
+
 /// The one shape every signal this layer sends the image takes: look the symbol
 /// up in `ZEMACS`, and call it only if a config actually defined it.
 ///
@@ -672,8 +727,40 @@ fn main() -> anyhow::Result<()> {
         let screens = app.term.screens(&editor);
         perf.input += frame_start.elapsed();
 
+        // Whether to draw at all. `Editor::generation` moves on every keystroke,
+        // every command, every Lisp primitive and every writer in this layer
+        // that reaches around them; if it has not moved, nothing on screen can
+        // have changed and the frame is two milliseconds spent proving it.
+        //
+        // A screenshot request draws regardless: `shoot` reads back the frame
+        // buffer below, and reading back one we declined to fill would hand out
+        // whatever was in it.
+        //
+        // ...and so does a frame that has not been drawn for `DRAW_AT_LEAST`,
+        // which is the safety net rather than a clock. `generation` is a list of
+        // writers rather than a property of the editor, so a writer added later
+        // that forgets to touch costs a fraction of a second of staleness — a
+        // lag somebody notices and reports — instead of a pane that silently
+        // stops updating, which is the failure nobody can describe.
+        let due = app.last_draw.elapsed() >= DRAW_AT_LEAST;
+        let shooting = control.as_ref().is_some_and(control::Control::shooting);
+        let drew = editor.generation != app.drawn_generation || due || shooting;
+
         let drawing = Instant::now();
-        let draws = app.draw(&mut editor, &screens)?;
+        let draws = match drew {
+            false => 0,
+            true => {
+                let n = app.draw(&mut editor, &screens)?;
+                // *After* the draw, not before: the renderer parks each pane's
+                // width and height back on the editor and `scroll_scene` may
+                // fix up a scene's offset, so a generation read before the draw
+                // would differ from the one after it and every frame would
+                // redraw its own bookkeeping for ever.
+                app.drawn_generation = editor.generation;
+                app.last_draw = Instant::now();
+                n
+            }
+        };
         perf.draw += drawing.elapsed();
 
         // Between the draw and the present, because that is the one moment the
@@ -690,7 +777,10 @@ fn main() -> anyhow::Result<()> {
         // Lisp primitive behind the display.
         drop(editor);
         let presenting = Instant::now();
-        let presents = app.present();
+        // Nothing was drawn, so there is nothing new to show. Skipped rather
+        // than left to `present`'s own digest test, which would answer the same
+        // and flush an empty command list per renderer to do it.
+        let presents = if drew { app.present() } else { 0 };
         presented = presents > 0;
         perf.present += presenting.elapsed();
         // A keystroke that changed nothing on screen — `k` at the top of the
@@ -705,6 +795,10 @@ fn main() -> anyhow::Result<()> {
     // one stray `clangd` indexing a repository per session, which is the kind of
     // thing you only notice when the fan starts.
     zemacs_rpc::stop_all();
+    // And so does a `:!`, for a different reason: it is not a PTY child, so the
+    // `SIGHUP` the note below relies on never reaches it. By name rather than by
+    // `Drop`, because `_exit` runs no destructors.
+    app.term.hangup();
     // Every way out of the loop, not just the `quit` op: a client waiting on
     // this also hears about the window being closed and about the editor
     // quitting itself.
@@ -733,9 +827,12 @@ fn main() -> anyhow::Result<()> {
     // which is why this survived a suite that never asked for a picture. Under
     // `--control` the cost was a leaked editor per session.
     //
-    // Nothing is lost by skipping the handlers. `zemacs_rpc::stop_all` above
-    // already took the language servers — the one thing that genuinely outlives
-    // this process — and a PTY's child gets its `SIGHUP` from the kernel.
+    // Nothing is lost by skipping the handlers, but only because the two things
+    // that genuinely outlive this process are taken by name above:
+    // `zemacs_rpc::stop_all` for the language servers, `Term::hangup` for an
+    // outstanding `:!`. A PTY's child needs neither — it gets its `SIGHUP` from
+    // the kernel. Anything else that comes to own a process must be added there
+    // too; a `Drop` will not run.
     unsafe { libc::_exit(0) }
 }
 
@@ -794,14 +891,24 @@ struct App {
     /// buffer that does not match, both mean "start again".
     told_lisp: Option<(BufferId, u64)>,
     told_syntax: Option<(BufferId, u64)>,
-    /// Where point was when the image was last told. `usize::MAX` cannot be a
-    /// real offset, so the first pass through the loop always reports — which is
-    /// what makes a config see the cursor it started next to.
-    last_point: usize,
+    /// Where point was when the image was last told, as `(buffer, offset)`.
+    /// The pair and not the offset alone, for the same reason the two above are
+    /// pairs: an offset means nothing without the document it indexes into, and
+    /// two buffers sit at the same one far too often to treat "unchanged" as
+    /// "unmoved". `None` is "never told", so the first pass through the loop
+    /// always reports — which is what makes a config see the cursor it started
+    /// next to. See [`queue_point_moved`].
+    last_point: Option<(BufferId, usize)>,
     last_file_query: Option<String>,
     last_grep: Option<String>,
     last_autosave: Instant,
     last_revert: Instant,
+    /// [`Editor::generation`] as it stood when the last frame was drawn. A frame
+    /// whose generation matches this one is a frame nothing could have changed
+    /// in, and is skipped whole. `MAX` so the first one always draws.
+    drawn_generation: u64,
+    /// When that was, for the safety net beside it — see [`DRAW_AT_LEAST`].
+    last_draw: Instant,
     revert_watch: Revert,
     /// Reads, writes and listings on other machines. Inert — no thread, no
     /// socket — until the first `/ssh:` name of the session.
@@ -882,11 +989,13 @@ impl App {
             last_revision: u64::MAX,
             told_lisp: None,
             told_syntax: None,
-            last_point: usize::MAX,
+            last_point: None,
             last_file_query: None,
             last_grep: None,
             last_autosave: Instant::now(),
             last_revert: Instant::now(),
+            drawn_generation: u64::MAX,
+            last_draw: Instant::now(),
             revert_watch: Revert::default(),
             remote,
         }
@@ -987,8 +1096,34 @@ impl App {
     fn dispatch(&mut self, editor: &mut Editor, cmd: EditorCommand) {
         match cmd {
             EditorCommand::CallLisp(form) => self.lisp.eval(form),
+            // `paste-image` before the rest, because it is the one terminal verb
+            // that needs something `Term` has not got: the clipboard belongs to
+            // the window system, and this is the layer that owns a window.
+            EditorCommand::Term(verb) if verb == "paste-image" => {
+                self.paste_image(editor);
+            }
             EditorCommand::Term(verb) => self.term.run(editor, &verb),
             EditorCommand::Project(verb) => self.project.run_verb(editor, &verb),
+            EditorCommand::PromptSource(spec) => self.project.fill_prompt(editor, &spec),
+            // Straight back into the image as `NAME` and `PATH` pairs, because
+            // the picker that asked is Lisp and the thing that can answer is a
+            // font library. Scanned on demand rather than at startup: it costs a
+            // few hundred `open`s, nobody who never runs `M-x choose-font`
+            // should pay them, and a font installed mid-session should show up.
+            EditorCommand::ListFonts => {
+                let pairs: String = zemacs_render::monospace_fonts()
+                    .iter()
+                    .map(|(name, path)| {
+                        format!(
+                            "({} . {})",
+                            zemacs_rpc::lisp::string(name),
+                            zemacs_rpc::lisp::string(&path.to_string_lossy())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.call_lisp("%FONTS-LISTED", &format!("'({pairs})"));
+            }
             // Dropped when no shell is running: a keystroke aimed at something that
             // is not there is nothing, not an error worth reporting on every key.
             EditorCommand::TermKey(key) => {
@@ -1023,7 +1158,15 @@ impl App {
             EditorCommand::SaveFile(path) => {
                 save_file(editor, path, Save::Guarded, &mut self.remote)
             }
-            EditorCommand::Git(verb) => self.magit.run(editor, &verb),
+            EditorCommand::Git(verb) => {
+                self.magit.run(editor, &verb);
+                // `RET` on a file in the status buffer leaves magit; opening a
+                // buffer is this layer's job, so magit asks rather than doing
+                // it — the same shape, and the same reason, as dired below.
+                if let Some(path) = self.magit.open_file.take() {
+                    open_file(editor, &path, &self.init_path, &mut self.remote);
+                }
+            }
             // The far side of a `yes`. Each arm goes to the *same* worker its
             // guarded twin does, with the guard spent — so the question is asked in
             // exactly one place and answered in exactly one place.
@@ -1040,19 +1183,12 @@ impl App {
                     "confirmed a command that is not guarded: {other:?}"
                 ))),
             },
-            EditorCommand::Dired(verb) => {
-                self.dired.run(editor, &verb);
-                // `RET` on a file leaves dired; opening a buffer is this layer's
-                // job, so dired asks rather than doing it.
-                if let Some(path) = self.dired.open_file.take() {
-                    open_file(editor, &path, &self.init_path, &mut self.remote);
-                }
-                // Same shape, same reason: dired owns no ssh worker, so a
-                // remote directory it has moved to is fetched from here.
-                if let Some(dir) = self.dired.want_list.take() {
-                    self.remote.list(dir);
-                }
-            }
+            // What dired *asks* for — a file to open, a directory to list, a
+            // write to send — is drained once a frame in `housekeep` rather
+            // than here. Every verb that asks for something arrives on the far
+            // side of a confirmation or a prompt, so "here" was the one arm
+            // none of them come through.
+            EditorCommand::Dired(verb) => self.dired.run(editor, &verb),
             EditorCommand::CloseFrame => {
                 let focused = editor.focus_frame;
                 close_frame(editor, &mut self.renderers, focused);
@@ -1073,6 +1209,13 @@ impl App {
         event: Event,
         batch: &mut Batch,
     ) -> ControlFlow<()> {
+        // Every event, before the match decides which one it was. Most arms end
+        // in a command and would say so anyway; the ones that do not are the
+        // ones that matter here — a resize writes each pane's width straight
+        // onto the editor from inside the *draw*, so a window the loop had
+        // stopped drawing would keep its old geometry for as long as it took the
+        // safety net to notice. See [`Editor::generation`].
+        editor.touch();
         match event {
             Event::Quit { .. } => return ControlFlow::Break(()),
             // Event-driven rather than polled: reading the clipboard is a
@@ -1086,8 +1229,23 @@ impl App {
             // do not use argv — macOS sends an `odoc` Apple event, which SDL
             // turns into this. Dragging a file onto the window is the same
             // event, so both work off one arm.
+            // A file from *outside* the process. Finder's "Open With" and a
+            // double-click on a file zemacs is the default for do not use argv —
+            // macOS sends an `odoc` Apple event, which SDL turns into this.
+            // Dragging a file onto the window is the same event.
+            //
+            // Onto a *terminal* it means something else, and that is the whole
+            // of this arm: dragging a screenshot onto a coding agent is how you
+            // show it what is wrong, and opening the PNG in an editor pane is
+            // not what anybody meant by the gesture. So the path is typed into
+            // the child, which is what every harness takes a picture as.
             Event::DropFile { filename, .. } => {
-                open_file(editor, &PathBuf::from(filename), &self.init_path, &mut self.remote)
+                let path = PathBuf::from(filename);
+                let typed = editor.mode == zemacs_core::Mode::Terminal
+                    && self.term.paste_path(editor, &path);
+                if !typed {
+                    open_file(editor, &path, &self.init_path, &mut self.remote);
+                }
             }
             Event::Window {
                 window_id,
@@ -1185,6 +1343,7 @@ impl App {
                 mouse_btn: MouseButton::Left,
                 x,
                 y,
+                clicks,
                 ..
             } => {
                 let Some((i, x, y)) = self.pointer(window_id, x as i32, y as i32) else {
@@ -1282,23 +1441,32 @@ impl App {
                 // unfocused terminal both focuses it and reaches the
                 // program in one gesture.
                 if editor.mode == zemacs_core::Mode::Terminal {
-                    let (col, row) = cell_at(editor, &self.renderers, x, y);
-                    let taken = self.term_mouse(editor, zemacs_term::MouseKind::Press, col, row);
+                    let (col, row, right) = cell_at(editor, &self.renderers, x, y);
+                    // Shift takes the mouse back off the child, which is
+                    // the convention in every terminal emulator there is
+                    // and the only way to copy text out of a full-screen
+                    // program that has claimed it. Read from SDL rather
+                    // than carried on the event because SDL3's button
+                    // events do not carry a modifier field.
+                    let shift = self
+                        .sdl
+                        .keyboard()
+                        .mod_state()
+                        .intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
+                    let taken = !shift
+                        && self.term_mouse(editor, zemacs_term::MouseKind::Press, col, row);
                     // Nobody wanted it. A shell never turns mouse
-                    // reporting on, so this is the click that used to
-                    // do nothing at all — it goes to Lisp with the row
-                    // it landed on and whatever OSC 8 link the child
-                    // hung on that cell, and which of the two is a link
-                    // is decided there. Same guard as a mode hook: a
-                    // config that never defined it is silence.
-                    if !taken {
-                        if let Some((line, uri)) = self.term.click_context(editor, col, row) {
-                            let uri = uri.map_or("nil".into(), |u| zemacs_rpc::lisp::string(&u));
-                            self.call_lisp(
-                                "%TERMINAL-CLICK",
-                                &format!("{} {col} {uri}", zemacs_rpc::lisp::string(&line)),
-                            );
-                        }
+                    // reporting on, so this is the gesture that used to
+                    // do nothing at all: it starts a selection in the
+                    // grid, and if it turns out to have been a click
+                    // rather than a drag, the release below hands it to
+                    // Lisp instead.
+                    self.mouse.selecting = !taken;
+                    if taken {
+                        self.term.select_clear(editor);
+                    } else {
+                        let kind = zemacs_term::Select::from_clicks(clicks);
+                        self.term.select_start(editor, col, row, right, kind);
                     }
                 }
             }
@@ -1309,7 +1477,7 @@ impl App {
                 y,
                 ..
             } => {
-                self.mouse.release();
+                let selecting = self.mouse.release();
                 // A press with no release is half a gesture. SGR reporting
                 // makes the two separate events, so a program that only
                 // ever hears the press has a button held down forever —
@@ -1317,8 +1485,26 @@ impl App {
                 // nothing until the *next* click.
                 if editor.mode == zemacs_core::Mode::Terminal {
                     if let Some((_, x, y)) = self.pointer(window_id, x as i32, y as i32) {
-                        let (col, row) = cell_at(editor, &self.renderers, x, y);
-                        self.term_mouse(editor, zemacs_term::MouseKind::Release, col, row);
+                        let (col, row, _) = cell_at(editor, &self.renderers, x, y);
+                        if !selecting {
+                            self.term_mouse(editor, zemacs_term::MouseKind::Release, col, row);
+                        } else if !self.term.copy_selection(editor) {
+                            // Selected nothing, so the gesture was a click
+                            // after all: it goes to Lisp with the row it
+                            // landed on and whatever OSC 8 link the child
+                            // hung on that cell, and which of the two is a
+                            // link is decided there. Same guard as a mode
+                            // hook: a config that never defined it is
+                            // silence.
+                            if let Some((line, uri)) = self.term.click_context(editor, col, row) {
+                                let uri =
+                                    uri.map_or("nil".into(), |u| zemacs_rpc::lisp::string(&u));
+                                self.call_lisp(
+                                    "%TERMINAL-CLICK",
+                                    &format!("{} {col} {uri}", zemacs_rpc::lisp::string(&line)),
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1365,10 +1551,16 @@ impl App {
                         // selection is made in `vim` or a pane resized in
                         // `tmux`. The terminal drops it unless the child
                         // asked for drag reporting, so this costs nothing
-                        // for a program that did not.
+                        // for a program that did not — and when the press
+                        // was ours rather than the child's, the same
+                        // motion drags out the grid selection instead.
                         if mousestate.left() && editor.mode == zemacs_core::Mode::Terminal {
-                            let (col, row) = cell_at(editor, &self.renderers, x, y);
-                            self.term_mouse(editor, zemacs_term::MouseKind::Drag, col, row);
+                            let (col, row, right) = cell_at(editor, &self.renderers, x, y);
+                            if self.mouse.selecting {
+                                self.term.select_update(editor, col, row, right);
+                            } else {
+                                self.term_mouse(editor, zemacs_term::MouseKind::Drag, col, row);
+                            }
                         }
                         // ...and everywhere else a drag is a selection. The
                         // press already put the cursor where the gesture
@@ -1457,7 +1649,7 @@ impl App {
                     // hand the notch to a program that asked for mouse
                     // events, or to send arrow keys to `less`.
                     if editor.mode == zemacs_core::Mode::Terminal {
-                        let (col, row) = cell_at(editor, &self.renderers, px, py);
+                        let (col, row, _) = cell_at(editor, &self.renderers, px, py);
                         self.term.wheel(editor, -y * SCROLL_LINES, col, row);
                     } else if let Some(at) = editor.buffer.scene.as_ref().map(|s| s.scroll) {
                         // A scene scrolls in pixels and has no viewport of
@@ -1593,30 +1785,11 @@ impl App {
             }
         }
         request_pending_parses(editor, highlighter);
-        // The other signal the image gets about a buffer, and the twin of the
-        // one above: the *cursor* moved. Without it a config only ever hears
-        // about a buffer when the document changes, which is the wrong half for
-        // anything whose job is to react to where you are looking — org's
-        // markup would reveal itself as you typed and stay hidden as you
-        // navigated, because `j` and `w` change no text at all.
-        //
-        // Queued rather than called, through the same `pending_hooks` and the
-        // same `fboundp` guard, so it costs nothing until something defines
-        // `point-moved-hook` — `runtime/modes/modes.lisp` does.
-        //
-        // Compared against `buffer.cursor` and not the focused window's: a
-        // buffer switch changes it too, and "the text under point is not the
-        // text that was under point" is exactly what a mover wants to hear.
-        //
-        // ponytail: no *previous* position is carried, so a config that wants
-        // to act on the range you left — re-rendering the equation you just
-        // stepped out of, say — has to remember it in the image. The upgrade
-        // is what `after_edit_form` above already does for the document: build
-        // the call here, where the lock is held, rather than queueing a name.
-        if editor.buffer.cursor != self.last_point && !editor.buffer.kind.is_generated() {
-            self.last_point = editor.buffer.cursor;
-            editor.pending_hooks.push("point-moved-hook".into());
-        }
+        // ...and the cursor half of the same report, before the queue below is
+        // drained so it goes out with this frame's hooks. Read against the live
+        // buffer and not the focused window's, because a switch moves point too
+        // even when the number does not change; see [`queue_point_moved`].
+        queue_point_moved(editor, &mut self.last_point);
 
         // Mode hooks: core records that one is due, the image runs it. Guarded
         // with `fboundp` so a mode with no hook defined is silence rather than
@@ -1672,6 +1845,20 @@ impl App {
         // adoption and the parse request below should see the buffer this frame
         // rather than the next one.
         self.remote.poll(editor, &mut self.dired);
+
+        // ...and immediately after it, because dired owns no ssh worker and no
+        // buffers: it sets a field and someone else spends it. Here rather than
+        // under `EditorCommand::Dired`, where the listing's ask used to be
+        // drained, because every *write* verb reaches dired through
+        // `EditorCommand::Confirmed` or through the file prompt instead — so a
+        // per-arm drain was a request that sat unsent until the next unrelated
+        // verb, and a verb added later through a fourth door would have been
+        // unsent again. Once a frame, unconditionally, is the shape that cannot
+        // be arrived at from the wrong side. See [`Remote::take_from`].
+        if let Some(path) = self.dired.open_file.take() {
+            open_file(editor, &path, &self.init_path, &mut self.remote);
+        }
+        self.remote.take_from(&mut self.dired);
 
         refresh_file_completions(editor, &mut self.last_file_query);
         refresh_grep(editor, &self.project, &mut self.last_grep);
@@ -1742,6 +1929,40 @@ impl App {
         // anyone outside can ask.
         self.clipboard.push(editor);
         Ok(())
+    }
+
+    /// Put the clipboard's image somewhere, and type its path into the child.
+    ///
+    /// The one gesture a coding agent needs that a text editor has no reason to
+    /// have: you take a screenshot of the thing that is wrong and hand it over.
+    /// Every harness takes one the same way — a path in its prompt — so the
+    /// whole feature is *write the bytes down and type where they went*.
+    ///
+    /// Reported when there is no image, unlike the plain paste beside it, and
+    /// the difference is what the gesture means: `paste` with an empty register
+    /// is a key that did nothing, and this is a key you pressed *because* you
+    /// had just copied a picture. Being told the clipboard has text in it is the
+    /// answer to "why did nothing happen".
+    fn paste_image(&mut self, editor: &mut Editor) {
+        let Some(path) = write_clipboard_image(&self.clipboard) else {
+            // Text in the clipboard is the overwhelmingly likely case, and
+            // pasting it is what was meant by anyone who pressed this by
+            // mistake. So do that rather than refuse.
+            if self.clipboard.util.has_clipboard_text() {
+                self.term.paste(editor);
+                return;
+            }
+            editor.apply(EditorCommand::Message(
+                "no image in the clipboard".into(),
+            ));
+            return;
+        };
+        if !self.term.paste_path(editor, &path) {
+            editor.apply(EditorCommand::Message(format!(
+                "no terminal here — the image is at {}",
+                display_path(&path)
+            )));
+        }
     }
 
     /// Draw every window, and answer how many draw calls it took.
@@ -1880,11 +2101,19 @@ fn request_pending_parses(editor: &mut Editor, highlighter: &zemacs_syntax::Work
 /// parse is already in flight for exactly that buffer.
 fn adopt_highlights(editor: &mut Editor, highlighter: &zemacs_syntax::Worker) {
     while let Some(done) = highlighter.poll() {
-        let Some(buffer) = editor.buffer_by_id_mut(done.buffer) else {
-            continue;
-        };
-        if buffer.change_count() == done.seen && buffer.language.as_deref() == Some(&done.lang) {
-            buffer.highlights = done.spans;
+        let mut adopted = false;
+        if let Some(buffer) = editor.buffer_by_id_mut(done.buffer) {
+            if buffer.change_count() == done.seen && buffer.language.as_deref() == Some(&done.lang) {
+                buffer.highlights = done.spans;
+                adopted = true;
+            }
+        }
+        // A parse landing is the classic thing that happens between keystrokes:
+        // the file arrives grey and turns colour a frame or two later, off a
+        // worker thread that raises no event of its own. Nothing else would
+        // tell the draw loop about it.
+        if adopted {
+            editor.touch();
         }
     }
 }
@@ -2036,11 +2265,58 @@ fn save_file(editor: &mut Editor, path: Option<PathBuf>, guard: Save, remote: &m
         editor.apply(EditorCommand::Message("no file name — use :w <path>".into()));
         return;
     };
+    // Is this the file the buffer is already visiting, or a save-as? Almost
+    // everything below turns on the difference.
+    let visiting = editor.buffer.path.as_ref() == Some(&target);
+
+    // Emacs' `save-buffer`: nothing to write means nothing is written. A save
+    // that always writes moves the mtime of every file you look at, which is
+    // what `make`, a file watcher and a git status all read as a change — and
+    // it costs you the backup of the last version that *was* different, since
+    // `backup` copies whatever is there now.
+    //
+    // Only when it is this buffer's own file. `:w <elsewhere>` is a save-as and
+    // the whole point of one is to produce a file that is not there yet, so
+    // "unmodified" says nothing about whether the target needs writing.
+    if visiting && !editor.buffer.modified {
+        editor.apply(EditorCommand::Message(format!(
+            "{}: no changes need to be saved",
+            display_path(&target)
+        )));
+        return;
+    }
+
+    // `*scratch*` is a *named, permanent* buffer you come back to, so naming it
+    // after a file is the one save-as that must not consume the buffer it
+    // saves. It duplicates instead: the file gets an ordinary buffer of its own
+    // and the scratchpad stays a scratchpad, with its text, its undo and its
+    // name. Every other pathless buffer — `*untitled*` — is named in place,
+    // which is what Emacs' `write-file` does and is right for a buffer whose
+    // name was only ever a placeholder.
+    let duplicating = editor.buffer.kind == BufferKind::Scratch && !visiting;
+    // The duplicate needs somewhere to land, and a buffer already visiting this
+    // file is not it: `Editor::load` would switch to *that* buffer rather than
+    // adopt the text, and stamping it saved would leave a buffer claiming to
+    // hold a file it does not. Refused whole rather than half-done — writing
+    // the file and then failing to duplicate would leave the open buffer
+    // silently stale against a disk that had moved under it.
+    if duplicating
+        && editor
+            .buffers()
+            .any(|b| b.id != editor.buffer.id && b.path.as_ref() == Some(&target))
+    {
+        editor.apply(EditorCommand::Message(format!(
+            "{} is already open — switch to it and paste, or pick another name",
+            display_path(&target)
+        )));
+        return;
+    }
+
     // Emacs' "has changed since visited; save anyway?". Only for the file this
     // buffer is actually visiting: `:w somewhere-else` is a save-as, and the
     // stamp on record describes the *original*, so comparing the two would be
     // asking about the wrong file.
-    if guard == Save::Guarded && editor.buffer.path.as_ref() == Some(&target) {
+    if guard == Save::Guarded && visiting {
         if let (Some(seen), Some(now)) = (editor.buffer.visited, disk_stamp(&target)) {
             if seen != now {
                 let shown = display_path(&target);
@@ -2052,6 +2328,25 @@ fn save_file(editor: &mut Editor, path: Option<PathBuf>, guard: Save, remote: &m
                 return;
             }
         }
+    }
+    // The scratchpad forks into two buffers here, above the local/remote fork
+    // so that both kinds of file get it, and above the write so that a write
+    // which fails leaves a buffer holding the text and the name — which is
+    // exactly the state visiting a file that does not exist yet puts you in,
+    // and the state a second `:w` can finish from.
+    //
+    // `Editor::load` is the whole of it: it stacks the outgoing buffer into the
+    // buffer list rather than discarding it, adopts the text into a fresh one,
+    // and sets the kind to `Text` — so the scratchpad keeps its own undo
+    // history and its own name while the file gets a buffer with none of a
+    // scratchpad's properties. Marked modified until the write says otherwise;
+    // `load` reasonably assumes what it adopted is on disk, and here it is not
+    // yet.
+    if duplicating {
+        let language = zemacs_syntax::language_for_path(&target);
+        let text = editor.buffer.text.to_string();
+        editor.load(&text, Some(target.clone()), language);
+        editor.buffer.modified = true;
     }
     // The fork, and it is *here* rather than in `dispatch` so that everything
     // above is asked once for both kinds of file: the refusal to write a
@@ -2182,6 +2477,10 @@ enum Job {
         path: tramp::RemotePath,
         bytes: usize,
     },
+    /// One of dired's write verbs — `rm`, `mv`, `cp`, `mkdir`, `: >`. Carries
+    /// the file it acted on rather than the operation, because that is all the
+    /// answer is for: `Dired` counts it, and a failure has to name something.
+    Dired(tramp::RemotePath),
 }
 
 impl Job {
@@ -2189,8 +2488,32 @@ impl Job {
     /// the context a user needs: it names the host and the file.
     fn path(&self) -> &tramp::RemotePath {
         match self {
-            Job::Probe(p) | Job::Open(p, _) | Job::List(p) | Job::Save { path: p, .. } => p,
+            Job::Probe(p)
+            | Job::Open(p, _)
+            | Job::List(p)
+            | Job::Save { path: p, .. }
+            | Job::Dired(p) => p,
         }
+    }
+}
+
+/// The file a dired operation acts on — `from` for the two-name verbs, because
+/// that is the line the cursor was on and the name the user will recognise.
+///
+/// Mechanical, and here rather than in `tramp` because it is this layer's
+/// question: `Op` is a message, and only the thing reporting failures needs one
+/// path out of it.
+fn acted_on(op: &tramp::Op) -> tramp::RemotePath {
+    match op {
+        tramp::Op::Read(p)
+        | tramp::Op::Write(p, _)
+        | tramp::Op::List(p)
+        | tramp::Op::Stat(p)
+        | tramp::Op::Mkdir(p)
+        | tramp::Op::CreateFile(p)
+        | tramp::Op::Delete { path: p, .. }
+        | tramp::Op::Rename { from: p, .. }
+        | tramp::Op::Copy { from: p, .. } => p.clone(),
     }
 }
 
@@ -2228,6 +2551,30 @@ impl Remote {
         self.request(tramp::Op::List(path.clone()), Job::List(path));
     }
 
+    /// Everything dired has queued this frame, in the order it queued it.
+    ///
+    /// Called once per frame from [`App::housekeep`] and from nowhere else,
+    /// which is the whole of why it is a method rather than four lines in a
+    /// `match` arm. Every one of dired's write verbs arrives on the far side of
+    /// a confirmation or a file prompt — `EditorCommand::Confirmed`,
+    /// `EditorCommand::OpenFile` — so a drain sitting under
+    /// `EditorCommand::Dired` reached none of them, and the next verb to be
+    /// added through a door nobody has built yet would be silently unsent too.
+    /// A drain that runs every frame cannot be arrived at from the wrong side.
+    ///
+    /// The writes before the listing, because the worker is one thread: the
+    /// re-read that dired queued behind them is then the directory as they
+    /// left it.
+    fn take_from(&mut self, dired: &mut Dired) {
+        for op in dired.want_op.drain(..) {
+            let job = Job::Dired(acted_on(&op));
+            self.request(op, job);
+        }
+        if let Some(dir) = dired.want_list.take() {
+            self.list(dir);
+        }
+    }
+
     /// `:w` on a remote buffer.
     ///
     /// The buffer stays `modified` until the host confirms, which is the whole
@@ -2257,17 +2604,24 @@ impl Remote {
             let Some(job) = self.jobs.remove(&id) else {
                 continue;
             };
-            match reply {
-                Ok(reply) => self.finish(editor, dired, job, reply),
-                // Errors are values. `tramp::Error`'s own words are better than
-                // anything this layer could write — they distinguish "add your
-                // key to the agent" from "accept the host key" from "cannot
-                // reach" — so they go to the status line unedited and the
-                // editor carries on. A failed save leaves the buffer modified,
-                // because it is.
-                Err(e) => {
-                    editor.apply(EditorCommand::Message(format!("{}: {e}", job.path())));
-                }
+            match job {
+                // dired's verbs report as a *set* — "deleted 3, failed 1" is
+                // one sentence about however many round trips it took — so a
+                // failure goes to its tally rather than to the status line on
+                // its own. Everything below has one answer and one message.
+                Job::Dired(path) => dired.did(editor, &path, reply),
+                job => match reply {
+                    Ok(reply) => self.finish(editor, dired, job, reply),
+                    // Errors are values. `tramp::Error`'s own words are better
+                    // than anything this layer could write — they distinguish
+                    // "add your key to the agent" from "accept the host key"
+                    // from "cannot reach" — so they go to the status line
+                    // unedited and the editor carries on. A failed save leaves
+                    // the buffer modified, because it is.
+                    Err(e) => {
+                        editor.apply(EditorCommand::Message(format!("{}: {e}", job.path())));
+                    }
+                },
             }
         }
     }
@@ -2613,6 +2967,159 @@ impl Clipboard {
         editor.adopt_register(text, linewise);
         self.pushed = editor.register_revision();
     }
+
+    /// The clipboard's *image*, if it is holding one, as bytes and the
+    /// extension to save them under.
+    ///
+    /// A coding agent takes screenshots — that is most of what you say to one
+    /// about a UI — and the way every one of them takes it is a **path** typed
+    /// into its prompt. So this reads the bytes and [`paste_image`] writes them
+    /// somewhere the agent can open. Nothing here decodes the image; the editor
+    /// has a decoder (`crates/figure`) and no reason to run it on the way past.
+    ///
+    /// Not in `sdl3`'s safe wrapper, which stops at text — so this is the raw
+    /// call, and the two rules that come with it are that the buffer is SDL's
+    /// to free and that it must be called on the main thread. Both hold here:
+    /// this is the loop's own thread and the copy is made before the free.
+    ///
+    /// PNG first because it is what a screenshot is on every platform this
+    /// runs on, and because it is lossless — a JPEG re-save of a screenshot is
+    /// a screenshot with artefacts around the text.
+    fn image(&self) -> Option<(Vec<u8>, &'static str)> {
+        // Both spellings of each type, because SDL passes the name straight to
+        // the platform's clipboard and the platforms do not agree on what a
+        // picture is called. macOS stores *uniform type identifiers* —
+        // `public.png` — and it is Finder and the screenshot key that put them
+        // there, so asking only for the MIME name finds an empty clipboard on
+        // the one platform this gesture matters most on. X11 and Wayland use
+        // the MIME name.
+        for (mime, ext) in [
+            ("image/png", "png"),
+            ("public.png", "png"),
+            ("image/jpeg", "jpg"),
+            ("public.jpeg", "jpg"),
+            ("image/gif", "gif"),
+            ("com.compuserve.gif", "gif"),
+            ("image/bmp", "bmp"),
+            // TIFF last, and only as a fallback: macOS puts one on the
+            // pasteboard beside almost every image, and it is the format an
+            // agent is least likely to take. Anything above this is preferred
+            // precisely because something else is holding the same picture.
+            ("image/tiff", "tiff"),
+            ("public.tiff", "tiff"),
+        ] {
+            let name = std::ffi::CString::new(mime).ok()?;
+            // SAFETY: `name` outlives the call, `size` is written before the
+            // pointer is read, and the buffer is copied and then freed exactly
+            // once. A NULL is "no data of that type", which is the common case.
+            let bytes = unsafe {
+                let mut size: usize = 0;
+                let data = sdl3::sys::clipboard::SDL_GetClipboardData(name.as_ptr(), &mut size);
+                if data.is_null() || size == 0 {
+                    continue;
+                }
+                let copy = std::slice::from_raw_parts(data as *const u8, size).to_vec();
+                sdl3::sys::stdinc::SDL_free(data);
+                copy
+            };
+            return Some((bytes, ext));
+        }
+        None
+    }
+}
+
+/// Where a pasted image goes. Beside the auto-saves, and not in the project:
+/// the same argument `autosave_dir` makes, one step further — a screenshot
+/// dropped into an agent is scratch, and a tree that grows `Screenshot 3.png`
+/// every time you describe a bug is a tree with a `.gitignore` problem.
+fn image_dir() -> Option<PathBuf> {
+    let dir = config_dir()?.join("images");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// The clipboard's image when SDL cannot reach it, which on a Mac is always.
+///
+/// SDL3 keeps its own record of what is on the clipboard and answers
+/// `SDL_GetClipboardData` out of it, so it can hand back a picture *this*
+/// process copied and nothing else — and the picture that matters here was put
+/// there by Preview, by Finder, or by ⌘⇧4. The pasteboard genuinely holds it
+/// (`osascript -e 'clipboard info'` lists PNG, TIFF, GIF, JPEG and BMP for a
+/// screenshot); SDL simply has no route to another application's data.
+///
+/// So: the platform's own tool, which is the same answer this app already gives
+/// for ripgrep and for git. AppleScript writes the PNG straight out rather than
+/// handing back hex for us to decode, and a clipboard with no picture in it
+/// makes the script fail, which is the `None` this wants.
+#[cfg(target_os = "macos")]
+fn platform_clipboard_image() -> Option<(Vec<u8>, &'static str)> {
+    let tmp = std::env::temp_dir().join(format!("zemacs-clipboard-{}.png", std::process::id()));
+    let out = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(format!(
+            "set f to open for access POSIX file \"{}\" with write permission",
+            tmp.display()
+        ))
+        .arg("-e")
+        .arg("set eof f to 0")
+        // PNG and not TIFF: macOS puts both on the pasteboard for almost every
+        // picture, and TIFF is the one an agent is least likely to accept.
+        .arg("-e")
+        .arg("write (the clipboard as «class PNGf») to f")
+        .arg("-e")
+        .arg("close access f")
+        .output()
+        .ok()?;
+    let bytes = std::fs::read(&tmp).ok();
+    let _ = std::fs::remove_file(&tmp);
+    match out.status.success() {
+        true => bytes.filter(|b| !b.is_empty()).map(|b| (b, "png")),
+        false => None,
+    }
+}
+
+/// The same on Linux, where the tool depends on the display server. Both are
+/// asked for `image/png` by name and both print it to stdout.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_clipboard_image() -> Option<(Vec<u8>, &'static str)> {
+    for (program, args) in [
+        ("wl-paste", vec!["--no-newline", "--type", "image/png"]),
+        ("xclip", vec!["-selection", "clipboard", "-t", "image/png", "-o"]),
+    ] {
+        let Ok(out) = std::process::Command::new(program).args(&args).output() else {
+            continue;
+        };
+        if out.status.success() && !out.stdout.is_empty() {
+            return Some((out.stdout, "png"));
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn platform_clipboard_image() -> Option<(Vec<u8>, &'static str)> {
+    None
+}
+
+/// Write the clipboard's image out and answer where it went.
+///
+/// Named by *content*, so pasting the same screenshot twice is one file: the
+/// directory is a cache rather than a log, and an agent asked about the same
+/// picture twice should be given the same path.
+// ponytail: nothing ever evicts. A screenshot is a few hundred kilobytes and
+// the naming collapses repeats, so this grows by what you actually showed an
+// agent — but it grows. The upgrade is the sweep `autosave_dir` will want too:
+// drop anything older than a month on the way past.
+fn write_clipboard_image(clipboard: &Clipboard) -> Option<PathBuf> {
+    let (bytes, ext) = clipboard.image().or_else(platform_clipboard_image)?;
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&bytes, &mut hash);
+    let name = format!("{:016x}.{ext}", std::hash::Hasher::finish(&hash));
+    let path = image_dir()?.join(name);
+    if !path.exists() {
+        std::fs::write(&path, &bytes).ok()?;
+    }
+    Some(path)
 }
 
 // --- auto-save -----------------------------------------------------------
@@ -2624,6 +3131,22 @@ impl Clipboard {
 // by eye when you need to go looking.
 
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
+
+/// How long a frame may go undrawn when [`Editor::generation`] says nothing has
+/// changed.
+///
+/// The safety net under the skip, and not a frame clock: nothing the user does
+/// waits for it, because everything the user does moves the generation. What it
+/// bounds is the cost of a *missing* `touch` — a writer added later in this
+/// layer that reaches around `apply` and forgets to say so. Half a second of a
+/// stale pane is a lag somebody notices and reports; a pane that silently stops
+/// updating is the bug nobody can describe.
+///
+/// Two draws a second while idle, against sixty. The draw is the couple of
+/// milliseconds `App::draw` documents, so this is the difference between an
+/// editor that costs a seventh of a core doing nothing and one that costs about
+/// half a percent.
+const DRAW_AT_LEAST: Duration = Duration::from_millis(500);
 
 fn autosave_dir() -> Option<PathBuf> {
     Some(config_dir()?.join("auto-save"))
@@ -3137,22 +3660,28 @@ fn scroll_scene(editor: &mut Editor, renderer: &mut Renderer, frame_index: usize
 
 // --- input translation ---------------------------------------------------
 
-/// The cell a pixel lands on, relative to the pane showing the terminal.
+/// The cell a pixel lands on, relative to the pane showing the terminal, and
+/// whether it landed in that cell's right half.
 ///
 /// The terminal thinks in cells and knows nothing about panes or HiDPI, so this
-/// is where those stop being its problem.
-fn cell_at(editor: &Editor, renderers: &[Renderer], x: i32, y: i32) -> (usize, usize) {
+/// is where those stop being its problem. The half is there for one caller: a
+/// *selection* has to know whether the character under the press is inside it,
+/// which is the difference between dragging out `hello` and `ello`. A mouse
+/// report names a cell and has no use for it.
+fn cell_at(editor: &Editor, renderers: &[Renderer], x: i32, y: i32) -> (usize, usize, bool) {
     let index = editor.focus_frame.min(renderers.len().saturating_sub(1));
     let Some(renderer) = renderers.get(index) else {
-        return (0, 0);
+        return (0, 0, false);
     };
     let (cell_w, line_h) = renderer.cell_size();
     // The mouse only ever reaches the session whose buffer is live, so that is
     // the pane the pixels are relative to.
     let (rect, _) = terminal_rect(editor, renderers, editor.buffer.id);
-    let col = ((x - rect.x).max(0) / cell_w.max(1)) as usize;
+    let cell_w = cell_w.max(1);
+    let dx = (x - rect.x).max(0);
+    let col = (dx / cell_w) as usize;
     let row = ((y - rect.y).max(0) / line_h.max(1)) as usize;
-    (col, row)
+    (col, row, dx % cell_w >= cell_w / 2)
 }
 
 /// The pane buffer `id` occupies and the renderer drawing it, or the focused
@@ -3294,6 +3823,26 @@ fn key_from_keydown(kc: Keycode, keymod: Mod, raw: bool) -> Option<Key> {
         (false, true) => return combo_char(kc, shift).map(Key::Meta),
         (false, false) => {}
     }
+    // F1–F12, by position rather than by twelve match arms below. `combo_char`
+    // cannot spell `"F1"` any more than it can spell `"Left"`, so before this
+    // every F-key answered `None` and no config could bind one at all.
+    const FN_KEYS: [Keycode; 12] = [
+        Keycode::F1,
+        Keycode::F2,
+        Keycode::F3,
+        Keycode::F4,
+        Keycode::F5,
+        Keycode::F6,
+        Keycode::F7,
+        Keycode::F8,
+        Keycode::F9,
+        Keycode::F10,
+        Keycode::F11,
+        Keycode::F12,
+    ];
+    if let Some(i) = FN_KEYS.iter().position(|&f| f == kc) {
+        return Some(Key::F(i as u8 + 1));
+    }
     match kc {
         Keycode::Escape => Some(Key::Esc),
         Keycode::Return | Keycode::KpEnter => Some(Key::Enter),
@@ -3308,6 +3857,15 @@ fn key_from_keydown(kc: Keycode, keymod: Mod, raw: bool) -> Option<Key> {
         Keycode::Right => Some(Key::Right),
         Keycode::Up => Some(Key::Up),
         Keycode::Down => Some(Key::Down),
+        // The block above them, dropped on the floor until now for the arrows'
+        // reason — a name `combo_char` cannot spell. Worst in a shell, where
+        // Home and End are readline's line-start and line-end, the page keys
+        // move a full-screen TUI and `⌦` is forward-delete.
+        Keycode::Home => Some(Key::Home),
+        Keycode::End => Some(Key::End),
+        Keycode::PageUp => Some(Key::PageUp),
+        Keycode::PageDown => Some(Key::PageDown),
+        Keycode::Delete => Some(Key::Delete),
         // Space has a multi-character key name, so `combo_char` cannot produce
         // it — but it is the leader key, so it has to work.
         Keycode::Space if raw => Some(Key::Char(' ')),
@@ -3641,6 +4199,30 @@ mod tests {
         }
     }
 
+    /// The block above the arrows, every one of which used to arrive here and
+    /// leave as `None`: their key names are words, so `combo_char` could not
+    /// spell them and nothing downstream ever saw the keystroke. Both raw
+    /// states, because none of them produces text and Insert takes the other
+    /// path — a shell reached through Insert must still get its Home key.
+    #[test]
+    fn the_navigation_block_survives_the_keydown() {
+        for raw in [true, false] {
+            let m = |kc| key_from_keydown(kc, Mod::NOMOD, raw);
+            assert_eq!(m(Keycode::Home), Some(Key::Home));
+            assert_eq!(m(Keycode::End), Some(Key::End));
+            assert_eq!(m(Keycode::PageUp), Some(Key::PageUp));
+            assert_eq!(m(Keycode::PageDown), Some(Key::PageDown));
+            assert_eq!(m(Keycode::Delete), Some(Key::Delete));
+            // Numbered from one, and the table is in order — an off-by-one here
+            // is a config binding `<f5>` and getting F6.
+            assert_eq!(m(Keycode::F1), Some(Key::F(1)));
+            assert_eq!(m(Keycode::F5), Some(Key::F(5)));
+            assert_eq!(m(Keycode::F12), Some(Key::F(12)));
+            // Forward delete is not Backspace, whatever the key is labelled.
+            assert_ne!(m(Keycode::Delete), m(Keycode::Backspace));
+        }
+    }
+
     /// Shift on the keys that have no character to carry it. Without these the
     /// keystroke reached nothing at all: `combo_char` cannot spell `<ret>` or an
     /// arrow, so org's `M-S-<ret>` was a binding that could not be written down.
@@ -3778,7 +4360,7 @@ mod tests {
 
     #[test]
     fn file_prompt_completes_from_the_filesystem() {
-        let dir = std::env::temp_dir().join("zemacs_completion_test");
+        let dir = std::env::temp_dir().join(fixture("completion"));
         let _ = std::fs::create_dir_all(dir.join("sub"));
         std::fs::write(dir.join("alpha.rs"), "").unwrap();
         std::fs::write(dir.join(".hidden"), "").unwrap();
@@ -3809,7 +4391,7 @@ mod tests {
     /// opening every listing on `.git` is the other half.
     #[test]
     fn dotfiles_appear_only_once_you_type_a_dot() {
-        let dir = std::env::temp_dir().join("zemacs_hidden_test");
+        let dir = std::env::temp_dir().join(fixture("hidden"));
         let _ = std::fs::create_dir_all(dir.join(".config"));
         std::fs::write(dir.join("plain.txt"), "").unwrap();
 
@@ -3846,8 +4428,27 @@ mod tests {
             .unwrap();
     }
 
+    /// A fixture directory nobody else is writing into.
+    ///
+    /// The process id is the whole of it, and it is not paranoia: these tests
+    /// used to build `$TMPDIR/zemacs_revert_test/unsaved.txt` at a path fixed at
+    /// compile time, so a second `cargo test` running at the same time — two
+    /// agents, a watch loop, a CI shard — wrote the same files under the same
+    /// names while the first was asserting about them. The failures that
+    /// produced were spectacular and useless: a saved file reading
+    /// `"three three two"`, a backup numbered v8 where v20 was expected, an
+    /// atomic write that had "lost" its exec bit to somebody else's `0644`.
+    ///
+    /// It looked exactly like a real bug in save, revert and backup, which is
+    /// the expensive part — two agents chased it today before it was pinned to
+    /// the path. A suite that goes red for reasons unrelated to your change
+    /// teaches you to stop reading red.
+    fn fixture(name: &str) -> String {
+        format!("zemacs_{name}_test-{}", std::process::id())
+    }
+
     fn scratch(name: &str, body: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("zemacs_revert_test");
+        let dir = std::env::temp_dir().join(fixture("revert"));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
@@ -3927,6 +4528,118 @@ mod tests {
 
     // --- saving --------------------------------------------------------
 
+    /// Emacs' `save-buffer`, and the reason it is worth having: a save that
+    /// always writes moves the mtime of every file you so much as look at,
+    /// which `make`, a file watcher and `git status` all read as a change — and
+    /// it spends the backup slot on a copy identical to what is already there.
+    #[test]
+    fn saving_a_buffer_with_no_changes_writes_nothing() {
+        let path = scratch("untouched.txt", "one\n");
+        let mut ed = Editor::new();
+        open_file(&mut ed, &path, &resolve_init_path(), &mut Remote::default());
+        assert!(!ed.buffer.modified);
+
+        // Something else wrote the file after we opened it. If the save went
+        // through it would clobber this with the buffer's copy; the point is
+        // that it does not go through at all.
+        std::fs::write(&path, "theirs\n").unwrap();
+        touch_forward(&path);
+        save_file(&mut ed, None, Save::Guarded, &mut Remote::default());
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+        assert!(ed.status.contains("no changes"), "{}", ed.status);
+        // ...and it is not the changed-on-disk question either. There is
+        // nothing to ask about, because there is nothing to write.
+        assert!(ed.prompt.is_none(), "asked about a save it was not making");
+
+        // One keystroke later there is something to save, and it saves.
+        ed.apply(EditorCommand::InsertText("mine ".into()));
+        save_file(&mut ed, None, Save::Forced, &mut Remote::default());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine one\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The exception, and the reason the check is not simply `!modified`: a
+    /// save-as is asking for a file that does not exist yet, so whether the
+    /// buffer has been touched says nothing about whether the target needs
+    /// writing.
+    #[test]
+    fn a_save_as_writes_even_when_nothing_was_typed() {
+        let from = scratch("original.txt", "content\n");
+        let to = from.with_file_name("copy.txt");
+        let _ = std::fs::remove_file(&to);
+        let mut ed = Editor::new();
+        open_file(&mut ed, &from, &resolve_init_path(), &mut Remote::default());
+        assert!(!ed.buffer.modified);
+
+        save_file(&mut ed, Some(to.clone()), Save::Guarded, &mut Remote::default());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "content\n");
+        let _ = std::fs::remove_file(&from);
+        let _ = std::fs::remove_file(&to);
+    }
+
+    /// `*scratch*` is a named buffer you come back to, so naming it after a
+    /// file must not consume it. It forks: the file gets an ordinary buffer and
+    /// the scratchpad stays a scratchpad.
+    #[test]
+    fn saving_the_scratchpad_forks_it_instead_of_consuming_it() {
+        let path = scratch("from_scratch.rs", "");
+        let _ = std::fs::remove_file(&path);
+        let mut ed = Editor::new();
+        // Buffer 1 is `*scratch*` in a fresh editor — go and stand on it.
+        ed.switch_buffer_id(1);
+        assert_eq!(ed.buffer.kind, BufferKind::Scratch);
+        ed.apply(EditorCommand::InsertText("fn main() {}\n".into()));
+        let scratch_id = ed.buffer.id;
+
+        save_file(&mut ed, Some(path.clone()), Save::Guarded, &mut Remote::default());
+
+        // The file is on disk...
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn main() {}\n");
+        // ...the live buffer is an ordinary one visiting it, with none of a
+        // scratchpad's properties left on it...
+        assert_eq!(ed.buffer.kind, BufferKind::Text);
+        assert_eq!(ed.buffer.path.as_ref(), Some(&path));
+        assert_eq!(ed.buffer.name(), "from_scratch.rs");
+        assert!(!ed.buffer.modified);
+        assert_ne!(ed.buffer.id, scratch_id, "the scratchpad was consumed");
+        // ...the language followed the extension, which is the thing the old
+        // in-place rename had to bump the revision by hand to get...
+        assert_eq!(ed.buffer.language.as_deref(), Some("rust"));
+        // ...and `*scratch*` is still there, still itself, still holding what
+        // was typed into it.
+        let kept = ed
+            .buffers()
+            .find(|b| b.id == scratch_id)
+            .expect("the scratchpad survived");
+        assert_eq!(kept.kind, BufferKind::Scratch);
+        assert_eq!(kept.name(), "*scratch*");
+        assert_eq!(kept.text.to_string(), "fn main() {}\n");
+        assert!(kept.path.is_none(), "the scratchpad kept no file behind it");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The fork needs somewhere to land. A buffer already visiting the target
+    /// would swallow it — `Editor::load` switches to an open path rather than
+    /// adopting text — so this is refused before anything is written rather
+    /// than leaving that buffer stale against a file that moved under it.
+    #[test]
+    fn forking_the_scratchpad_onto_an_open_file_is_refused() {
+        let path = scratch("occupied.txt", "theirs\n");
+        let mut ed = Editor::new();
+        open_file(&mut ed, &path, &resolve_init_path(), &mut Remote::default());
+        ed.switch_buffer_id(1);
+        assert_eq!(ed.buffer.kind, BufferKind::Scratch);
+        ed.apply(EditorCommand::InsertText("mine\n".into()));
+
+        save_file(&mut ed, Some(path.clone()), Save::Guarded, &mut Remote::default());
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+        assert!(ed.status.contains("already open"), "{}", ed.status);
+        assert_eq!(ed.buffer.kind, BufferKind::Scratch, "still on the scratchpad");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The mode bits have to survive the rename, or every save of a shell
     /// script silently takes its executable bit off.
     #[test]
@@ -3976,7 +4689,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         // Its own directory, because making it read-only is the way to force
         // the failure and that must not stop the other tests writing.
-        let dir = std::env::temp_dir().join("zemacs_failed_write_test");
+        let dir = std::env::temp_dir().join(fixture("failed_write"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("precious.txt");
@@ -4001,7 +4714,7 @@ mod tests {
     #[test]
     fn backups_are_numbered_and_pruned_to_the_last_twenty() {
         let path = scratch("versioned.txt", "v0\n");
-        let store = std::env::temp_dir().join("zemacs_backup_test");
+        let store = std::env::temp_dir().join(fixture("backup"));
         let _ = std::fs::remove_dir_all(&store);
 
         // One more save than the cap, so the pruning arm actually runs.
@@ -4632,5 +5345,44 @@ mod tests {
         typing(&mut editor, "a\"b\\c\nd");
         let form = after_edit_form(&editor, &mut told).unwrap();
         assert!(form.contains("\"a\\\"b\\\\c\nd\""), "{form}");
+    }
+
+    // --- the point-moved report ----------------------------------------------
+
+    /// Offset 0 is where every buffer starts, so a switch between two of them
+    /// moves point without moving the number — and an offset alone cannot tell
+    /// the difference. Before the buffer travelled with it this was silence, and
+    /// anything that re-renders on point (the equation preview, org-appear,
+    /// show-paren) went on describing the buffer you had left.
+    ///
+    /// The order is asserted too, because a config may well have both hooks:
+    /// core queues `buffer-switch-hook` from the switch itself and this appends
+    /// after it, so the mode's global settings are re-resolved before anything
+    /// re-renders against them.
+    #[test]
+    fn a_switch_between_two_buffers_at_the_same_offset_still_moves_point() {
+        let mut editor = Editor::new();
+        editor.load("first", None, None);
+        let first = editor.buffer.id;
+        let mut last = None;
+        queue_point_moved(&mut editor, &mut last);
+
+        editor.create_buffer("*second*".into());
+        queue_point_moved(&mut editor, &mut last);
+        editor.pending_hooks.clear();
+
+        // Back to a buffer that never moved off 0 either, from one that is
+        // still sitting on it. Nothing about the *number* has changed since the
+        // last report; everything about the text under it has.
+        editor.switch_buffer_id(first);
+        assert_eq!(editor.buffer.cursor, 0, "both have to be at 0 or this tests nothing");
+        queue_point_moved(&mut editor, &mut last);
+        assert_eq!(editor.pending_hooks, ["buffer-switch-hook", "point-moved-hook"]);
+
+        // ...and the frame after, with nothing touched, is silent — the pair is
+        // a watermark, not a "always report on a switch" flag.
+        editor.pending_hooks.clear();
+        queue_point_moved(&mut editor, &mut last);
+        assert!(editor.pending_hooks.is_empty(), "{:?}", editor.pending_hooks);
     }
 }

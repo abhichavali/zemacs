@@ -2863,7 +2863,7 @@ impl Editor {
         // that may not even be there any more. Overlays go the same way: dired
         // and magit put their faces back on every refresh anyway — see
         // [`Buffer::adopt`], which is where the rest of that list lives.
-        self.buffer.adopt(text);
+        self.adopt_text(text);
         self.buffer.move_to_line_col(line, 0);
         self.mode = kind.mode();
         self.revision += 1;
@@ -3233,7 +3233,7 @@ impl Editor {
         self.buffer.given_name = Some(name);
         self.buffer.kind = BufferKind::Text;
         self.buffer.path = None;
-        self.buffer.adopt("");
+        self.adopt_text("");
         // A scene is about a document too, and this path *reuses* the live
         // buffer when it was pristine — so a page left over from the buffer
         // that was here would be drawn over a scratchpad that has nothing to do
@@ -3605,36 +3605,19 @@ impl Editor {
                         .insert((mode, normalize_keys(&keys)), command);
                 }
             },
-            EditorCommand::Overlay(edit) => {
-                // Whether this edit is about to take an id *away* from an
-                // overlay — which is not the same question as which variant it
-                // is. `Image(_, Some(new))` over an overlay that already had one
-                // lets go of the first exactly as clearing it would, and
-                // re-rendering the same fragment (a theme change, a zoom, an
-                // edit inside `$…$`) is how that arm gets reached twice.
-                //
-                // Asked rather than assumed, because the *first* typeset —
-                // `None` becoming `Some` — displaces nothing, and pruning there
-                // would sweep every bitmap rasterised but not yet named. A page
-                // is built by adding its figures and then setting the scene, so
-                // that window is real and the loss is silent: see the roots this
-                // walks in [`Editor::prune_images`].
-                let drops = match edit {
-                    OverlayEdit::Delete(_) | OverlayEdit::RemoveIn(..) => true,
-                    // Had one, and is not being handed the same one back.
-                    OverlayEdit::Image(id, next) => {
-                        matches!(self.buffer.overlays.image(id), Some(Some(old)) if Some(old) != next)
-                    }
-                    _ => false,
-                };
-                self.buffer.overlays.edit(edit);
-                // Only when an overlay could have let go of one: an image nobody
-                // points at is a few hundred KB and a texture the renderer will
-                // never draw again.
-                if drops {
-                    self.prune_images();
-                }
-            }
+            // No sweep here. Whether this edit let go of an `ImageId` is a
+            // question only the overlay itself can answer — see
+            // [`overlay::Overlays::edit`], which asks it on the way past and
+            // arms the same `dropped` flag an edit to the *text* arms. The one
+            // drain at the end of `apply` turns either into a prune.
+            //
+            // It used to sweep inline, unconditionally, on every delete: an
+            // image nobody points at is a few hundred KB and a texture the
+            // renderer will never draw again, so the sweep has to happen — but
+            // a delete of an overlay carrying no image cannot orphan one, and
+            // paying a walk over every buffer to discover that is what made
+            // clearing a mode's overlays quadratic in the whole editor.
+            EditorCommand::Overlay(edit) => self.buffer.overlays.edit(edit),
 
             // --- lisp-api ----------------------------------------------------
             EditorCommand::CreateBuffer(name) => self.create_buffer(name),
@@ -3837,7 +3820,7 @@ impl Editor {
         // its own undo stack with it, so one `u` here can never restore the
         // file you were looking at a moment ago. Its markers went the same way,
         // and any left are stale by the same argument. See [`Buffer::adopt`].
-        self.buffer.adopt(text);
+        self.adopt_text(text);
         self.buffer.path = path;
         self.buffer.language = language;
         // ...and the scene, for the reason `create_buffer` clears it: a
@@ -4256,6 +4239,26 @@ impl Editor {
     /// A miss in any of the three is the same shape of bug and it is not a
     /// crash: the image simply stops being drawn, some time later, for a reason
     /// nowhere near where it went.
+    /// [`Buffer::adopt`], and then the sweep it arms.
+    ///
+    /// The three callers — `show_named` regenerating a listing, `create_buffer`
+    /// emptying a scratchpad, `load` taking a file's text — are all *replacing a
+    /// document*, which drops every overlay on it at once. Only `create_buffer`
+    /// goes through [`Editor::apply`], so two of the three would never reach the
+    /// drain at the end of it and a reverted page's bitmaps would sit there
+    /// until something unrelated dropped an overlay somewhere else.
+    ///
+    /// One method rather than the same two lines three times, for the reason
+    /// `apply`'s own drain gives: remembering which callers let go of an overlay
+    /// is exactly the mistake that leaves this kind of hole, and a fourth caller
+    /// arriving later cannot forget what it never has to remember.
+    fn adopt_text(&mut self, text: &str) {
+        self.buffer.adopt(text);
+        if self.buffer.overlays.take_dropped() {
+            self.prune_images();
+        }
+    }
+
     fn prune_images(&mut self) {
         if self.images.is_empty() {
             return;
@@ -5732,6 +5735,41 @@ mod tests {
         assert!(ed.has_image(10), "and the one that replaced it stayed");
     }
 
+    /// Regenerating a listing frees the bitmaps that were on the old one.
+    ///
+    /// `Buffer::adopt` drops every overlay at once, and `show_named` — which
+    /// rebuilds a dired or magit listing in place — does not go through
+    /// [`Editor::apply`], so the drain at the end of it never came here.
+    ///
+    /// `load` was the other suspect and turned out not to be one, which is worth
+    /// recording so nobody "fixes" it: opening a file *stacks* the outgoing
+    /// buffer unless it was pristine, so its overlays are still live in
+    /// `others` and its bitmap is still named. Freeing there would be the bug.
+    #[test]
+    fn regenerating_a_listing_frees_the_bitmaps_that_were_on_it() {
+        let mut ed = fresh("listing");
+        ed.add_image(11, Image { width: 4, height: 4, depth: 0, rgba: vec![0; 64] });
+        let mark = ed.make_overlay(0, 4);
+        ed.apply(EditorCommand::Overlay(OverlayEdit::Image(mark, Some(11))));
+        assert!(ed.has_image(11));
+
+        ed.show_named(BufferKind::Text, None, "regenerated");
+        assert!(!ed.has_image(11), "a regenerated listing keeps none of its marks");
+    }
+
+    /// The buffer a file-open pushed aside keeps its previews, because it keeps
+    /// its overlays — see the note above. The other half of that pair.
+    #[test]
+    fn a_stacked_buffer_keeps_the_preview_that_was_on_it() {
+        let mut ed = fresh("$x^2$ and more");
+        ed.add_image(9, Image { width: 4, height: 4, depth: 0, rgba: vec![0; 64] });
+        let preview = ed.make_overlay(0, 5);
+        ed.apply(EditorCommand::Overlay(OverlayEdit::Image(preview, Some(9))));
+
+        ed.load("something else entirely", None, None);
+        assert!(ed.has_image(9), "the buffer it belongs to is stacked, not gone");
+    }
+
     /// The other half of the policy: an edit that dropped *nothing* must not pay
     /// for the sweep, and must not lose a bitmap to it either.
     #[test]
@@ -5778,6 +5816,64 @@ mod tests {
                 .all(|b| page_text(b).as_deref() != Some("gone")),
             "the scene went with the buffer, because it was never anywhere else"
         );
+    }
+
+    /// Clearing a mode's overlays one at a time leaves the image table exactly
+    /// right — nothing leaked, nothing swept that something still names.
+    ///
+    /// The shape of `(mapc #'delete-overlay ovs)` in `org-modern.lisp` and
+    /// `org-latex.lisp`, and the reason the sweep is armed per *overlay* rather
+    /// than per delete: almost none of these carries a bitmap, so almost none of
+    /// them may cost a walk over every buffer — but the two that do must still
+    /// free theirs, and the walk they arm must not take the page's figure or the
+    /// dashboard's logo with it.
+    #[test]
+    fn clearing_a_thousand_overlays_leaves_the_image_table_exact() {
+        let mut ed = Editor::new();
+        let bitmap = |n| Image { width: n, height: n, depth: 0, rgba: vec![0; (n * n * 4) as usize] };
+        for id in 1..=5 {
+            ed.add_image(id, bitmap(4));
+        }
+        ed.dashboard.logo = Some(1); // the editor's own, owned by no document
+
+        // A second document holding a page, so the sweep has more than the live
+        // buffer to walk and something to wrongly free.
+        ed.apply(EditorCommand::CreateBuffer("*page*".into()));
+        let mut scene = zemacs_gui::Scene::default();
+        let figure = scene.push(zemacs_gui::Node::Image { image: 2, width: 4, height: 4, depth: 0 });
+        scene.set_root(figure);
+        ed.apply(EditorCommand::SetScene(Some(scene)));
+
+        ed.apply(EditorCommand::CreateBuffer("*doc*".into()));
+        ed.apply(EditorCommand::InsertText("x".repeat(4100)));
+        // A preview that survives the clear, because nothing deletes it.
+        let keeper = ed.make_overlay(0, 4);
+        ed.apply(EditorCommand::Overlay(OverlayEdit::Image(keeper, Some(3))));
+
+        // A thousand plain overlays, two of them previews, cleared oldest-first.
+        let mut doomed = Vec::new();
+        for i in 0..1000 {
+            let ov = ed.make_overlay(i * 4 + 8, i * 4 + 12);
+            if i == 250 {
+                ed.apply(EditorCommand::Overlay(OverlayEdit::Image(ov, Some(4))));
+            }
+            if i == 750 {
+                ed.apply(EditorCommand::Overlay(OverlayEdit::Image(ov, Some(5))));
+            }
+            doomed.push(ov);
+        }
+        assert!((1..=5).all(|id| ed.has_image(id)), "all five are named");
+
+        for ov in doomed {
+            ed.apply(EditorCommand::Overlay(OverlayEdit::Delete(ov)));
+        }
+
+        assert_eq!(ed.buffer.overlays().len(), 1, "only the keeper is left");
+        assert!(ed.has_image(1), "the dashboard's logo belongs to no document");
+        assert!(ed.has_image(2), "the other buffer's page still names its figure");
+        assert!(ed.has_image(3), "the preview nobody deleted keeps its bitmap");
+        assert!(!ed.has_image(4), "the deleted preview's bitmap went");
+        assert!(!ed.has_image(5), "and so did the second one's");
     }
 
     /// A scene belongs to a document, so parking one and bringing it back has

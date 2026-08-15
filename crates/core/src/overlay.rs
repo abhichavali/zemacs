@@ -316,11 +316,31 @@ pub enum OverlayEdit {
 /// day something puts one on every hit of a search (avy will), and the answer
 /// then is the same: an interval tree, or at least keeping the list sorted by
 /// `start` so the renderer can binary-search a line.
+///
+/// ponytail: *deleting* them one at a time is quadratic, and this is the floor
+/// rather than a slow implementation. The three modes that clear their own
+/// overlays do it with `(mapc #'delete-overlay ovs)` over a list in creation
+/// order, so every delete takes the front of the list and shifts every survivor
+/// down — an [`Overlay`] is 184 bytes, so clearing 4000 of them moves 1.5 GB and
+/// measures 41 ms against a 37 ms memory-bandwidth floor. No cheaper removal
+/// exists for an order-preserving compacted array, and creation order is load
+/// bearing: it is the order the renderer resolves attributes in. The two ways
+/// out both cost more than they are worth today — batch the removals behind a
+/// doomed set and compact once, which [`Overlays::all`] forbids because it hands
+/// out a `&[Overlay]` that `crates/render` and `crates/app` read straight from
+/// [`Buffer::overlays`](crate::Buffer::overlays); or keep a dead-prefix window
+/// so a front delete is `head += 1`, which every method on this type then has to
+/// know about. Worth it when a clear of a few thousand overlays stops being a
+/// keypress you asked for and starts being something a mode does per keystroke.
 #[derive(Default)]
 pub struct Overlays {
     live: Vec<Overlay>,
-    /// Whether an edit has collapsed an overlay out of existence since anyone
-    /// last asked. See [`Overlays::take_dropped`].
+    /// Whether an edit has let go of an [`ImageId`] since anyone last asked —
+    /// by collapsing an overlay out of existence, by deleting one that named a
+    /// bitmap, or by handing one a second bitmap over its first. The three are
+    /// one flag because the only thing anybody does with the answer is sweep,
+    /// and the sweep does not care which of them happened. See
+    /// [`Overlays::take_dropped`].
     dropped: bool,
 }
 
@@ -360,17 +380,6 @@ impl Overlays {
         self.live.iter().find(|o| o.id == id).map(|o| (o.start, o.end))
     }
 
-    /// The bitmap this overlay names, if it is live and names one.
-    ///
-    /// Two `None`s in one answer, and the caller that wanted this cares about
-    /// the difference: the outer says there is no such overlay, the inner says
-    /// there is one and it carries no image. [`Editor::apply`] asks on the way
-    /// *into* an [`OverlayEdit::Image`] to find out whether the edit displaces a
-    /// bitmap or merely puts the first one on.
-    pub fn image(&self, id: OverlayId) -> Option<Option<ImageId>> {
-        self.live.iter().find(|o| o.id == id).map(|o| o.image)
-    }
-
     /// Everything overlapping `[start, end)`, in creation order.
     pub fn in_range(&self, start: usize, end: usize) -> impl Iterator<Item = &Overlay> {
         self.live
@@ -380,14 +389,43 @@ impl Overlays {
 
     /// Editing one this buffer does not have is silently nothing — the handle
     /// may name a deleted overlay, or one another buffer owns.
+    ///
+    /// Sets the [`take_dropped`] flag when the edit **let go of an
+    /// [`ImageId`]**, which is the same question [`adjust`] and [`clamp`]
+    /// answer and is answered here for the same reason: this is the only code
+    /// that sees the overlay's `image` field on the way past, and the sweep it
+    /// arms costs a walk over every buffer in the editor.
+    ///
+    /// Asked rather than assumed, in both directions:
+    ///
+    /// - a delete of an overlay carrying **no** image takes no name off any of
+    ///   the roots [`Editor::prune_images`] walks, so the sweep would be a
+    ///   guaranteed no-op. That is the common case by a mile — a mode clearing
+    ///   its substitutions deletes thousands of overlays and almost none of
+    ///   them is a preview — and arming the sweep on all of them is what made
+    ///   `(mapc #'delete-overlay ovs)` drag a full editor walk behind every
+    ///   iteration;
+    /// - the *first* typeset — `image` going from `None` to `Some` —
+    ///   displaces nothing, and sweeping there would free every bitmap
+    ///   rasterised but not yet named. A page is built by adding its figures
+    ///   and *then* setting the scene, so that window is real and the loss is
+    ///   silent. `Image(_, Some(new))` over an overlay that already had one is
+    ///   a different matter: it lets go of the first exactly as clearing it
+    ///   would, and re-rendering the same fragment (a theme change, a zoom, an
+    ///   edit inside `$…$`) is how that arm gets reached twice.
+    ///
+    /// [`take_dropped`]: Overlays::take_dropped
+    /// [`adjust`]: Overlays::adjust
+    /// [`clamp`]: Overlays::clamp
+    /// [`Editor::prune_images`]: crate::Editor
     pub fn edit(&mut self, edit: OverlayEdit) {
         let id = match edit {
             OverlayEdit::Delete(id) => {
-                self.live.retain(|o| o.id != id);
+                self.retain_freeing(|o| o.id != id);
                 return;
             }
             OverlayEdit::RemoveIn(start, end) => {
-                self.live.retain(|o| !(o.end > start && o.start < end));
+                self.retain_freeing(|o| !(o.end > start && o.start < end));
                 return;
             }
             OverlayEdit::Face(id, _)
@@ -406,11 +444,18 @@ impl Overlays {
         let Some(o) = self.live.iter_mut().find(|o| o.id == id) else {
             return;
         };
+        // Set after the borrow of `o` ends, which is the only reason it is a
+        // local rather than a write straight to the field.
+        let mut freed = false;
         match edit {
             OverlayEdit::Face(_, k) => o.face = k,
             OverlayEdit::Background(_, k) => o.background = k,
             OverlayEdit::Display(_, s) => o.display = s,
-            OverlayEdit::Image(_, i) => o.image = i,
+            OverlayEdit::Image(_, i) => {
+                // Had one, and is not being handed the same one back.
+                freed = o.image.is_some() && o.image != i;
+                o.image = i;
+            }
             // 100% is the body size, which is what "no scale" already means —
             // folded here so the renderer never has to ask the question twice.
             OverlayEdit::Scale(_, s) => o.scale = s.filter(|&s| s != 100),
@@ -423,9 +468,35 @@ impl Overlays {
             OverlayEdit::Fold(_, f) => o.fold = f,
             OverlayEdit::Delete(_) | OverlayEdit::RemoveIn(..) => unreachable!("returned above"),
         }
+        self.dropped |= freed;
     }
 
+    /// [`Vec::retain`], arming the sweep if any overlay it threw away named a
+    /// bitmap. One pass rather than a lookup and then a `retain`: the predicate
+    /// is already visiting the overlay whose `image` is the answer.
+    fn retain_freeing(&mut self, keep: impl Fn(&Overlay) -> bool) {
+        let mut freed = false;
+        self.live.retain(|o| {
+            if keep(o) {
+                return true;
+            }
+            freed |= o.image.is_some();
+            false
+        });
+        self.dropped |= freed;
+    }
+
+    /// Arms `dropped` like every other route that lets an overlay go, which is
+    /// the whole point of it being here and not an inlined `live.clear()`.
+    ///
+    /// `Buffer::adopt` calls this — a revert, an auto-revert, a buffer taking
+    /// the text of the file underneath it — and a document being reverted is
+    /// exactly the one whose previews were rasterised a moment ago. Without the
+    /// flag those bitmaps had no name left in any of the three roots and no
+    /// sweep to notice, so they stayed until something unrelated dropped an
+    /// overlay somewhere else.
     pub fn clear(&mut self) {
+        self.dropped |= self.live.iter().any(|o| o.image.is_some());
         self.live.clear();
     }
 

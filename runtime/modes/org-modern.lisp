@@ -36,9 +36,12 @@
 ;;;; `org-modern-appear' hangs off it beside the change hook at the foot of this
 ;;;; file.
 ;;;;
-;;;; The ceiling that remains is `org-modern-refresh': markup *typed since the
-;;;; last refresh* has no overlay to reveal, because a full rescan per keystroke
-;;;; is not affordable and the editor reports no change delta. `SPC m m'.
+;;;; The ceiling that remains is the *extent* of a redraw. A change hook says the
+;;;; document moved and not what moved, so `org-modern-refresh-line' infers the
+;;;; size of the edit from the buffer's line count and redraws a window of that
+;;;; size around point — which is what draws a pasted block, and what misses an
+;;;; edit that lands somewhere point is not. `SPC m m' is still the answer to
+;;;; anything it missed.
 
 (in-package :zemacs)
 
@@ -76,9 +79,12 @@
 (defparameter *org-modern-stars* '("●" "○" "■" "□" "▸" "‣")
   "One bullet per heading level, cycling past the end.
 
-A level-N heading substitutes N-1 spaces and then its bullet for its N stars,
-so the glyph steps right as the level deepens and the heading *text* does not
-move at all — the substitution is the same width as what it replaces.
+A level-N heading substitutes its bullet and then N-1 spaces for its N stars, so
+every bullet sits in the same column whatever the depth, and the heading *text*
+does not move at all — the substitution is the same width as what it replaces.
+The spaces trail the glyph rather than lead it: a bullet that stepped right with
+the level made a `**' sit one column past a `*', and depth is already readable
+from the shape.
 
 Filled and hollow alternating, and a shape change every two levels, so the depth
 is readable at a glance rather than by counting. Every one of them is in both
@@ -462,9 +468,9 @@ shim now and this arm list never sees the question."
          (let ((scale (nth (1- n) *org-modern-heading-scale*)))
            (append (list 'display
                          (concatenate 'string
-                                      (make-string (1- n) :initial-element #\Space)
                                       (nth (mod (1- n) (length *org-modern-stars*))
-                                           *org-modern-stars*)))
+                                           *org-modern-stars*)
+                                      (make-string (1- n) :initial-element #\Space)))
                    ;; `scale' is line-wide, so setting it on the stars sizes the
                    ;; whole heading. Weight is *not* — see `:heading-line'.
                    (when scale (list 'scale scale))))))
@@ -566,6 +572,25 @@ once would otherwise answer each other's question whenever they happened to be
 the same length — a src block in one drawn with bullets because the other has
 prose at those lines. See `%org-modern-in-block-p', the only reader and its own
 invalidator.")
+
+(defvar *org-modern-lines* nil
+  "(BUFFER . LINE-COUNT) as the last change hook left it, or NIL.
+
+*This is the whole of how a paste gets drawn.* `org-modern-refresh-line' redraws
+the line point is on, which is everything a keystroke can dirty and nothing like
+what an arriving block of org is: `p' lands twenty lines at once, point sits on
+one of them, and the other nineteen kept the punctuation they were written with
+until you pressed `SPC m m'.
+
+The editor reports that the document moved and not *what* moved, so the size of
+an edit has to be inferred, and the line count is the one measure of it that
+costs nothing — `%org-modern-in-block-p' was already making that query on this
+path, so the two now share one read of it.
+
+BUFFER is in the key for the reason `*org-modern-blocks*' has it one entry up:
+there is one of these for the whole image, and two org files of different
+lengths would otherwise report the difference between them as a twenty-line edit
+on the first keystroke after you switched.")
 
 (defparameter *org-modern-appear-kinds* '(:emphasis :link)
   "The kinds of substitution that give way to the cursor. *This is the policy.*
@@ -687,26 +712,75 @@ where the author meant to close it."
     (when (and open (<= open n)) (push (cons open n) out))
     (nreverse out)))
 
-(defun %org-modern-in-block-p (line)
+(defun %org-modern-in-block-p (line &optional (name (buffer-name)) (count (line-count)))
   "True when LINE — a line *number* — is inside a `#+begin_'..`#+end_' body.
+
+NAME and COUNT are the buffer's name and its line count. Defaulted for anyone
+who has neither, and passed in by `org-modern-refresh-line', which read both
+before it decided how many lines to redraw: they are a `%query' apiece for an
+answer that cannot change while one pass over a window of lines is running, so
+handing them down is what keeps the per-keystroke path costing exactly what it
+cost before the window existed.
 
 Its own invalidator, which is what keeps the cache from being a second thing to
 remember to update: the ranges are line numbers, so they survive every edit that
 does not change how many lines there are, and the buffer name and line count are
 two cheap reads to compare. `org-modern-refresh-line' clears the cache outright
-when the line being edited *is* a delimiter — that is the one edit which changes
+when a line being redrawn *is* a delimiter — that is the one edit which changes
 what a block is without changing either."
-  (let ((name (buffer-name))
-        (count (line-count)))
-    (unless (and (equal name (first *org-modern-blocks*))
-                 (eql count (second *org-modern-blocks*)))
-      (setf *org-modern-blocks*
-            (list* name count (%org-modern-block-lines)))))
+  (unless (and (equal name (first *org-modern-blocks*))
+               (eql count (second *org-modern-blocks*)))
+    (setf *org-modern-blocks*
+          (list* name count (%org-modern-block-lines))))
   (some (lambda (r) (and (<= (car r) line) (<= line (cdr r))))
         (cddr *org-modern-blocks*)))
 
+(defun %org-modern-edited-lines (name count)
+  "How many lines the change now being reported added or removed, and remember
+COUNT as buffer NAME's size for the next one.
+
+Zero for an ordinary keystroke, and that is the number this exists to make
+cheap: `after-change-hook' fires on every keystroke in every buffer, so the
+question \"was anything pasted\" has to cost two comparisons and a CONS. It
+costs that, and no query at all — the caller had already read both arguments.
+
+Zero as well for the first change seen in a buffer, where there is nothing to
+compare against. Entering the mode has just drawn the whole thing, so a first
+keystroke redrawing only its own line is exactly right."
+  (let ((was (and (equal name (car *org-modern-lines*)) (cdr *org-modern-lines*))))
+    (setf *org-modern-lines* (cons name count))
+    (if was (abs (- count was)) 0)))
+
+(defun %org-modern-draw-line (n at name count)
+  "Redraw line number N's substitutions. T when N *is* a block delimiter, which
+is the one thing a line cannot decide for itself and which the caller escalates
+on; NIL otherwise.
+
+AT, NAME and COUNT — point, the buffer's name, its line count — are passed
+rather than read, for the reason `%org-modern-draw' gives about the first of
+them: each is a `%query', none of the three can change while the pass is
+running, and the pass is now a *window* of lines rather than one."
+  (let ((line (line-string n))
+        (beg (line-start n))
+        (end (line-end n)))
+    (cond
+      ((or (%org-directive-p line "#+begin_") (%org-directive-p line "#+end_")) t)
+      ((%org-modern-in-block-p n name count) nil)
+      (t
+       ;; Its own overlays on this line, and only this line: `overlays-in'
+       ;; does not count touching at a boundary as overlapping, so BEG..END is
+       ;; exactly the line and neither neighbour is disturbed.
+       (dolist (o (%org-modern-overlays beg end))
+         (when (eql o *org-modern-revealed*) (setf *org-modern-revealed* nil))
+         (delete-overlay o))
+       (dolist (s (%org-modern-line line))
+         (destructuring-bind (a b kind) s
+           (%org-modern-draw (+ beg a) (+ beg b) kind (subseq line a b) at)))
+       nil))))
+
 (defun org-modern-refresh-line ()
-  "Redraw the substitutions on the line point is on.
+  "Redraw the substitutions on the lines the change just reported could have
+touched.
 
 **This is what makes typing feel live**, and it is the ceiling the note at the
 foot of this file used to describe: a full rescan per keystroke is a `%do' per
@@ -716,46 +790,56 @@ markup you had just typed stayed as punctuation until you pressed `SPC m m'. A
 an overlay per hit on one line — so `- ' becomes a bullet as you type it and a
 heading whose text you extended keeps its weight over the new words.
 
-The line is also the unit that is *correct*: every substitution org-modern makes
-lives inside one line (`%org-modern-line' is the whole grammar), so a line's
-overlays can be replaced without asking what the rest of the buffer looks like.
+The line is also the unit that is *correct* for a keystroke: every substitution
+org-modern makes lives inside one line (`%org-modern-line' is the whole
+grammar), so a line's overlays can be replaced without asking what the rest of
+the buffer looks like.
 
-The two things one line cannot answer for itself:
+**A paste is not a keystroke**, and one line was the whole of why pasting org
+into an org buffer arrived undecorated. `p' lands a block: point sits on one of
+its lines — the first, pasted linewise; the last, pasted charwise — and every
+other line of it was never looked at. The change hook does not say what moved,
+so the size of the edit is inferred from the buffer's line count, which
+`*org-modern-lines*' remembers and `%org-modern-edited-lines' differences. A
+window that many lines either side of point covers the block whichever end of it
+point landed on, and collapses to the one line under point when nothing was
+pasted — so ordinary typing walks a loop of length one and pays for nothing it
+did not use.
+
+The two things one line still cannot answer for itself:
 
   - Whether it is inside a `#+begin_src' block, where a `- ' is a diff line and
     a `*' is a glob. `%org-modern-in-block-p' remembers, and rescans itself
     when the buffer or its line count changes underneath it.
   - Whether it *is* a block delimiter, which changes what every line below it
     means. That one escalates to a full redraw, which is rare enough to be free
-    — you type `#+end_src' once per block."
+    — you type `#+end_src' once per block, and a pasted one is a paste.
+
+ponytail: the window is centred on *point*, so an edit that does not move point
+is still redrawn as though it happened where the cursor is — Lisp writing into a
+buffer you are not looking at, or a visual-mode `p' that replaces exactly as
+many lines as it inserts and so reports no change in the count at all. Ceiling:
+those two need `SPC m m', as everything did before the window existed. Upgrade
+path: `after-edit-hook' already carries (START OLD-END NEW-END TEXT) and would
+name the range outright — it is unusable here for the reason `docs/boundary.org'
+records, that the record names no *buffer*, and closing that is one argument in
+`after_edit_form' in `crates/app/src/main.rs'."
   (when (and (minor-mode-p 'org-modern)
              (notany #'derived-mode-p *org-modern-appear-inhibit-modes*))
-    (let ((line (line-string))
-          (beg (line-start))
-          (end (line-end))
-          (at (point)))
-      (cond
-        ((or (%org-directive-p line "#+begin_") (%org-directive-p line "#+end_"))
-         ;; Typing a delimiter changes what every line below it *means* without
-         ;; necessarily changing how many lines there are, which is the one
-         ;; thing `%org-modern-in-block-p' cannot notice for itself.
-         (setf *org-modern-blocks* nil)
-         (%org-modern-redraw))
-        ((%org-modern-in-block-p (line-number)))
-        (t
-         ;; Its own overlays on this line, and only this line: `overlays-in'
-         ;; does not count touching at a boundary as overlapping, so BEG..END is
-         ;; exactly the line and neither neighbour is disturbed.
-         (dolist (o (%org-modern-overlays beg end))
-           (when (eql o *org-modern-revealed*) (setf *org-modern-revealed* nil))
-           (delete-overlay o))
-         (dolist (s (%org-modern-line line))
-           (destructuring-bind (a b kind) s
-             (%org-modern-draw (+ beg a)
-                               (+ beg b)
-                               kind
-                               (subseq line a b)
-                               at)))))))
+    (let* ((name (buffer-name))
+           (count (line-count))
+           (moved (%org-modern-edited-lines name count))
+           (here (line-number))
+           (at (point)))
+      (loop for n from (max 1 (- here moved)) to (min count (+ here moved))
+            do (when (%org-modern-draw-line n at name count)
+                 ;; A delimiter changes what every line below it *means* without
+                 ;; necessarily changing how many lines there are, which is the
+                 ;; one thing `%org-modern-in-block-p' cannot notice for itself.
+                 ;; The full pass supersedes the rest of the window, so stop.
+                 (setf *org-modern-blocks* nil)
+                 (%org-modern-redraw)
+                 (return)))))
   ;; A hook as well as a command, so it answers NIL rather than a count.
   nil)
 

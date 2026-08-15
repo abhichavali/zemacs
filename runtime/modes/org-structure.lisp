@@ -568,15 +568,21 @@ that has something to do when the answer is no."
 (defun org-ctrl-c-ctrl-c ()
   "`C-c C-c' — org's do-what-I-mean key.
 
-A checkbox under point is ticked, and a headline's keyword goes with it. Failing
-that the cookies are recounted, which is what `C-c C-c' on a heading means in
-org and is the useful answer on a `* Tasks [2/3]' that has no box of its own.
-Failing *that* the buffer's markup is redrawn — \"take another look at this\",
-which is the right answer for a real reason rather than as a consolation:
-`org-modern-refresh-line' redraws the line you are typing on, and text that
-arrived some other way — a paste, an undo, a program writing into the buffer —
-is exactly what it cannot have seen."
-  (cond ((org-toggle-checkbox))
+A table under point is aligned, which is what `C-c C-c' means on one in org and
+is why it comes first: a table is the one thing this key lands on where the
+other three answers would all be wrong. A checkbox is ticked, and a headline's
+keyword goes with it. Failing that the cookies are recounted, which is what
+`C-c C-c' on a heading means in org and is the useful answer on a `* Tasks
+[2/3]' that has no box of its own. Failing *that* the buffer's markup is redrawn
+— \"take another look at this\", which is the right answer for a real reason
+rather than as a consolation: `org-modern-refresh-line' redraws around where you
+are typing, and text that arrived some other way — a program writing into the
+buffer, a `p' in a pane you are not standing in — is what it cannot have seen.
+
+`fboundp' on the table half, because `org-table.lisp' is a module a config may
+have dropped from `*runtime-modules*' and this file loads before it either way."
+  (cond ((and (fboundp 'org-table-align) (%org-table-bounds)) (org-table-align))
+        ((org-toggle-checkbox))
         ((plusp (org-update-statistics-cookies)) (message "cookies updated"))
         (t (org-modern-refresh))))
 

@@ -9,7 +9,7 @@
 //! you had selected), and they are keyed by *name* rather than by index for the
 //! same reason — an index means something different after a sort or a delete.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -46,6 +46,55 @@ pub struct Dired {
     /// Set when a remote directory needs fetching. Same shape as `open_file`
     /// and for the same reason: dired owns no ssh worker, so it asks.
     pub want_list: Option<tramp::RemotePath>,
+    /// Remote *writes* waiting to be sent, oldest first — the same ask as
+    /// [`Dired::want_list`], for everything that is not a listing.
+    ///
+    /// A `Vec` rather than an `Option` because `x` over four flagged files is
+    /// four `rm`s: a [`tramp::Op`] names one path. The worker is one thread and
+    /// answers in the order it was asked, so a `want_list` drained behind these
+    /// is the directory *after* the writes rather than a race against them.
+    pub want_op: Vec<tramp::Op>,
+    /// The delete in flight: which answers are still owed, and how it has gone
+    /// so far.
+    ///
+    /// [`Self::remove_all`] used to count inside its own loop, because the loop
+    /// and the round trips were the same thing. Over the worker the answers
+    /// land a frame apart, so the count has to outlive it — and "deleted 3,
+    /// failed 1" stays one sentence rather than becoming four.
+    deleting: Option<Deleting>,
+}
+
+/// How a delete is going. One per [`Dired::remove_all`], local or remote.
+#[derive(Default)]
+struct Deleting {
+    /// The files still out, by remote name. Empty means the sentence can be
+    /// written — and always empty for a local delete, which is finished by the
+    /// time its loop is.
+    ///
+    /// A set rather than a count, because it is also how an answer is
+    /// recognised as *this batch's*: every one of dired's verbs comes back
+    /// through [`Dired::did`], so a rename that happened to be queued beside
+    /// the deletes must not be counted as one of them.
+    owed: HashSet<String>,
+    gone: usize,
+    failed: Vec<String>,
+}
+
+impl Deleting {
+    /// The one line the user reads. It names every failure rather than counting
+    /// them, because "failed 1" without saying which file is a message you then
+    /// have to go and check by hand.
+    fn report(&self) -> String {
+        match self.failed.as_slice() {
+            [] => format!("deleted {}", self.gone),
+            errs => format!(
+                "deleted {}, failed {}: {}",
+                self.gone,
+                errs.len(),
+                errs.join("; ")
+            ),
+        }
+    }
 }
 
 /// An operation that needs a name before it can run.
@@ -135,37 +184,80 @@ impl Dired {
             anyhow::bail!("cancelled");
         }
         let dir = self.dir()?.to_path_buf();
+        // The two-name verbs fork on the *names*, the two creating ones on the
+        // listing — the same question, asked from the only end each of them
+        // has. A rename can be given a destination anywhere, and [`pair`] is
+        // what refuses one that is on another machine; `+` and `C-c n` create
+        // in the directory on screen and nowhere else, which is [`one_name`].
         match pending {
             // A bare name stays in this directory; a path with a separator is
             // taken as given, so you can move a file elsewhere.
-            Pending::Rename(from) => dired::rename(&from, &resolve(&dir, answer))?,
-            Pending::Copy(from) => dired::copy(&from, &resolve(&dir, answer))?,
-            Pending::Mkdir => {
-                dired::create_dir(&dir, answer)?;
+            Pending::Rename(from) => {
+                let to = self.destination(&dir, answer);
+                match pair("rename", &from, &to)? {
+                    Some((from, to)) => self.want_op.push(tramp::Op::Rename { from, to }),
+                    None => dired::rename(&from, &to)?,
+                }
             }
-            Pending::CreateFile => {
-                dired::create_file(&dir, answer)?;
+            Pending::Copy(from) => {
+                let to = self.destination(&dir, answer);
+                match pair("copy", &from, &to)? {
+                    Some((from, to)) => self.want_op.push(tramp::Op::Copy { from, to }),
+                    None => dired::copy(&from, &to)?,
+                }
             }
+            Pending::Mkdir => match self.remote.clone() {
+                Some(remote) => self
+                    .want_op
+                    .push(tramp::Op::Mkdir(remote.join(one_name(answer)?))),
+                None => {
+                    dired::create_dir(&dir, answer)?;
+                }
+            },
+            Pending::CreateFile => match self.remote.clone() {
+                Some(remote) => self
+                    .want_op
+                    .push(tramp::Op::CreateFile(remote.join(one_name(answer)?))),
+                None => {
+                    dired::create_file(&dir, answer)?;
+                }
+            },
         }
+        self.reread();
         self.refresh(editor)
     }
 
-    fn try_run(&mut self, editor: &mut Editor, verb: &str) -> anyhow::Result<()> {
-        // ponytail: a remote listing is read-only. `zemacs-tramp` has `rename`,
-        // `delete` and `mkdir` and they are tested, so the upgrade is three more
-        // turns of the `want_list`/reply crank plus a `copy` script it does not
-        // have yet. Refused here rather than in each arm because the arms below
-        // hand `zemacs_dired` a `PathBuf` spelled `/ssh:host:/etc/x`, which is a
-        // perfectly good *local* name for a file that is not there — so the
-        // failure without this guard is "No such file", about the wrong machine.
-        if self.remote.is_some()
-            && matches!(
-                verb,
-                "rename" | "copy" | "delete" | "execute" | "mkdir" | "create-file"
-            )
-        {
-            anyhow::bail!("{verb} is not available on a remote directory");
+    /// Ask for the directory again after a verb changed it.
+    ///
+    /// Nothing at all locally, where [`Self::refresh`] re-reads by itself. Over
+    /// ssh the entries in hand have just become a lie, and `refresh`'s every
+    /// other caller is a mark or a sort that must not pay for a round trip —
+    /// see [`Dired::remote_entries`] — so the verbs that change the directory
+    /// ask here, and only they.
+    ///
+    /// The same `want_list` a move to another directory sets, and it is queued
+    /// *behind* the writes in [`Dired::want_op`] rather than racing them: one
+    /// worker thread, answers in order, so what comes back is the directory as
+    /// the writes left it. The listing on screen is the pre-verb one until then
+    /// — a few frames of a stale row, against a minute of a frozen editor.
+    fn reread(&mut self) {
+        self.want_list = self.remote.clone();
+    }
+
+    /// Where a `rename`/`copy` answer points.
+    ///
+    /// [`resolve`] for a local listing. A bare name in a remote one has to go
+    /// through [`tramp::RemotePath::join`] instead, because `Path::join` on
+    /// `/ssh:host:` — which is the login's *home* — produces `/ssh:host:/x`,
+    /// the remote root, and that is a different directory entirely.
+    fn destination(&self, dir: &Path, answer: &str) -> PathBuf {
+        match &self.remote {
+            Some(remote) if bare(answer) => PathBuf::from(remote.join(answer).to_string()),
+            _ => resolve(dir, answer),
         }
+    }
+
+    fn try_run(&mut self, editor: &mut Editor, verb: &str) -> anyhow::Result<()> {
         match verb {
             "open" => {
                 let dir = self.locate(editor);
@@ -310,6 +402,13 @@ impl Dired {
                 if let Some(p) = editor.prompt.as_mut() {
                     p.label = format!("{verb} to: ");
                     p.text = name;
+                    // Over ssh the candidates are this machine's files, and
+                    // `Prompt::value` prefers the highlighted one — so a remote
+                    // rename would submit a local path and be refused for
+                    // crossing machines. `bare` for the same reason `+` is:
+                    // completion that cannot see the directory is worse than
+                    // none. `docs/boundary.org` records the missing half.
+                    p.bare = self.remote.is_some();
                     p.refilter();
                 }
                 Ok(())
@@ -408,27 +507,107 @@ impl Dired {
     /// Both `D` and `x` come through here, so this is the only place data is
     /// destroyed — one routine to audit, one count to trust, and no way for a
     /// second delete path to grow its own quieter reporting.
+    ///
+    /// A local delete finishes its count here, because the loop and the work
+    /// are the same thing. A remote one only *queues*, and [`Self::did`] closes
+    /// the same [`Deleting`] an answer at a time. Both write one sentence out of
+    /// one tally, which is what keeps "deleted 3, failed 1" a property of the
+    /// verb rather than of which machine the files happened to be on.
     fn remove_all(&mut self, editor: &mut Editor, doomed: &[PathBuf]) -> anyhow::Result<()> {
-        let mut gone = 0usize;
-        let mut failed = Vec::new();
+        // Merged into whatever is still in flight rather than replacing it: `D`
+        // twice before the first answer lands is two batches and one sentence,
+        // and a tally that had been overwritten would count the first batch's
+        // answers against the second.
+        let mut tally = self.deleting.take().unwrap_or_default();
         for path in doomed {
-            match dired::delete(path) {
-                Ok(()) => {
-                    gone += 1;
-                    if let Some(name) = path.file_name() {
-                        self.marks.remove(name);
-                    }
+            // The fork, and it belongs *here* rather than in the two verbs:
+            // `D` and `x` both arrive through this loop, so one `match` serves
+            // both and a third door cannot grow its own quieter answer. It asks
+            // the *path* rather than `self.remote` because the path is what the
+            // deletion acts on — see [`machine`]. Recursive either way, which is
+            // what `zemacs_dired::delete` is for a directory.
+            match machine(path) {
+                Some(path) => {
+                    tally.owed.insert(path.to_string());
+                    self.want_op.push(tramp::Op::Delete {
+                        path,
+                        recursive: true,
+                    });
                 }
-                Err(e) => failed.push(format!("{}: {e}", path.display())),
+                None => match dired::delete(path) {
+                    Ok(()) => {
+                        tally.gone += 1;
+                        if let Some(name) = path.file_name() {
+                            self.marks.remove(name);
+                        }
+                    }
+                    Err(e) => tally.failed.push(format!("{}: {e}", path.display())),
+                },
             }
         }
+        self.reread();
         self.refresh(editor)?;
-        let msg = match failed.as_slice() {
-            [] => format!("deleted {gone}"),
-            errs => format!("deleted {gone}, failed {}: {}", errs.len(), errs.join("; ")),
-        };
-        editor.apply(EditorCommand::Message(msg));
+        match tally.owed.len() {
+            // Nothing went over the network, so the sentence is finished here
+            // exactly as it always was.
+            0 => editor.apply(EditorCommand::Message(tally.report())),
+            // ...and when it did, say so rather than saying nothing for a round
+            // trip. `go` sets the same expectation when it moves directory.
+            owed => {
+                editor.apply(EditorCommand::Message(format!("deleting {owed}…")));
+                self.deleting = Some(tally);
+            }
+        }
         Ok(())
+    }
+
+    /// One remote operation came back.
+    ///
+    /// Only a delete is *counted*, because it is the one verb that acts on more
+    /// than one file and its answers land a frame apart — so the tally
+    /// [`Self::remove_all`] started is closed here rather than there.
+    /// Everything else is a single operation whose failure is its own sentence,
+    /// in the same words `main.rs` gives a failed read.
+    ///
+    /// Which of the two an answer is turns on the *path* rather than on the
+    /// order they land in: every verb dired queues comes back through here, and
+    /// a rename that happened to be in flight beside a batch of deletes is not
+    /// one of the files that batch is counting.
+    pub fn did(
+        &mut self,
+        editor: &mut Editor,
+        path: &tramp::RemotePath,
+        reply: tramp::Result<tramp::Reply>,
+    ) {
+        let mine = self
+            .deleting
+            .as_mut()
+            .is_some_and(|tally| tally.owed.remove(&path.to_string()));
+        let Some(tally) = self.deleting.as_mut().filter(|_| mine) else {
+            if let Err(e) = reply {
+                editor.apply(EditorCommand::Message(format!("{path}: {e}")));
+            }
+            return;
+        };
+        match reply {
+            Ok(_) => {
+                tally.gone += 1;
+                // Marks are keyed by *name* — see the field — and a remote
+                // name's last component is the entry's, exactly as it is
+                // locally. A file that is still there keeps its mark, so `D`
+                // again retries the ones that stuck and only those.
+                let full = path.to_string();
+                if let Some(name) = Path::new(&full).file_name().map(OsString::from) {
+                    self.marks.remove(&name);
+                }
+            }
+            Err(e) => tally.failed.push(format!("{path}: {e}")),
+        }
+        // The last answer of the batch writes the sentence — however many round
+        // trips it took, and whichever of them failed.
+        if let Some(tally) = self.deleting.take_if(|tally| tally.owed.is_empty()) {
+            editor.apply(EditorCommand::Message(tally.report()));
+        }
     }
 
     /// Delete everything flagged `D`. Guarded by [`Self::confirm_question`], so
@@ -605,6 +784,7 @@ fn face_span(span: dired::Span) -> zemacs_core::Span {
             Face::Number => HlKind::Number,
             Face::Comment => HlKind::Comment,
             Face::Constant => HlKind::Constant,
+            Face::Error => HlKind::Error,
             Face::Punctuation => HlKind::Punctuation,
         },
     }
@@ -661,12 +841,66 @@ fn dot_entry(dir: &tramp::RemotePath, name: &str) -> dired::Entry {
 
 /// A bare name stays in `dir`; anything with a separator is taken as written.
 fn resolve(dir: &Path, answer: &str) -> PathBuf {
-    let p = Path::new(answer);
-    if p.components().count() > 1 || answer.starts_with('/') {
-        p.to_path_buf()
-    } else {
+    if bare(answer) {
         dir.join(answer)
+    } else {
+        PathBuf::from(answer)
     }
+}
+
+/// One component and no separator: a *name*, which stays in the directory on
+/// screen, as opposed to a path, which says where to go.
+fn bare(answer: &str) -> bool {
+    !answer.starts_with('/') && Path::new(answer).components().count() <= 1
+}
+
+/// The machine a dired path names, or `None` for a file on this one.
+///
+/// Every verb asks this rather than `self.remote`, because a path is what an
+/// operation acts on and the listing is only where the path came from: a rename
+/// out of a remote directory can be given a local destination, and it has to be
+/// told so rather than being run against the wrong filesystem.
+fn machine(path: &Path) -> Option<tramp::RemotePath> {
+    tramp::parse(&path.to_string_lossy())
+}
+
+/// Both ends of `rename`/`copy` as remote names, or `None` when both are here.
+///
+/// A mixed pair is refused rather than guessed at: moving a file between two
+/// machines is a read plus a write plus a delete, which is a different feature
+/// with its own half-finished state to report. Named by verb, so the message
+/// says which key the user pressed.
+fn pair(
+    verb: &str,
+    from: &Path,
+    to: &Path,
+) -> anyhow::Result<Option<(tramp::RemotePath, tramp::RemotePath)>> {
+    match (machine(from), machine(to)) {
+        (None, None) => Ok(None),
+        (Some(from), Some(to)) => Ok(Some((from, to))),
+        _ => anyhow::bail!(
+            "cannot {verb} {} to {}: different machines",
+            from.display(),
+            to.display()
+        ),
+    }
+}
+
+/// A *name*, not a path: one component, so that a prompt answered
+/// `../../.ssh/authorized_keys` cannot create anything outside the directory on
+/// screen. `zemacs_dired`'s `child` says this for the local half and is private
+/// to that crate, and the remote half hands `tramp` a whole path — so it has to
+/// be said again here rather than inherited.
+fn one_name(answer: &str) -> anyhow::Result<&str> {
+    if answer == "."
+        || answer == ".."
+        || answer.contains('/')
+        || answer.contains('\\')
+        || answer.contains('\0')
+    {
+        anyhow::bail!("{answer:?} is not a file name");
+    }
+    Ok(answer)
 }
 
 #[cfg(test)]
@@ -696,7 +930,7 @@ mod tests {
 
     /// A listing of three files, with the cursor parked on a real entry.
     fn listing_of_three(name: &str) -> (Dired, Editor, PathBuf) {
-        let dir = std::env::temp_dir().join(name);
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for f in ["a.txt", "b.txt", "c.txt"] {
@@ -708,8 +942,13 @@ mod tests {
             ..Default::default()
         };
         dired.refresh(&mut editor).unwrap();
-        // Onto the first real entry — past `.` and `..`, which `selected`
-        // refuses and which would otherwise make this fixture assert nothing.
+        onto_a_file(&dired, &mut editor);
+        (dired, editor, dir)
+    }
+
+    /// Park the cursor on the first real entry — past `.` and `..`, which every
+    /// verb refuses and which would otherwise make a fixture assert nothing.
+    fn onto_a_file(dired: &Dired, editor: &mut Editor) {
         let entries = &dired.listing.as_ref().unwrap().entries;
         let line = dired
             .lines
@@ -718,16 +957,15 @@ mod tests {
                 dired::Line::Entry(i) => !entries[*i].is_dot(),
                 _ => false,
             })
-            .expect("a listing of three files has a real entry");
+            .expect("the listing has a real entry");
         editor.buffer.cursor = editor.buffer.line_start(line);
-        (dired, editor, dir)
     }
 
     /// The rule `D` lives or dies by. Deleting is not undoable here, so
     /// "which files" has to be exactly Emacs' answer and nothing looser.
     #[test]
     fn delete_takes_the_marks_or_the_line_and_asks_before_either() {
-        let (mut dired, editor, dir) = listing_of_three("zemacs_dired_delete_one");
+        let (mut dired, mut editor, dir) = listing_of_three("zemacs_dired_delete_one");
 
         // Nothing marked: the entry under the cursor, alone.
         let one = dired.selected(&editor).unwrap();
@@ -758,6 +996,13 @@ mod tests {
         // no-op is how people learn to dismiss them unread.
         assert_eq!(dired.confirm_question(&editor, "refresh"), None);
         assert_eq!(dired.confirm_question(&editor, "mark"), None);
+
+        // And the far side of `yes` really does delete, on this machine —
+        // `remove_all` is the funnel a remote listing now shares, so this is
+        // also the assertion that the fork left the local half alone.
+        dired.run_confirmed(&mut editor, "delete");
+        assert!(!dir.join("a.txt").exists() && !dir.join("c.txt").exists());
+        assert!(dir.join("b.txt").exists(), "only the marked ones went");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -819,6 +1064,30 @@ mod tests {
 
     // --- remote listings --------------------------------------------------
 
+    /// What the app would put on the wire this frame, in the order it would:
+    /// the writes, then the re-read behind them. Exactly [`crate::Remote`]'s
+    /// `take_from`, minus the worker — a real round trip needs a host, and what
+    /// these tests are about is settled before ssh would ever be spawned:
+    /// which machine a verb chose, and whether it asked the user first.
+    fn sent(dired: &mut Dired) -> Vec<tramp::Op> {
+        let mut ops: Vec<tramp::Op> = dired.want_op.drain(..).collect();
+        ops.extend(dired.want_list.take().map(tramp::Op::List));
+        ops
+    }
+
+    /// Answer everything that went out, the way an emptied directory would and
+    /// in the order the worker would: one thread, so replies come back as
+    /// asked. This is the half that used to happen inside the verb, on this
+    /// thread, and now lands frames later.
+    fn answered(dired: &mut Dired, editor: &mut Editor, ops: &[tramp::Op]) {
+        for op in ops {
+            match op {
+                tramp::Op::List(dir) => dired.listed(editor, dir, Vec::new()),
+                _ => dired.did(editor, &crate::acted_on(op), Ok(tramp::Reply::Done)),
+            }
+        }
+    }
+
     fn remote_dired(dir: &str, names: &[(&str, bool)]) -> (Dired, Editor) {
         let remote = tramp::parse(dir).expect("a remote name");
         let mut dired = Dired {
@@ -839,7 +1108,21 @@ mod tests {
         };
         let mut editor = Editor::default();
         dired.refresh(&mut editor).unwrap();
+        onto_a_file(&dired, &mut editor);
+        let _ = sent(&mut dired);
         (dired, editor)
+    }
+
+    /// One remote listing, one verb, one answer to the prompt it opened, and
+    /// everything that went to the host. A verb per listing, because the
+    /// re-read that follows one empties the listing it ran in.
+    fn verb_answered(dir: &str, verb: &str, answer: &str) -> (Vec<tramp::Op>, Editor) {
+        let (mut dired, mut editor) = remote_dired(dir, &[("a.conf", false)]);
+        dired.run(&mut editor, verb);
+        assert!(dired.awaiting_input(), "{verb} opened no prompt");
+        dired.supply(&mut editor, answer);
+        assert!(!dired.awaiting_input(), "{verb} is done");
+        (sent(&mut dired), editor)
     }
 
     /// A listing that arrived over ssh renders like any other, and — the part
@@ -933,22 +1216,225 @@ mod tests {
         );
     }
 
-    /// Everything that destroys or creates is refused, loudly and by name.
-    /// Without the guard these reach `zemacs_dired` with a `PathBuf` spelled
-    /// `/ssh:host:/etc/x`, which is a perfectly good local name for a file that
-    /// is not there — so the error would be "No such file", about this machine.
+    /// `D` on a remote listing, and the half worth pinning down: it comes
+    /// through the *same* funnel as the local one, so it is asked about before
+    /// anything reaches the host. A remote delete that skipped the question
+    /// because it took a different door is the data-loss shape this file is
+    /// built to prevent, and it is one this tree has been bitten by before.
     #[test]
-    fn a_remote_listing_refuses_the_verbs_that_would_act_on_the_wrong_machine() {
+    fn a_remote_delete_asks_first_and_then_goes_to_the_host() {
         let (mut dired, mut editor) = remote_dired("/ssh:host:/etc", &[("a.conf", false)]);
-        for verb in ["rename", "copy", "delete", "execute", "mkdir", "create-file"] {
-            dired.run(&mut editor, verb);
-            assert!(
-                editor.status.contains(verb) && editor.status.contains("remote"),
-                "{verb}: {}",
-                editor.status
-            );
-            assert!(!dired.awaiting_input(), "{verb} left a prompt armed");
+
+        dired.run(&mut editor, "delete");
+        assert!(sent(&mut dired).is_empty(), "it deleted before the user agreed");
+        assert!(editor.pending_confirm.is_some(), "nothing was parked");
+        let label = editor.prompt.as_ref().expect("a question").label.clone();
+        assert!(label.contains("a.conf"), "asked by name: {label}");
+
+        dired.run_confirmed(&mut editor, "delete");
+        let ops = sent(&mut dired);
+        match &ops[..] {
+            [tramp::Op::Delete { path, recursive }, tramp::Op::List(dir)] => {
+                assert_eq!(path.to_string(), "/ssh:host:/etc/a.conf");
+                // `zemacs_dired::delete` is recursive locally, and a directory
+                // left behind because `rm` had no `-r` is a worse surprise.
+                assert!(*recursive);
+                // ...and the entries in hand are a lie the moment it lands.
+                assert_eq!(dir.to_string(), "/ssh:host:/etc");
+            }
+            other => panic!("{other:?}"),
         }
+        // Nothing is *reported* until the host has answered, which is the whole
+        // of the change: the editor stays alive across the round trip, so a
+        // count claimed before it landed would be a guess.
+        assert!(!editor.status.contains("deleted 1"), "{}", editor.status);
+        answered(&mut dired, &mut editor, &ops);
+        assert!(editor.status.contains("deleted 1"), "{}", editor.status);
+    }
+
+    /// `x` is the other door into `remove_all`, and it has to be guarded by the
+    /// same check — which is the whole reason the check is in `run`.
+    #[test]
+    fn a_remote_expunge_asks_once_for_all_of_them() {
+        let (mut dired, mut editor) =
+            remote_dired("/ssh:host:/etc", &[("a.conf", false), ("b.conf", false)]);
+        for name in ["a.conf", "b.conf"] {
+            dired.marks.insert(name.into(), dired::MARK_DELETE);
+        }
+
+        dired.run(&mut editor, "execute");
+        assert!(sent(&mut dired).is_empty(), "`x` deleted before asking");
+        assert_eq!(
+            dired.confirm_question(&editor, "execute").as_deref(),
+            Some("Delete 2 files?"),
+        );
+
+        dired.run_confirmed(&mut editor, "execute");
+        // Two deletes and one re-read: one round trip per file, which is the
+        // ceiling `want_op` names — but all three are in flight at once now,
+        // so it is the host's time rather than the editor's.
+        let ops = sent(&mut dired);
+        assert_eq!(ops.len(), 3, "{ops:?}");
+        assert!(matches!(ops[2], tramp::Op::List(_)), "{ops:?}");
+
+        // Two answers, one sentence: the count outlives the loop that queued
+        // them, so `x` over marked files still reports once and not per file.
+        answered(&mut dired, &mut editor, &ops[..1]);
+        assert!(!editor.status.contains("deleted"), "reported half way: {}", editor.status);
+        answered(&mut dired, &mut editor, &ops[1..]);
+        assert!(editor.status.contains("deleted 2"), "{}", editor.status);
+    }
+
+    /// ...and the other half of that sentence: a host that refuses one of them
+    /// is still one message naming which. The synchronous version got this out
+    /// of a single `Result`; spread over frames it has to be counted, and a
+    /// silent degrade to "some deletes failed" is what that must not become.
+    #[test]
+    fn a_delete_that_partly_fails_names_what_stayed() {
+        let (mut dired, mut editor) = remote_dired(
+            "/ssh:host:/etc",
+            &[("a.conf", false), ("b.conf", false), ("c.conf", false)],
+        );
+        for name in ["a.conf", "b.conf", "c.conf"] {
+            dired.marks.insert(name.into(), dired::MARK_SELECT);
+        }
+
+        dired.run_confirmed(&mut editor, "delete");
+        let ops = sent(&mut dired);
+        assert_eq!(ops.len(), 4, "three deletes and a re-read: {ops:?}");
+
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                tramp::Op::List(dir) => dired.listed(&mut editor, dir, Vec::new()),
+                // The middle one is refused, the way a directory you cannot
+                // write to refuses one file and not the others.
+                _ => dired.did(
+                    &mut editor,
+                    &crate::acted_on(op),
+                    match i {
+                        1 => Err(tramp::Error::Refused("Permission denied".into())),
+                        _ => Ok(tramp::Reply::Done),
+                    },
+                ),
+            }
+        }
+
+        assert!(editor.status.contains("deleted 2"), "{}", editor.status);
+        assert!(editor.status.contains("failed 1"), "{}", editor.status);
+        assert!(editor.status.contains("b.conf"), "which one stayed: {}", editor.status);
+        // ...and the one that stayed keeps its mark, so `D` again retries it
+        // and only it.
+        assert_eq!(dired.marks.len(), 1, "{:?}", dired.marks);
+        assert!(dired.marks.contains_key(&OsString::from("b.conf")));
+    }
+
+    /// The bug this whole route exists to close. Every write verb reaches dired
+    /// on the far side of a confirmation, and the drain used to live under
+    /// `EditorCommand::Dired` — the one arm none of them come through — so the
+    /// delete sat in the field until some later, unrelated verb pushed it out.
+    #[test]
+    fn a_verb_confirmed_still_reaches_the_worker() {
+        // A host nothing listens on, so the worker this spawns fails at
+        // `connect(2)` rather than acting on anything — the same trick the
+        // `Remote` tests in `main.rs` use.
+        let (mut dired, mut editor) =
+            remote_dired("/ssh:0.0.0.0#1:/nowhere", &[("a.conf", false)]);
+
+        dired.run(&mut editor, "delete");
+        assert!(dired.want_op.is_empty(), "sent before the user agreed");
+
+        // The two halves of a frame in which a confirmation was answered: what
+        // `EditorCommand::Confirmed(Dired(..))` does, then what `housekeep`
+        // does afterwards — and the second one is unconditional, which is the
+        // property being asserted.
+        dired.run_confirmed(&mut editor, "delete");
+        assert_eq!(dired.want_op.len(), 1, "the verb queued nothing");
+        let mut remote = crate::Remote::default();
+        remote.take_from(&mut dired);
+
+        assert!(dired.want_op.is_empty(), "queued from `Confirmed` and never sent");
+        assert!(dired.want_list.is_none(), "the re-read behind it was never sent");
+        assert_eq!(remote.jobs.len(), 2, "the delete and the re-read");
+        assert!(
+            remote.jobs.values().any(|job| {
+                matches!(job, crate::Job::Dired(p) if p.path == "/nowhere/a.conf")
+            }),
+            "the delete did not reach the worker: {:?}",
+            remote.jobs.len(),
+        );
+    }
+
+    /// The four verbs that ask for a name, each reaching the host the listing
+    /// came from. Where the name *lands* matters as much as the operation:
+    /// `Path::join` on `/ssh:host:` — the login's home — would have put it at
+    /// the remote root instead, which is a different directory entirely.
+    #[test]
+    fn the_naming_verbs_reach_the_host_with_the_name_that_was_typed() {
+        let (ops, _) = verb_answered("/ssh:host:", "rename", "b.conf");
+        match &ops[..] {
+            [tramp::Op::Rename { from, to }, tramp::Op::List(_)] => {
+                assert_eq!(from.to_string(), "/ssh:host:~/a.conf");
+                assert_eq!(to.to_string(), "/ssh:host:~/b.conf");
+            }
+            other => panic!("rename: {other:?}"),
+        }
+
+        // The login travels with the path, since it is half of which host it is.
+        let (ops, _) = verb_answered("/ssh:user@host#22:/etc", "copy", "b.conf");
+        match &ops[..] {
+            [tramp::Op::Copy { from, to }, tramp::Op::List(_)] => {
+                assert_eq!(from.to_string(), "/ssh:user@host#22:/etc/a.conf");
+                assert_eq!(to.to_string(), "/ssh:user@host#22:/etc/b.conf");
+            }
+            other => panic!("copy: {other:?}"),
+        }
+
+        let (ops, _) = verb_answered("/ssh:host:", "mkdir", "sub");
+        match &ops[..] {
+            [tramp::Op::Mkdir(p), tramp::Op::List(_)] => {
+                assert_eq!(p.to_string(), "/ssh:host:~/sub");
+            }
+            other => panic!("mkdir: {other:?}"),
+        }
+
+        let (ops, _) = verb_answered("/ssh:host:/etc", "create-file", "notes.txt");
+        match &ops[..] {
+            // `CreateFile`, never a `Write` of nothing: one would truncate a
+            // file that is already there, which is what `C-c n` must not do.
+            [tramp::Op::CreateFile(p), tramp::Op::List(_)] => {
+                assert_eq!(p.to_string(), "/ssh:host:/etc/notes.txt");
+            }
+            other => panic!("create-file: {other:?}"),
+        }
+    }
+
+    /// The two answers a remote prompt has to refuse: one that would act on
+    /// this machine instead of that one, and one that would leave the directory
+    /// on screen. Neither may reach the host at all.
+    #[test]
+    fn a_remote_prompt_refuses_the_answers_that_leave_the_directory() {
+        let (mut dired, mut editor) = remote_dired("/ssh:host:/etc", &[("a.conf", false)]);
+
+        dired.run(&mut editor, "rename");
+        dired.supply(&mut editor, "/tmp/here.conf");
+        assert!(
+            editor.status.contains("different machines"),
+            "{}",
+            editor.status
+        );
+        assert!(sent(&mut dired).is_empty(), "a rename crossed machines");
+
+        dired.run(&mut editor, "mkdir");
+        dired.supply(&mut editor, "../evil");
+        assert!(
+            editor.status.contains("not a file name"),
+            "{}",
+            editor.status
+        );
+        assert!(
+            sent(&mut dired).is_empty(),
+            "a name with a separator reached the host"
+        );
     }
 
     /// `U` clears every mark, where `u` clears one. Asserted because the

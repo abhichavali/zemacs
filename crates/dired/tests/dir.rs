@@ -987,7 +987,11 @@ fn marks_permissions_sizes_and_dates_each_get_their_own_face() {
     marks[index] = Some(MARK_DELETE);
     let faces = coloured(&listing, &marks);
 
-    assert_coloured(&faces, &MARK_DELETE.to_string(), Face::Constant);
+    // Deletion is the one mark with a face of its own. `*` says "I have picked
+    // this one out" and `D` says "this one is going", and reading the letter is
+    // the only thing that used to tell them apart — on a column one character
+    // wide, at the far left, which is exactly where a reader is not looking.
+    assert_coloured(&faces, &MARK_DELETE.to_string(), Face::Error);
     assert_coloured(&faces, "11", Face::Number);
     #[cfg(unix)]
     assert_coloured(&faces, "-rw-r--r--", Face::Comment);
@@ -998,12 +1002,34 @@ fn marks_permissions_sizes_and_dates_each_get_their_own_face() {
             .any(|(t, k)| *k == Face::Comment && t.len() == 16 && t.starts_with("20")),
         "no timestamp span: {faces:#?}"
     );
-    // An unmarked entry contributes no mark span; only the one D exists.
+    // ...and it is not merely *a* different face: it must not be the one every
+    // other mark uses, or the assertion above would pass on a rename.
     assert_eq!(
         faces.iter().filter(|(_, k)| *k == Face::Constant).count(),
+        0,
+        "the deletion flag is still being drawn as an ordinary mark: {faces:#?}"
+    );
+    assert_eq!(
+        faces.iter().filter(|(_, k)| *k == Face::Error).count(),
         1,
         "{faces:#?}"
     );
+}
+
+/// The two marks are told apart by colour, not only by letter.
+#[test]
+fn a_selection_mark_and_a_deletion_flag_are_different_colours() {
+    let temp = Temp::new("colour-marks");
+    temp.file("keep.txt", "x\n");
+    temp.file("drop.txt", "x\n");
+    let listing = list(temp.path());
+    let mut marks = vec![None; listing.entries.len()];
+    marks[listing.index_of(OsStr::new("keep.txt")).unwrap()] = Some('*');
+    marks[listing.index_of(OsStr::new("drop.txt")).unwrap()] = Some(MARK_DELETE);
+    let faces = coloured(&listing, &marks);
+
+    assert_coloured(&faces, "*", Face::Constant);
+    assert_coloured(&faces, &MARK_DELETE.to_string(), Face::Error);
 }
 
 #[test]

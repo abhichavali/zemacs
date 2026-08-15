@@ -720,11 +720,6 @@ fn main() -> anyhow::Result<()> {
         // Park the live cursor and scroll on the focused window, once, so every
         // pane in every frame can be drawn from its own `Window`.
         editor.sync_focused_window();
-        // One grid per terminal buffer on screen, not one for "the" terminal:
-        // see `Term::screens`. Gathered after `sync_focused_window`, so a
-        // session that just became visible is measured against the window it is
-        // actually in.
-        let screens = app.term.screens(&editor);
         perf.input += frame_start.elapsed();
 
         // Whether to draw at all. `Editor::generation` moves on every keystroke,
@@ -750,6 +745,20 @@ fn main() -> anyhow::Result<()> {
         let draws = match drew {
             false => 0,
             true => {
+                // One grid per terminal buffer on screen, not one for "the"
+                // terminal: see `Term::screens`. Gathered after
+                // `sync_focused_window`, so a session that just became visible
+                // is measured against the window it is actually in.
+                //
+                // Inside this arm rather than above the decision, which is
+                // where it used to sit. `screens` copies `rows * cols` cells
+                // per visible terminal out from under alacritty's lock, and it
+                // has exactly one consumer — the `draw` on the next line. Above
+                // the decision it ran on the sixty iterations a second that
+                // draw nothing, and took the PTY reader's lock to do it. It
+                // reads the grid and advances nothing, so the only thing
+                // gathering it here changes is that the copy is fresher.
+                let screens = app.term.screens(&editor);
                 let n = app.draw(&mut editor, &screens)?;
                 // *After* the draw, not before: the renderer parks each pane's
                 // width and height back on the editor and `scroll_scene` may
@@ -799,6 +808,11 @@ fn main() -> anyhow::Result<()> {
     // `SIGHUP` the note below relies on never reaches it. By name rather than by
     // `Drop`, because `_exit` runs no destructors.
     app.term.hangup();
+    // Auto-save writes on a thread of its own now, and a thread is exactly what
+    // `_exit` takes down without asking. This is the wait that keeps the
+    // promise the synchronous sweep used to keep for free: quitting in the
+    // moment between a sweep and its writes must not be how you lose them.
+    autosave_flush();
     // Every way out of the loop, not just the `quit` op: a client waiting on
     // this also hears about the window being closed and about the editor
     // quitting itself.
@@ -827,12 +841,14 @@ fn main() -> anyhow::Result<()> {
     // which is why this survived a suite that never asked for a picture. Under
     // `--control` the cost was a leaked editor per session.
     //
-    // Nothing is lost by skipping the handlers, but only because the two things
-    // that genuinely outlive this process are taken by name above:
+    // Nothing is lost by skipping the handlers, but only because everything
+    // that genuinely outlives this process is taken by name above:
     // `zemacs_rpc::stop_all` for the language servers, `Term::hangup` for an
-    // outstanding `:!`. A PTY's child needs neither — it gets its `SIGHUP` from
-    // the kernel. Anything else that comes to own a process must be added there
-    // too; a `Drop` will not run.
+    // outstanding `:!`, `autosave_flush` for writes still queued on the
+    // auto-save thread. A PTY's child needs none of it — it gets its `SIGHUP`
+    // from the kernel. Anything else that comes to own a process, or a thread
+    // holding work nobody can redo, must be added there too; a `Drop` will not
+    // run.
     unsafe { libc::_exit(0) }
 }
 
@@ -1910,7 +1926,10 @@ impl App {
 
         // Wall-clock rather than keystroke-counted: the loop already runs at
         // vsync, so an elapsed check is free, and a crash costs at most this
-        // interval's worth of typing either way.
+        // interval's worth of typing either way. What this costs the loop is a
+        // copy per modified buffer and nothing else — the writes leave on
+        // `autosave_queue`, which is what keeps a big buffer on a slow disk from
+        // being a hitch every thirty seconds.
         if self.last_autosave.elapsed() >= AUTOSAVE_EVERY {
             autosave_all(editor);
             self.last_autosave = Instant::now();
@@ -2189,30 +2208,29 @@ fn open_at(editor: &mut Editor, root: &Path, hit: &str, init_path: &Path, remote
 }
 
 /// Ask ripgrep for matches. Empty for a pattern too short to be worth running —
-/// one character across a large tree is tens of thousands of hits and a visible
-/// stall.
+/// one character across a large tree is tens of thousands of hits.
+///
+/// This used to be a second `Command` built here, next to a first one in
+/// `zemacs_project::search` that nothing outside its own tests ever called. Two
+/// copies of one question, and the copy the editor actually ran was the one
+/// without the streaming: it buffered every line ripgrep printed and then threw
+/// all but 2000 away, synchronously, under the editor lock. On a tree with
+/// nothing gitignored that is 1168 ms against 7.7 ms, and every window, every
+/// keystroke and every Lisp primitive waits it out.
+///
+/// So there is one now, and it is the crate's. What stays here is the only part
+/// that was ever this layer's: the minimum length, which is a property of the
+/// *prompt* — it fires per keystroke, and the first character of what you are
+/// about to type is never a search worth running.
 fn grep(root: &Path, pattern: &str) -> Vec<String> {
     const MIN: usize = 2;
-    const LIMIT: usize = 2000;
     if pattern.trim().len() < MIN {
         return Vec::new();
     }
-    // `--` so a pattern starting with a dash is a pattern, not a flag.
-    let out = std::process::Command::new("rg")
-        .current_dir(root)
-        .args(["--line-number", "--no-heading", "--color=never", "--smart-case"])
-        .arg("--max-count=50")
-        .arg("--")
-        .arg(pattern)
-        .output();
-    let Ok(out) = out else {
-        return vec!["ripgrep (rg) is not installed".into()];
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .take(LIMIT)
-        .map(str::to_string)
-        .collect()
+    // A failure is shown as the one row rather than raised: the grep prompt has
+    // nowhere to put an error, and "ripgrep (rg) is not installed" in the
+    // candidate list is the message anyway.
+    zemacs_project::search(root, pattern).unwrap_or_else(|e| vec![e.to_string()])
 }
 
 /// Re-run ripgrep when the pattern changes.
@@ -2673,7 +2691,7 @@ impl Remote {
                         // by name rather than through `autosave_forget`,
                         // because that reads a buffer we are already holding.
                         if let Some(copy) = autosave_file(&name) {
-                            let _ = std::fs::remove_file(copy);
+                            autosave_drop(copy);
                         }
                     }
                     if b.path.is_none() {
@@ -3183,12 +3201,87 @@ fn autosave_one(buffer: &zemacs_core::Buffer) {
     let Some(target) = autosave_path(buffer) else {
         return;
     };
-    if let Some(dir) = target.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    // The copy is made here and the write is not, and that split is the whole
+    // of `autosave_queue`: this line runs on the main thread under the editor
+    // lock because it has to — the rope belongs to the editor — and it is a
+    // memcpy, tens of microseconds for a file nobody would call small. The
+    // `write` behind it is milliseconds on an SSD and unbounded on a network
+    // mount, and it needs nothing the lock is holding.
+    let text = buffer.text.to_string();
+    autosave_queue(move || {
+        if let Some(dir) = target.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Silent on failure, like `remember_recent`: a full disk must not put a
+        // message in front of someone who is mid-sentence — and out here there
+        // is no longer anyone to put it in front of.
+        let _ = std::fs::write(target, text);
+    });
+}
+
+/// A unit of work for the auto-save thread: one `write`, or one `remove_file`.
+///
+/// A closure rather than an enum of the two because there is nothing to decide
+/// between them — the queue's only job is to run them *in order*, and the order
+/// is the entire reason it exists.
+type SaveJob = Box<dyn FnOnce() + Send>;
+
+/// The one thread every auto-save write happens on.
+///
+/// One thread and one queue, not a thread per sweep, and ordering is why. A
+/// sweep, the next sweep and a `:w` all name the same recovery copy: the write
+/// queued last has to be the one that lands, and a `remove_file` racing a write
+/// of the same file can leave a copy the save already superseded sitting there
+/// looking newer than the file — which is exactly what [`recovery_against`]
+/// reads as "there is something to recover". Threads spawned per sweep race;
+/// one thread draining a FIFO cannot.
+///
+/// Started on first use, so a session that never modifies anything never spawns
+/// it, and never joined — see the `_exit` at the end of `main`, which runs no
+/// destructors. [`autosave_flush`] is how the exit path waits for the backlog
+/// instead.
+///
+/// ponytail: unbounded queue. The ceiling is a disk that cannot keep up with a
+/// sweep every thirty seconds, which would grow the backlog by a buffer's text
+/// at a time; the upgrade is a `bounded(1)` channel and `try_send`, dropping a
+/// sweep the previous one has not finished — safe precisely because the next
+/// sweep carries the same text thirty seconds later.
+static AUTOSAVE: std::sync::OnceLock<Sender<SaveJob>> = std::sync::OnceLock::new();
+
+fn autosave_queue(job: impl FnOnce() + Send + 'static) {
+    let tx = AUTOSAVE.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::unbounded::<SaveJob>();
+        std::thread::spawn(move || {
+            for job in rx {
+                job();
+            }
+        });
+        tx
+    });
+    // Silent if the thread is gone, for the same reason the write itself is:
+    // there is nothing a person mid-sentence can do about it.
+    let _ = tx.send(Box::new(job));
+}
+
+/// Wait for the queue to be empty. One line at the end of `main`, and it buys
+/// back the only thing moving the writes off-thread cost: before this change a
+/// sweep was finished by the time the loop went round again, so quitting could
+/// not drop one. A job that sends back when it runs is the whole mechanism —
+/// the queue is FIFO, so hearing from *this* one means every write ahead of it
+/// has already happened.
+///
+/// A no-op when nothing was ever queued: `get` rather than `get_or_init`, so
+/// quitting a session that modified nothing does not start a thread in order to
+/// wait for it.
+fn autosave_flush() {
+    let Some(tx) = AUTOSAVE.get() else { return };
+    let (done, wait) = crossbeam_channel::unbounded();
+    let ack: SaveJob = Box::new(move || {
+        let _ = done.send(());
+    });
+    if tx.send(ack).is_ok() {
+        let _ = wait.recv();
     }
-    // Silent on failure, like `remember_recent`: a full disk must not put a
-    // message in front of someone who is mid-sentence.
-    let _ = std::fs::write(target, buffer.text.to_string());
 }
 
 /// The auto-save copy of `path`, if there is one *and* it is newer than the
@@ -3214,8 +3307,21 @@ fn recovery_against(path: &Path, on_disk: std::time::SystemTime) -> Option<PathB
 /// that was already saved.
 fn autosave_forget(buffer: &zemacs_core::Buffer) {
     if let Some(path) = autosave_path(buffer) {
-        let _ = std::fs::remove_file(path);
+        autosave_drop(path);
     }
+}
+
+/// Delete a recovery copy, behind whatever is already queued for it.
+///
+/// Both callers go through here rather than calling `remove_file` themselves,
+/// and that is not tidiness: a sweep a moment ago may still be holding this
+/// file's text, and a delete that overtook it would put the copy *back* — newer
+/// than the file the save just wrote, which is the one state that makes zemacs
+/// offer to recover text it has already saved.
+fn autosave_drop(path: PathBuf) {
+    autosave_queue(move || {
+        let _ = std::fs::remove_file(path);
+    });
 }
 
 // --- writing a file ------------------------------------------------------
@@ -5106,6 +5212,10 @@ mod tests {
         ed.load("listen 80;\n", Some(name.clone()), None);
         ed.apply(EditorCommand::InsertText("# ".into()));
         autosave_all(&ed);
+        // The sweep queues; the thread writes. Same wait `main` does on its way
+        // out, and the only thing between "auto-save ran" and "auto-save is on
+        // disk" now.
+        autosave_flush();
 
         assert_eq!(std::fs::read_to_string(&copy).unwrap(), "# listen 80;\n");
         // Older on the host than the copy: recoverable. Newer: superseded.
@@ -5115,6 +5225,151 @@ mod tests {
         );
         assert_eq!(recovery_against(&name, std::time::SystemTime::now()), None);
         let _ = std::fs::remove_file(&copy);
+    }
+
+    /// The sweep runs on the main thread, inside the editor lock, every thirty
+    /// seconds. What it may not do there is *write*: a couple of megabytes is
+    /// milliseconds on an SSD and unbounded on a network mount, and a hitch on a
+    /// clock rather than on a keystroke is the one nobody can reproduce.
+    ///
+    /// Asserted by holding the auto-save thread rather than by timing a disk,
+    /// which is the only version of this that is not a coin toss on a fast
+    /// machine: with the writer parked on a channel, a sweep that wrote for
+    /// itself would have left the copy on disk before it returned. It did not,
+    /// and the copy still lands once the thread is let go — which is the other
+    /// half, and the half that matters.
+    #[test]
+    fn the_sweep_queues_the_write_instead_of_doing_it() {
+        let name = std::env::temp_dir()
+            .join(fixture("autosave"))
+            .join("held.txt");
+        let copy = autosave_file(&name).expect("a home directory");
+        let _ = std::fs::remove_file(&copy);
+
+        // Park the writer on a channel nobody has sent to yet. Every job behind
+        // this one — including the sweep's — is stuck until `go` is dropped.
+        let (go, hold) = crossbeam_channel::unbounded::<()>();
+        autosave_queue(move || {
+            let _ = hold.recv();
+        });
+
+        let mut ed = Editor::new();
+        ed.load("one\n", Some(name.clone()), None);
+        ed.apply(EditorCommand::InsertText("edited ".into()));
+
+        let started = Instant::now();
+        autosave_all(&ed);
+        let queued = started.elapsed();
+        let landed_early = copy.exists();
+
+        // Released before the first assertion: a panic here with the writer
+        // still parked would hang every other test that auto-saves.
+        drop(go);
+        autosave_flush();
+
+        assert!(
+            !landed_early,
+            "the sweep wrote {copy:?} itself while the auto-save thread was held"
+        );
+        assert!(
+            queued < Duration::from_millis(100),
+            "the sweep took {queued:?} with the writer parked — it waited for it"
+        );
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "edited one\n");
+        let _ = std::fs::remove_file(&copy);
+    }
+
+    /// A save drops the recovery copy, and the drop has to go through the same
+    /// queue as the writes. Straight to `remove_file` it could overtake a sweep
+    /// still holding the buffer's text and put the copy *back* — newer than the
+    /// file that was just written, which is precisely how zemacs decides there
+    /// is something to recover. You would be offered your own saved text back.
+    #[test]
+    fn forgetting_a_copy_cannot_overtake_the_write_it_supersedes() {
+        let name = std::env::temp_dir()
+            .join(fixture("autosave_forget"))
+            .join("saved.txt");
+        let copy = autosave_file(&name).expect("a home directory");
+        let _ = std::fs::remove_file(&copy);
+
+        let (go, hold) = crossbeam_channel::unbounded::<()>();
+        autosave_queue(move || {
+            let _ = hold.recv();
+        });
+
+        let mut ed = Editor::new();
+        ed.load("one\n", Some(name.clone()), None);
+        ed.apply(EditorCommand::InsertText("edited ".into()));
+        autosave_all(&ed); // queued behind the parked job
+        ed.buffer.modified = false; // ...and now the real save lands
+        autosave_forget(&ed.buffer);
+
+        drop(go);
+        autosave_flush();
+
+        assert!(
+            !copy.exists(),
+            "{copy:?} outlived the save that superseded it"
+        );
+    }
+
+    /// `screens` moved below the draw decision, and this is why that is safe: it
+    /// *reads* the child's grid under alacritty's lock and advances nothing, so
+    /// gathering it inside the drawing arm can only ever hand `draw` the same
+    /// screenful or a fresher one — never a drained one.
+    ///
+    /// The other half of the move is that a frame with new output is always a
+    /// frame that draws: `Term::sync` calls `Editor::touch` when the grid's text
+    /// changes, which is what moves `generation` and makes `drew` true. Without
+    /// that the grid would be gathered on a frame that never showed it, and a
+    /// terminal would go stale until something else happened to redraw.
+    ///
+    /// `/bin/cat` because it echoes and then stays alive: a child that exits is
+    /// retired out of the session list, and there would be no grid left to ask
+    /// about.
+    #[test]
+    fn a_terminals_grid_is_still_there_when_the_draw_asks_for_it() {
+        let mut ed = Editor::new();
+        let mut term = Term::default();
+        term.run(&mut ed, "run:zemacs-grid-test:/bin/cat");
+        let Some(&id) = term.buffers().first() else {
+            return; // no PTY in this sandbox, nothing to assert about
+        };
+        let sizes = [(id, 40, 8)];
+
+        term.key(&ed, Key::Char('z'));
+        term.key(&ed, Key::Enter);
+
+        // The child echoes on its own schedule, so this is a deadline rather
+        // than a fixed number of turns.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut moved = false;
+        while Instant::now() < deadline && !ed.buffer.text.to_string().contains('z') {
+            let was = ed.generation;
+            term.sync(&mut ed, &sizes);
+            moved |= ed.generation != was;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let shown = ed.buffer.text.to_string();
+        assert!(shown.contains('z'), "the child never echoed: {shown:?}");
+        assert!(
+            moved,
+            "output landed without moving the generation — the frame that \
+             gathers the grid would not have drawn it"
+        );
+
+        // Twice in a row with no `sync` between: the second read is what `draw`
+        // now gets, and it has to be the same screenful as the first.
+        let early = term.screens(&ed);
+        let late = term.screens(&ed);
+        assert_eq!(early.len(), 1, "one visible, unfrozen session");
+        assert_eq!(early[0].0, id);
+        assert!(early[0].1.to_text().contains('z'), "the grid has the echo in it");
+        assert_eq!(early[0].1.to_text(), late[0].1.to_text());
+        assert_eq!(early[0].1.cells.len(), late[0].1.cells.len());
+
+        term.hangup();
     }
 
     #[test]

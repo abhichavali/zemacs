@@ -33,7 +33,8 @@ use std::sync::Arc;
 use alacritty_terminal::event::{Event, EventListener, Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
-use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
@@ -64,6 +65,44 @@ impl Cell {
             bold: false,
             italic: false,
             underline: false,
+        }
+    }
+}
+
+/// A stretch of scrollback the child gave the same attributes, in **char**
+/// offsets into the text [`Terminal::history`] hands back beside it.
+///
+/// A run rather than a cell, because the frozen view turns each of these into an
+/// overlay and a 10,000-line scrollback is two million cells. `None` is "the
+/// editor's own", which is what an overlay's `None` already means — so a plain
+/// shell line produces no run at all and the buffer carries overlays only where
+/// the child asked for something.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Run {
+    pub start: usize,
+    pub end: usize,
+    pub fg: Option<[u8; 3]>,
+    pub bg: Option<[u8; 3]>,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+/// What a press selects: the cell under it, the word, or the whole line — one
+/// click, two, three, the way every terminal has done it since X.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Select {
+    Cell,
+    Word,
+    Line,
+}
+
+impl Select {
+    /// SDL counts clicks; this is what the count means.
+    pub fn from_clicks(clicks: u8) -> Self {
+        match clicks {
+            1 => Select::Cell,
+            2 => Select::Word,
+            _ => Select::Line,
         }
     }
 }
@@ -133,6 +172,19 @@ pub enum Input {
     /// sequence* rather than an ESC glued to the front of one: see [`encode`].
     AltLeft,
     AltRight,
+    /// The block above the arrows, none of which used to reach a child at all.
+    /// Home and End are readline's line-start and line-end, the page keys move
+    /// a full-screen program a screenful, and `Delete` is forward-delete —
+    /// nothing else in this enum does any of those.
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Delete,
+    /// `F1`–`F12`, the menu bar of every TUI. Numbered rather than twelve
+    /// variants, as the editor's own `Key::F` is; outside that range [`encode`]
+    /// sends nothing, because there is nothing to send.
+    F(u8),
 }
 
 /// The bytes a real terminal would send for `input`.
@@ -191,6 +243,31 @@ pub fn encode(input: Input, app_cursor: bool) -> Vec<u8> {
         // an agent's input box reads as a word jump.
         Input::AltRight => vec![0x1b, b'[', b'1', b';', b'3', b'C'],
         Input::AltLeft => vec![0x1b, b'[', b'1', b';', b'3', b'D'],
+        // Home and End go through `arrow` because they are arrows as far as
+        // DECCKM is concerned: `ESC [ H`/`ESC [ F` normally, `ESC O H`/`ESC O F`
+        // in application mode, which is what `infocmp xterm-256color` lists as
+        // `khome`/`kend` — and `child_env` sets exactly that TERM. The VT220
+        // `ESC [ 1 ~`/`ESC [ 4 ~` spellings are the other tradition and are
+        // deliberately not what we send.
+        Input::Home => arrow(b'H'),
+        Input::End => arrow(b'F'),
+        // The `~` family carries its own number, so there is no room for a mode
+        // to change it: these three are the same bytes either way. `kpp`, `knp`
+        // and `kdch1`.
+        Input::PageUp => vec![0x1b, b'[', b'5', b'~'],
+        Input::PageDown => vec![0x1b, b'[', b'6', b'~'],
+        Input::Delete => vec![0x1b, b'[', b'3', b'~'],
+        // F1–F4 are SS3 and the rest are the `~` family, which is history
+        // rather than design — and the numbers skip 16 and 22, which is the
+        // part everyone gets wrong. Read off `kf1`–`kf12` of xterm-256color.
+        Input::F(n) => match n {
+            1..=4 => vec![0x1b, b'O', b'P' + (n - 1)],
+            5..=12 => {
+                let code = [15, 17, 18, 19, 20, 21, 23, 24][n as usize - 5];
+                format!("\x1b[{code}~").into_bytes()
+            }
+            _ => vec![],
+        },
     }
 }
 
@@ -460,13 +537,6 @@ impl Terminal {
             }
         }
 
-        let mut env = HashMap::new();
-        // Not `alacritty`, which is the default: that terminfo entry only exists
-        // where Alacritty is installed, and a shell that cannot find its TERM
-        // entry loses colour, arrow keys and clear-screen. `xterm-256color` is
-        // everywhere.
-        env.insert("TERM".to_string(), "xterm-256color".to_string());
-
         let options = tty::Options {
             shell: command
                 .clone()
@@ -477,7 +547,7 @@ impl Terminal {
             // instead of the session going blank at the moment it has something
             // to say.
             drain_on_exit: true,
-            env,
+            env: child_env(),
         };
         let pty = tty::new(&options, window_size(cols, rows), 0)?;
 
@@ -545,6 +615,49 @@ impl Terminal {
             }
             None => false,
         }
+    }
+
+    /// Begin a text selection in the grid, at the cell `(col, row)` of the
+    /// visible screen. `right` is which half of that cell the pointer was in,
+    /// which is the difference between a selection that includes the character
+    /// under the press and one that starts after it.
+    ///
+    /// This is the editor's own selection, not the child's: a program that has
+    /// claimed the mouse never hears about it. That is deliberate and it is what
+    /// every terminal emulator does — see the shift-bypass in `main.rs`, without
+    /// which text inside `vim`, `htop` or an agent's pane could not be copied at
+    /// all.
+    pub fn select_start(&self, col: usize, row: usize, right: bool, kind: Select) {
+        let mut term = self.term.lock();
+        let point = point_at(&term, col, row);
+        let ty = match kind {
+            Select::Cell => SelectionType::Simple,
+            Select::Word => SelectionType::Semantic,
+            Select::Line => SelectionType::Lines,
+        };
+        term.selection = Some(Selection::new(ty, point, side(right)));
+    }
+
+    /// Drag the far end of the selection to `(col, row)`. Silent with no
+    /// selection started, so a stray motion cannot invent one.
+    pub fn select_update(&self, col: usize, row: usize, right: bool) {
+        let mut term = self.term.lock();
+        let point = point_at(&term, col, row);
+        if let Some(selection) = term.selection.as_mut() {
+            selection.update(point, side(right));
+        }
+    }
+
+    pub fn select_clear(&self) {
+        self.term.lock().selection = None;
+    }
+
+    /// What is selected, or `None` when nothing is — which is also the answer
+    /// for a selection of only blank cells, since copying a rectangle of spaces
+    /// is never what the gesture meant.
+    pub fn selection_text(&self) -> Option<String> {
+        let text = self.term.lock().selection_to_string()?;
+        (!text.trim().is_empty()).then_some(text)
     }
 
     /// Turn a wheel notch into whatever this program expects.
@@ -670,34 +783,85 @@ impl Terminal {
         self.term.lock().scroll_display(Scroll::Delta(lines));
     }
 
-    /// Everything the terminal remembers, as plain text: the whole scrollback
-    /// followed by the visible screen.
+    /// Everything the terminal remembers — the whole scrollback followed by the
+    /// visible screen — as text, and as the colour that text was printed in:
+    /// one [`Run`] per stretch of cells sharing their attributes.
     ///
     /// This is what goes in the buffer when the editor takes the keyboard back,
     /// and it is the only reason the motions have anything to work on — the
     /// visible grid alone is one screenful with no history to search, yank from,
-    /// or jump around in.
-    pub fn history_text(&self) -> String {
+    /// or jump around in. The runs are what stops that buffer being the grey
+    /// flattening it used to be: see `show_history` in `zemacs-app`.
+    ///
+    /// One function and not two, which is the whole design of it: every row here
+    /// loses its trailing blanks and the blank rows below the prompt are dropped
+    /// altogether, so a second pass that re-derived either would have to agree
+    /// with this one about both — and [`Screen::to_text`] beside [`Screen`] is
+    /// the standing example of what happens when two such passes drift. The
+    /// offsets are counted off the text as it is built, so they cannot.
+    ///
+    /// Char offsets, because that is what the rope and an overlay both count.
+    pub fn history(&self, fg: [u8; 3], bg: [u8; 3]) -> (String, Vec<Run>) {
         let term = self.term.lock();
         let grid = term.grid();
         let (rows, cols) = (grid.screen_lines(), grid.columns());
         let first = -(grid.history_size() as i32);
 
         let mut out = String::new();
+        let mut runs = Vec::new();
+        let mut at = 0usize;
+        let mut cells: Vec<(char, Attrs)> = Vec::with_capacity(cols);
         for row in first..rows as i32 {
             let line = &grid[Line(row)];
-            let text: String = (0..cols)
-                .filter(|c| !line[Column(*c)].flags.contains(Flags::WIDE_CHAR_SPACER))
-                .map(|c| line[Column(c)].c)
-                .collect();
-            out.push_str(text.trim_end());
+            cells.clear();
+            cells.extend(
+                (0..cols)
+                    .map(|c| &line[Column(c)])
+                    // A wide character owns two columns and the spacer after it
+                    // has no glyph; the text takes one char for the pair.
+                    .filter(|c| !c.flags.contains(Flags::WIDE_CHAR_SPACER))
+                    .map(|c| (c.c, attrs(c, fg, bg))),
+            );
+            // `trim_end`'s rule — the same `char::is_whitespace` it uses —
+            // asked of the cells, so the offsets below are measured against the
+            // text that lands in the buffer rather than against the grid.
+            let used = cells
+                .iter()
+                .rposition(|(c, _)| !c.is_whitespace())
+                .map_or(0, |i| i + 1);
+            out.extend(cells[..used].iter().map(|&(c, _)| c));
             out.push('\n');
+
+            let mut col = 0;
+            while col < used {
+                let a = cells[col].1;
+                let end = cells[col..used]
+                    .iter()
+                    .position(|&(_, b)| b != a)
+                    .map_or(used, |n| col + n);
+                // Nothing to say about a cell the child left alone: that is
+                // most of a scrollback, and an overlay per row of plain output
+                // would be a bill the renderer pays every frame.
+                if a != (fg, bg, false, false) {
+                    runs.push(Run {
+                        start: at + col,
+                        end: at + end,
+                        fg: (a.0 != fg).then_some(a.0),
+                        bg: (a.1 != bg).then_some(a.1),
+                        bold: a.2,
+                        italic: a.3,
+                    });
+                }
+                col = end;
+            }
+            at += used + 1;
         }
         // Blank rows below the prompt are not history, and landing on them with
-        // `G` would look like the buffer had lost its contents.
+        // `G` would look like the buffer had lost its contents. No run reaches
+        // into what this drops — a blank row trimmed to nothing has none.
         let keep = out.trim_end_matches('\n').len();
         out.truncate(keep);
-        out
+        (out, runs)
     }
 
     /// Copy the visible grid out. `fg`/`bg` are the editor's own colours, used
@@ -705,6 +869,7 @@ impl Terminal {
     /// theme instead of being a black rectangle in the middle of it.
     pub fn screen(&self, fg: [u8; 3], bg: [u8; 3]) -> Screen {
         let term = self.term.lock();
+        let selection = term.selection.as_ref().and_then(|s| s.to_range(&term));
         let grid = term.grid();
         let (rows, cols) = (grid.screen_lines(), grid.columns());
         let offset = grid.display_offset() as i32;
@@ -721,22 +886,27 @@ impl Terminal {
                 if flags.contains(Flags::WIDE_CHAR_SPACER) {
                     continue;
                 }
-                let (mut fg_c, mut bg_c) = (
-                    resolve(cell.fg, fg, bg, flags.contains(Flags::BOLD)),
-                    resolve(cell.bg, fg, bg, false),
-                );
-                if flags.contains(Flags::INVERSE) {
+                let (mut fg_c, mut bg_c, bold, italic) = attrs(cell, fg, bg);
+                // A selection reads as reverse video, which is what a terminal
+                // has always done and the one highlight that is legible against
+                // any theme and any program's own colours.
+                //
+                // ponytail: not a themed selection face. Ceiling: a config that
+                // wants to colour it. The upgrade path is a third colour
+                // argument here, beside `fg` and `bg`, which the app already
+                // reads out of the theme to pass the other two.
+                if selection
+                    .as_ref()
+                    .is_some_and(|r| r.contains(Point::new(line, Column(col))))
+                {
                     std::mem::swap(&mut fg_c, &mut bg_c);
-                }
-                if flags.contains(Flags::HIDDEN) {
-                    fg_c = bg_c;
                 }
                 cells[row * cols + col] = Cell {
                     c: cell.c,
                     fg: fg_c,
                     bg: bg_c,
-                    bold: flags.contains(Flags::BOLD),
-                    italic: flags.contains(Flags::ITALIC),
+                    bold,
+                    italic,
                     underline: flags.contains(Flags::UNDERLINE),
                 };
             }
@@ -796,7 +966,91 @@ fn cursor_at(
     (row < rows && column.0 < cols).then_some((row, column.0))
 }
 
+/// The grid point under cell `(col, row)` of the *visible* screen.
+///
+/// Clamped rather than fallible: a drag runs off the edge of the pane all the
+/// time, and the selection it makes should stop at the last column rather than
+/// stop existing. `display_offset` is what makes a selection made while scrolled
+/// back name the scrollback line the eye is on, not the one the child is
+/// writing.
+fn point_at<T>(term: &Term<T>, col: usize, row: usize) -> Point {
+    let grid = term.grid();
+    let row = row.min(grid.screen_lines().saturating_sub(1));
+    let col = col.min(grid.columns().saturating_sub(1));
+    Point::new(
+        Line(row as i32 - grid.display_offset() as i32),
+        Column(col),
+    )
+}
+
+/// Which half of a cell the pointer is in. Sub-cell precision only a selection
+/// needs: a mouse *report* names a cell and stops there.
+fn side(right: bool) -> Side {
+    if right {
+        Side::Right
+    } else {
+        Side::Left
+    }
+}
+
+/// What every child is told about the terminal it is running in. Added to the
+/// environment zemacs was launched with rather than replacing it, which is what
+/// `tty::Options::env` means.
+///
+/// `TERM` is not `alacritty`, which is the library's default: that terminfo
+/// entry only exists where Alacritty is installed, and a shell that cannot find
+/// its `TERM` entry loses colour, arrow keys and clear-screen. `xterm-256color`
+/// is everywhere.
+///
+/// `COLORTERM` is the one that decides whether an agent's code blocks are
+/// syntax-highlighted at all. Terminfo has no capability for 24-bit colour, so
+/// the convention every emulator settled on is this variable — and the libraries
+/// the harnesses are built from read it directly: Node's `supports-color`, which
+/// is what `chalk` and every Ink CLI ask, reports truecolor only when it is set
+/// and otherwise falls back to a 256-colour level that most highlighting themes
+/// answer by emitting *no* styling.
+///
+/// It is set here rather than inherited because inheriting it is the bug: a
+/// zemacs started from a terminal picks the variable up from that terminal and
+/// the highlighting works, while the same zemacs started from the Dock gets the
+/// bare GUI environment and the same harness prints flat text. Nothing about the
+/// grid differs between those two — `resolve` has always handled `Color::Spec` —
+/// so the colour was never arriving in the first place.
+fn child_env() -> HashMap<String, String> {
+    HashMap::from([
+        ("TERM".to_string(), "xterm-256color".to_string()),
+        ("COLORTERM".to_string(), "truecolor".to_string()),
+    ])
+}
+
 // --- colour ---------------------------------------------------------------
+
+/// What one grid cell is drawn in: foreground, background, bold, italic.
+type Attrs = ([u8; 3], [u8; 3], bool, bool);
+
+/// Everything about a cell that is not its character, resolved against the
+/// editor's own colours.
+///
+/// Shared by the live view and the frozen one, and it has to be: reverse video
+/// and `HIDDEN` are the two rules a second copy would forget, and an agent's
+/// selected menu item is drawn with the first of them. [`Screen`]'s own
+/// selection is the one thing left outside — it belongs to the *view*, not to
+/// the cell, and there is no selection in a scrollback.
+fn attrs(cell: &alacritty_terminal::term::cell::Cell, fg: [u8; 3], bg: [u8; 3]) -> Attrs {
+    let flags = cell.flags;
+    let bold = flags.contains(Flags::BOLD);
+    let (mut fg_c, mut bg_c) = (
+        resolve(cell.fg, fg, bg, bold),
+        resolve(cell.bg, fg, bg, false),
+    );
+    if flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg_c, &mut bg_c);
+    }
+    if flags.contains(Flags::HIDDEN) {
+        fg_c = bg_c;
+    }
+    (fg_c, bg_c, bold, flags.contains(Flags::ITALIC))
+}
 
 /// Turn a terminal colour into RGB, given the editor's default foreground and
 /// background.
@@ -943,6 +1197,65 @@ mod tests {
         assert_eq!(encode(Input::Ctrl('c'), true), vec![0x03]);
     }
 
+    /// Home and End are arrows as far as DECCKM is concerned, which is the one
+    /// thing about them that is easy to get wrong: readline turns the mode on,
+    /// and `ESC [ H` there is not what Home means.
+    ///
+    /// Checked against `infocmp xterm-256color` — `khome=\EOH`, `kend=\EOF` —
+    /// which is the terminal `child_env` claims to be. The VT220 `ESC [ 1 ~`
+    /// and `ESC [ 4 ~` are the other tradition and deliberately not these.
+    #[test]
+    fn home_and_end_follow_application_cursor_mode() {
+        assert_eq!(encode(Input::Home, false), b"\x1b[H".to_vec());
+        assert_eq!(encode(Input::End, false), b"\x1b[F".to_vec());
+        assert_eq!(encode(Input::Home, true), b"\x1bOH".to_vec());
+        assert_eq!(encode(Input::End, true), b"\x1bOF".to_vec());
+    }
+
+    /// The `~` family carries its own number, so no mode can change it: `kpp`,
+    /// `knp` and `kdch1` of xterm-256color, the same bytes either way.
+    #[test]
+    fn the_page_keys_and_forward_delete_ignore_the_cursor_mode() {
+        for app in [false, true] {
+            assert_eq!(encode(Input::PageUp, app), b"\x1b[5~".to_vec());
+            assert_eq!(encode(Input::PageDown, app), b"\x1b[6~".to_vec());
+            assert_eq!(encode(Input::Delete, app), b"\x1b[3~".to_vec());
+        }
+        // Forward delete is not Backspace, however macOS labels the key.
+        assert_ne!(encode(Input::Delete, false), encode(Input::Backspace, false));
+    }
+
+    /// `kf1`–`kf12`, read off xterm-256color. F1–F4 are SS3 and the rest are
+    /// the `~` family — and the numbers skip 16 and 22, which is the part
+    /// everybody gets wrong.
+    #[test]
+    fn the_function_keys_match_terminfo_gaps_and_all() {
+        let want: [&[u8]; 12] = [
+            b"\x1bOP",
+            b"\x1bOQ",
+            b"\x1bOR",
+            b"\x1bOS",
+            b"\x1b[15~",
+            b"\x1b[17~",
+            b"\x1b[18~",
+            b"\x1b[19~",
+            b"\x1b[20~",
+            b"\x1b[21~",
+            b"\x1b[23~",
+            b"\x1b[24~",
+        ];
+        for (i, bytes) in want.iter().enumerate() {
+            let n = i as u8 + 1;
+            assert_eq!(encode(Input::F(n), false), bytes.to_vec(), "F{n}");
+            // Application-cursor mode governs the arrows and nothing else.
+            assert_eq!(encode(Input::F(n), true), bytes.to_vec(), "F{n} in app mode");
+        }
+        // Nothing outside the twelve, rather than bytes a child would read as
+        // some other key entirely.
+        assert_eq!(encode(Input::F(0), false), Vec::<u8>::new());
+        assert_eq!(encode(Input::F(13), false), Vec::<u8>::new());
+    }
+
     /// `⌘⌫` is `ESC DEL`, which readline reads as backward-kill-word.
     #[test]
     fn meta_backspace_kills_a_word_in_the_shell() {
@@ -980,6 +1293,179 @@ mod tests {
             assert!(Instant::now() < deadline, "no hyperlink arrived");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Dragging out text and getting it back, which is the whole of what a
+    /// selection is for. The grid, not the buffer: the buffer's flattening of
+    /// this screen is rewritten every time the child prints.
+    ///
+    /// Also the proof that the sub-cell side is wired up — a drag that ends on
+    /// the *right* half of the `o` includes it, and one ending on the left half
+    /// stops before it. That one character is the difference between copying a
+    /// path and copying a path with its last letter missing.
+    #[test]
+    fn a_drag_selects_cells_and_a_double_click_selects_the_word() {
+        let mut term = Terminal::spawn_command(
+            40,
+            4,
+            None,
+            Some(Command::new("printf", vec!["hello world".into()])),
+        )
+        .expect("printf must be on $PATH");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            term.poll();
+            if term.screen([0; 3], [0; 3]).cell(0, 0).map(|c| c.c) == Some('h') {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the child never printed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        term.select_start(0, 0, false, Select::Cell);
+        term.select_update(4, 0, true);
+        assert_eq!(term.selection_text().as_deref(), Some("hello"));
+        term.select_update(4, 0, false);
+        assert_eq!(term.selection_text().as_deref(), Some("hell"));
+
+        // A press in the middle of a word takes the word, which is what the
+        // second click of a double-click means everywhere.
+        term.select_start(8, 0, false, Select::Word);
+        assert_eq!(term.selection_text().as_deref(), Some("world"));
+
+        // ...and the third takes the line, newline and all — a line yanked
+        // without its break pastes into the middle of whatever it lands on.
+        term.select_start(8, 0, false, Select::Line);
+        assert_eq!(term.selection_text().as_deref(), Some("hello world\n"));
+
+        // What the eye sees: reverse video over the selected cells and nothing
+        // over the rest, since the renderer draws `Screen` and knows no more
+        // about a selection than it does about a hyperlink.
+        term.select_start(0, 0, false, Select::Cell);
+        term.select_update(4, 0, true);
+        let screen = term.screen([1, 2, 3], [9, 8, 7]);
+        let selected = screen.cell(0, 0).expect("the grid is 40 wide");
+        assert_eq!((selected.fg, selected.bg), ([9, 8, 7], [1, 2, 3]), "reversed");
+        let plain = screen.cell(0, 6).expect("the grid is 40 wide");
+        assert_eq!((plain.fg, plain.bg), ([1, 2, 3], [9, 8, 7]), "past the selection");
+
+        term.select_clear();
+        assert_eq!(term.selection_text(), None);
+    }
+
+    /// The two variables a harness reads before it decides whether to colour
+    /// anything. Asserted on the map rather than on a live child on purpose: the
+    /// bug being guarded against is *inheritance*, and a test process started
+    /// from a terminal has `COLORTERM` set already, so a child that echoed it
+    /// back would pass here and still print flat text from the Dock.
+    #[test]
+    fn a_child_is_told_it_has_a_terminal_and_that_it_has_true_colour() {
+        let env = child_env();
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
+    }
+
+    /// ...and the other half: a 24-bit SGR sequence has to survive the grid as
+    /// the exact colour asked for. Nothing rounds it to the 256-colour cube, so
+    /// a highlighting theme's greys stay distinguishable.
+    #[test]
+    fn a_24_bit_colour_reaches_the_cell_unrounded() {
+        let mut term = Terminal::spawn_command(
+            20,
+            2,
+            None,
+            // `printf` and not `echo -e`: `/bin/sh` is `dash` on some systems
+            // and its `echo` does not read the escapes.
+            Some(Command::new(
+                "printf",
+                vec!["\\033[38;2;17;34;51mx\\033[0m".into()],
+            )),
+        )
+        .expect("printf must be on $PATH");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            term.poll();
+            let screen = term.screen([0; 3], [0; 3]);
+            if let Some(cell) = screen.cell(0, 0).filter(|c| c.c == 'x') {
+                assert_eq!(cell.fg, [17, 34, 51], "the exact RGB, not a palette match");
+                return;
+            }
+            assert!(Instant::now() < deadline, "the child never printed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The frozen half of the same story: the buffer gets the scrollback as
+    /// text, and the runs beside it have to point at exactly the characters the
+    /// child coloured — an offset a column out paints the wrong letter on every
+    /// line, which is the whole reason the text and the runs come from one pass.
+    ///
+    /// Three things at once, because they are the three ways the offsets can
+    /// drift: a wide character is two columns and one char, a row loses its
+    /// trailing blanks even when they were coloured, and a run that claims only
+    /// emphasis is still a run.
+    #[test]
+    fn the_runs_of_a_frozen_scrollback_land_on_the_characters_that_were_coloured() {
+        const FG: [u8; 3] = [1, 2, 3];
+        const BG: [u8; 3] = [4, 5, 6];
+        let mut term = Terminal::spawn_command(
+            20,
+            4,
+            None,
+            Some(Command::new(
+                "printf",
+                // 日本 in 24-bit blue, then plain text; then a bold word with
+                // two coloured spaces after it that the trim must eat.
+                vec!["\\033[38;2;17;34;51m日本\\033[0m x\\n\\033[1mbold  \\033[0m\\n".into()],
+            )),
+        )
+        .expect("printf must be on $PATH");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            term.poll();
+            let (text, runs) = term.history(FG, BG);
+            if text == "日本 x\nbold" {
+                // Char offsets, so 日本 is two of them and not six bytes.
+                let of = |r: &Run| -> String {
+                    text.chars().skip(r.start).take(r.end - r.start).collect()
+                };
+                assert_eq!(runs.len(), 2, "one per stretch, not one per cell: {runs:?}");
+                assert_eq!(of(&runs[0]), "日本");
+                assert_eq!(runs[0].fg, Some([17, 34, 51]), "the exact RGB");
+                assert_eq!(runs[0].bg, None, "the child never asked for a background");
+                assert!(!runs[0].bold);
+                // The two spaces the child printed in bold are trimmed off the
+                // text, so the run must stop where the text does.
+                assert_eq!(of(&runs[1]), "bold");
+                let want = Run {
+                    start: 5,
+                    end: 9,
+                    fg: None,
+                    bg: None,
+                    bold: true,
+                    italic: false,
+                };
+                assert_eq!(runs[1], want);
+                return;
+            }
+            assert!(Instant::now() < deadline, "the child never printed; got {text:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A rectangle of blank cells is not a copy anybody meant, so it answers
+    /// nothing and the app treats the gesture as the click it was.
+    #[test]
+    fn selecting_only_blank_cells_copies_nothing() {
+        let mut term =
+            Terminal::spawn_command(40, 4, None, Some(Command::new("true", vec![]))).unwrap();
+        term.poll();
+        term.select_start(10, 2, false, Select::Cell);
+        term.select_update(20, 2, true);
+        assert_eq!(term.selection_text(), None);
     }
 
     #[test]

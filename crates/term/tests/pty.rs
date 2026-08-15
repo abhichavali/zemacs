@@ -85,7 +85,7 @@ fn a_shell_runs_and_its_output_reaches_the_grid() {
     // keyboard back. Without it, stepping out of a terminal leaves the motions
     // with one screenful and no history to search or yank from — which is
     // exactly what made every vim key look broken in here.
-    let history = term.history_text();
+    let (history, _) = term.history(FG, BG);
     assert!(
         history.contains("expr 21 + 21") && history.lines().any(|l| l.trim() == "42"),
         "the scrollback should hold what scrolled past; got:\n{history}"

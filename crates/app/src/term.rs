@@ -5,8 +5,11 @@
 //! the mode. This is the seam: it forks the child, feeds it keystrokes, and
 //! flattens its grid back into buffer text so that the buffer switcher, the
 //! modeline and `buffer-string` all work on a terminal without a special case.
-//! The *colour* does not survive that flattening, so the renderer reads the
-//! grid directly — see [`Term::screens`], one per terminal buffer on screen.
+//! The *colour* does not survive that flattening, and it is recovered twice
+//! over, once per view: a live session hands the renderer its grid — see
+//! [`Term::screens`], one per terminal buffer on screen — and a frozen one,
+//! which has no grid to draw from, carries its colour as overlays instead. See
+//! [`show_history`].
 //!
 //! # Many sessions, not one
 //!
@@ -25,7 +28,7 @@
 use std::path::PathBuf;
 
 use zemacs_core::{BufferId, BufferKind, Editor, EditorCommand, Key, Mode};
-use zemacs_term::{Command, Input, Mouse, Screen, Terminal};
+use zemacs_term::{Command, Input, Mouse, Run, Screen, Select, Terminal};
 
 /// Rows and columns to start with, before the renderer has measured a pane.
 /// Replaced on the first frame; the child only sees the real size.
@@ -71,13 +74,63 @@ struct Session {
 #[derive(Default)]
 pub struct Term {
     sessions: Vec<Session>,
-    /// The `:!` commands still running, each waiting to deliver its one line.
-    /// Not a [`Session`]: a session is a PTY and a buffer, and the whole point
-    /// of the bang is that it leaves neither behind — see [`Term::shell`].
-    bangs: Vec<std::sync::mpsc::Receiver<String>>,
+    /// The `:!` commands still running, each waiting to deliver its one line —
+    /// beside the child it is waiting on, which is kept for one reason only:
+    /// something has to be able to hang up on it. Not a [`Session`]: a session
+    /// is a PTY and a buffer, and the whole point of the bang is that it leaves
+    /// neither behind — see [`Term::shell`].
+    bangs: Vec<(std::process::Child, std::sync::mpsc::Receiver<String>)>,
+}
+
+/// Hang up on every `:!` that is still running, which is the difference
+/// between a shell-out and a shell's `&`.
+///
+/// `:!sleep 300` used to outlive the editor that started it: the thread went
+/// down with the process and nobody had ever held the child. Holding it is the
+/// whole of the fix, and this is the only thing the handle is held *for*.
+///
+/// A bang that already finished has already been reported — [`Term::reap_bangs`]
+/// takes it out of the list on the frame its output lands — so there is nothing
+/// here to lose.
+///
+/// ponytail: two ceilings. `main` leaves through `libc::_exit`, which runs no
+/// destructor, so today this fires on a drop the tests do and not on a real
+/// quit; dropping the `App` — or calling `Term::drop`'s loop — before that
+/// `_exit` is the line that finishes it, and it belongs in `main`, not here.
+/// And the signal reaches the shell, not its children: `$SHELL -c` usually
+/// `exec`s a simple command, so `:!sleep 300` dies, while `:!sleep 300 & wait`
+/// leaves the grandchild for init. Killing the whole process group is the
+/// upgrade, and it costs a `setsid`/`process_group` on the spawn.
+impl Drop for Term {
+    fn drop(&mut self) {
+        self.hangup();
+    }
 }
 
 impl Term {
+    /// Hang up on every outstanding `:!`.
+    ///
+    /// A method and not only a `Drop`, because `main` leaves through
+    /// `libc::_exit(0)` and that runs no destructors — see the long note at the
+    /// bottom of `main`, which used to say nothing outlives this process now
+    /// that the language servers are stopped. A bang is the exception it did not
+    /// know about: it is not a PTY child, so no `SIGHUP` reaches it from the
+    /// kernel, and `:!sleep 300` was surviving quit. The exit path calls this by
+    /// name; `Drop` calls it for every other way a `Term` can go.
+    ///
+    /// ponytail: `SIGKILL` reaches the shell and not a grandchild it put in the
+    /// background, so `:!sleep 300 & wait` still orphans. The upgrade is a
+    /// process group on the spawn and a signal to the group, which is one
+    /// `pre_exec` and turns this into a `killpg`.
+    pub fn hangup(&mut self) {
+        for (child, _) in &mut self.bangs {
+            let _ = child.kill();
+            // Waited as well as killed: a zombie is still a pid, so "the child
+            // is gone" only becomes true here.
+            let _ = child.wait();
+        }
+    }
+
     /// True while any session is alive, so the app knows to pump them.
     ///
     /// A running bang counts, and that is the only reason `housekeep` needs no
@@ -132,6 +185,10 @@ impl Term {
             // scrollback, and the register mirrors out to the window system on
             // its own.
             "paste" => self.paste(editor),
+            // Handled a layer up, in `dispatch`: the clipboard belongs to the
+            // window system and this file has no `Clipboard`. Named here anyway
+            // so the verb list stays the list of what a terminal answers to.
+            "paste-image" => {}
             // `run:` starts a session; `rerun:` replaces the one of that name.
             //
             // Two verbs because there are two intentions and they are opposites.
@@ -193,15 +250,19 @@ impl Term {
         // keep halving the frame, and a pane dismissed with `q` has to come
         // back in one of its own rather than taking over whatever you moved on
         // to reading.
+        //
+        // Below rather than beside, because compiler output is *lines*: a
+        // rustc error is a path, a caret and a note wrapped to whatever width
+        // it is given, and half a frame is not enough of one. Stacked, the
+        // pane is as wide as the editor and the code above it keeps the shape
+        // you were reading it in.
         if start == Start::Output {
             let onscreen = existing.is_some_and(|i| {
                 let id = self.sessions[i].buffer;
                 (editor.frames.iter()).any(|f| f.windows.iter().any(|w| w.buffer == id))
             });
             if !onscreen {
-                editor.apply(EditorCommand::SplitWindow(
-                    zemacs_core::frame::Split::Columns,
-                ));
+                editor.apply(EditorCommand::SplitWindow(zemacs_core::frame::Split::Rows));
             }
         }
 
@@ -235,8 +296,11 @@ impl Term {
     /// A thread and a channel rather than a `try_wait` loop over the child,
     /// because the output is wanted: an unread pipe fills at about 64k and the
     /// command then blocks forever waiting for a reader that is busy drawing
-    /// frames. `wait_with_output` already reads both pipes correctly, so the
-    /// laziest way to have it is to let it block somewhere that is not here.
+    /// frames. So the reading blocks somewhere that is not here — but only the
+    /// reading. `wait_with_output` would do it in one call and take the
+    /// [`std::process::Child`] with it, and a child nobody holds is a child
+    /// nobody can kill; the handle stays here and the pipes go, which is why
+    /// the thread below is longer than one line.
     ///
     /// Fired again while one is running, both run — `:!make` and then `:!git
     /// status` is a thing to want, and a bang that refused would be a bang you
@@ -245,35 +309,49 @@ impl Term {
     /// log is for.
     fn shell(&mut self, editor: &mut Editor, line: &str) {
         let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let (tx, rx) = std::sync::mpsc::channel();
         // Said before the command has said anything, because the frame comes
         // back instantly now and a `:!make` that answered with nothing at all
         // would look like a bang that did not fire.
         editor.apply(EditorCommand::Message(format!("running {line}…")));
-        let line = line.to_string();
+        let mut child = match std::process::Command::new(sh)
+            .arg("-c")
+            .arg(line)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            // A `$SHELL` that is not there is the one failure that happens
+            // here rather than on the thread, and it used to travel down the
+            // channel to be said. Now it is said on the spot.
+            Err(e) => {
+                editor.apply(EditorCommand::Message(format!("{line}: {e}")));
+                return;
+            }
+        };
+        // The pipes leave with the thread, the child stays here. That is the
+        // whole trade named above.
+        let (out, err) = (child.stdout.take(), child.stderr.take());
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let msg = match std::process::Command::new(sh).arg("-c").arg(&line).output() {
-                Err(e) => format!("{line}: {e}"),
-                Ok(out) => {
-                    // stderr only when there is no stdout: a command that
-                    // printed both is being read for what it produced, and the
-                    // echo area has room for one of them.
-                    let text = match out.stdout.is_empty() {
-                        true => String::from_utf8_lossy(&out.stderr).into_owned(),
-                        false => String::from_utf8_lossy(&out.stdout).into_owned(),
-                    };
-                    echo_line(text.trim(), out.status)
-                }
+            // Both pipes at once, which is what the inner thread buys: reading
+            // stdout to the end first would leave a command that fills the 64k
+            // stderr buffer blocked on a reader that does not start until
+            // stdout ends, which it then never does.
+            let err = std::thread::spawn(move || slurp(err));
+            let out = slurp(out);
+            // stderr only when there is no stdout: a command that printed both
+            // is being read for what it produced, and the echo area has room
+            // for one of them.
+            let text = match out.is_empty() {
+                true => err.join().unwrap_or_default(),
+                false => out,
             };
             // The receiver is gone only if the editor is, and then there is
             // nobody left to tell.
-            let _ = tx.send(msg);
+            let _ = tx.send(text);
         });
-        // ponytail: nothing hangs up on the child when the editor quits, so
-        // `:!sleep 300` outlives it — the same thing a shell's `&` does. Keeping
-        // the `Child` to kill on drop is the upgrade, and it costs the thread
-        // the `wait_with_output` that makes this ten lines.
-        self.bangs.push(rx);
+        self.bangs.push((child, rx));
     }
 
     /// Report every `:!` that has finished since the last frame.
@@ -283,15 +361,26 @@ impl Term {
     /// is outstanding.
     fn reap_bangs(&mut self, editor: &mut Editor) {
         let mut done = Vec::new();
-        self.bangs.retain(|rx| match rx.try_recv() {
+        self.bangs.retain_mut(|(child, rx)| match rx.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
-            Ok(msg) => {
-                done.push(msg);
+            Ok(text) => {
+                // The other half of the `wait_with_output` the thread gave up,
+                // and it returns at once: text arriving means stdout hit EOF,
+                // and a shell closes stdout by exiting. Waiting is not optional
+                // either — a child nobody waits on is a zombie.
+                done.push(match child.wait() {
+                    Ok(status) => echo_line(text.trim(), status),
+                    Err(e) => format!("{e}"),
+                });
                 false
             }
             // A sender dropped without sending is a panicked thread: there is
-            // nothing to report and nothing left to wait for.
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+            // nothing to report, and the child it was reading is nobody's now.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                false
+            }
         });
         for msg in done {
             editor.apply(EditorCommand::Message(msg));
@@ -493,6 +582,11 @@ impl Term {
         let Some(i) = self.current(editor) else {
             return false;
         };
+        // Typing drops the selection. Not because the highlight is stale — it
+        // rides the scrollback correctly — but because the next thing a key does
+        // is print, and a highlight left over a screen that has moved on reads as
+        // the terminal having lost track of the pointer.
+        self.sessions[i].inner.select_clear();
         let input = match key {
             Key::Char(c) => Input::Char(c),
             Key::Ctrl(c) => Input::Ctrl(c),
@@ -514,6 +608,16 @@ impl Term {
             // an agent's input box, and in the editor's own Insert mode.
             Key::MetaLeft => Input::AltLeft,
             Key::MetaRight => Input::AltRight,
+            // The whole reason these keys were worth adding: a shell reads Home
+            // and End as line-start and line-end, a pager reads the page keys,
+            // `⌦` is forward-delete, and an F-key is the menu bar of every TUI.
+            // Until now every one of them stopped dead in `key_from_keydown`.
+            Key::Home => Input::Home,
+            Key::End => Input::End,
+            Key::PageUp => Input::PageUp,
+            Key::PageDown => Input::PageDown,
+            Key::Delete => Input::Delete,
+            Key::F(n) => Input::F(n),
             // A shifted arrow or Enter is sent as the plain one, which is what a
             // child saw before shift was a modifier at all: `Input` speaks the
             // VT sequences a terminal has, and there is no `ESC [1;2D` in it —
@@ -555,6 +659,48 @@ impl Term {
             .is_some_and(|i| self.sessions[i].inner.mouse(mouse))
     }
 
+    /// Start, extend and drop a text selection in the live session's grid.
+    ///
+    /// The grid rather than the buffer: the buffer holds a *flattening* of the
+    /// screen that the child rewrites under the cursor, and a selection anchored
+    /// in it would slide a line every time something printed. `zemacs-term` owns
+    /// the selection for the same reason it owns the scrollback.
+    pub fn select_start(&self, editor: &Editor, col: usize, row: usize, right: bool, kind: Select) {
+        if let Some(i) = self.current(editor) {
+            self.sessions[i].inner.select_start(col, row, right, kind);
+        }
+    }
+
+    pub fn select_update(&self, editor: &Editor, col: usize, row: usize, right: bool) {
+        if let Some(i) = self.current(editor) {
+            self.sessions[i].inner.select_update(col, row, right);
+        }
+    }
+
+    pub fn select_clear(&self, editor: &Editor) {
+        if let Some(i) = self.current(editor) {
+            self.sessions[i].inner.select_clear();
+        }
+    }
+
+    /// Put whatever is selected into the register — which *is* the system
+    /// clipboard here, so this is the missing other half of `paste`. False when
+    /// nothing was selected, which is how the caller tells a drag that copied
+    /// something from a click that only landed somewhere.
+    pub fn copy_selection(&self, editor: &mut Editor) -> bool {
+        let Some(i) = self.current(editor) else {
+            return false;
+        };
+        let Some(text) = self.sessions[i].inner.selection_text() else {
+            return false;
+        };
+        editor.apply(EditorCommand::SetRegister {
+            text,
+            linewise: false,
+        });
+        true
+    }
+
     /// Hand the keyboard back to the editor, with the whole scrollback in the
     /// buffer so the motions have something to move through.
     ///
@@ -565,9 +711,9 @@ impl Term {
     pub fn freeze(&mut self, editor: &mut Editor) {
         let Some(i) = self.current(editor) else { return };
         self.sessions[i].frozen = true;
-        let text = self.sessions[i].inner.history_text();
+        let (text, runs) = self.sessions[i].inner.history(fg(editor), bg(editor));
         let name = self.sessions[i].name.clone();
-        editor.show_named(BufferKind::Terminal, Some(&name), &text);
+        show_history(editor, &name, &text, &runs);
         editor.apply(EditorCommand::SetMode(Mode::Normal));
         // Land at the bottom, where the prompt is — that is what was on screen
         // a moment ago, and starting at line 1 of a 10,000-line scrollback is
@@ -585,6 +731,26 @@ impl Term {
         if !text.is_empty() {
             self.sessions[i].inner.paste(text);
         }
+    }
+
+    /// Type a *path* into the child, with a space after it.
+    ///
+    /// What an image reaches a coding agent as. Every harness worth pointing at
+    /// one takes a picture the same way — a path in its prompt — so a screenshot
+    /// pasted or a file dragged onto the pane becomes those characters and
+    /// nothing about images has to be understood on this side.
+    ///
+    /// The trailing space is the difference between a path and a path you can
+    /// go on typing after, which is what you always want: the sentence about
+    /// the picture comes next.
+    ///
+    /// Quoted when it has to be — see [`typed_path`].
+    pub fn paste_path(&self, editor: &Editor, path: &std::path::Path) -> bool {
+        let Some(i) = self.current(editor) else {
+            return false;
+        };
+        self.sessions[i].inner.paste(&typed_path(path));
+        true
     }
 
     /// Give the keyboard back to the child.
@@ -610,7 +776,7 @@ impl Term {
         self.reap_bangs(editor);
         self.reap(editor);
 
-        let mut exited: Vec<(String, Option<i32>, String)> = Vec::new();
+        let mut exited: Vec<(String, Option<i32>, String, Vec<Run>)> = Vec::new();
         self.sessions.retain_mut(|session| {
             if let Some((_, cols, rows)) = sizes.iter().find(|(id, ..)| *id == session.buffer) {
                 session.inner.resize(*cols, *rows);
@@ -622,11 +788,8 @@ impl Term {
                 // in the list, so without this the buffer keeps whatever the
                 // previous frame happened to leave and a build loses the last
                 // lines it printed. On a failure those are the error.
-                exited.push((
-                    session.name.clone(),
-                    session.inner.exit_status(),
-                    session.inner.history_text(),
-                ));
+                let (text, runs) = session.inner.history(fg(editor), bg(editor));
+                exited.push((session.name.clone(), session.inner.exit_status(), text, runs));
                 return false;
             }
             true
@@ -634,8 +797,9 @@ impl Term {
 
         // Report and freeze *after* the retain, so the borrow of `self` is over
         // before the editor is touched.
-        for (name, status, text) in exited {
-            self.retire(editor, &name, status, &text);
+        for (name, status, text, runs) in exited {
+            self.retire(editor, &name, status, &text, &runs);
+            editor.touch();
         }
 
         // Only the live session's buffer is refreshed. A parked one keeps the
@@ -678,6 +842,10 @@ impl Term {
         if editor.buffer.text != text {
             let name = self.sessions[i].name.clone();
             editor.show_named(BufferKind::Terminal, Some(&name), &text);
+            // A child printing is the other thing that happens with nobody at
+            // the keyboard. The draw loop skips a frame whose generation has
+            // not moved, and a shell's output moves nothing else here.
+            editor.touch();
         }
         // A session running a harness is in `ai-mode`, a plain shell in
         // `terminal-mode` — the axis `(major-mode)` answers on, which is what a
@@ -706,7 +874,14 @@ impl Term {
     /// A child that exited on its own. Its buffer keeps the last screenful —
     /// which is usually the error — and becomes an ordinary read-only buffer
     /// you can search and yank from until you kill it.
-    fn retire(&mut self, editor: &mut Editor, name: &str, status: Option<i32>, text: &str) {
+    fn retire(
+        &mut self,
+        editor: &mut Editor,
+        name: &str,
+        status: Option<i32>,
+        text: &str,
+        runs: &[Run],
+    ) {
         let how = match status {
             Some(0) | None => String::new(),
             // 127 is the shell's "command not found", and the one exit code
@@ -719,7 +894,7 @@ impl Term {
         if editor.buffer.given_name.as_deref() == Some(name) {
             // The final scrollback goes in here rather than being left to the
             // refresh below, which no longer runs for a session that is gone.
-            editor.show_named(BufferKind::Terminal, Some(name), text);
+            show_history(editor, name, text, runs);
             editor.apply(EditorCommand::SetMode(Mode::Normal));
         }
     }
@@ -812,6 +987,82 @@ impl Term {
     }
 }
 
+/// How many of a scrollback's coloured runs get an overlay, counted back from
+/// the prompt.
+///
+/// ponytail: a ceiling, and it is the *renderer's* rather than the freeze's.
+/// Freezing all of it is a one-shot 26ms on the worst scrollback there is — a
+/// full 10,000 rows of 200 coloured columns, which measures 24ms to flatten and
+/// 2ms to hang 20,000 overlays off. One to two frames, once, on a keypress:
+/// fine. What is not fine is what those 20,000 then cost *every* frame, because
+/// `overlays_for_line`, `line_style` and `fold_hiding` each scan the whole list
+/// for each of the ~50 lines a pane draws: 4.7ms a frame, forever, for a pane
+/// you are only reading. At 4,000 that is 0.9ms, and 4,000 runs is several
+/// hundred lines of a coloured agent session — everything you scrolled back to
+/// look at. Older scrollback keeps its text and loses its colour.
+///
+/// The upgrade path is the one `zemacs_core::overlay` already names: keep the
+/// list sorted by `start` so a line can be binary-searched, after which this
+/// constant can go entirely.
+const COLOURED_RUNS: usize = 4_000;
+
+/// Put a scrollback in its buffer, in the colours it was printed in.
+///
+/// The frozen view is the one an agent session is *read* in — the only one that
+/// scrolls, searches and yanks — and it was the one with no colour: the buffer
+/// holds a flattening of the grid with every attribute gone, and [`Term::screens`]
+/// leaves a frozen session out, so the pane falls through to the plain-text path.
+/// Which is backwards, and this is the other half of the fix `COLORTERM` started.
+///
+/// Overlays, because that is how everything coloured that is *not* a parser's
+/// output is drawn — org-modern's bullets and a LaTeX preview take the same
+/// road, and the draw loop needed no new path, only a literal colour where it
+/// was reading a face name. One per run of cells the child gave the same
+/// attributes, never one per cell: a 10,000-line scrollback at 200 columns is
+/// two million of those.
+///
+/// **Order matters.** `show_named` adopts the text as a new document and
+/// `Buffer::adopt` clears the overlays with the markers, so the paint has to
+/// come after it — the other way round is a buffer that is briefly coloured and
+/// then is not.
+fn show_history(editor: &mut Editor, name: &str, text: &str, runs: &[Run]) {
+    editor.show_named(BufferKind::Terminal, Some(name), text);
+    for run in runs.iter().skip(runs.len().saturating_sub(COLOURED_RUNS)) {
+        editor.make_overlay_with(run.start, run.end, |o| {
+            o.fg_rgb = run.fg.map(to_floats);
+            o.bg_rgb = run.bg.map(to_floats);
+            // `None` and not `Some(false)`: the child said nothing about weight
+            // here, and nothing is not the same claim as "upright".
+            o.bold = run.bold.then_some(true);
+            o.italic = run.italic.then_some(true);
+        });
+    }
+}
+
+/// A path as it should arrive in a child's prompt: quoted if it has to be, and
+/// with a space after it.
+///
+/// `~/Desktop/Screenshot 2026-08-12 at 16.04.png` is what macOS names a
+/// screenshot, and an unquoted space is two arguments — so the one thing this
+/// gesture must not do is hand an agent half a path. Single quotes, and a `'`
+/// inside one closed, escaped and reopened: the one form that works in every
+/// shell. An agent's prompt is not a shell at all, and reads a quoted path the
+/// same way.
+///
+/// Left bare when it does not need quoting, because most paths do not and an
+/// unquoted one reads better in a sentence.
+///
+/// The trailing space is the difference between a path and a path you can go on
+/// typing after, which is always what you want: what you have to say about the
+/// picture comes next.
+fn typed_path(path: &std::path::Path) -> String {
+    let shown = path.to_string_lossy();
+    match shown.contains(|c: char| c.is_whitespace() || c == '\'') {
+        true => format!("'{}' ", shown.replace('\'', r"'\''")),
+        false => format!("{shown} "),
+    }
+}
+
 /// The editor's colours, as the terminal wants them. Settings are `0.0..1.0`
 /// floats and a terminal is bytes.
 fn fg(editor: &Editor) -> [u8; 3] {
@@ -824,6 +1075,11 @@ fn bg(editor: &Editor) -> [u8; 3] {
 
 fn to_bytes(c: [f32; 3]) -> [u8; 3] {
     c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// The way back: a grid colour in the unit an overlay and the theme both hold.
+fn to_floats(c: [u8; 3]) -> [f32; 3] {
+    c.map(|v| f32::from(v) / 255.0)
 }
 
 /// A command line split into arguments, the way a shell splits one: runs of
@@ -879,6 +1135,20 @@ fn words(line: &str) -> Vec<String> {
     out
 }
 
+/// One of a bang's two pipes, drained to the end.
+///
+/// Lossy, the way `wait_with_output` is lossy once you ask it for a `String`:
+/// the echo area takes text, and a command that printed a byte that is not
+/// UTF-8 is still a command that ran. `Option` because [`std::process::Child`]
+/// hands its pipes out exactly once and has no opinion about who asked first.
+fn slurp(pipe: Option<impl std::io::Read>) -> String {
+    let mut buf = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = pipe.read_to_end(&mut buf);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// A command's output as the one line the echo area has room for.
 ///
 /// The first line, plus a count of what is not being shown — so `:!wc -l *` is
@@ -904,6 +1174,53 @@ fn echo_line(text: &str, status: std::process::ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three things the app half of the colour can get wrong: painting
+    /// before the text lands, where `Buffer::adopt` would wipe it; converting
+    /// the grid's bytes into something that is not the theme's unit; and letting
+    /// a whole scrollback's worth of overlays through to the renderer.
+    #[test]
+    fn a_frozen_scrollback_is_painted_after_its_text_and_only_at_the_tail() {
+        let mut ed = Editor::new();
+        let text = "red\nplain\nbold";
+        let run = |start, end, fg, bold| Run {
+            start,
+            end,
+            fg,
+            bg: None,
+            bold,
+            italic: false,
+        };
+        let runs = [
+            Run {
+                bg: Some([255, 0, 0]),
+                ..run(0, 3, Some([17, 34, 51]), false)
+            },
+            run(10, 14, None, true),
+        ];
+        show_history(&mut ed, "*one*", text, &runs);
+        assert_eq!(ed.buffer.text, text, "the text is the flattening, unchanged");
+        let on = ed.buffer.overlays();
+        assert_eq!(on.len(), 2, "one per run, and they survived `show_named`");
+        assert_eq!((on[0].start, on[0].end), (0, 3));
+        assert_eq!(on[0].fg_rgb, Some([17.0 / 255.0, 34.0 / 255.0, 51.0 / 255.0]));
+        assert_eq!(on[0].bg_rgb, Some([1.0, 0.0, 0.0]));
+        assert_eq!(on[0].bold, None, "the child said nothing about weight here");
+        assert_eq!((on[1].start, on[1].end, on[1].bold), (10, 14, Some(true)));
+        assert_eq!(on[1].fg_rgb, None, "default colour, so no claim at all");
+
+        // Past the ceiling, the *tail* is what keeps its colour: the prompt is
+        // at the bottom and that is where you were reading.
+        let long = "ab".repeat(COLOURED_RUNS + 10);
+        let many: Vec<Run> = (0..COLOURED_RUNS + 10)
+            .map(|i| run(i * 2, i * 2 + 2, Some([1, 2, 3]), false))
+            .collect();
+        show_history(&mut ed, "*one*", &long, &many);
+        let on = ed.buffer.overlays();
+        assert_eq!(on.len(), COLOURED_RUNS);
+        assert_eq!(on[0].start, 20, "the first ten runs were dropped, not the last");
+        assert_eq!(on[COLOURED_RUNS - 1].end, long.len());
+    }
 
     /// What `:!` leaves behind now that it leaves no buffer behind: one line,
     /// honest about how much it is not showing, and quiet when there is nothing
@@ -987,6 +1304,68 @@ mod tests {
         // No buffer, no window, no session — the point of the bang.
         assert!(term.sessions.is_empty());
         assert_eq!(ed.buffer_names(), Editor::new().buffer_names());
+    }
+
+    /// Whether a pid is still a process, zombie included.
+    ///
+    /// Asked of the system rather than of the [`std::process::Child`], because
+    /// the whole question is what happened to a child the `Term` no longer has
+    /// — and `kill -0` is the one way to ask that from outside.
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("kill -0 {pid}"))
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// ...and the editor going away takes the ones still running with it, which
+    /// is the only thing the `Child` is kept for.
+    ///
+    /// The pid is the assertion rather than a wall-clock guess about how long a
+    /// kill takes to land, and it is asked twice: alive with the `Term` still
+    /// standing, gone the moment it is not. `sleep 30` because everything above
+    /// the drop finishes in milliseconds — the child only has to outlast the
+    /// test, not the machine.
+    ///
+    /// The *duration* of the drop is the second assertion, and it is not
+    /// decoration: killing and waiting is one pair, and a drop that kept only
+    /// the wait would still leave the pid gone — after sitting there for the
+    /// whole thirty seconds. Quitting must hang up on the bang, not wait it out.
+    ///
+    /// The quick bang beside it is the other half of the claim: reaping is what
+    /// reports, so a bang that finished before the quit must already have said
+    /// its line and left the list, and the kill must have nothing of it to
+    /// swallow.
+    #[test]
+    fn quitting_kills_a_bang_that_is_still_running() {
+        use std::time::{Duration, Instant};
+
+        let mut ed = Editor::new();
+        let mut term = Term::default();
+        term.run(&mut ed, "shell:echo quick");
+        term.run(&mut ed, "shell:sleep 30");
+        let pid = term.bangs[1].0.id();
+        assert!(alive(pid), "the long bang never started");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !ed.messages.iter().any(|m| m == "quick") {
+            assert!(Instant::now() < deadline, "{:?}", ed.messages);
+            term.sync(&mut ed, &[]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(term.bangs.len(), 1, "the finished bang is out of the list");
+        assert!(alive(pid), "the slow one was hung up on early");
+
+        let quit = Instant::now();
+        drop(term);
+        assert!(!alive(pid), "the bang outlived the editor");
+        assert!(
+            quit.elapsed() < Duration::from_secs(5),
+            "quitting waited the bang out instead of hanging up: {:?}",
+            quit.elapsed()
+        );
     }
 
     #[test]
@@ -1119,8 +1498,12 @@ mod tests {
     /// path into a terminal buffer sets `Mode::Terminal` from the buffer
     /// *kind*, so an output pane that forgot to undo that would look right and
     /// type the first `q` at make.
+    ///
+    /// The direction is asserted because it is a one-word constant nothing
+    /// else would notice changing, and it is the whole readability of the
+    /// pane: compiler output is lines, and half a frame is not enough of one.
     #[test]
-    fn an_output_pane_keeps_the_keyboard_and_opens_beside_you() {
+    fn an_output_pane_keeps_the_keyboard_and_opens_below_you() {
         let mut ed = Editor::new();
         let mut term = Term::default();
         assert_eq!(ed.frame().windows.len(), 1);
@@ -1129,6 +1512,17 @@ mod tests {
         assert_eq!(ed.buffer.name(), "*make*");
         assert_eq!(ed.mode, Mode::Normal, "the child must not get the keyboard");
         assert_eq!(ed.frame().windows.len(), 2, "it opens in a split");
+        assert!(
+            matches!(
+                ed.frame().layout,
+                zemacs_core::frame::Layout::Split {
+                    dir: zemacs_core::frame::Split::Rows,
+                    ..
+                }
+            ),
+            "stacked, so the pane is as wide as the editor: {:?}",
+            ed.frame().layout
+        );
         assert!(term.sessions[0].output);
 
         // Already on screen, so a second press re-runs into the same pane
@@ -1153,6 +1547,29 @@ mod tests {
     /// separately and the seam between them is a string: core turns the name
     /// into a verb by stripping a prefix, and this file matches on what is
     /// left. Either side can be right about its own half while the two disagree
+    /// A dropped screenshot is `~/Desktop/Screenshot 2026-08-12 at 16.04.png`
+    /// on every Mac there has ever been, and an unquoted space is two arguments
+    /// — so the one thing this gesture must not do is hand an agent half a path.
+    ///
+    /// Asserted on the *text* rather than through a session, because a session
+    /// is a real PTY and a real child: what can be wrong here is the quoting.
+    #[test]
+    fn a_pasted_path_survives_the_spaces_a_screenshot_comes_with() {
+        let quote = |s: &str| typed_path(std::path::Path::new(s));
+        // The common case is untouched — an unquoted path reads better in a
+        // sentence, and most paths are.
+        assert_eq!(quote("/tmp/shot.png"), "/tmp/shot.png ");
+        // A trailing space, always: the sentence about the picture comes next.
+        assert!(quote("/tmp/a.png").ends_with(' '));
+        assert_eq!(
+            quote("/Users/me/Desktop/Screenshot 2026-08-12 at 16.04.png"),
+            "'/Users/me/Desktop/Screenshot 2026-08-12 at 16.04.png' "
+        );
+        // ...and a quote in the name closes, escapes and reopens, which is the
+        // one form that works in every shell.
+        assert_eq!(quote("/tmp/it's here.png"), r"'/tmp/it'\''s here.png' ");
+    }
+
     /// about the spelling, and the symptom of that is "unknown terminal verb"
     /// naming a verb that is plainly in the match below.
     #[test]
@@ -1166,6 +1583,7 @@ mod tests {
             ("terminal-normal", "normal"),
             ("terminal-insert", "insert"),
             ("terminal-paste", "paste"),
+            ("terminal-paste-image", "paste-image"),
         ] {
             let mut ed = Editor::new();
             let out = ed.run_action(name);

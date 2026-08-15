@@ -131,7 +131,7 @@ fn control_mode_answers_over_a_pipe() {
 ///     pressed edited that. Nothing in the resulting text records it.
 #[test]
 fn org_structure_edits_an_outline() {
-    let dir = std::env::temp_dir().join("zemacs_org_structure");
+    let dir = std::env::temp_dir().join(format!("zemacs_org_structure-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     let path = dir.join("plan.org");
@@ -294,7 +294,7 @@ fn org_structure_edits_an_outline() {
 fn hovering_a_diagnostic_mark_shows_what_is_wrong() {
     const MESSAGE: &str = "error: expected `;`, found `}` [probe]";
 
-    let dir = std::env::temp_dir().join("zemacs_hover");
+    let dir = std::env::temp_dir().join(format!("zemacs_hover-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     let path = dir.join("hover.rs");

@@ -64,7 +64,8 @@ fn an_org_subtree_folds_from_lisp_and_stops_occupying_rows() {
     )
     .expect("runtime/init.lisp must exist");
 
-    let init = std::env::temp_dir().join("zemacs_test_fold_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_fold_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

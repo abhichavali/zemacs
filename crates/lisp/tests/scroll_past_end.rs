@@ -74,7 +74,8 @@ fn scroll_past_end_is_a_setting_the_image_can_read_write_and_claim() {
     )
     .expect("runtime/modes/modes.lisp must exist");
 
-    let init = std::env::temp_dir().join("zemacs_test_scroll_past_end_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_scroll_past_end_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

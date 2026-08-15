@@ -84,7 +84,8 @@ fn runtime(name: &str) -> PathBuf {
 
 #[test]
 fn lisp_can_drive_a_json_rpc_child() {
-    let init = std::env::temp_dir().join("zemacs_test_rpc_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_rpc_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

@@ -113,7 +113,8 @@ fn wait_prompt(shared: &Shared, completing: bool) {
 
 #[test]
 fn lisp_can_make_buffers_run_verbs_and_ask_questions() {
-    let init = std::env::temp_dir().join("zemacs_test_prompt_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_prompt_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         "(in-package :zemacs)\n(message \"prompt test init loaded\")\n",

@@ -40,7 +40,8 @@ fn wait<T>(shared: &Shared, what: &str, f: impl Fn(&Editor) -> Option<T>) -> T {
 
 #[test]
 fn a_primitive_reaches_the_editor_from_a_lisp_worker_thread() {
-    let init = std::env::temp_dir().join("zemacs_test_worker_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_worker_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         // The marker is written from the *worker*, so the assertion cannot pass

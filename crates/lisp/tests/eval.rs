@@ -80,7 +80,8 @@ fn wait_for(
 
 #[test]
 fn init_lisp_drives_editor_commands() {
-    let init = std::env::temp_dir().join("zemacs_test_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         r#"(in-package :zemacs)
@@ -551,7 +552,8 @@ fn init_lisp_drives_editor_commands() {
     // a file that never says `(in-package :zemacs)` — the scratch buffer — call
     // the primitives unqualified. Without that binding this reads as an
     // undefined CL-USER::MESSAGE.
-    let file = std::env::temp_dir().join("zemacs_test_eval_file.lisp");
+    let file = std::env::temp_dir()
+        .join(format!("zemacs_test_eval_file-{}.lisp", std::process::id()));
     std::fs::write(&file, "(message \"evaluated from a file\")\n").unwrap();
     lisp.eval(format!("(%eval-file {:?})", file.display().to_string()));
     wait_message(&shared, "message from the loaded file", |m| {
@@ -572,16 +574,21 @@ fn init_lisp_drives_editor_commands() {
     // It is a real file, because `find-file` is the only primitive that can put
     // the editor in a *different* buffer; `insert` would write the header into
     // whatever the user was already editing.
-    let scratch = std::env::temp_dir().join("zemacs_test_scratch.lisp");
+    let scratch = std::env::temp_dir()
+        .join(format!("zemacs_test_scratch-{}.lisp", std::process::id()));
     let _ = std::fs::remove_file(&scratch);
     lisp.eval(format!(
         "(setf *scratch-file* (pathname {:?}))",
         scratch.display().to_string()
     ));
     lisp.eval("(lisp-scratch)".into());
+    // Compared against the path this test actually built, not a literal: the
+    // name carries the process id so two concurrent `cargo test` runs cannot
+    // write each other's fixture, and a hard-coded copy of it here is a second
+    // place that has to be kept in step.
+    let want = scratch.file_name().map(|n| n.to_owned());
     wait_for(&rx, &mut seen, "OpenFile for the scratch buffer", |c| {
-        matches!(c, EditorCommand::OpenFile(p)
-                 if p.file_name() == Some(std::ffi::OsStr::new("zemacs_test_scratch.lisp")))
+        matches!(c, EditorCommand::OpenFile(p) if p.file_name() == want.as_deref())
     });
     let header = std::fs::read_to_string(&scratch).expect("lisp-scratch must create the file");
     assert!(

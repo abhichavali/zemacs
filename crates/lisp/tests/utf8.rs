@@ -170,7 +170,8 @@ fn text_crossing_the_shim_is_characters_in_both_directions() {
     // `modes.lisp` alone first, then the two modes that read documents. Half the
     // tests in this directory load a mode file against a bare image and never
     // read a config, which is why this one does too.
-    let init = std::env::temp_dir().join("zemacs_test_utf8_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_utf8_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

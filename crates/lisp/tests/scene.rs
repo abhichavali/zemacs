@@ -117,7 +117,8 @@ fn a_page_built_in_lisp_reaches_the_buffer_and_its_clicks_come_back() {
     )
     .expect("runtime/init.lisp must exist");
 
-    let init = std::env::temp_dir().join("zemacs_test_scene_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_scene_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

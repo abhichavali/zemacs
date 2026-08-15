@@ -125,7 +125,8 @@ const TRICKY: &str = "\
 
 #[test]
 fn indentation_drives_the_closing_parentheses() {
-    let init = std::env::temp_dir().join("zemacs_test_parinfer_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_parinfer_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

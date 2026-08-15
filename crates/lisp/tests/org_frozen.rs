@@ -223,7 +223,8 @@ def solve(a, b):
 
 #[test]
 fn frozen_org_builds_a_page_of_nodes_that_the_cell_grid_could_not_have_drawn() {
-    let init = std::env::temp_dir().join("zemacs_test_org_frozen_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_org_frozen_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

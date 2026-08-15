@@ -136,7 +136,8 @@ fn wait_for_log(lisp: &zemacs_lisp::Lisp, path: &str, needle: &str) {
 
 #[test]
 fn changes_go_out_as_ranges_counted_in_utf16() {
-    let server = std::env::temp_dir().join("zemacs_fake_lsp_sync.sh");
+    let server = std::env::temp_dir()
+        .join(format!("zemacs_fake_lsp_sync-{}.sh", std::process::id()));
     std::fs::write(&server, FAKE_SERVER).unwrap();
     #[cfg(unix)]
     {
@@ -155,7 +156,8 @@ fn changes_go_out_as_ranges_counted_in_utf16() {
     // A root marker, so both sessions stop here rather than at /tmp.
     std::fs::write(format!("{DIR}/pyproject.toml"), "[project]\nname = \"x\"\n").unwrap();
 
-    let init = std::env::temp_dir().join("zemacs_test_lsp_sync_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_lsp_sync_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

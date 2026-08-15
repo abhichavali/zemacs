@@ -172,7 +172,8 @@ const COMPLETION: &str = r#"{"id":"gen-1","choices":[{"index":0,"message":{"role
 
 #[test]
 fn a_photograph_becomes_the_answer_to_the_problem_point_is_in() {
-    let root = std::env::temp_dir().join("zemacs_test_written");
+    let root = std::env::temp_dir()
+        .join(format!("zemacs_test_written-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let sync = root.join("MathSync");

@@ -111,11 +111,14 @@ fn the_tutor_opens_two_panes_at_the_contents_and_marks_what_you_write() {
     // Somewhere that is not the developer's own `~/.config/zemacs`: this test
     // records pass marks, and doing that over somebody's real progress would be
     // a rude way to run a test suite.
-    let progress = std::env::temp_dir().join("zemacs_test_tutor_progress.lisp");
-    let scratch = std::env::temp_dir().join("zemacs_test_tutor_check.lisp");
+    let progress = std::env::temp_dir()
+        .join(format!("zemacs_test_tutor_progress-{}.lisp", std::process::id()));
+    let scratch = std::env::temp_dir()
+        .join(format!("zemacs_test_tutor_check-{}.lisp", std::process::id()));
     let _ = std::fs::remove_file(&progress);
 
-    let init = std::env::temp_dir().join("zemacs_test_tutor_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_tutor_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

@@ -74,7 +74,8 @@ fn a_config_outside_the_runtime_still_finds_the_library() {
     // Somewhere with *nothing* beside it. A fresh directory rather than
     // `temp_dir()` itself, which on a developer's machine has whatever the last
     // hundred tests left in it — and one of those is a `zemacs_test_*.lisp`.
-    let home = std::env::temp_dir().join("zemacs_config_elsewhere");
+    let home = std::env::temp_dir()
+        .join(format!("zemacs_config_elsewhere-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
     let init = home.join("init.lisp");

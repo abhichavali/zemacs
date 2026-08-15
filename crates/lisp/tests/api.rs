@@ -88,7 +88,8 @@ fn load(shared: &Shared) {
 fn the_extension_api_reaches_the_editor() {
     // Nothing to configure: the whole point is that the library is installed by
     // the shim, before any config is read.
-    let init = std::env::temp_dir().join("zemacs_test_api_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_api_init-{}.lisp", std::process::id()));
     std::fs::write(&init, "(in-package :zemacs)\n(message \"api test init loaded\")\n").unwrap();
 
     let (tx, rx) = crossbeam_channel::unbounded();

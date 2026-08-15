@@ -261,7 +261,8 @@ Show that matrix multiplication is associative.
 
 #[test]
 fn a_curriculum_is_read_navigated_and_written_back() {
-    let dir = std::env::temp_dir();
+    let dir = std::env::temp_dir().join(format!("zemacs_test_math-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
     let org = dir.join("zemacs_test_math.org");
     // The figure lives beside the .org file, because that is what
     // `[[file:...]]` means in a document and what `%org-expand-file` implements.

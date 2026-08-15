@@ -63,7 +63,8 @@ fn runtime(name: &str) -> std::path::PathBuf {
 
 #[test]
 fn the_shared_helpers_do_what_the_copies_they_replaced_did() {
-    let init = std::env::temp_dir().join("zemacs_test_stdlib_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_stdlib_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

@@ -170,7 +170,8 @@ fn a_programming_problem_becomes_a_program_a_venv_and_a_run_key() {
     // A directory of our own, emptied first: every path below is derived from
     // the .org file's, so a leftover `.venv` from a previous run would make
     // "the environment is not built" untestable.
-    let root = std::env::temp_dir().join("zemacs-math-code-test");
+    let root = std::env::temp_dir()
+        .join(format!("zemacs-math-code-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     // Canonicalised, because `%math-code-curriculum-of` confirms with

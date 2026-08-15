@@ -65,7 +65,8 @@ fn runtime(name: &str) -> std::path::PathBuf {
 
 #[test]
 fn the_scanner_reads_rules_and_ignores_everything_else() {
-    let dir = std::env::temp_dir().join("zemacs_test_project_make");
+    let dir = std::env::temp_dir()
+        .join(format!("zemacs_test_project_make-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // Every line here is a claim about make's grammar, and the comment on each
     // says which. `\t` is load-bearing: a recipe line is one that starts with a
@@ -99,7 +100,8 @@ fn the_scanner_reads_rules_and_ignores_everything_else() {
     )
     .unwrap();
 
-    let init = std::env::temp_dir().join("zemacs_test_project_make_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_project_make_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

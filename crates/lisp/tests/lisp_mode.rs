@@ -80,10 +80,12 @@ fn lisp_editing_and_the_repl_are_built_in_lisp() {
     // config directory — the REPL writes to the *file* whenever its buffer is
     // not open, which headless it never is, and that is exactly what lets this
     // test read back what the REPL wrote.
-    let transcript = std::env::temp_dir().join("zemacs_test_repl.lisp");
+    let transcript = std::env::temp_dir()
+        .join(format!("zemacs_test_repl-{}.lisp", std::process::id()));
     let _ = std::fs::remove_file(&transcript);
 
-    let init = std::env::temp_dir().join("zemacs_test_lisp_mode_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_lisp_mode_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

@@ -103,7 +103,8 @@ fn modes_are_built_in_lisp() {
     )
     .expect("runtime/modes/modes.lisp must exist");
 
-    let init = std::env::temp_dir().join("zemacs_test_modes_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_modes_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

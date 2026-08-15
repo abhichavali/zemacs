@@ -125,7 +125,8 @@ fn a_typed_character_labels_the_screen_and_one_key_jumps() {
     )
     .expect("runtime/init.lisp must exist");
 
-    let init = std::env::temp_dir().join("zemacs_test_avy_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_avy_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

@@ -73,7 +73,8 @@ fn runtime(name: &str) -> std::path::PathBuf {
 /// A directory under the system temp directory, emptied first so a re-run does
 /// not inherit last run's markers.
 fn tree(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("zemacs_test_project_plugin").join(name);
+    let dir = std::env::temp_dir()
+        .join(format!("zemacs_test_project_plugin-{}", std::process::id())).join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -109,7 +110,8 @@ fn the_climb_and_the_build_table_answer_what_crates_project_used_to() {
     let explicit = repo.join("crates").join("app");
     std::fs::write(explicit.join(".project"), "").unwrap();
 
-    let init = std::env::temp_dir().join("zemacs_test_project_plugin_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_project_plugin_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(
@@ -305,5 +307,6 @@ fn the_climb_and_the_build_table_answer_what_crates_project_used_to() {
         m == "no compile command for a git project"
     });
 
-    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("zemacs_test_project_plugin"));
+    let _ = std::fs::remove_dir_all(std::env::temp_dir()
+        .join(format!("zemacs_test_project_plugin-{}", std::process::id())));
 }

@@ -94,7 +94,8 @@ fn a_completion_reply_becomes_a_popup_and_a_keystroke_puts_one_in_the_buffer() {
     )
     .expect("runtime/init.lisp must exist");
 
-    let init = std::env::temp_dir().join("zemacs_test_completion_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_completion_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

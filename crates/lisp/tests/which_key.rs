@@ -72,7 +72,8 @@ fn a_pending_prefix_reaches_which_key_and_lands_in_the_status_line() {
     )
     .expect("runtime/init.lisp must exist");
 
-    let init = std::env::temp_dir().join("zemacs_test_which_key_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_which_key_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

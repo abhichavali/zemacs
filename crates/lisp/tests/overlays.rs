@@ -80,7 +80,8 @@ fn wait_overlays(shared: &Shared, n: usize) {
 
 #[test]
 fn overlays_reach_the_editor_and_move_with_the_text() {
-    let init = std::env::temp_dir().join("zemacs_test_overlay_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_overlay_init-{}.lisp", std::process::id()));
     std::fs::write(&init, "(in-package :zemacs)\n(message \"overlay test init loaded\")\n").unwrap();
 
     let (tx, _rx) = crossbeam_channel::unbounded();

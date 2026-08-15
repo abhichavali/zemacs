@@ -87,7 +87,8 @@ fn expect(shared: &Shared, want: &[(usize, usize)]) {
 
 #[test]
 fn the_bracket_at_point_and_its_partner_are_both_highlighted() {
-    let init = std::env::temp_dir().join("zemacs_test_show_paren_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_show_paren_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(

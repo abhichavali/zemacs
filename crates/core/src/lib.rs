@@ -2530,9 +2530,10 @@ pub struct Editor {
     ///
     /// Per *editor* rather than per buffer: it is a cache of rendered pixels,
     /// like the theme is a table of colours, and nothing about it belongs to one
-    /// document. ponytail: nothing evicts. The set is bounded by the distinct
-    /// fragments a session actually previews, which is small — the day it is
-    /// not, drop entries no buffer's overlays still name.
+    /// document. This said "nothing evicts" for a long time and no longer does:
+    /// [`Editor::prune_images`] drops every entry no buffer's overlays, no
+    /// buffer's scene and not the dashboard still names, and it runs whenever an
+    /// edit or an overlay command actually let go of one.
     images: HashMap<ImageId, Image>,
     /// The em, in the device pixels the renderer draws with — `font_size` times
     /// the display's scale factor, which core cannot know and the renderer parks

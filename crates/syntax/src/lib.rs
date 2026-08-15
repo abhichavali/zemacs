@@ -610,13 +610,18 @@ impl Session {
             Some(old) => requery(config, &mut self.cursor, old, &tree, text, edit),
             None => spans(config, &mut self.cursor, &tree, text, 0..text.len()),
         };
-        // ponytail: from here down the work is the size of the *file* again —
-        // a copy of every span, and a walk of the text to put the copy in char
-        // offsets — which is what now dominates a keystroke in a megabyte
-        // buffer, at a few milliseconds where the query used to be a hundred.
-        // The upgrade is to hand the caller the changed run instead of the
-        // whole list, and that is a change to core's and the renderer's side of
-        // the boundary rather than to this crate's.
+        // From here down the work is the size of the *file* again — a copy of
+        // every span, and a walk of the text to put the copy in char offsets.
+        //
+        // This carried a `ponytail:` claiming that now dominates a keystroke in
+        // a megabyte buffer "at a few milliseconds", and proposing that the
+        // caller be handed the changed run instead. Measured, it does not: at
+        // 2.8 MB the clone is 0.073 ms and `text.to_string()` 0.046 ms of a
+        // 9.35 ms warm keystroke, because `to_char_offsets` early-returns on
+        // ASCII. The 9.35 ms is the incremental parse and the widening in
+        // `requery`. Left as it is, and the note deleted rather than kept:
+        // an upgrade path pointing at 1% of the cost sends the next reader to
+        // the wrong end of the function.
         let mut out = bytes.clone();
         to_char_offsets(text, &mut out);
         if let Some(buffer) = buffer {

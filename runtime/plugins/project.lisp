@@ -1,18 +1,26 @@
-;;;; project.lisp — where a project starts, and what "build it" means there.
+;;;; project.lisp — where a project starts, what "build it" means there, and
+;;;; every picker that opens onto one.
 ;;;;
-;;;; Wave 2 of the Common Lisp migration, and deliberately only the half of
-;;;; `crates/app/src/project.rs' that is *policy*. The split is the boundary in
-;;;; `docs/boundary.org', applied verb by verb:
+;;;; Waves 2 and 3 of the Common Lisp migration. Wave 2 moved the four questions
+;;;; answered by a handful of `probe-file' calls and a table; wave 3 moved the
+;;;; four pickers, which needed something first. The split now:
 ;;;;
-;;;;   here    project-root, project-dired, project-compile, project-test —
-;;;;           four questions answered by a handful of `probe-file' calls and a
-;;;;           table, once per command.
-;;;;   Rust    project-find-file, project-find-dir, project-forget — a walk of
-;;;;           the whole tree behind a cache that has to answer between two
-;;;;           keystrokes; project-switch and project-open, which need a prompt
-;;;;           seeded with candidates core owns.
+;;;;   here    every `project-' verb but one.
+;;;;   Rust    the tree walk behind `project-files' / `project-dirs', which has
+;;;;           to answer between two keystrokes and is a cache rather than a
+;;;;           decision; and `project-forget', which drops that cache.
 ;;;;
-;;;; The table below is the reason this moved. `cargo build' being what a Rust
+;;;; What wave 3 needed was a way to *seed a prompt with candidates core owns*.
+;;;; `docs/boundary.org' listed the absence of one as the reason these four
+;;;; could not move: `completing-read' carried its own candidates and could not
+;;;; borrow the app's, and a project's file list is exactly the list you must not
+;;;; carry into the image and back out again. Three verbs closed it —
+;;;; `prompt-text', `prompt-label' and `prompt-source' — and the third is the
+;;;; interesting one: Lisp names the list it wants and the app fills the picker
+;;;; directly, so the label, the callback and what accepting one *means* are
+;;;; here, and fifty thousand paths never cross the shim.
+;;;;
+;;;; The table below is the reason wave 2 moved. `cargo build' being what a Rust
 ;;;; project's `SPC p c' runs was a `match' arm in `crates/project', so wanting
 ;;;; `cargo build --release', or `zig build' for a `build.zig', meant editing
 ;;;; Rust and recompiling. It is now a list you can PUSH onto from your init,
@@ -180,3 +188,155 @@ repository called `my\"repo'."
 (defun project-test ()
   "Run this project's tests, in an output pane. Bound to `SPC p t'."
   (%project-run :test "test"))
+
+;;; ---------------------------------------------------------------------------
+;;; The pickers
+;;;
+;;; Each is the same three moves: open a `completing-read' with no candidates,
+;;; name the list the app should pour into it, and say what accepting one does.
+;;; The list never enters the image — see the header — so a repository with fifty
+;;; thousand files costs the same here as one with ten.
+;;;
+;;; The order matters and is the only subtlety. `completing-read' and
+;;; `prompt-source' are both `%do' verbs, so they are applied in the order they
+;;; were emitted: the prompt exists by the time the app goes looking for one to
+;;; fill.
+
+(defun %project-name (root)
+  "ROOT's own directory name, for a prompt label — `zemacs', not the whole path."
+  (or (car (last (pathname-directory root))) (namestring root)))
+
+(defun %project-pick (source label callback)
+  "Ask LABEL over the app's SOURCE list, and call CALLBACK with the answer.
+
+CALLBACK is spared the two checks every one of these wants: a cancelled prompt
+answers NIL, and a prompt with nothing highlighted answers whatever was typed,
+which for a picker over paths may be the empty string."
+  (completing-read label nil
+                   (lambda (answer)
+                     (when (and answer (plusp (length answer)))
+                       (funcall callback answer))))
+  (%do "prompt-source" source 0 0)
+  nil)
+
+(defun project-find-file ()
+  "Pick a file from anywhere in this project. Bound to `SPC p f'.
+
+The list is the app's cached walk of the tree, which is what makes it answer
+between two keystrokes. What is *here* is the part worth bending: which project
+you are in, what the prompt says, and that accepting one opens it — swap
+`find-file' for a split and `SPC p f' opens in the other window."
+  (let ((found (%project-at)))
+    (if (null found)
+        (message *project-none*)
+        (let ((root (namestring (first found))))
+          (%project-pick (format nil "project-files ~a" root)
+                         (format nil "~a: " (%project-name (first found)))
+                         #'find-file))))
+  nil)
+
+(defun project-find-dir ()
+  "Pick a directory from anywhere in this project. Bound to `SPC p D'.
+
+The same listing folded up to the directories holding those files, so it costs
+one pass over a list that is already cached rather than a second walk. Accepting
+one opens it as a directory, which is dired."
+  (let ((found (%project-at)))
+    (if (null found)
+        (message *project-none*)
+        (let ((root (namestring (first found))))
+          (%project-pick (format nil "project-dirs ~a" root)
+                         (format nil "~a directory: " (%project-name (first found)))
+                         #'find-file))))
+  nil)
+
+(defun project-switch ()
+  "Pick from the projects visited before. Bound to `SPC p p'.
+
+They open as directories, and a directory opens dired, which is where you would
+want to land.
+
+An ordinary `completing-read' rather than a `prompt-source', because this list
+is a few dozen paths and it is worth having *in the image*: with nothing
+remembered, switching project simply is browsing for one, and only a caller that
+can see the list is empty can hand over to `project-open' instead of opening a
+picker onto nothing."
+  (let ((seen (project-recent)))
+    (cond
+      ((null seen)
+       (message "no projects visited yet — type a path to one")
+       (project-open))
+      (t (completing-read "Switch to project: " seen
+                          (lambda (answer)
+                            (when (and answer (plusp (length answer)))
+                              (find-file answer)))))))
+  nil)
+
+(defparameter *project-grep-limit* 2000
+  "Most rows `project-grep' will put in the listing. Past this you are reading a
+concordance rather than a search result, and the thing to do is narrow the
+pattern.")
+
+(defun project-grep ()
+  "Search the project and put every hit in a buffer. Bound to `SPC p g'.
+
+The other half of `search-project', which is the same ripgrep through a
+*picker*: a picker offers you one of its candidates and throws the rest away,
+and this is for the times when the list itself is the answer — reading every
+call site, or replacing across them, which is `r' in the listing.
+
+Absolute paths, because the rows outlive the search: `find-file-at' opens one
+long after the process's own directory has stopped being relevant, and
+`xref-replace' writes to them. Passing the root as ripgrep's *path argument* is
+what makes them absolute — it prints what it was given."
+  (let ((found (%project-at)))
+    (if (null found)
+        (message *project-none*)
+        (let ((root (namestring (first found))))
+          (read-string "Search project: "
+            (lambda (pattern)
+              (when (and pattern (plusp (length pattern)))
+                (multiple-value-bind (out status)
+                    (run-process "rg" (list "--line-number" "--no-heading"
+                                            "--color=never" "--smart-case"
+                                            "--" pattern root))
+                  (let ((rows (remove "" (split-string (or out "") #\Newline)
+                                      :test #'string=)))
+                    (cond
+                      ;; ripgrep exits 1 for "no matches", which is not a
+                      ;; failure — an empty output with a clean exit is the same
+                      ;; answer said twice.
+                      ((and (null rows) (eq status :exited))
+                       (message (format nil "no matches for ~a" pattern)))
+                      ((null rows)
+                       (message (format nil "rg: ~a" (or out status))))
+                      (t
+                       (let ((rows (if (> (length rows) *project-grep-limit*)
+                                       (subseq rows 0 *project-grep-limit*)
+                                       rows)))
+                         (xref-show (format nil "~a hit~:p for ~a"
+                                            (length rows) pattern)
+                                    rows))))))))))))
+  nil)
+
+(defun project-open ()
+  "Type the path of a directory anywhere on the filesystem. Bound to `SPC p o'.
+
+The hole this fills: `project-switch' can only offer roots you have been in and
+`project-find-file' is scoped to one of them, so a project you had never opened
+was unreachable from the project keymap — which is the only place anyone looks
+for it.
+
+This is the editor's own file picker rather than a `completing-read', because
+the app completes it from the filesystem one directory at a time: typing or Tab
+descends, and a leading `/' starts again from the root. Seeded at an *expanded*
+home rather than a literal `~/', because those completions come back as absolute
+paths and the fuzzy filter would match none of them against a tilde.
+
+Accepting a directory opens dired on it *and* records it as a project, because
+the app remembers every directory it opens — so this prompt is only ever needed
+for the first visit and `project-switch' covers the rest."
+  (open-prompt "file")
+  (%do "prompt-label" "Open directory: " 0 0)
+  (%do "prompt-text" (namestring (user-homedir-pathname)) 0 0)
+  nil)

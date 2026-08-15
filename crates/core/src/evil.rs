@@ -19,6 +19,7 @@ use crate::{
     PromptKind,
 };
 use regex::Regex;
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -256,6 +257,13 @@ pub(crate) struct Vim {
     /// arrives through a *prompt*, so the verb has to outlive the keystroke
     /// that named it by however long it takes to type the pattern.
     search_op: Option<Op>,
+    /// The last regex compiled for a search, beside the exact arguments it was
+    /// compiled from. See [`Vim::regex`].
+    re_cache: RefCell<Option<(String, bool, Option<Regex>)>>,
+    /// How many times [`Vim::regex`] actually reached the engine, so a test can
+    /// assert that the cache was *used* rather than assert on a clock.
+    #[cfg(test)]
+    compiles: std::cell::Cell<usize>,
 }
 
 impl Vim {
@@ -302,6 +310,54 @@ impl Vim {
             }
             self.registers.insert('1', (text.to_string(), linewise));
         }
+    }
+
+    /// [`compile`], remembering the last answer.
+    ///
+    /// The pattern the screen is lit with does not change between frames, but
+    /// `search_hits` runs once per *pane* per drawn frame, so a four-pane window
+    /// with `hlsearch` on compiled the same pattern four times every time
+    /// anything moved. **It was never as expensive as it looked**: release, this
+    /// machine, a compile plus the first scan that builds the lazy DFA is 0.003
+    /// ms for `fn` and 0.015 ms for the `\bfn\b` that `*` produces, so four
+    /// panes were spending 0.01–0.06 ms of a 1.6 ms draw — under one per cent
+    /// to about four, not the tenth of a frame it was feared to be, and below
+    /// what the frame timer can resolve on a machine with anything else
+    /// running. It is here because a cache is smaller than the compile it
+    /// replaces and there is one pattern to hold, not because a profile
+    /// screamed.
+    ///
+    /// **The key is `compile`'s whole argument list and nothing else**, which is
+    /// the only key that can be right: `\c` and `\C` live inside `pat` and so
+    /// come along for free, `ignore_case` is the caller's own smart-case
+    /// decision and can flip while the text stays the same — `:s/x/y/i` after
+    /// `/x` — and direction never reaches the engine at all, because `?` is a
+    /// different way of *walking* the same matches. A cache keyed on the
+    /// pattern alone would quietly hand back a case-folded regex to a search
+    /// that asked for a case-sensitive one.
+    ///
+    /// A pattern that does not compile is cached as the `None` it produced.
+    /// Half a regex is normal input — it is what every `/` prompt holds between
+    /// the first character and the last — so the failing case is the *common*
+    /// one during incremental search, and it is the one worth not repeating.
+    ///
+    /// One slot, because there is one search pattern at a time and every caller
+    /// asks about that one. ponytail: two callers alternating patterns would
+    /// thrash it and be no worse than before; a two-entry array is the fix if
+    /// something ever does.
+    fn regex(&self, pat: &str, ignore_case: bool) -> Option<Ref<'_, Regex>> {
+        let stale = !matches!(&*self.re_cache.borrow(),
+            Some((p, c, _)) if p == pat && *c == ignore_case);
+        if stale {
+            #[cfg(test)]
+            self.compiles.set(self.compiles.get() + 1);
+            *self.re_cache.borrow_mut() =
+                Some((pat.to_string(), ignore_case, compile(pat, ignore_case)));
+        }
+        // Handed out borrowed rather than cloned: `Regex::clone` is an `Arc`
+        // bump plus a fresh scratch pool, which is cheap next to a compile but
+        // is not free, and every caller here is done with it before it returns.
+        Ref::filter_map(self.re_cache.borrow(), |s| s.as_ref()?.2.as_ref()).ok()
     }
 }
 
@@ -3123,13 +3179,15 @@ impl Editor {
     /// Char offsets in and out; the engine works in bytes, so the conversion
     /// happens here and nowhere else.
     ///
-    /// ponytail: the pattern is compiled and the rope flattened on every call,
-    /// and incremental search calls it once per keystroke rather than once per
-    /// `n`. Both are a whole-buffer allocation for what is usually a match a
-    /// few characters away. Cache the compiled pattern and feed the engine the
-    /// rope's chunks when a large file starts to feel it.
+    /// ponytail: the rope is flattened on every call, and incremental search
+    /// calls it once per keystroke rather than once per `n` — a whole-buffer
+    /// allocation for what is usually a match a few characters away. 0.22 ms at
+    /// 2.8 MB, which is the whole of what a keystroke here costs now that the
+    /// compile comes from [`Vim::regex`]: the pattern was never the expensive
+    /// half. Feed the engine the rope's chunks if a much larger file starts to
+    /// feel it.
     fn search_pos(&self, pat: &str, from: usize, forward: bool) -> Option<usize> {
-        let re = compile(pat, false)?;
+        let re = self.vim.regex(pat, false)?;
         let hay = self.buffer.text.to_string();
         let start = self
             .buffer
@@ -3177,10 +3235,9 @@ impl Editor {
     /// `last` is exclusive and clamped, so a pane whose rows outrun the buffer
     /// asks about lines that are not there and gets nothing rather than a panic.
     ///
-    /// ponytail: the pattern is compiled per call, which is once per pane per
-    /// drawn frame. Tens of microseconds against a draw measured in
-    /// milliseconds, and the idle loop no longer draws at all — cache it on the
-    /// editor beside `last_search` if a profile ever disagrees.
+    /// The pattern comes from [`Vim::regex`], so it is compiled once per
+    /// *change* of pattern rather than once per pane per drawn frame — see
+    /// there for what that was worth, which is less than it sounds.
     pub fn search_hits(
         &self,
         buf: &crate::Buffer,
@@ -3191,7 +3248,7 @@ impl Editor {
         if pat.is_empty() {
             return Vec::new();
         }
-        let Some(re) = compile(pat, false) else {
+        let Some(re) = self.vim.regex(pat, false) else {
             return Vec::new();
         };
         let lines = buf.len_lines();
@@ -3231,7 +3288,7 @@ impl Editor {
             return vec![EditorCommand::Message("no previous search".into())];
         }
         let pat = self.last_search.clone();
-        if compile(&pat, false).is_none() {
+        if self.vim.regex(&pat, false).is_none() {
             return vec![EditorCommand::Message(format!("bad pattern: {pat}"))];
         }
         match self.search_pos(&pat, from, forward) {
@@ -5541,6 +5598,88 @@ mod tests {
         // 12 and not 14: `é` and `ö` are two bytes each and one character each.
         assert_eq!(hits[1], (12, 17));
         assert_eq!(&ed.buffer.slice_string(hits[1].0, hits[1].1), "héllo");
+    }
+
+    /// The whole point of the cache: `search_hits` runs once per pane per drawn
+    /// frame, so four panes lighting one pattern must reach the regex engine
+    /// once between them and not four times.
+    #[test]
+    fn four_panes_lighting_one_pattern_compile_it_once() {
+        let mut ed = fresh("one two one two\n");
+        ed.last_search = "one".into();
+
+        let before = ed.vim.compiles.get();
+        for _ in 0..4 {
+            assert_eq!(ed.search_hits(&ed.buffer, 0, 10).len(), 2);
+        }
+        assert_eq!(ed.vim.compiles.get(), before + 1, "four panes, one compile");
+
+        // A different pattern is a different regex, and the cache must not
+        // answer for it — with the *hits* proving it, not only the counter.
+        ed.last_search = "two".into();
+        let hits = ed.search_hits(&ed.buffer, 0, 10);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(&ed.buffer.slice_string(hits[0].0, hits[0].1), "two");
+        assert_eq!(ed.vim.compiles.get(), before + 2);
+        assert_eq!(ed.search_hits(&ed.buffer, 0, 10).len(), 2);
+        assert_eq!(ed.vim.compiles.get(), before + 2, "and then it is cached");
+
+        // Typing into a `/` prompt changes the pattern every keystroke, which is
+        // a miss every time and has to be: the file lights up as you type.
+        ed.handle_key(Key::Char('/'));
+        let typing = ed.vim.compiles.get();
+        for c in "two".chars() {
+            ed.handle_key(Key::Char(c));
+            ed.search_hits(&ed.buffer, 0, 10);
+        }
+        assert_eq!(ed.vim.compiles.get(), typing + 3);
+    }
+
+    /// The bug a pattern-keyed cache would introduce, and it is silent: the same
+    /// pattern *text* compiles to two different regexes depending on the case
+    /// rule asked for, so `/alpha` followed by `:s//x/i` would be handed back a
+    /// case-sensitive regex for a fold that asked for neither.
+    #[test]
+    fn the_same_pattern_folded_and_not_are_two_different_regexes() {
+        let ed = fresh("Alpha alpha\n");
+        let hay = "Alpha alpha";
+        let count = |pat: &str, fold: bool| {
+            ed.vim.regex(pat, fold).map(|re| re.find_iter(hay).count())
+        };
+
+        assert_eq!(count("alpha", false), Some(1));
+        let after = ed.vim.compiles.get();
+        // A stale answer here would still say one.
+        assert_eq!(count("alpha", true), Some(2));
+        assert_eq!(ed.vim.compiles.get(), after + 1, "the flag is part of the key");
+        // And back the other way, which is the same trap mirrored.
+        assert_eq!(count("alpha", false), Some(1));
+
+        // `\c` and `\C` ride inside the pattern text, so they need no key of
+        // their own — the string is different, so the cache is already right.
+        assert_eq!(count(r"\calpha", false), Some(2));
+        assert_eq!(count(r"\Calpha", false), Some(1));
+    }
+
+    /// Half a regex is what a `/` prompt holds for every keystroke but the last,
+    /// so a pattern that does not compile is ordinary input: nothing lights up,
+    /// nothing is said, and the failure is remembered as a failure rather than
+    /// re-attempted once per pane.
+    #[test]
+    fn a_half_typed_pattern_lights_nothing_and_is_not_recompiled() {
+        let mut ed = fresh("a b c\n");
+        // A character class with nothing closing it yet. `(` would not do —
+        // that one is literal text in vim's dialect and compiles fine.
+        ed.last_search = "[ab".into();
+        let before = ed.vim.compiles.get();
+        for _ in 0..4 {
+            assert!(ed.search_hits(&ed.buffer, 0, 10).is_empty());
+        }
+        assert_eq!(ed.vim.compiles.get(), before + 1);
+
+        // ...and the next character finishing it is a hit, not a stale `None`.
+        ed.last_search = "[ab]".into();
+        assert_eq!(ed.search_hits(&ed.buffer, 0, 10).len(), 2);
     }
 
     /// A pattern that can match nothing matches *everywhere*, and a zero-width
@@ -8088,4 +8227,3 @@ mod window_zoom {
         }
     }
 }
-

@@ -43,9 +43,9 @@
 //!
 //! Anything that can lose work is its own named function and says so in its
 //! first line: [`reset_hard`], [`discard`], [`discard_untracked`],
-//! [`discard_hunk`], [`stash_drop`], [`branch_delete_force`], [`rebase_abort`],
-//! [`drop_commit`], [`amend`], [`reword`], [`squash`]. None of them is the
-//! fallback arm of anything.
+//! [`discard_hunk`], [`discard_lines`], [`stash_drop`], [`branch_delete_force`],
+//! [`rebase_abort`], [`sequence_abort`], [`resolve`], [`push_force`], [`drop_commit`], [`amend`],
+//! [`reword`], [`squash`]. None of them is the fallback arm of anything.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -57,7 +57,10 @@ mod hunk;
 mod rebase;
 pub mod render;
 
-pub use hunk::{discard_hunk, file_diff, stage_hunk, unstage_hunk, FileDiff, Hunk};
+pub use hunk::{
+    discard_hunk, discard_lines, file_diff, stage_hunk, stage_lines, unstage_hunk, unstage_lines,
+    FileDiff, Hunk,
+};
 pub use rebase::{
     amend, drop_commit, parse_todo, plan_last, plan_onto, rebase_abort, rebase_continue,
     rebase_skip, rebase_start, rebase_state, reword, squash, write_todo, Action, Plan, Rebase,
@@ -96,6 +99,11 @@ pub struct Status {
     pub stashes: Vec<Stash>,
     /// The last [`RECENT`] commits, newest first. Empty on an unborn HEAD.
     pub recent: Vec<Commit>,
+    /// The commits behind [`Status::ahead`], newest first: what a push would
+    /// send. Empty when there is no upstream, or when there is nothing to send.
+    pub unpushed: Vec<Commit>,
+    /// The commits behind [`Status::behind`]: what a pull would bring.
+    pub unpulled: Vec<Commit>,
 }
 
 impl Status {
@@ -222,6 +230,12 @@ pub struct View {
     pub diffs: Vec<FileDiff>,
     /// Sections folded shut. Empty is Magit's default: everything open.
     pub collapsed: Vec<Section>,
+    /// Commits the user has opened, as `(hash, what git show said)`. Text and
+    /// not a [`FileDiff`], because nothing can be staged out of a commit.
+    pub shown: Vec<(String, String)>,
+    /// How many commits the log section shows. `0` is [`RECENT`], which is what
+    /// a status buffer nobody has asked for more from wants.
+    pub log_limit: usize,
 }
 
 impl View {
@@ -234,17 +248,17 @@ impl View {
     pub fn of(status: Status) -> View {
         View {
             status,
-            diffs: Vec::new(),
-            collapsed: Vec::new(),
+            ..View::default()
         }
     }
 
-    /// Re-read git, keeping the folds and reloading every open diff.
+    /// Re-read git, keeping the folds and reloading everything open.
     ///
     /// A file that has left its section — staged, committed, discarded — simply
-    /// falls shut, because there is nothing left there to show.
+    /// falls shut, because there is nothing left there to show, and so does a
+    /// commit that a rewrite has left with no such hash.
     pub fn refresh(&mut self, repo: &Path) -> Result<()> {
-        self.status = status(repo)?;
+        self.status = status_with(repo, self.limit())?;
         let open: Vec<(Section, PathBuf)> = self
             .diffs
             .iter()
@@ -258,6 +272,40 @@ impl View {
                 }
             }
         }
+        let shown: Vec<String> = self.shown.iter().map(|(hash, _)| hash.clone()).collect();
+        self.shown.clear();
+        for hash in shown {
+            if let Ok(text) = show(repo, &hash) {
+                self.shown.push((hash, text));
+            }
+        }
+        Ok(())
+    }
+
+    /// How many commits the log section is asking for.
+    pub fn limit(&self) -> usize {
+        if self.log_limit == 0 {
+            RECENT
+        } else {
+            self.log_limit
+        }
+    }
+
+    /// The open diff for a commit, if it is open.
+    pub fn commit_diff(&self, hash: &str) -> Option<&str> {
+        self.shown
+            .iter()
+            .find(|(open, _)| open == hash)
+            .map(|(_, text)| text.as_str())
+    }
+
+    /// Show a commit's patch under its line in the log, or hide it again.
+    pub fn toggle_commit(&mut self, repo: &Path, hash: &str) -> Result<()> {
+        if let Some(at) = self.shown.iter().position(|(open, _)| open == hash) {
+            self.shown.remove(at);
+            return Ok(());
+        }
+        self.shown.push((hash.to_string(), show(repo, hash)?));
         Ok(())
     }
 
@@ -324,6 +372,12 @@ pub fn repo_root(from: &Path) -> Option<PathBuf> {
 /// commits has no log and one with no stash ref has no stashes, and neither is
 /// a reason to have no status buffer.
 pub fn status(repo: &Path) -> Result<Status> {
+    status_with(repo, RECENT)
+}
+
+/// [`status`], with the length of the log section chosen by the caller — what
+/// Magit's `l` does when ten commits are not far enough back.
+pub fn status_with(repo: &Path, recent: usize) -> Result<Status> {
     let out = git(
         repo,
         [
@@ -338,7 +392,17 @@ pub fn status(repo: &Path) -> Result<Status> {
     status.in_progress = in_progress(repo);
     status.rebase = rebase_state(repo).ok().flatten();
     status.stashes = stashes(repo).unwrap_or_default();
-    status.recent = log(repo, RECENT).unwrap_or_default();
+    status.recent = log(repo, recent).unwrap_or_default();
+    // The counts came out of the porcelain, so a branch level with its upstream
+    // — which is most of them, most of the time — pays for no extra `git log`
+    // at all. `@{upstream}` rather than the name, so a remote called `-f` or a
+    // branch with a slash in it is git's problem and not a parse of ours.
+    if status.ahead > 0 {
+        status.unpushed = log_range(repo, "@{upstream}..HEAD", status.ahead).unwrap_or_default();
+    }
+    if status.behind > 0 {
+        status.unpulled = log_range(repo, "HEAD..@{upstream}", status.behind).unwrap_or_default();
+    }
     Ok(status)
 }
 
@@ -438,14 +502,97 @@ pub fn commit(repo: &Path, message: &str) -> Result<String> {
 }
 
 /// Push to the configured upstream. Fails loudly when there is none — that is
-/// something the user has to see, not something to paper over.
-///
-/// ponytail: no `--set-upstream` variant, so the first push of a new branch has
-/// to happen elsewhere. Adding one is `push --set-upstream <remote> HEAD`, but
-/// it needs UI for choosing the remote.
+/// something the user has to see, not something to paper over. [`push_upstream`]
+/// is the one that configures it.
 pub fn push(repo: &Path) -> Result<String> {
     let out = run(repo, ["push"])?;
     Ok(last_line(&out).unwrap_or_else(|| "pushed".into()))
+}
+
+/// Push, and make the branch track where it was pushed. The first push of a new
+/// branch, which plain [`push`] refuses for want of an upstream.
+///
+/// `HEAD` rather than the branch name so that nothing has to be parsed out of
+/// the status first, and so a name with a slash in it cannot be misread.
+pub fn push_upstream(repo: &Path, remote: &str) -> Result<String> {
+    let out = run(
+        repo,
+        [
+            "push".to_string(),
+            "--set-upstream".into(),
+            rev(remote)?.to_string(),
+            "HEAD".into(),
+        ],
+    )?;
+    Ok(last_line(&out).unwrap_or_else(|| "pushed".into()))
+}
+
+/// **Overwrites the remote branch.** Whatever the remote had that we do not is
+/// no longer on it, and no reflog on this machine remembers it — the commits
+/// were somebody else's, on their machine.
+///
+/// `--force-with-lease` rather than `--force`: it refuses if the remote has
+/// moved since we last fetched, so this can throw away *our* stale view of the
+/// branch and never a push that arrived while we were not looking.
+pub fn push_force(repo: &Path) -> Result<String> {
+    let out = run(repo, ["push", "--force-with-lease"])?;
+    Ok(last_line(&out).unwrap_or_else(|| "pushed".into()))
+}
+
+/// Merge `rev` into HEAD, committing the result when it is clean.
+///
+/// A conflict comes back as an error carrying git's own words and leaves the
+/// merge half-finished, which the status buffer says: [`sequence_continue`] and
+/// [`sequence_abort`] are the two ways out.
+pub fn merge(repo: &Path, revision: &str) -> Result<String> {
+    let out = run(
+        repo,
+        [
+            "merge".to_string(),
+            "--no-edit".into(),
+            rev(revision)?.to_string(),
+        ],
+    )?;
+    Ok(last_line(&out).unwrap_or_else(|| "merged".into()))
+}
+
+/// Carry on with whatever is half-finished, once the conflicts are staged.
+///
+/// One verb for four operations because the user has one gesture for them: the
+/// status buffer already says which of them stopped, and `git merge`,
+/// `cherry-pick`, `revert` and `rebase` each spell `--continue` the same way.
+pub fn sequence_continue(repo: &Path) -> Result<String> {
+    let op = in_progress(repo).context("nothing in progress to continue")?;
+    let out = run(repo, [op.label(), "--continue"])?;
+    Ok(last_line(&out).unwrap_or_else(|| "continued".into()))
+}
+
+/// **Destroys work.** Throws away everything the half-finished merge, rebase,
+/// cherry-pick or revert has done, along with every conflict resolution made in
+/// the working tree since it stopped, and puts HEAD, the index and the working
+/// tree back where the operation began. None of it is in any reflog.
+pub fn sequence_abort(repo: &Path) -> Result<String> {
+    let op = in_progress(repo).context("nothing in progress to abort")?;
+    let out = run(repo, [op.label(), "--abort"])?;
+    Ok(last_line(&out).unwrap_or_else(|| "aborted".into()))
+}
+
+/// **Destroys work.** Resolves a conflicted file by taking one whole side of it
+/// — `ours` is what HEAD had, theirs is what is being merged in — and stages
+/// the result, which is what marks it resolved. Every edit made to that file
+/// since the conflict appeared, a half-finished resolution by hand included, is
+/// overwritten and was never committed.
+pub fn resolve(repo: &Path, path: &Path, ours: bool) -> Result<()> {
+    git(
+        repo,
+        [
+            OsStr::new("checkout"),
+            OsStr::new(if ours { "--ours" } else { "--theirs" }),
+            OsStr::new("--"),
+            path.as_os_str(),
+        ],
+    )?;
+    stage(repo, path)
 }
 
 pub fn pull(repo: &Path) -> Result<String> {
@@ -479,6 +626,12 @@ pub fn diff(repo: &Path, path: &Path, staged: bool) -> Result<String> {
 
 /// The last `n` commits on HEAD, newest first.
 pub fn log(repo: &Path, n: usize) -> Result<Vec<Commit>> {
+    log_range(repo, "HEAD", n)
+}
+
+/// The last `n` commits of a range — `"HEAD"`, `"@{upstream}..HEAD"` — newest
+/// first.
+pub fn log_range(repo: &Path, range: &str, n: usize) -> Result<Vec<Commit>> {
     let out = git(
         repo,
         [
@@ -487,12 +640,48 @@ pub fn log(repo: &Path, n: usize) -> Result<Vec<Commit>> {
             "--no-color".into(),
             format!("--max-count={n}"),
             "--format=%h%x1f%s".into(),
+            rev(range)?.to_string(),
         ],
     )?;
     Ok(records(&out)
         .into_iter()
         .map(|(hash, subject)| Commit { hash, subject })
         .collect())
+}
+
+/// One commit as git shows it: the header, the diffstat and the patch.
+///
+/// Text rather than a [`FileDiff`], because nothing can be staged out of a
+/// commit — it is there to be read.
+pub fn show(repo: &Path, revision: &str) -> Result<String> {
+    let out = git(
+        repo,
+        [
+            "show".to_string(),
+            "--no-color".into(),
+            "--no-ext-diff".into(),
+            "--stat".into(),
+            "--patch".into(),
+            rev(revision)?.to_string(),
+        ],
+    )?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// A commit's whole message, subject and body — what goes into the buffer when
+/// the message is about to be rewritten.
+pub fn message_of(repo: &Path, revision: &str) -> Result<String> {
+    let out = git(
+        repo,
+        [
+            "log".to_string(),
+            "-1".into(),
+            "--no-color".into(),
+            "--format=%B".into(),
+            rev(revision)?.to_string(),
+        ],
+    )?;
+    Ok(String::from_utf8_lossy(&out).trim_end().to_string())
 }
 
 /// The stash stack, newest first.

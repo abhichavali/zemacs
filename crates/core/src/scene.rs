@@ -197,6 +197,18 @@ impl HlKind {
             HlKind::Link => 19,
             HlKind::Code => 20,
             HlKind::Markup => 21,
+            HlKind::Region => 22,
+            HlKind::Cursor => 23,
+            HlKind::CurrentLine => 24,
+            HlKind::LineNumber => 25,
+            HlKind::LineNumberCurrent => 26,
+            HlKind::Divider => 27,
+            HlKind::Error => 28,
+            HlKind::Warning => 29,
+            HlKind::Match => 30,
+            HlKind::Popup => 31,
+            HlKind::PopupBorder => 32,
+            HlKind::Accent => 33,
         }
     }
 

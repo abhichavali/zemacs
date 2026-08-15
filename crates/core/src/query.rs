@@ -242,7 +242,22 @@ pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
         "font-size" => float(ed.settings.font_size),
         "tab-width" => ed.settings.tab_width.to_string(),
         "text-width" => ed.settings.text_width.to_string(),
-        "line-numbers-p" => boolean(ed.settings.line_numbers),
+        // The gutter went per buffer, so this answers the *buffer's* effective
+        // value — its override, falling back to the editor-wide setting — which
+        // is the pair `gutter_on` in `crates/render` draws from. Emacs' own
+        // semantics: `display-line-numbers` is buffer-local with a global
+        // default, and reading it gives you the buffer you are in. Reading only
+        // `settings.line_numbers` told a mode `t` in an org buffer on the
+        // no-gutter list while no gutter was drawn beside it.
+        //
+        // ponytail: the rule is spelled twice — a dashboard and a terminal have
+        // no buffer lines to number, and `gutter_on` says so where this does
+        // not. Harmless because nothing asks a menu whether it is numbered; hoist
+        // `gutter_on` into core and call it from both if that stops being true.
+        "line-numbers-p" => boolean(buf.line_numbers.unwrap_or(ed.settings.line_numbers)),
+        // Editor-wide, unlike the line above, and deliberately: `Buffer` has no
+        // override for it because counting from the cursor is about how you
+        // navigate, not about what kind of thing a buffer holds.
         "relative-line-numbers-p" => boolean(ed.settings.relative_line_numbers),
         "scroll-past-end-p" => boolean(ed.settings.scroll_past_end),
         "modeline-relief" => ed.settings.modeline_relief.to_string(),
@@ -303,7 +318,12 @@ fn string(s: &str) -> String {
 /// lisp-api: the same escaping, for a caller outside this module. `evil.rs` has
 /// to spell a prompt's answer as source before handing it to the image, and
 /// there is no second right way to write a Lisp string literal.
-pub(crate) fn lisp_string(s: &str) -> String {
+///
+/// `pub` rather than crate-private since the readers that cannot live here moved
+/// out: an `ask_here` arm in `crates/lisp` answers in the same envelope, so it
+/// needs the same escaping, and a second copy of it in another crate is a second
+/// chance to get a backslash wrong.
+pub fn lisp_string(s: &str) -> String {
     string(s)
 }
 
@@ -582,6 +602,23 @@ mod tests {
         assert_eq!(q(&ed, "completion-style"), "\"center\"");
         assert_eq!(q(&ed, "background"), "(0.5 0.25 0.0)");
         assert_eq!(q(&ed, "line-numbers-p"), "t");
+    }
+
+    /// The gutter is decided per buffer, so the reader has to be too. A mode
+    /// asking "am I showing line numbers?" in an org buffer on the no-gutter
+    /// list was told `t` while the renderer drew none — it read the editor-wide
+    /// default and the renderer read the buffer's override of it.
+    #[test]
+    fn line_numbers_p_answers_the_buffer_not_the_editor_wide_default() {
+        let mut ed = editor("x");
+        // What `set-no-gutter-modes` stamps on a buffer whose mode is on the
+        // list, while the editor-wide setting stays on for everything else.
+        ed.buffer.line_numbers = Some(false);
+        assert!(ed.settings.line_numbers, "the default is still on");
+        assert_eq!(q(&ed, "line-numbers-p"), "nil");
+        // Relative numbering has no per-buffer half, so it keeps answering for
+        // the editor.
+        assert_eq!(q(&ed, "relative-line-numbers-p"), "nil");
     }
 
     /// A face is named by a string everywhere else, but a query only takes

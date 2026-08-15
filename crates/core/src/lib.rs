@@ -14,6 +14,7 @@ pub mod dashboard;
 pub mod display;
 pub mod evil;
 pub mod frame;
+pub mod fuzzy;
 pub mod marker;
 pub mod minibuffer;
 pub mod modeline;
@@ -125,6 +126,11 @@ impl Key {
     /// and the split is the shell's own doing: a terminal reads `M-<left>` as
     /// word-wise motion (`Input::AltLeft`) and has no encoding at all for the
     /// shifted pair, so keeping them is taking nothing away from it.
+    ///
+    /// Home, End, the page keys, forward-Delete and the F-keys are all absent
+    /// for that same test, and it is not close: they are line-start and
+    /// line-end in readline, a screenful in every pager, and the whole menu bar
+    /// of a TUI. Taking any of them would be taking the terminal's own keys.
     pub fn is_editor_key(self) -> bool {
         matches!(
             self,
@@ -215,6 +221,26 @@ pub enum Key {
     Right,
     Up,
     Down,
+    /// The block above the arrows, which this enum simply had none of: every
+    /// one of them was dropped on the floor in every mode, because `combo_char`
+    /// spells a key by its name and all of these names are words.
+    ///
+    /// `Home` is *beginning of line* and not first-non-blank — `0`, not `^`.
+    /// That is what Home does in every other text field on the machine, and
+    /// `ESC [ H` is what readline reads the same way.
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    /// Forward delete — `⌦`, the far side of the cursor. Not
+    /// [`Key::Backspace`], which macOS also prints "delete" on.
+    Delete,
+    /// `F1`–`F12`, numbered rather than twelve variants: they do nothing by
+    /// default, so a variant each would be eleven more copies of `vec![]` in
+    /// every crate that reads a `Key` — which is exactly the debt the note
+    /// above is already carrying. Only 1..=12 is constructible, from
+    /// [`Key::from_token`] or from a keystroke.
+    F(u8),
 }
 
 impl Key {
@@ -249,6 +275,18 @@ impl Key {
             Key::Right => "<right>".into(),
             Key::Up => "<up>".into(),
             Key::Down => "<down>".into(),
+            Key::Home => "<home>".into(),
+            Key::End => "<end>".into(),
+            // `<pageup>`/`<pagedown>`, not Emacs' `<prior>`/`<next>`: this
+            // codebase names a thing for what it does whenever the traditional
+            // name is a polarity nobody remembers (see `LineOverflow`, and the
+            // window splits named for the side they land on). `from_token`
+            // still reads the Emacs spellings, so a binding copied out of an
+            // `.emacs` is understood — it is only not what `token` writes.
+            Key::PageUp => "<pageup>".into(),
+            Key::PageDown => "<pagedown>".into(),
+            Key::Delete => "<delete>".into(),
+            Key::F(n) => format!("<f{n}>"),
         }
     }
 
@@ -299,8 +337,22 @@ impl Key {
             "S-<right>" => Key::ShiftRight,
             "S-<up>" => Key::ShiftUp,
             "S-<down>" => Key::ShiftDown,
+            "<home>" => Key::Home,
+            "<end>" => Key::End,
+            "<pageup>" | "<prior>" => Key::PageUp,
+            "<pagedown>" | "<next>" => Key::PageDown,
+            "<delete>" | "<del>" => Key::Delete,
             "M-S-<left>" => Key::MetaShiftLeft,
             "M-S-<right>" => Key::MetaShiftRight,
+            // `<f1>`…`<f12>`, and nothing outside that range: `zemacs-term` has
+            // sequences for exactly these twelve, so an `<f13>` would be a
+            // binding that parses and can then never be pressed.
+            _ if s.starts_with("<f") && s.ends_with('>') => Key::F(
+                s[2..s.len() - 1]
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=12).contains(n))?,
+            ),
             // Order matters: `C-M-` has to be tried before `C-`.
             _ if s.starts_with("C-M-") => Key::CtrlMeta(one(&s[4..])?.to_ascii_lowercase()),
             _ if s.starts_with("C-") => Key::Ctrl(one(&s[2..])?.to_ascii_lowercase()),
@@ -390,10 +442,84 @@ pub enum HlKind {
     /// The `*`, `/` and `=` that delimit markup — dimmed, so the text stands
     /// out from its own syntax.
     Markup,
+
+    // ---------------------------------------------------------------------
+    // The UI faces.
+    //
+    // Everything above is a fact about *text* — a parser found a keyword, a
+    // theme says keywords are magenta. Everything below is a fact about the
+    // *editor*: where point is, what is selected, what a panel is drawn on.
+    // They live in the same table anyway, because the table is what Lisp
+    // already knows how to talk to and a second one would be a second thing
+    // to explain.
+    //
+    // They differ from the 22 in one way that matters: **they are optional.**
+    // A face above this line that a theme forgets falls back to the body
+    // colour, which is visibly wrong, which is why `themes.rs` insists every
+    // theme names all 22. A face below it falls back to the ratio the
+    // renderer used before these existed — `mix(bg, fg, 0.28)` for a region,
+    // and so on — so a theme that names none of them looks exactly as it did.
+    // That is the whole point: eleven shipped themes did not have to be
+    // rewritten for the cursor to become themeable, and a theme that *does*
+    // want its own cursor says so in one line.
+    //
+    // The cost of optional is that a face set by one theme survives into the
+    // next one, which is the bug `themes.rs` exists to prevent for the 22.
+    // `load-theme` answers it by clearing the table first — see `ResetFaces`.
+    /// The selection band. A *background*: the text keeps its own faces.
+    Region,
+    /// The caret. The glyph underneath is knocked out to the background.
+    Cursor,
+    /// The stripe behind the line point is on. A background, and a subtle one —
+    /// a few percent off the ground. Read as "you are here", not as a highlight.
+    CurrentLine,
+    /// Gutter digits.
+    LineNumber,
+    /// The digit on point's own line, which is the only one anybody reads.
+    LineNumberCurrent,
+    /// The rule between panes.
+    Divider,
+    /// Errors: an LSP diagnostic, dired's `D` flag, anything that has gone
+    /// wrong. The face `lsp.lisp` says outright it was missing.
+    Error,
+    /// Warnings — the severity below [`HlKind::Error`], and the reason both had
+    /// to arrive together: one of the two alone cannot say "this is worse".
+    Warning,
+    /// A search hit. A background, like [`HlKind::Region`], and drawn under it:
+    /// the two mean different things and only one of them is where you are.
+    ///
+    /// Every hit on screen, in the document, plus the matched characters of a
+    /// candidate in a completing prompt. While `/` is open it follows what is
+    /// being *typed*, so a pattern lights the file up before you commit to it;
+    /// after Enter it follows `last_search`, which is vim's `hlsearch`, and
+    /// `:noh` is the way out.
+    ///
+    /// This entry used to say nothing drew it, and named the ceiling that
+    /// stopped it: `overlays_for_line` is a linear scan per drawn line, so one
+    /// overlay per hit was the wrong shape, and an *index* was the upgrade path
+    /// it asked for. What it got is neither. [`Editor::search_hits`] scans the
+    /// lines a pane is about to draw and answers char ranges — the same shape
+    /// as the highlight spans beside it, recomputed rather than invalidated, and
+    /// bounded by the window instead of by the file.
+    Match,
+    /// The fill of a floating panel: completion, which-key, corfu, the context
+    /// menu, a tooltip. One face for all of them, because they are one surface
+    /// appearing in several places, and a reader who has learnt what a panel
+    /// looks like should not have to learn it twice.
+    Popup,
+    /// The 1px stroke around that panel.
+    PopupBorder,
+    /// The UI accent — selection bars, kind chips, the dashboard's rule. Every
+    /// one of those hardcoded [`HlKind::Function`] before this existed, which
+    /// worked because a function name is an accent colour in most themes and
+    /// was luck in the rest. This is the theme saying which colour it meant.
+    Accent,
 }
 
 impl HlKind {
-    pub const ALL: [HlKind; 22] = [
+    /// Every face, in `face-list` order — which is [`HlKind::face_id`] order,
+    /// which is the order a scene numbers them in.
+    pub const ALL: [HlKind; 34] = [
         HlKind::Keyword,
         HlKind::Function,
         HlKind::Type,
@@ -416,7 +542,32 @@ impl HlKind {
         HlKind::Link,
         HlKind::Code,
         HlKind::Markup,
+        HlKind::Region,
+        HlKind::Cursor,
+        HlKind::CurrentLine,
+        HlKind::LineNumber,
+        HlKind::LineNumberCurrent,
+        HlKind::Divider,
+        HlKind::Error,
+        HlKind::Warning,
+        HlKind::Match,
+        HlKind::Popup,
+        HlKind::PopupBorder,
+        HlKind::Accent,
     ];
+
+    /// The faces a theme is *required* to name — the first 22, the ones about
+    /// text. `ALL` minus the UI faces, and the list `crates/lisp/tests/themes.rs`
+    /// holds every shipped theme to.
+    ///
+    /// A prefix of [`HlKind::ALL`] rather than its own array, so a face added to
+    /// one cannot go missing from the other. The split is the point: a theme
+    /// that forgets `keyword' is broken and a theme that leaves `cursor' to the
+    /// renderer's own ratio is not, and one test cannot say both at once.
+    pub const CORE: &'static [HlKind] = {
+        let (core, _ui) = HlKind::ALL.split_at(22);
+        core
+    };
 
     pub fn name(self) -> &'static str {
         match self {
@@ -442,6 +593,18 @@ impl HlKind {
             HlKind::Link => "link",
             HlKind::Code => "code",
             HlKind::Markup => "markup",
+            HlKind::Region => "region",
+            HlKind::Cursor => "cursor",
+            HlKind::CurrentLine => "current-line",
+            HlKind::LineNumber => "line-number",
+            HlKind::LineNumberCurrent => "line-number-current",
+            HlKind::Divider => "divider",
+            HlKind::Error => "error",
+            HlKind::Warning => "warning",
+            HlKind::Match => "match",
+            HlKind::Popup => "popup",
+            HlKind::PopupBorder => "popup-border",
+            HlKind::Accent => "accent",
         }
     }
 
@@ -534,6 +697,25 @@ impl Theme {
     pub fn set_style(&mut self, kind: HlKind, style: FaceStyle) {
         self.styles.insert(kind, style);
     }
+
+    /// Forget every face, colour and style alike.
+    ///
+    /// Empty rather than back to [`Theme::default`], and the difference is the
+    /// whole reason this exists: a theme is a pile of assignments into a table,
+    /// so a face the incoming theme does not mention keeps the *outgoing*
+    /// theme's answer. `crates/lisp/tests/themes.rs` holds the 22 core faces to
+    /// naming all of themselves, which closes that hole by making the pile
+    /// total — but the UI faces are deliberately optional, and an optional face
+    /// cannot be made total by a test. So `load-theme` empties the table first
+    /// and every unset face falls through to the renderer's own ratio, which is
+    /// the one answer that is right regardless of what was loaded before.
+    ///
+    /// `Default` would put eleven arbitrary colours back instead, which is a
+    /// twelfth theme nobody asked for showing through the gaps in the eleventh.
+    pub fn reset(&mut self) {
+        self.map.clear();
+        self.styles.clear();
+    }
 }
 
 /// The single channel of document mutation. Keyboard input and the Lisp
@@ -550,6 +732,10 @@ pub enum EditorCommand {
     DeleteForward,
     /// Delete `[start, end)` in char offsets.
     DeleteRange(usize, usize),
+    /// Insert `text` at a char offset, leaving point after it. The insert twin
+    /// of [`EditorCommand::DeleteRange`] — for an edit whose position is
+    /// computed rather than "wherever the cursor is". See `Buffer::insert_at`.
+    InsertAt(usize, String),
     /// Copy `[start, end)` into the unnamed register.
     Yank {
         start: usize,
@@ -580,6 +766,14 @@ pub enum EditorCommand {
 
     // --- settings, all reachable from Lisp ---
     SetFontSize(f32),
+    /// Set the body font by file path, or `None` to go back to the renderer's
+    /// own search. Takes effect on the next frame — see `Renderer::sync`.
+    SetFontPath(Option<String>),
+    /// Ask the app what fonts are installed. Answered asynchronously, by calling
+    /// `(%fonts-listed ...)` in the image: core does no IO and has no font
+    /// library, so this is a *request* rather than a query, in the shape
+    /// [`EditorCommand::Term`] and [`EditorCommand::Project`] already have.
+    ListFonts,
     SetBackground([f32; 3]),
     SetForeground([f32; 3]),
     SetSyntaxColor(String, [f32; 3]),
@@ -588,8 +782,14 @@ pub enum EditorCommand {
     /// theme overwhelmingly wants to set a colour and say nothing about weight,
     /// and one command carrying both would make every such line say `nil nil`.
     SetFaceStyle(String, bool, bool),
+    /// Empty the face table — see [`Theme::reset`]. `load-theme` sends this
+    /// before it loads the file, so nothing survives from the theme before.
+    ResetFaces,
     SetLineNumbers(bool),
     SetTabWidth(usize),
+    /// Space-separated line endings that open a block, for auto-indent — see
+    /// [`Settings::indent_openers`]. Empty is "only copy the previous indent".
+    SetIndentOpeners(String),
     /// Columns of text to centre in the pane; 0 turns it off. See
     /// [`Settings::text_width`].
     SetTextWidth(usize),
@@ -799,12 +999,56 @@ pub enum EditorCommand {
         id: u64,
         label: String,
         completing: bool,
+        /// Send the highlighted candidate back as `%prompt-preview` every time
+        /// the selection moves — consult's live preview, with the *meaning* of
+        /// it left in the image. See [`PromptKind::Lisp`].
+        previewing: bool,
     },
     /// Append one candidate to the open Lisp prompt. Ignored for any other
     /// prompt — the file and grep pickers get their candidates from the app,
     /// and a stray item from a continuation that has already been cancelled
     /// must not land in somebody else's list.
     PromptItem(String),
+    /// The same, for a whole list at once: one candidate per line.
+    ///
+    /// [`EditorCommand::PromptItem`] is one lock and one crossing of the shim
+    /// *per candidate*, which `shim.c` says outright is fine for the few hundred
+    /// a command offers and wants a different route for a list long enough to
+    /// feel. A project's file list is that list — tens of thousands of paths —
+    /// and this is that route: `completing-read` sends its candidates in one
+    /// string, whatever the length.
+    ///
+    /// Newline-separated because the write envelope carries one string and a
+    /// candidate is a row in a one-line-per-row popup, so it has nowhere to put
+    /// a newline of its own.
+    // ponytail: a candidate containing a newline splits into two. Nothing in the
+    // tree produces one; the upgrade is a separator the payload cannot hold,
+    // which means not a C string.
+    PromptItems(String),
+    /// Replace what has been typed into the open prompt, and re-rank against it.
+    ///
+    /// The seeding half of the gap `docs/boundary.org` recorded as *"Seed a
+    /// prompt with text or candidates core owns"*. `project-open` wants the file
+    /// picker to start at an expanded `~/` so the app's absolute completions
+    /// match; `dired-rename` wants the name being renamed. Neither could be said
+    /// from Lisp, so both were Rust that only existed to set one field.
+    SetPromptText(String),
+    /// Retitle the open prompt. The other half: a picker that Lisp filled owes
+    /// the reader a label naming what it filled it with.
+    SetPromptLabel(String),
+    /// Fill the open prompt from a list **the app owns** — `"SOURCE ARGUMENT"`,
+    /// split at the first space.
+    ///
+    /// The candidates never enter the image, which is the whole point. A
+    /// project's files come off a cached tree walk that has to answer between
+    /// two keystrokes; handing them to Lisp so Lisp could hand them back would
+    /// be two crossings of a list that exists precisely because walking it is
+    /// too slow to do twice. So Lisp owns the verb, the label and what accepting
+    /// one means, and says *which* list it wants by name.
+    ///
+    /// See [`EditorCommand::needs_app`]: the sources are the app's, as
+    /// [`EditorCommand::Dired`] and [`EditorCommand::Git`] are.
+    PromptSource(String),
 
     /// Append one `"KEY LABEL"` row to the which-key panel, or — with `None` —
     /// empty it. Rows arrive one at a time for the same reason
@@ -816,6 +1060,20 @@ pub enum EditorCommand {
     /// an overlay anchors to a range of buffer text and moves with it, and a
     /// panel describing the keyboard is not about the document at all.
     WhichKey(Option<String>),
+
+    /// Append one segment to the modeline's format, or — with `None` — empty
+    /// both sides of it.
+    ///
+    /// [`EditorCommand::WhichKey`]'s shape, for its reason: the write envelope
+    /// carries one string, a format is many, and clearing has to be sayable so a
+    /// config can build a strip rather than append to the shipped one.
+    ///
+    /// The difference from which-key is what happens next. A which-key row is
+    /// text that gets drawn; this is a *template* that gets expanded per pane per
+    /// frame, so the image speaks once and pays nothing per frame. See
+    /// [`modeline`](crate::modeline) for the codes and for why it is not a
+    /// callback.
+    Modeline(Option<(bool, modeline::Spec)>),
 
     /// corfu: the in-buffer completion popup, which is which-key's sibling and
     /// is filled the same way — see [`CompletionEdit`] and [`Completion`].
@@ -1084,6 +1342,7 @@ impl EditorCommand {
                 | EditorCommand::DeleteBackward
                 | EditorCommand::DeleteForward
                 | EditorCommand::DeleteRange(..)
+                | EditorCommand::InsertAt(..)
                 | EditorCommand::Paste { .. }
                 | EditorCommand::Undo
                 | EditorCommand::Redo
@@ -1114,6 +1373,10 @@ impl EditorCommand {
                 | EditorCommand::Dired(_)
                 | EditorCommand::OpenAt(_)
                 | EditorCommand::Project(_)
+                // The list is the app's — a cached tree walk core has no crate
+                // for. See [`EditorCommand::PromptSource`].
+                | EditorCommand::PromptSource(_)
+                | EditorCommand::ListFonts
                 | EditorCommand::Term(_)
                 | EditorCommand::TermKey(_)
                 | EditorCommand::CallLisp(_)
@@ -1122,13 +1385,42 @@ impl EditorCommand {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+// `Clone` but no longer `Copy`: `font_path` is a `String`, and every reader in
+// the tree already takes `&Settings` — so the bound was costing nothing and
+// keeping it would have meant putting the font somewhere other than the settings
+// it plainly is one of.
+#[derive(Clone, Debug)]
 pub struct Settings {
     pub font_size: f32,
+    /// The file the body text is set in, or `None` for the renderer's own
+    /// search. A *path* and not a family name, because that is what opening a
+    /// font takes and core has no font library to resolve a name with — see
+    /// `set-font` in `runtime/library.lisp`, which is where a name becomes one.
+    pub font_path: Option<String>,
     pub background: [f32; 3],
     pub foreground: [f32; 3],
     pub line_numbers: bool,
     pub tab_width: usize,
+    /// What, at the end of a line, means the next line is *inside* something —
+    /// so a newline after it indents one step further.
+    ///
+    /// `":"` for Python, `"{"` for the C family, `"("`, `"["`, `"do"`, `"then"`
+    /// for the shells. A **table rather than a parser**, and deliberately: this
+    /// runs on the Enter key, where a tree-sitter query would be a parse per
+    /// keystroke to answer a question a suffix test gets right almost always. It
+    /// is also the half a config has an opinion about, which is why it arrives
+    /// from Lisp — `runtime/modes/modes.lisp` claims it per major mode, exactly
+    /// as it claims the tab width beside it.
+    ///
+    /// Empty by default, which is *only* copy-the-previous-indent. A plain text
+    /// buffer where `Notes:` opened a block would be worse than one that does
+    /// nothing clever at all.
+    ///
+    /// Global rather than per buffer, unlike [`Buffer::text_width`], and the
+    /// difference is which question is being asked: a measure is *drawn* for
+    /// every pane at once, and this is only ever read for the buffer being typed
+    /// into, which is by construction the live one.
+    pub indent_openers: Vec<String>,
     /// Where completing prompts (`M-x`, find-file, buffer switch) are drawn.
     pub completion_style: CompletionStyle,
     /// Modeline bevel, in pixels, following Emacs' `:box :line-width`:
@@ -1167,10 +1459,12 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             font_size: 18.0,
+            font_path: None,
             background: [0.06, 0.06, 0.09],
             foreground: [0.86, 0.90, 1.00],
             line_numbers: true,
             tab_width: 4,
+            indent_openers: Vec::new(),
             completion_style: CompletionStyle::default(),
             modeline_relief: 2,
             modeline_pad: 8,
@@ -1412,6 +1706,24 @@ pub struct Buffer {
     /// [`Editor::gutter_for_mode`] — so it is a cache of a decision, never a
     /// second place to state one.
     pub line_numbers: Option<bool>,
+    /// The column measure *this buffer* is held to and centred in, or `None` to
+    /// follow the editor-wide [`Settings::text_width`].
+    ///
+    /// [`Buffer::line_numbers`]' argument, one setting along, and it arrived the
+    /// same way: `org-mode` claims 80 columns, a terminal claims none, and with
+    /// one measure in the editor the pane that won was whichever mode had been
+    /// entered last. Focusing a shell in a split therefore un-centred the org
+    /// document beside it — the text did not move, the *measure* did, in a pane
+    /// nobody had touched.
+    ///
+    /// Stamped by [`EditorCommand::SetTextWidth`] rather than recomputed from a
+    /// table, which is the one difference from the gutter and is what keeps a
+    /// second policy list out of core: `runtime/modes/modes.lisp` re-pushes
+    /// every claimed setting whenever the modes change, and it does that *for
+    /// the buffer that just entered one*. So the value arriving here is always
+    /// about this buffer, and the editor-wide setting stays what it always was —
+    /// the baseline a buffer nobody has claimed anything about is drawn at.
+    pub text_width: Option<usize>,
     /// Minor modes, on top of the major one. Order is the order enabled.
     pub minor_modes: Vec<String>,
     /// Scroll position, parked here while another buffer is on screen.
@@ -1505,6 +1817,7 @@ impl Buffer {
             // what makes a buffer nobody has an opinion about look like every
             // other one.
             line_numbers: None,
+            text_width: None,
             major_mode: FUNDAMENTAL.into(),
             minor_modes: Vec::new(),
             saved_scroll: 0,
@@ -1645,34 +1958,37 @@ impl Buffer {
             text: self.text.clone(),
             cursor: self.cursor,
         });
-        // Recorded as a whole-document replacement, and that is the whole of
-        // what undo can honestly say. A snapshot is a rope, not a diff: there
-        // is no edit here to report, only two documents, and the record that
-        // describes "this one became that one" without lying is
-        // `0..old_len -> 0..new_len`. Every reader already handles it — the
-        // parser reparses, a language server takes one full-range change, the
-        // image reads the buffer back — because it is the same record `load`
-        // and `revert-buffer` produce.
+        // **Applied as the edit it is, not as a whole-document swap.** A
+        // snapshot is two ropes and no diff, but the diff between them is one
+        // scan from each end: everything an undo did is between the first
+        // character that differs and the last, because that is what a snapshot
+        // of an *edit* differs by.
         //
-        // ponytail: a `u` on a one-character typo therefore costs a full
-        // reparse. The ceiling is the file size at which that is felt, the same
-        // few hundred KB the parser's own ceiling sits at. The upgrade is an
-        // undo history of *edits* rather than snapshots, which is a different
-        // undo system and would retire the clamping two lines below with it.
-        self.replace_text(snap.text);
+        // This used to be a `replace_text` — `0..old_len -> 0..new_len`, with
+        // the markers and overlays afterwards *clamped* rather than moved. It
+        // was honest and it was wrong in a way that only showed up once
+        // something hung off an offset. An overlay does not survive being told
+        // the whole document changed: it keeps its absolute position, so
+        // undoing an edit *above* a LaTeX preview left the preview where it
+        // was while the text under it slid — an image over the wrong equation,
+        // and the same for every diagnostic mark, fold and org-modern bullet in
+        // the file. Splicing runs them through `adjust`, which is the machinery
+        // that has always kept them in place across an ordinary edit.
+        //
+        // Two more things fall out. The change record is now the *range* that
+        // changed, so a `u` on a one-character typo is an incremental reparse
+        // and one small `didChange` rather than a full pass over the file —
+        // which is the ceiling the note that used to be here named. And the
+        // clamping is gone, because a splice cannot leave anything outside the
+        // document in the first place.
+        let (at, removed, inserted) = Self::diff(&self.text, &snap.text);
+        let text: String = snap.text.slice(at..at + inserted).chars().collect();
+        self.splice(at, removed, &text);
+        // Belt and braces: the scan above is arithmetic and the assertion it
+        // rests on — that splicing the difference produces the snapshot — is
+        // one every reader below depends on.
+        debug_assert_eq!(self.text, snap.text, "undo did not restore the snapshot");
         self.cursor = snap.cursor.min(self.text.len_chars());
-        // A snapshot is a whole rope, not a diff, so there is no edit to run the
-        // markers through: they keep the positions they had and are pulled back
-        // inside the restored text. Undoing the very edit that moved a marker
-        // therefore leaves it approximately rather than exactly where it was —
-        // but never outside the document, which is the invariant a marker owes
-        // its holder. ponytail: exact would mean recording edits instead of
-        // snapshots, which is a different undo system.
-        self.markers.clamp(self.text.len_chars());
-        // Same argument, and one more consequence: an overlay clamped down to
-        // nothing is dropped, so undoing the insertion of a LaTeX fragment takes
-        // its preview with it rather than leaving an image over other text.
-        self.overlays.clamp(self.text.len_chars());
         self.modified = true;
         true
     }
@@ -1718,6 +2034,46 @@ impl Buffer {
             .map(|i| self.text.char(start + i))
             .take_while(|c| *c == ' ' || *c == '\t')
             .collect()
+    }
+
+    /// True when `line` ends with something that opens a block — see
+    /// [`Settings::indent_openers`].
+    ///
+    /// Tested against the line with its trailing whitespace removed, so a `{`
+    /// you left a space after still counts, and against a *comment-free* line it
+    /// deliberately does not: `if x: # note` is a line that opens a block and a
+    /// suffix test says it does not. That is the known cost of not parsing, and
+    /// it fails in the direction that leaves you where you were rather than
+    /// indenting text you did not mean to indent.
+    fn opens_block(&self, line: usize, openers: &[String]) -> bool {
+        if openers.is_empty() {
+            return false;
+        }
+        let start = self.line_start(line);
+        let text: String = (0..self.line_len(line))
+            .map(|i| self.text.char(start + i))
+            .collect();
+        let text = text.trim_end();
+        openers.iter().any(|o| !o.is_empty() && text.ends_with(o.as_str()))
+    }
+
+    /// The indentation a line opened *after* `line` should start with: what
+    /// `line` had, plus one step when it opened a block.
+    ///
+    /// One function because the three keys that open a line — `Enter`, `o` and
+    /// `O` — have to agree, and they did not: `o` and `O` carried the previous
+    /// indent and `Enter` carried nothing, so the same gesture written two ways
+    /// produced two different lines.
+    pub fn indent_after(&self, line: usize, openers: &[String], tab: usize) -> String {
+        let mut indent = self.line_indent(line);
+        if self.opens_block(line, openers) {
+            // Spaces, because that is what `Tab` inserts here — see
+            // `insert_key`. A buffer indented with tabs keeps its tabs (they came
+            // from `line_indent`) and gains a step of spaces, which is what any
+            // editor without a tabs-versus-spaces setting does.
+            indent.push_str(&" ".repeat(tab.max(1)));
+        }
+        indent
     }
 
     /// The bracket matching the one at `pos`, or the one just before it.
@@ -1829,6 +2185,60 @@ impl Buffer {
         start
     }
 
+    /// The smallest splice that turns `old` into `new`: `(start, removed, the
+    /// text to put there)`, in **characters**, since that is what `splice`
+    /// counts in.
+    ///
+    /// Not a diff — a diff would find the several edits an agent actually made
+    /// and this finds the one span containing all of them. That is the right
+    /// trade here: it is two linear walks with no allocation and no table, it is
+    /// exact when the change is contiguous (which a formatter's or an agent's
+    /// usually is), and when it is not, the cost is overlays inside the span
+    /// between the first and last change — never overlays outside it, which is
+    /// the property that matters.
+    ///
+    /// ponytail: no Myers diff. Ceiling: two edits at opposite ends of a file
+    /// widen the splice to the whole file and drop the folds in between. The
+    /// upgrade path is a real diff behind this same signature, so nothing above
+    /// changes.
+    fn narrow<'a>(old: &str, new: &'a str) -> (usize, usize, &'a str) {
+        let mut pre = 0;
+        let mut a = old.chars();
+        let mut b = new.chars();
+        // Byte offset into `new` of the first differing character, tracked
+        // alongside the char count because slicing a `str` needs bytes.
+        let mut pre_bytes = 0;
+        loop {
+            match (a.next(), b.next()) {
+                (Some(x), Some(y)) if x == y => {
+                    pre += 1;
+                    pre_bytes += x.len_utf8();
+                }
+                _ => break,
+            }
+        }
+        let old_len = old.chars().count();
+        let new_len = new.chars().count();
+        // Never past the prefix: with `old = "aa"` and `new = "aaa"` the naive
+        // suffix walk would claim both `a`s twice over and describe a negative
+        // range.
+        let room = (old_len - pre).min(new_len - pre);
+        let mut suf = 0;
+        let mut suf_bytes = 0;
+        let mut a = old.chars().rev();
+        let mut b = new.chars().rev();
+        while suf < room {
+            match (a.next(), b.next()) {
+                (Some(x), Some(y)) if x == y => {
+                    suf += 1;
+                    suf_bytes += x.len_utf8();
+                }
+                _ => break,
+            }
+        }
+        (pre, old_len - pre - suf, &new[pre_bytes..new.len() - suf_bytes])
+    }
+
     /// Replace `removed` characters at `start` with `text` — the only place the
     /// rope is edited, so it is also the only place markers have to be moved.
     ///
@@ -1836,6 +2246,40 @@ impl Buffer {
     /// adjusting at each call site is the point: a mutation path that forgets to
     /// adjust is exactly the bug markers exist to prevent, and one that forgets
     /// to *splice* does not compile.
+    /// What one has to be spliced with to become the other: `(at, removed,
+    /// inserted)`, all in characters.
+    ///
+    /// The common prefix and the common suffix, and everything between them.
+    /// That is not a general diff and does not try to be — it is exactly what
+    /// an *undo* needs, because the two ropes it compares differ by the one
+    /// edit that was undone, and a single edit is by construction one
+    /// contiguous range. A cleverer diff would find the same range and cost
+    /// more to do it.
+    ///
+    /// Iterators from both ends rather than `Rope::char(i)`: random access into
+    /// a rope is logarithmic per character, and a prefix scan over an edit near
+    /// the end of a large file would walk most of it that way.
+    ///
+    /// The two runs are not allowed to overlap, which is the whole of the
+    /// correctness argument for `aaa` -> `aa`: the prefix would happily claim
+    /// all of `aa` and the suffix would claim it again, and the result would be
+    /// a removal of minus one.
+    fn diff(old: &Rope, new: &Rope) -> (usize, usize, usize) {
+        let (n, m) = (old.len_chars(), new.len_chars());
+        let shortest = n.min(m);
+        let mut at = 0;
+        let (mut a, mut b) = (old.chars(), new.chars());
+        while at < shortest && a.next() == b.next() {
+            at += 1;
+        }
+        let mut tail = 0;
+        let (mut a, mut b) = (old.chars_at(n), new.chars_at(m));
+        while tail < shortest - at && a.prev() == b.prev() {
+            tail += 1;
+        }
+        (at, n - at - tail, m - at - tail)
+    }
+
     fn splice(&mut self, start: usize, removed: usize, text: &str) {
         let start = start.min(self.len_chars());
         let removed = removed.min(self.len_chars() - start);
@@ -1950,6 +2394,21 @@ impl Buffer {
         if col < self.line_len(line) {
             self.splice(self.cursor, 1, "");
         }
+    }
+
+    /// Put `text` at `at`, leaving point after it — the insert twin of
+    /// [`Buffer::delete_range`], and there for the same reason: an edit whose
+    /// position is *computed* rather than "wherever the cursor is".
+    ///
+    /// `o` on a closed fold is the case that needed it. The line it opens after
+    /// is the last line the fold hides, and a cursor may not sit on a hidden
+    /// line — `clamp_cursor` escapes it back to the fold's head at the end of
+    /// every `apply`, so moving there and then inserting put the newline at the
+    /// top of the fold instead of below it.
+    fn insert_at(&mut self, at: usize, text: &str) {
+        let at = at.min(self.len_chars());
+        self.splice(at, 0, text);
+        self.cursor = (at + text.chars().count()).min(self.len_chars());
     }
 
     fn delete_range(&mut self, start: usize, end: usize) {
@@ -2137,6 +2596,28 @@ pub struct Editor {
 
     /// Bumped on every document mutation; the app re-highlights when it moves.
     pub revision: u64,
+    /// Bumped whenever *anything the screen is made of* changes — the document,
+    /// the cursor, the mode, a prompt, a message, an overlay, the frame layout.
+    ///
+    /// [`Editor::revision`]'s coarser sibling, and it exists for the app's draw
+    /// loop rather than for the highlighter: an editor nobody is touching used
+    /// to redraw at the display's refresh rate and throw every frame away when a
+    /// digest of the draw calls said it was identical. That is correct and it is
+    /// a couple of milliseconds of CPU per display frame spent proving nothing
+    /// happened.
+    ///
+    /// **Conservative on purpose.** Over-counting costs a frame that was going
+    /// to be drawn anyway; under-counting leaves a stale screen. So every
+    /// [`Editor::apply`] bumps it whether or not the command changed anything,
+    /// every keystroke bumps it, and every Lisp primitive that takes the editor
+    /// mutably bumps it — which is the one signal that catches the image editing
+    /// the buffer through the shared mutex, since that raises no window event.
+    ///
+    /// Writers outside core call [`Editor::touch`]. The app's draw loop pairs
+    /// this with a periodic forced draw, so a writer that forgets costs a
+    /// fraction of a second of staleness rather than a screen that never
+    /// updates — see `App::draw`.
+    pub generation: u64,
 
     /// First visible line, and how many lines fit (set by the renderer).
     pub scroll: usize,
@@ -2173,6 +2654,14 @@ pub struct Editor {
     /// is pending any more. Filling it is the image's job, because what a prefix
     /// means is Lisp's opinion and not core's.
     pub which_key: Vec<String>,
+    /// What the modeline says, as a list of templates the image set.
+    ///
+    /// Filed beside `which_key` and `dashboard`, which are the other two
+    /// surfaces whose *content* is Lisp's and whose drawing is not. It differs
+    /// from both in being read every frame for every pane, which is why it is a
+    /// format expanded here rather than rows pushed across — see
+    /// [`modeline`](crate::modeline).
+    pub modeline: modeline::Format,
     /// corfu: candidates for the word being typed, filed here for
     /// [`Completion`]'s reasons and read through [`Editor::completion`] rather
     /// than directly.
@@ -2285,6 +2774,7 @@ impl Editor {
             messages: Vec::new(),
             should_quit: false,
             revision: 0,
+            generation: 0,
             scroll: 0,
             viewport_lines: 24,
             wrap_cols: 0,
@@ -2292,6 +2782,9 @@ impl Editor {
             visual_anchor: None,
             ace: None,
             which_key: Vec::new(), // which-key panel
+            // Almost nothing until `runtime/init.lisp` says otherwise — see
+            // `modeline::Format::default`.
+            modeline: modeline::Format::default(),
             completion: None,      // corfu
             grab_key: None,        // avy
             context_menu: None,
@@ -2410,7 +2903,34 @@ impl Editor {
         };
         let (line, col) = buffer.cursor_line_col();
         let end = buffer.len_chars();
-        buffer.splice(0, end, text);
+        // Only what actually *changed*, and this is the whole of why folds
+        // survive an agent now.
+        //
+        // This used to be `splice(0, end, text)` — replace the document with the
+        // document. `Overlays::adjust` collapses every overlay an edit swallowed
+        // and drops the empty ones, quite rightly, so a whole-buffer splice
+        // dropped **all** of them: every fold, every org-modern glyph, every
+        // LaTeX preview, on every write by a coding agent. The buffer came back
+        // correct and completely unfolded, which is not what "the file changed
+        // underneath you" should mean.
+        //
+        // Trimming the common prefix and suffix costs two walks and turns the
+        // usual case — an agent rewriting four lines of a five-hundred-line file
+        // — into a four-line splice that the existing adjustment machinery
+        // handles correctly and has always handled correctly. Overlays outside
+        // the edit are untouched because they are outside the edit. Nothing here
+        // is special-cased for folds; they were never the exception, the maximal
+        // splice was.
+        let old = buffer.slice_string(0, end);
+        let (start, removed, replacement) = Buffer::narrow(&old, text);
+        if removed == 0 && replacement.is_empty() {
+            // `touch` on an unchanged file, or a rewrite that put back exactly
+            // what was there. Doing nothing is not an optimisation, it is the
+            // correct answer: a revision bump would re-parse and re-render the
+            // buffer to arrive at the pixels already on screen.
+            return true;
+        }
+        buffer.splice(start, removed, replacement);
         buffer.move_to_line_col(line, col);
         // `splice` sets it and is wrong to: the buffer now holds exactly what is
         // on disk, which is the definition of unmodified.
@@ -2424,7 +2944,15 @@ impl Editor {
         // uncoloured, and the app hands the name to the syntax thread on its
         // next pass.
         buffer.highlights.clear();
+        let dropped = buffer.overlays.take_dropped();
         self.pending_highlight.push(id);
+        // Asked here as well as in [`Editor::apply`], because an agent rewriting
+        // a file can land on the lines a preview covers, and this buffer is very
+        // often *not* the live one — the sweep at the end of `apply` would never
+        // come to it.
+        if dropped {
+            self.prune_images();
+        }
         self.revision += 1;
         true
     }
@@ -2775,8 +3303,24 @@ impl Editor {
         self.revision += 1;
     }
 
+    /// Say that something the screen is made of has changed, for a writer
+    /// outside core — the app adopting highlight spans, a terminal grid moving,
+    /// a picker being refilled from the filesystem. See [`Editor::generation`].
+    ///
+    /// Free to call when nothing changed. Costing a frame that was going to be
+    /// drawn anyway is the *cheap* mistake here; the expensive one is a screen
+    /// that stops updating.
+    pub fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
     /// The one and only document mutator.
     pub fn apply(&mut self, cmd: EditorCommand) {
+        // Before the read-only refusal below and before every early return in
+        // the match: a command that was *refused* still put a message on the
+        // status line, and a command that did nothing at all costs one frame
+        // rather than a wrong one. See [`Editor::generation`].
+        self.touch();
         // Generated buffers are views, not documents: *dashboard* and *magit*
         // are re-rendered from state, so an edit would be silently discarded on
         // the next refresh and `:w` would write a screenshot of a status list.
@@ -2800,6 +3344,7 @@ impl Editor {
             EditorCommand::DeleteBackward => self.edit(Buffer::delete_backward),
             EditorCommand::DeleteForward => self.edit(Buffer::delete_forward),
             EditorCommand::DeleteRange(a, b) => self.edit(|buf| buf.delete_range(a, b)),
+            EditorCommand::InsertAt(at, text) => self.edit(|buf| buf.insert_at(at, &text)),
             EditorCommand::Yank {
                 start,
                 end,
@@ -2858,6 +3403,11 @@ impl Editor {
             EditorCommand::Quit => self.should_quit = true,
 
             EditorCommand::SetFontSize(s) => self.settings.font_size = s.clamp(4.0, 400.0),
+            // Not checked for existence here: core does no IO, so a path that
+            // is not a font is the renderer's to refuse — and it refuses by
+            // keeping the face it already has, which is the only failure mode
+            // that leaves an editor you can still read.
+            EditorCommand::SetFontPath(p) => self.settings.font_path = p,
             EditorCommand::SetBackground(c) => self.settings.background = clamp3(c),
             EditorCommand::SetForeground(c) => {
                 self.settings.foreground = clamp3(c);
@@ -2874,12 +3424,33 @@ impl Editor {
                 Some(k) => self.theme.set_style(k, FaceStyle { bold, italic }),
                 None => self.status = format!("unknown syntax face: {name}"),
             },
+            // The pane's own background and foreground are *settings*, not
+            // faces, and are deliberately left alone: a theme sets both on its
+            // first two lines, and clearing them here would flash the previous
+            // ground for the length of one `load'.
+            EditorCommand::ResetFaces => self.theme.reset(),
             EditorCommand::SetLineNumbers(on) => self.settings.line_numbers = on,
             EditorCommand::SetTabWidth(n) => self.settings.tab_width = n.clamp(1, 16),
+            // Space-separated, because an opener is a token like `:` or `{` or
+            // `do` and none of them contains a space. One string is what the
+            // write envelope carries; splitting it here is what keeps this off
+            // the list of things that needed a C primitive.
+            EditorCommand::SetIndentOpeners(s) => {
+                self.settings.indent_openers =
+                    s.split_whitespace().map(str::to_string).collect();
+            }
             // Not clamped at the low end past zero, which is the "off" value:
             // a measure of one or two columns is silly rather than dangerous,
             // and the renderer never lets the inset exceed the pane anyway.
-            EditorCommand::SetTextWidth(n) => self.settings.text_width = n.min(1000),
+            // Both, and the pair is the whole fix for a split losing its
+            // centring — see [`Buffer::text_width`]. The editor-wide value is
+            // the baseline for a buffer no mode has spoken for; the stamp is
+            // what makes the pane beside a terminal keep its own measure.
+            EditorCommand::SetTextWidth(n) => {
+                let n = n.min(1000);
+                self.settings.text_width = n;
+                self.buffer.text_width = Some(n);
+            }
             EditorCommand::SetCompletionStyle(name) => match CompletionStyle::from_name(&name) {
                 Some(s) => self.settings.completion_style = s,
                 None => self.status = format!("unknown completion style: {name}"),
@@ -3034,10 +3605,27 @@ impl Editor {
                 }
             },
             EditorCommand::Overlay(edit) => {
-                let drops = matches!(
-                    edit,
-                    OverlayEdit::Delete(_) | OverlayEdit::RemoveIn(..) | OverlayEdit::Image(_, None)
-                );
+                // Whether this edit is about to take an id *away* from an
+                // overlay — which is not the same question as which variant it
+                // is. `Image(_, Some(new))` over an overlay that already had one
+                // lets go of the first exactly as clearing it would, and
+                // re-rendering the same fragment (a theme change, a zoom, an
+                // edit inside `$…$`) is how that arm gets reached twice.
+                //
+                // Asked rather than assumed, because the *first* typeset —
+                // `None` becoming `Some` — displaces nothing, and pruning there
+                // would sweep every bitmap rasterised but not yet named. A page
+                // is built by adding its figures and then setting the scene, so
+                // that window is real and the loss is silent: see the roots this
+                // walks in [`Editor::prune_images`].
+                let drops = match edit {
+                    OverlayEdit::Delete(_) | OverlayEdit::RemoveIn(..) => true,
+                    // Had one, and is not being handed the same one back.
+                    OverlayEdit::Image(id, next) => {
+                        matches!(self.buffer.overlays.image(id), Some(Some(old)) if Some(old) != next)
+                    }
+                    _ => false,
+                };
                 self.buffer.overlays.edit(edit);
                 // Only when an overlay could have let go of one: an image nobody
                 // points at is a few hundred KB and a texture the renderer will
@@ -3081,9 +3669,17 @@ impl Editor {
                 id,
                 label,
                 completing,
+                previewing,
             } => {
-                let mut prompt = Prompt::new(PromptKind::Lisp { id, completing }, &label, Vec::new());
-                // Nothing previews, so nothing has to be restored on Escape.
+                let kind = PromptKind::Lisp {
+                    id,
+                    completing,
+                    previewing,
+                };
+                let mut prompt = Prompt::new(kind, &label, Vec::new());
+                // Still nothing for *core* to restore on Escape, even when this
+                // one previews: what a Lisp preview disturbed is not a cursor
+                // and not a buffer, and the callback puts it back on the NIL.
                 prompt.origin = None;
                 self.prompt = Some(prompt);
             }
@@ -3094,9 +3690,39 @@ impl Editor {
                     }
                 }
             }
+            // Gated the same way and for the same reason. A trailing newline is
+            // how `~{~a~^~%~}` prints an empty list and how a text file ends, so
+            // the empty tail it leaves is dropped rather than offered as a
+            // candidate with no name.
+            EditorCommand::PromptItems(text) => {
+                if let Some(p) = self.prompt.as_mut() {
+                    if matches!(p.kind, PromptKind::Lisp { .. }) {
+                        p.extend_items(text.lines().map(str::to_string));
+                    }
+                }
+            }
+            // Not gated: seeding is asked for *by* the code that opened the
+            // prompt, one command earlier in the same batch, and the prompt it
+            // means may be any kind — `project-open` seeds the app's file
+            // picker, which is the case the verb exists for.
+            EditorCommand::SetPromptText(text) => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.text = text;
+                    p.refilter();
+                }
+            }
+            EditorCommand::SetPromptLabel(label) => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.label = label;
+                }
+            }
             EditorCommand::WhichKey(row) => match row {
                 Some(r) => self.which_key.push(r),
                 None => self.which_key.clear(),
+            },
+            EditorCommand::Modeline(seg) => match seg {
+                Some((right, spec)) => self.modeline.push(right, spec),
+                None => self.modeline.clear(),
             },
             // avy. A plain assignment and not a push: there is one next
             // keystroke, so a second `GrabKey` before the first is spent is a
@@ -3156,6 +3782,12 @@ impl Editor {
             EditorCommand::Project(verb) => {
                 self.status = format!("no project backend for {verb}")
             }
+            // Silent, unlike its neighbours: a prompt with no candidates is a
+            // prompt you can still type an answer into, which is what a
+            // headless core should do with one. Saying "no backend" would put
+            // an error over a picker that is working.
+            EditorCommand::PromptSource(_) => {}
+            EditorCommand::ListFonts => self.status = "no font backend".into(),
             // Only reachable with no app under core — a keystroke aimed at a
             // shell that is not there is nothing, not an error worth reporting
             // on every key.
@@ -3169,6 +3801,15 @@ impl Editor {
         }
         if self.revision != before && !history {
             self.buffer.redo.clear();
+        }
+        // An ordinary edit drops overlays too: select the text under a LaTeX
+        // preview, delete it, and the overlay that named the bitmap collapses
+        // inside `splice` with nobody above it any the wiser. Asked once here,
+        // for every command rather than the editing ones, because taking a
+        // `bool` is free and remembering which arms edit is exactly the mistake
+        // that left this hole. See [`Editor::prune_images`].
+        if self.buffer.overlays.take_dropped() {
+            self.prune_images();
         }
         self.clamp_cursor();
         self.ensure_cursor_visible();
@@ -3520,6 +4161,25 @@ impl Editor {
         let id = self.next_overlay_id;
         self.next_overlay_id += 1;
         self.buffer.overlays.add(id, start, end);
+        id
+    }
+
+    /// [`Editor::make_overlay`], with the payload set in the same call — see
+    /// [`overlay::Overlays::add_with`] for why that is worth a second method.
+    pub fn make_overlay_with(
+        &mut self,
+        start: usize,
+        end: usize,
+        f: impl FnOnce(&mut Overlay),
+    ) -> OverlayId {
+        let n = self.buffer.len_chars();
+        let (start, end) = (start.min(n), end.min(n));
+        if start >= end {
+            return 0;
+        }
+        let id = self.next_overlay_id;
+        self.next_overlay_id += 1;
+        self.buffer.overlays.add_with(id, start, end, f);
         id
     }
 
@@ -4264,7 +4924,10 @@ mod tests {
         assert_eq!(normalize_keys("SPC f f"), "SPC f f");
         assert_eq!(normalize_keys("C-x C-f"), "C-x C-f");
         // Named keys are one token, not five characters.
-        for named in ["<tab>", "<backtab>", "<ret>", "<esc>", "<bs>", "<left>"] {
+        for named in [
+            "<tab>", "<backtab>", "<ret>", "<esc>", "<bs>", "<left>", "<home>", "<end>",
+            "<pageup>", "<pagedown>", "<delete>", "<f1>", "<f12>",
+        ] {
             assert_eq!(normalize_keys(named), named);
         }
         // ...and each still matches what the key actually produces.
@@ -4298,6 +4961,85 @@ mod tests {
         ed.apply(EditorCommand::InsertText("xy".into()));
         assert_eq!(ed.marker_position(m), Some(8));
         assert_eq!(ed.buffer.slice_string(8, 12), "beta");
+    }
+
+    /// `narrow` on its own, because the off-by-ones live here and a whole-buffer
+    /// case would hide them.
+    #[test]
+    fn the_smallest_splice_that_turns_one_text_into_another() {
+        // A change in the middle touches only the middle.
+        assert_eq!(Buffer::narrow("abcXdef", "abcYdef"), (3, 1, "Y"));
+        // Pure insertion and pure deletion.
+        assert_eq!(Buffer::narrow("abcdef", "abcZZdef"), (3, 0, "ZZ"));
+        assert_eq!(Buffer::narrow("abcZZdef", "abcdef"), (3, 2, ""));
+        // Identical text is no edit at all, which is what lets `revert_buffer`
+        // return without bumping the revision.
+        assert_eq!(Buffer::narrow("same", "same"), (4, 0, ""));
+        // Nothing in common, so it really is the whole document.
+        assert_eq!(Buffer::narrow("abc", "xyz"), (0, 3, "xyz"));
+        // The prefix and the suffix must not both claim the same characters:
+        // "aa" -> "aaa" is one insertion, not two overlapping ones.
+        assert_eq!(Buffer::narrow("aa", "aaa"), (2, 0, "a"));
+        assert_eq!(Buffer::narrow("aaa", "aa"), (2, 1, ""));
+        // Counted in characters and sliced in bytes, which are not the same
+        // number the moment a document is not ASCII.
+        assert_eq!(Buffer::narrow("αβγ", "αΔγ"), (1, 1, "Δ"));
+        // Empty on either side.
+        assert_eq!(Buffer::narrow("", "new"), (0, 0, "new"));
+        assert_eq!(Buffer::narrow("old", ""), (0, 3, ""));
+    }
+
+    /// What an agent rewriting a file must not cost you.
+    ///
+    /// A fold is an overlay, and so is every org-modern glyph and every LaTeX
+    /// preview. `revert_buffer` used to splice the whole document, and
+    /// `Overlays::adjust` drops an overlay the edit swallowed — so a file
+    /// rewritten underneath the editor came back correct and completely
+    /// unfolded. The splice is now the changed span only, and everything outside
+    /// it is outside the edit.
+    #[test]
+    fn reverting_a_file_keeps_the_overlays_the_change_did_not_touch() {
+        let mut ed = Editor::new();
+        ed.load("one\ntwo\nthree\nfour\n", None, None);
+        // After the load, not before: `load` switches to a buffer of its own,
+        // and the id taken first is the dashboard's.
+        let id = ed.buffer.id;
+        // Over "four", the last line — well clear of the edit below, and the
+        // one that used to vanish on every write by an agent.
+        let far = ed.make_overlay(14, 18);
+        // ...and one over "two", which the edit lands on.
+        let near = ed.make_overlay(4, 7);
+
+        assert!(ed.revert_buffer(id, "one\nTWO\nthree\nfour\n"));
+        assert_eq!(ed.buffer.slice_string(0, 19), "one\nTWO\nthree\nfour\n");
+        assert_eq!(
+            ed.overlay_span(far),
+            Some((14, 18)),
+            "an overlay outside the change must not move or vanish"
+        );
+        // The one *on* the change survives too, because a three-character
+        // replacement is a three-character splice and `adjust` moves its ends
+        // rather than collapsing them. Worth pinning: it is the difference
+        // between a fold around an edited line staying folded and springing
+        // open every time an agent touches the line.
+        assert_eq!(ed.overlay_span(near), Some((4, 7)));
+
+        // The drop rule still holds where it should. Deleting the line an
+        // overlay covers really does swallow it, and an overlay describing text
+        // that is gone has to go — that is the same rule as any other edit, and
+        // the one the whole-buffer splice was accidentally applying to
+        // everything.
+        let doomed = ed.make_overlay(8, 14);
+        assert!(ed.revert_buffer(id, "one\nTWO\nfour\n"));
+        assert_eq!(ed.overlay_span(doomed), None, "its text was deleted");
+
+        // A rewrite that changed nothing changes nothing — no dropped overlays,
+        // and no revision bump to re-parse and re-render an identical buffer.
+        let before = ed.revision;
+        let kept = ed.make_overlay(4, 7);
+        assert!(ed.revert_buffer(id, "one\nTWO\nfour\n"));
+        assert_eq!(ed.overlay_span(kept), Some((4, 7)));
+        assert_eq!(ed.revision, before, "an unchanged file is not an edit");
     }
 
     /// The reason every edit is a splice: a path that forgets to adjust is the
@@ -4370,8 +5112,11 @@ mod tests {
         assert_eq!(ed.selection(), None);
     }
 
+    /// Undo runs the markers *backwards through the edit* rather than clamping
+    /// them into the restored text, which is the difference between a marker
+    /// that survives an undo and one that merely stays inside the document.
     #[test]
-    fn undo_keeps_markers_inside_the_restored_text() {
+    fn undo_puts_a_marker_back_where_it_was() {
         let (mut ed, m) = marked("alpha", 0);
         ed.apply(EditorCommand::Checkpoint);
         ed.apply(EditorCommand::MoveTo(5));
@@ -4379,19 +5124,23 @@ mod tests {
         ed.set_marker(m, 12);
         ed.apply(EditorCommand::Undo);
         assert_eq!(ed.buffer.text.to_string(), "alpha");
-        // Undo restores a snapshot rather than replaying the edit backwards, so
-        // a marker beyond the restored end is clamped onto it.
+        // Inside the text the undo removed, so it collapses onto the start of
+        // the removal — the same answer a marker inside any deleted range gets.
         assert_eq!(ed.marker_position(m), Some(5));
 
-        // ...and one that still fits keeps the position it had, which is what
-        // makes it survive an undo at all.
+        // The one that changed when undo stopped being a whole-document swap.
+        // An insertion *above* the marker pushed it from 6 to 8; undoing that
+        // insertion has to bring it back to 6, because 6 is where it was
+        // pointing — at the `beta`. Clamping left it at 8, still inside the
+        // document and two characters wrong, which is what put a LaTeX preview
+        // over the wrong equation after an undo higher up the file.
         let (mut ed, m) = marked("alpha beta", 6);
         ed.apply(EditorCommand::Checkpoint);
         ed.apply(EditorCommand::MoveTo(0));
         ed.apply(EditorCommand::InsertText("xy".into()));
         assert_eq!(ed.marker_position(m), Some(8));
         ed.apply(EditorCommand::Undo);
-        assert_eq!(ed.marker_position(m), Some(8));
+        assert_eq!(ed.marker_position(m), Some(6));
     }
 
     #[test]
@@ -4522,6 +5271,29 @@ mod tests {
         assert_eq!(ed.selection(), Some((0, 2)));
     }
 
+    /// The blank-line half of the claim [`Editor::line_cells`] exists for: what
+    /// `j`, a click and a wrap point count on an empty line carrying ghost text
+    /// is the cells the renderer draws there, not the zero its text has. Core
+    /// used to say zero on both counts — `display_subs` dropped the overlay and
+    /// `substitute` had no cell to walk — so the two sides agreed only by both
+    /// drawing nothing.
+    #[test]
+    fn an_empty_line_is_laid_out_with_the_display_string_on_it() {
+        // "a\n\nb\n": line 1 is blank, chars [2, 2), and the only range an
+        // overlay on it can have is the newline that ends it.
+        let mut ed = fresh("a\n\nb\n");
+        let ghost = ed.make_overlay(2, 3);
+        ed.apply(EditorCommand::Overlay(OverlayEdit::Display(
+            ghost,
+            Some("type here".into()),
+        )));
+        let text_of = |c: Vec<display::Cell>| c.iter().map(|&(c, _)| c).collect::<String>();
+        assert_eq!(text_of(ed.line_cells(1)), "type here");
+        // ...and a blank line nothing was put on is still blank, so this is the
+        // overlay's doing and not a newline that grew a column.
+        assert!(text_of(ed.line_cells(3)).is_empty());
+    }
+
     // --- lisp-api ------------------------------------------------------------
 
     /// `from_token` is only worth having if it is the *exact* inverse of
@@ -4561,10 +5333,30 @@ mod tests {
             Key::Right,
             Key::Up,
             Key::Down,
+            Key::Home,
+            Key::End,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Delete,
+            Key::F(1),
+            Key::F(9),
+            Key::F(12),
         ];
         for key in all {
             assert_eq!(Key::from_token(&key.token()), Some(key), "{}", key.token());
         }
+        // Emacs' names for the page keys are read but not written — a binding
+        // copied out of an `.emacs` works, and `token` still answers with the
+        // spelling that says which way it goes.
+        assert_eq!(Key::from_token("<prior>"), Some(Key::PageUp));
+        assert_eq!(Key::from_token("<next>"), Some(Key::PageDown));
+        assert_eq!(Key::PageUp.token(), "<pageup>");
+        // Only the twelve the terminal has sequences for, so a binding that
+        // parses is a binding that can be pressed.
+        assert_eq!(Key::from_token("<f13>"), None);
+        assert_eq!(Key::from_token("<f0>"), None);
+        assert_eq!(Key::from_token("<f>"), None);
+        assert_eq!(Key::from_token("<fx>"), None);
         // A chord is folded to lower case on the way out, so that is what comes
         // back — `token` is the canonical spelling and this agrees with it.
         assert_eq!(Key::from_token("C-A"), Some(Key::Ctrl('a')));
@@ -4886,6 +5678,74 @@ mod tests {
         assert!(!Editor::new().has_images(), "and a fresh editor has none");
     }
 
+    /// Deleting the *text* under a preview frees its bitmap, not just deleting
+    /// the overlay.
+    ///
+    /// The sweep used to hang off `EditorCommand::Overlay` alone, so the way you
+    /// actually get rid of a preview — select the equation, `d`, the overlay
+    /// collapses inside `splice` — left a few hundred KB and the renderer's
+    /// texture for it sitting there until some unrelated overlay elsewhere
+    /// happened to be deleted. Bounded, and still a leak with no upper bound
+    /// anybody could name.
+    #[test]
+    fn deleting_the_text_under_a_preview_frees_its_bitmap() {
+        let mut ed = fresh("hello world");
+        ed.add_image(9, Image { width: 4, height: 4, depth: 0, rgba: vec![0; 64] });
+        let preview = ed.make_overlay(0, 5);
+        ed.apply(EditorCommand::Overlay(OverlayEdit::Image(preview, Some(9))));
+        assert!(ed.has_image(9));
+
+        // A real splice over exactly the overlay's range, which is what a visual
+        // selection and `d` comes down to.
+        ed.apply(EditorCommand::DeleteRange(0, 5));
+        assert_eq!(ed.buffer.overlays.span(preview), None, "the overlay went");
+        assert!(!ed.has_image(9), "and its bitmap went with it");
+
+        // Undo brings the text back but not the overlay — an overlay is not in
+        // the snapshot — so the bitmap stays gone rather than coming back
+        // unreferenced.
+        ed.apply(EditorCommand::Undo);
+        assert!(!ed.has_image(9));
+    }
+
+    /// Re-typesetting frees the bitmap it replaced.
+    ///
+    /// The sibling of the entry above, and it hid for the same reason in
+    /// reverse: `Image(_, None)` was in the `drops` list and `Image(_, Some)`
+    /// was not, so *clearing* a preview swept and *replacing* one did not. Every
+    /// route that re-renders the same fragment — a theme change, a zoom, an edit
+    /// inside `$…$` — goes through the second arm, so the leak was one per
+    /// re-render of every equation on screen rather than a rarity.
+    #[test]
+    fn re_typesetting_a_preview_frees_the_bitmap_it_replaced() {
+        let mut ed = fresh("hello world");
+        ed.add_image(9, Image { width: 4, height: 4, depth: 0, rgba: vec![0; 64] });
+        let preview = ed.make_overlay(0, 5);
+        ed.apply(EditorCommand::Overlay(OverlayEdit::Image(preview, Some(9))));
+
+        // The same overlay, a second bitmap: nothing points at 9 any more, and
+        // no overlay was dropped, so the text path's flag never fires for this.
+        ed.add_image(10, Image { width: 8, height: 8, depth: 0, rgba: vec![0; 256] });
+        ed.apply(EditorCommand::Overlay(OverlayEdit::Image(preview, Some(10))));
+        assert!(!ed.has_image(9), "the bitmap it replaced went");
+        assert!(ed.has_image(10), "and the one that replaced it stayed");
+    }
+
+    /// The other half of the policy: an edit that dropped *nothing* must not pay
+    /// for the sweep, and must not lose a bitmap to it either.
+    #[test]
+    fn an_ordinary_edit_leaves_every_bitmap_alone() {
+        let mut ed = fresh("hello world");
+        ed.add_image(9, Image { width: 4, height: 4, depth: 0, rgba: vec![0; 64] });
+        let preview = ed.make_overlay(6, 11);
+        ed.apply(EditorCommand::Overlay(OverlayEdit::Image(preview, Some(9))));
+
+        ed.apply(EditorCommand::InsertAt(0, "say ".into()));
+        assert!(!ed.buffer.overlays.take_dropped(), "nothing collapsed");
+        assert!(ed.has_image(9), "so nothing was swept");
+        assert_eq!(ed.buffer.overlays.span(preview), Some((10, 15)));
+    }
+
     /// The whole argument for the field living on the buffer: there is no scene
     /// table, so there is nothing to sweep and nothing to leak.
     #[test]
@@ -4963,6 +5823,7 @@ mod tests {
             id: 7,
             label: "Name: ".into(),
             completing: false,
+            previewing: false,
         });
         assert!(!ed.prompt.as_ref().unwrap().kind.completes());
         let out = {
@@ -4983,6 +5844,7 @@ mod tests {
             id: 8,
             label: "Name: ".into(),
             completing: false,
+            previewing: false,
         });
         assert_eq!(
             ed.handle_key(Key::Esc),
@@ -4994,6 +5856,7 @@ mod tests {
             id: 9,
             label: "Name: ".into(),
             completing: false,
+            previewing: false,
         });
         assert_eq!(
             ed.handle_key(Key::Backspace),
@@ -5006,6 +5869,7 @@ mod tests {
             id: 10,
             label: "Pick: ".into(),
             completing: true,
+            previewing: false,
         });
         for c in ["alpha", "beta", "gamma"] {
             ed.apply(EditorCommand::PromptItem(c.into()));
@@ -5033,6 +5897,7 @@ mod tests {
             id: 11,
             label: "s: ".into(),
             completing: false,
+            previewing: false,
         });
         let out = {
             let mut out = Vec::new();
@@ -5169,24 +6034,69 @@ mod tests {
         assert_eq!(ed.buffer.text.to_string(), "wo!!rld");
     }
 
-    /// Undo restores a snapshot rather than replaying an edit, so the honest
-    /// record is the whole document — and it has to *be* recorded, because a
-    /// reader told only that the revision moved would keep a stale copy.
+    /// The bug this was reported as: "LaTeX previews render nicely, but adding
+    /// them messes up undo".
+    ///
+    /// A preview is an overlay over the `$…$` it replaces. Undo used to hand the
+    /// buffer a whole-document replacement and then *clamp* the overlays, so an
+    /// undo anywhere above a preview left the preview at its old absolute
+    /// offset while the text slid out from under it — an image over the wrong
+    /// equation, and the same for every fold, diagnostic mark and org-modern
+    /// bullet in the file. Nothing about the undo *stack* was ever broken,
+    /// which is why it took a document with overlays in it to see.
     #[test]
-    fn undo_and_redo_report_a_whole_document_because_a_snapshot_is_not_a_diff() {
+    fn an_overlay_follows_the_text_back_through_an_undo() {
+        let mut ed = fresh("intro\n$x^2$\n");
+        // The preview, over the fragment on line 2.
+        let ov = 1u64;
+        ed.buffer.overlays.add(ov, 6, 11);
+        assert_eq!(ed.buffer.overlays.span(ov), Some((6, 11)));
+
+        // An edit *above* it, which pushes it along...
+        ed.apply(EditorCommand::Checkpoint);
+        ed.apply(EditorCommand::MoveTo(0));
+        ed.apply(EditorCommand::InsertText("PREFIX ".into()));
+        assert_eq!(ed.buffer.overlays.span(ov), Some((13, 18)));
+
+        // ...and undoing that edit has to bring it back to the equation rather
+        // than leaving it seven characters along, still inside the document and
+        // over `\n$x^2` instead of `$x^2$`.
+        ed.apply(EditorCommand::Undo);
+        assert_eq!(ed.buffer.text.to_string(), "intro\n$x^2$\n");
+        assert_eq!(ed.buffer.overlays.span(ov), Some((6, 11)));
+        assert_eq!(&ed.buffer.slice_string(6, 11), "$x^2$");
+
+        // ...and redo takes it back with the text, which is the same claim in
+        // the other direction.
+        ed.apply(EditorCommand::Redo);
+        assert_eq!(ed.buffer.overlays.span(ov), Some((13, 18)));
+        assert_eq!(&ed.buffer.slice_string(13, 18), "$x^2$");
+    }
+
+    /// Undo reports the *range* it changed, not the whole document.
+    ///
+    /// It used to report `0..old -> 0..new`, which was honest about a snapshot
+    /// being two ropes and cost a full reparse and a full `didChange` for a `u`
+    /// on one character. The two ropes differ by exactly the edit that was
+    /// undone, and that is one contiguous range — so undo splices it, and every
+    /// reader downstream gets the small record it would have got for the
+    /// original keystroke.
+    #[test]
+    fn undo_and_redo_report_only_what_changed() {
         let mut ed = fresh("abcdef");
         feed(&mut ed, &[Key::Char('x')]);
         let seen = ed.buffer.change_count();
         feed(&mut ed, &[Key::Char('u')]);
+        // Putting the `a` back: one character inserted at 0.
         assert_eq!(
             ed.buffer.changes_since(seen).unwrap(),
-            [Change { start: 0, old_end: 5, new_end: 6 }]
+            [Change { start: 0, old_end: 0, new_end: 1 }]
         );
         let seen = ed.buffer.change_count();
         feed(&mut ed, &[Key::Ctrl('r')]);
         assert_eq!(
             ed.buffer.changes_since(seen).unwrap(),
-            [Change { start: 0, old_end: 6, new_end: 5 }]
+            [Change { start: 0, old_end: 1, new_end: 0 }]
         );
     }
 

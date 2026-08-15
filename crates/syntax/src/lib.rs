@@ -1,9 +1,11 @@
 //! zemacs-syntax — tree-sitter highlighting, flattened into [`zemacs_core::Span`].
 //!
 //! The whole crate is three functions ([`language_for_path`], [`highlight`],
-//! [`languages`]) over one idea: run a grammar's `highlights.scm` over a parse
-//! tree, keep the innermost capture covering each byte, and convert byte
-//! offsets to char offsets, which is what the rope and the renderer index by.
+//! [`languages`]) over one idea: run a `highlights.scm` over a parse tree, keep
+//! the innermost capture covering each byte, and convert byte offsets to char
+//! offsets, which is what the rope and the renderer index by. Most of those
+//! queries are the grammar's own; `lisp.scm`, `python.scm` and `json.scm` are
+//! ours, and each says in its header why.
 //!
 //! The exception is org, which has no grammar we can use (see [`org`]) and is
 //! scanned by hand, a line at a time, straight into char offsets.
@@ -24,7 +26,10 @@
 //! it a tree — the `Tree` it builds lives inside its iterator and dies with it.
 //! Incremental reparsing is the one optimisation that matters here, and it is
 //! unreachable through that API, so [`spans`] below does the flattening
-//! instead. With no injection and no locals query — which is what this crate
+//! instead. Owning the flattening turned out to buy the second optimisation as
+//! well: [`requery`] runs the query over the part of the tree that moved and
+//! splices, which needs both the previous spans and a say in how they are put
+//! together. With no injection and no locals query — which is what this crate
 //! configured either way, "lexical color only" — the algorithm it replaces
 //! reduces to three rules, all of them in [`spans`]: captures arrive in tree
 //! order, the last capture on a node wins, and a capture nested inside another
@@ -46,19 +51,25 @@ use zemacs_core::{BufferId, Change, HlKind, Span};
 
 /// The capture names we recognize, and the [`HlKind`] each folds onto.
 ///
-/// `HighlightConfiguration::configure` does the prefix work for us: it matches
-/// a query's capture name against this list by dot-separated parts, longest
-/// match wins. So `function.macro` and `function.builtin` both land on
-/// `function`, `punctuation.bracket` on `punctuation`, and so on. Capture names
-/// absent from this list (`embedded`, `spell`, ...) simply get no highlight.
+/// [`kind_for`] matches a query's capture name against this list by
+/// dot-separated parts, longest match wins: `function.macro` lands on
+/// `function` and `punctuation.bracket` on `punctuation`, while a name spelled
+/// out here in full takes its own face instead of its parent's. That last part
+/// is the whole mechanism for saying "`len` is not one of your functions" and
+/// "a docstring is prose" without adding a face for either — a face costs a
+/// variant in [`HlKind`], a line in every one of the eleven themes, and a
+/// colour nobody had picked. Capture names absent from this list (`embedded`,
+/// `spell`, ...) simply get no highlight.
 const CAPTURES: &[(&str, HlKind)] = &[
     ("attribute", HlKind::Constant),
+    ("boolean", HlKind::Constant),
     ("comment", HlKind::Comment),
     ("constant", HlKind::Constant),
     ("constructor", HlKind::Type),
     ("delimiter", HlKind::Punctuation),
     ("escape", HlKind::String),
     ("function", HlKind::Function),
+    ("function.builtin", HlKind::Constant),
     ("keyword", HlKind::Keyword),
     ("label", HlKind::Constant),
     ("number", HlKind::Number),
@@ -66,8 +77,13 @@ const CAPTURES: &[(&str, HlKind)] = &[
     ("property", HlKind::Variable),
     ("punctuation", HlKind::Punctuation),
     ("string", HlKind::String),
+    ("string.documentation", HlKind::Comment),
     ("type", HlKind::Type),
     ("variable", HlKind::Variable),
+    // `self` in Rust, `this` and `super` in JavaScript, `self`/`cls` in Python:
+    // every grammar's word for "the name the language gave you", and a keyword
+    // in all three languages' own `-ts-mode`.
+    ("variable.builtin", HlKind::Keyword),
 ];
 
 /// Language id -> the file extensions that select it. First match wins, so the
@@ -238,7 +254,24 @@ fn end_row(node: &tree_sitter::Node) -> usize {
 /// * a node's range is either disjoint from or wholly inside every earlier
 ///   one — they came out of a tree — so a stack is enough to know which
 ///   highlight is innermost, and no interval arithmetic is needed.
-fn spans(config: &Config, cursor: &mut QueryCursor, tree: &Tree, text: &str) -> Vec<Span> {
+///
+/// `range` is how much of the tree to look at, and `0..text.len()` is all of
+/// it. A narrower one is the whole of [`requery`]: the cursor still walks from
+/// the root, so a pattern rooted anywhere above the range is entered and
+/// matched as usual, and what the range buys is not descending into the
+/// subtrees that fall outside it. Captures landing outside are the caller's to
+/// discard — a pattern rooted at the file root can put one anywhere.
+fn spans(
+    config: &Config,
+    cursor: &mut QueryCursor,
+    tree: &Tree,
+    text: &str,
+    range: std::ops::Range<usize>,
+) -> Vec<Span> {
+    // Set on every call and never inherited from the last one: the cursor
+    // outlives this function, and a range left over from some other buffer's
+    // edit would silently colour a fraction of the file.
+    cursor.set_byte_range(range);
     // Read out before flattening rather than streamed, because deciding what a
     // node's highlight is means looking at the capture *after* it, and the
     // query cursor is a streaming iterator that cannot be peeked. One `usize`
@@ -289,14 +322,27 @@ fn paint(out: &mut Vec<Span>, at: &mut usize, to: usize, kind: Option<HlKind>) {
         return;
     }
     if let Some(kind) = kind {
-        match out.last_mut() {
-            // Nesting splits a run at every boundary; glue the pieces that
-            // ended up the same colour back together.
-            Some(last) if last.kind == kind && last.end == *at => last.end = to,
-            _ => out.push(Span { start: *at, end: to, kind }),
-        }
+        push(out, *at, to, kind);
     }
     *at = to;
+}
+
+/// Add `start..end` to a span list, gluing it onto the run before it when they
+/// meet and agree.
+///
+/// Nesting splits a run at every boundary and this is what puts the pieces that
+/// ended up the same colour back together — the reason no two spans in a list
+/// are ever adjacent and equal. [`requery`] needs the same rule at its seams,
+/// where a run that a full query would have produced in one piece arrives as an
+/// old piece and a new one.
+fn push(out: &mut Vec<Span>, start: usize, end: usize, kind: HlKind) {
+    if end <= start {
+        return;
+    }
+    match out.last_mut() {
+        Some(last) if last.kind == kind && last.end == start => last.end = end,
+        _ => out.push(Span { start, end, kind }),
+    }
 }
 
 /// Rewrite byte offsets to char offsets in place.
@@ -399,15 +445,18 @@ fn build_configs() -> HashMap<&'static str, Config> {
         tree_sitter_commonlisp::LANGUAGE_COMMONLISP.into(),
         include_str!("lisp.scm"),
     );
+    // Python and JSON carry their own queries for the same reason lisp does,
+    // arrived at from the other end: the stock ones exist but are thin — see the
+    // headers of those two files for what each was missing.
     add(
         "python",
         tree_sitter_python::LANGUAGE.into(),
-        tree_sitter_python::HIGHLIGHTS_QUERY,
+        include_str!("python.scm"),
     );
     add(
         "json",
         tree_sitter_json::LANGUAGE.into(),
-        tree_sitter_json::HIGHLIGHTS_QUERY,
+        include_str!("json.scm"),
     );
     add(
         "toml",
@@ -444,6 +493,12 @@ struct Parsed {
     /// place a stray byte offset silently lies about an accented character.
     text: String,
     tree: Tree,
+    /// What this text last flattened to, in **bytes** — the one span list in
+    /// the crate kept in tree-sitter's units rather than the editor's, because
+    /// bytes are what the next call's changed ranges will be in. The char
+    /// offsets everyone else indexes by are made from it on the way out, to a
+    /// copy, which is one walk of the text and no state to keep in step.
+    spans: Vec<Span>,
 }
 
 /// How many documents keep a tree.
@@ -530,6 +585,7 @@ impl Session {
         // Anything else is a different text, and handing tree-sitter an old
         // tree that does not describe it is the one way to get a *wrong* parse
         // rather than a slow one.
+        let mut edit = None;
         let old = mine.filter(|p| p.lang == lang).and_then(|mut old| {
             edits.map(|edits| {
                 // One `InputEdit` for the whole run rather than one each:
@@ -537,21 +593,31 @@ impl Session {
                 // are here to convert offsets against. A wider edit than
                 // strictly happened costs a wider reparse and nothing else.
                 if let Some(change) = Change::coalesce(edits) {
-                    old.tree.edit(&input_edit(&old.text, text, change));
+                    edit = Some(input_edit(&old.text, text, change));
+                    old.tree.edit(edit.as_ref().expect("just filled"));
                 }
-                old.tree
+                old
             })
         });
-        let Some(tree) = self.parser.parse(text, old.as_ref()) else {
+        let Some(tree) = self.parser.parse(text, old.as_ref().map(|old| &old.tree)) else {
             return Vec::new();
         };
-        // ponytail: the *query* still runs over the whole tree, so this saves
-        // the parse and not the colouring. The parse is the part that grows
-        // superlinearly and the part that was measured; re-running the query
-        // only over `tree.changed_ranges(&old)` means keeping the previous
-        // spans and splicing the new ones into them, which is a second
-        // stateful thing to get wrong for a smaller win.
-        let mut out = spans(config, &mut self.cursor, &tree, text);
+        // The colouring is incremental too, and on the same terms as the parse:
+        // with a tree to compare against, only what moved is re-queried. See
+        // [`requery`] for why a span outside the changed set cannot need
+        // recolouring, and for the file shape where that saves nothing.
+        let bytes = match &old {
+            Some(old) => requery(config, &mut self.cursor, old, &tree, text, edit),
+            None => spans(config, &mut self.cursor, &tree, text, 0..text.len()),
+        };
+        // ponytail: from here down the work is the size of the *file* again —
+        // a copy of every span, and a walk of the text to put the copy in char
+        // offsets — which is what now dominates a keystroke in a megabyte
+        // buffer, at a few milliseconds where the query used to be a hundred.
+        // The upgrade is to hand the caller the changed run instead of the
+        // whole list, and that is a change to core's and the renderer's side of
+        // the boundary rather than to this crate's.
+        let mut out = bytes.clone();
         to_char_offsets(text, &mut out);
         if let Some(buffer) = buffer {
             if self.parsed.len() == TREES {
@@ -562,10 +628,178 @@ impl Session {
                 lang: lang.to_string(),
                 text: text.to_string(),
                 tree,
+                spans: bytes,
             });
         }
         out
     }
+}
+
+/// Re-run the query only where the tree moved, and splice the result into the
+/// spans the previous call left behind.
+///
+/// The parse was already incremental; this is the other half, and it turns
+/// entirely on one question: can a span *outside* the changed ranges need
+/// recolouring? It can, and `tree.changed_ranges()` alone does not say where.
+///
+/// * A query match is a pure function of the subtree it is rooted at —
+///   tree-sitter patterns cannot look at a parent, or at anything outside their
+///   own root — so a match can only change when that subtree does.
+/// * But `changed_ranges` does not report a changed subtree, only the parts of
+///   it that are not byte-identical: it skips any child whose symbol, size,
+///   parse state and scanner state all still agree. Type a statement above a
+///   Python docstring and the *string* is untouched and goes unreported, while
+///   `(module . (expression_statement (string) @string.documentation))` quietly
+///   stops matching it — the docstring is the second statement now, not the
+///   first.
+///
+/// So the changed set is widened to whole **top-level items**: every child of
+/// the root it touches, and one item either side. Every match then lies wholly
+/// inside a re-queried item, where the fresh spans replace it outright, or
+/// wholly inside an item tree-sitter reused byte for byte, where it cannot have
+/// moved. The one item of slack is for patterns rooted at the file root itself,
+/// which are the only ones that span two items at once: the seven queries here
+/// have exactly one, the module docstring above, and it reaches one child
+/// either side of the change.
+///
+/// Runaway edits need no special case, which is the pleasant surprise: opening
+/// a `/*` or a `"` at the top of a file *does* recolour everything below, and
+/// it reparses everything below too, so the changed set is already the rest of
+/// the file and the query follows it there. What the changed set does not
+/// survive is error recovery, and that one is not a surprise at all — see
+/// [`dirty`]'s last rule, the single place this stops believing it.
+///
+/// ponytail: the ceiling is a file whose top level is a single item — a JSON
+/// document, a Rust file that is one `mod` — where "the item that changed" is
+/// the whole file and this saves nothing but the parse. The upgrade is to
+/// descend instead of stopping at the root's children: the same argument holds
+/// at any depth, with the deepest pattern in the query as the number of
+/// ancestors that have to be swept up rather than "all of them".
+fn requery(
+    config: &Config,
+    cursor: &mut QueryCursor,
+    old: &Parsed,
+    tree: &Tree,
+    text: &str,
+    edit: Option<InputEdit>,
+) -> Vec<Span> {
+    let Some((lo, hi)) = dirty(&old.tree, tree, edit, text.len()) else {
+        return old.spans.clone(); // nothing moved, so nothing shifted either
+    };
+    let fresh = spans(config, cursor, tree, text, lo..hi);
+    if lo == 0 && hi >= text.len() {
+        return fresh; // the whole file moved; there is nothing to splice it into
+    }
+    // Where a byte after the edit ended up. Only ever asked about offsets at or
+    // past `old_end`, where this is exactly "add the delta"; below it the
+    // saturating subtraction keeps the arithmetic from wrapping and the answer
+    // is thrown away by the `max(hi)` at the one place it could be read.
+    let (old_end, new_end) = edit.map_or((0, 0), |e| (e.old_end_byte, e.new_end_byte));
+    let shift = |at: usize| (at + new_end).saturating_sub(old_end);
+
+    let mut out = Vec::with_capacity(old.spans.len() + fresh.len());
+    for span in &old.spans {
+        if span.start >= lo {
+            break;
+        }
+        push(&mut out, span.start, span.end.min(lo), span.kind);
+    }
+    for span in &fresh {
+        push(&mut out, span.start.max(lo), span.end.min(hi), span.kind);
+    }
+    for span in &old.spans {
+        let end = shift(span.end);
+        if end > hi {
+            push(&mut out, shift(span.start).max(hi), end, span.kind);
+        }
+    }
+    // A record that never described these two texts can leave an old span
+    // hanging past the end of the text now in hand, and these offsets are what
+    // the renderer slices with. Same rule as everywhere else here: a caller's
+    // bug costs colours, not the editor.
+    while out.last().is_some_and(|span| span.start >= text.len()) {
+        out.pop();
+    }
+    if let Some(last) = out.last_mut() {
+        last.end = last.end.min(text.len());
+    }
+    out
+}
+
+/// The byte range to re-run the query over: everywhere the tree moved, widened
+/// to whole top-level items with one item of slack either side, or `None` when
+/// nothing moved at all.
+///
+/// The edit's own range goes in beside the changed ranges, which costs nothing
+/// and closes two holes: an edit that changes no *structure* — a space typed
+/// into indentation — reports no changed range whatsoever, and the spans over
+/// the edited bytes have to be rebuilt regardless, because the text underneath
+/// them is not the text they were made from.
+///
+/// Nothing here needs unioning across a run of coalesced edits, which is the
+/// hazard the worker's queue has: these ranges are read off the two trees, and
+/// the old tree has already taken every edit in the run. Whatever a dropped
+/// request cost, it did not cost this.
+fn dirty(old: &Tree, tree: &Tree, edit: Option<InputEdit>, len: usize) -> Option<(usize, usize)> {
+    let root = tree.root_node();
+    // A document whose top level is a single item has only one answer here —
+    // [`requery`]'s stated ceiling — and `changed_ranges` charges a walk of that
+    // item's children to arrive at it: 10 ms on a flat 40 000-key JSON file, to
+    // be told what the shape of the file already said.
+    if root.child_count() <= 1 {
+        return Some((0, len));
+    }
+    let (mut lo, mut hi) = (usize::MAX, 0);
+    for range in old.changed_ranges(tree) {
+        lo = lo.min(range.start_byte);
+        hi = hi.max(range.end_byte);
+    }
+    if let Some(edit) = edit {
+        lo = lo.min(edit.start_byte);
+        hi = hi.max(edit.new_end_byte);
+    }
+    if lo > hi {
+        return None;
+    }
+    // One walk of the root's children, which is the file's items and not its
+    // nodes. `a` ends up on the last item that finishes before the change and
+    // `b` on the first that starts after it — the slack — and everything
+    // between them is the run of items the change is inside of.
+    let mut walk = root.walk();
+    let (mut a, mut b) = (0, len);
+    for item in root.children(&mut walk) {
+        if item.end_byte() <= lo {
+            a = item.start_byte();
+        }
+        if item.start_byte() >= hi {
+            b = item.end_byte();
+            break;
+        }
+    }
+    let (a, b) = (a.min(lo), b.max(hi));
+    // And the one place `changed_ranges` is not to be believed. It walks the
+    // two trees in step and skips any pair of subtrees agreeing on symbol,
+    // size, parse state and error cost, on the reasoning that a deterministic
+    // parse of the same bytes from the same state is the same tree. Under error
+    // recovery that reasoning fails: two *different* error subtrees can agree on
+    // all four, and the walk skips over a region that really did change. Found
+    // by the fuzz below — one deletion in a file of broken Python re-lexed a
+    // `from` a thousand bytes away from an identifier into a keyword, and
+    // nothing in the changed set said so.
+    //
+    // So an item that did not parse cleanly is only trusted where it is being
+    // re-queried anyway. Typing inside the item you have just broken — which is
+    // where the error is while anyone is typing — stays on the fast path; an
+    // error left behind somewhere else in the file costs the whole query, which
+    // is what every keystroke used to cost.
+    let mut walk = root.walk();
+    let suspect = root
+        .children(&mut walk)
+        .any(|item| item.has_error() && (item.start_byte() < a || item.end_byte() > b));
+    if suspect {
+        return Some((0, len));
+    }
+    Some((a, b))
 }
 
 /// A [`Change`] in the two shapes tree-sitter wants: byte offsets, and
@@ -797,6 +1031,18 @@ mod tests {
         text_of(src, span)
     }
 
+    /// The face covering the first occurrence of `needle`, or `None` where the
+    /// renderer would leave body text. The language tests below are all "these
+    /// two things are not the same colour", which is the question a flat
+    /// highlighter fails and a "some spans came back" assertion never asks.
+    fn kind_of(src: &str, spans: &[Span], needle: &str) -> Option<HlKind> {
+        let byte = src
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not in the source"));
+        let at = src[..byte].chars().count();
+        spans.iter().find(|s| s.start <= at && at < s.end).map(|s| s.kind)
+    }
+
     /// Every span of `kind`, in order, as text.
     fn all(src: &str, spans: &[Span], kind: HlKind) -> Vec<String> {
         spans
@@ -844,6 +1090,120 @@ mod tests {
         assert_eq!(first(src, &spans, HlKind::Keyword), "let");
         assert_eq!(first(src, &spans, HlKind::Function), "print");
         assert_eq!(first(src, &spans, HlKind::Number), "1");
+    }
+
+    /// Everything `python-ts-mode` marks that the grammar's own query does not.
+    /// Before `python.scm` the decorator was a function call, the docstring was
+    /// an ordinary string, `len` was one of your own functions, and the
+    /// brackets and the parameters were body text.
+    #[test]
+    fn python_marks_what_the_grammars_own_query_left_flat() {
+        let src = concat!(
+            "\"\"\"Module blurb.\"\"\"\n",
+            "@app.route\n",
+            "def greet(name, count=2):\n",
+            "    \"\"\"Say hello.\"\"\"\n",
+            "    msg = \"plain\"\n",
+            "    return len(msg) + count\n",
+        );
+        let spans = highlight("python", src);
+        let k = |needle: &str| kind_of(src, &spans, needle);
+        // the decorator, `@' and dotted path alike
+        assert_eq!(k("@app"), Some(HlKind::Type));
+        assert_eq!(k("route"), Some(HlKind::Type));
+        assert_eq!(k("greet"), Some(HlKind::Function));
+        assert_ne!(k("@app"), k("greet"), "a decorator is not a call");
+        // a builtin is not one of yours
+        assert_eq!(k("len"), Some(HlKind::Constant));
+        assert_ne!(k("len"), k("greet"));
+        // a docstring is not an ordinary string, in either of the two places
+        // this file has one
+        assert_eq!(k("Module blurb"), Some(HlKind::Comment));
+        assert_eq!(k("Say hello"), Some(HlKind::Comment));
+        assert_eq!(k("\"plain\""), Some(HlKind::String));
+        // parameters, an assignment target, a number and the brackets
+        assert_eq!(k("name"), Some(HlKind::Variable));
+        assert_eq!(k("count"), Some(HlKind::Variable));
+        assert_eq!(k("msg"), Some(HlKind::Variable));
+        assert_eq!(k("2"), Some(HlKind::Number));
+        assert_eq!(k("("), Some(HlKind::Punctuation));
+    }
+
+    /// The other half of what level 3 of `python-ts-mode` paints: `self`, the
+    /// `__dunder__` names, annotations, and a class told apart from a function.
+    #[test]
+    fn python_reads_self_dunders_and_annotations_the_way_python_ts_mode_does() {
+        let src = concat!(
+            "class Widget:\n",
+            "    \"\"\"A widget.\"\"\"\n",
+            "    def __init__(self, size: float) -> None:\n",
+            "        self.size = size\n",
+            "        print(__name__)\n",
+        );
+        let spans = highlight("python", src);
+        let k = |needle: &str| kind_of(src, &spans, needle);
+        assert_eq!(k("Widget"), Some(HlKind::Type));
+        assert_eq!(k("A widget"), Some(HlKind::Comment)); // the class docstring
+        // a definition first and a dunder second, which is the order the
+        // patterns are in: `def __init__` is still a definition
+        assert_eq!(k("__init__"), Some(HlKind::Function));
+        assert_ne!(k("Widget"), k("__init__"), "a class is not a function");
+        assert_eq!(k("self"), Some(HlKind::Keyword));
+        assert_eq!(k("size"), Some(HlKind::Variable));
+        assert_eq!(k("float"), Some(HlKind::Type));
+        assert_eq!(k("None"), Some(HlKind::Constant));
+        assert_eq!(k("__name__"), Some(HlKind::Constant));
+        assert_eq!(k("print"), Some(HlKind::Constant));
+    }
+
+    /// The blanket `(identifier) @variable` is gone on purpose: a name that is
+    /// not something in particular gets no span at all and the renderer leaves
+    /// it in the body colour. Nothing else checks that decision.
+    #[test]
+    fn a_plain_python_name_is_left_as_body_text() {
+        let src = "import os\nwhere = os.getcwd()\n";
+        let spans = highlight("python", src);
+        assert_eq!(kind_of(src, &spans, "os\n"), None);
+        assert_eq!(kind_of(src, &spans, "where"), Some(HlKind::Variable));
+        assert_eq!(kind_of(src, &spans, "getcwd"), Some(HlKind::Function));
+    }
+
+    #[test]
+    fn an_f_string_is_a_string_and_what_is_in_its_braces_is_not() {
+        let src = "note = f\"total: {len(rows)}\"\n";
+        let spans = highlight("python", src);
+        let k = |needle: &str| kind_of(src, &spans, needle);
+        assert_eq!(k("total:"), Some(HlKind::String));
+        assert_eq!(k("{"), Some(HlKind::Punctuation));
+        assert_eq!(k("len"), Some(HlKind::Constant));
+        assert_eq!(k("rows"), Some(HlKind::Variable));
+    }
+
+    /// A JSON key is not the same thing as a string value — the stock query had
+    /// its two patterns in the order that made it one — and a TOML boolean had
+    /// no capture this crate answered to at all.
+    #[test]
+    fn json_keys_and_toml_booleans_are_not_the_colour_of_their_neighbours() {
+        let json = "{\"name\": \"zemacs\", \"n\": 1}";
+        let spans = highlight("json", json);
+        assert_eq!(kind_of(json, &spans, "\"name\""), Some(HlKind::Type));
+        assert_eq!(kind_of(json, &spans, "\"zemacs\""), Some(HlKind::String));
+        let toml = "debug = true\nname = \"zemacs\"\n";
+        let spans = highlight("toml", toml);
+        assert_eq!(kind_of(toml, &spans, "true"), Some(HlKind::Constant));
+    }
+
+    /// `self` is a keyword in Rust and `this` is one in JavaScript. Both
+    /// grammars call it `@variable.builtin`, which used to fold onto the face a
+    /// plain identifier gets — the body colour, in most themes.
+    #[test]
+    fn self_and_this_are_keywords_rather_than_plain_names() {
+        let rust = "impl T { fn f(&self) -> u8 { self.x } }";
+        let spans = highlight("rust", rust);
+        assert_eq!(kind_of(rust, &spans, "self)"), Some(HlKind::Keyword));
+        let js = "class C { m() { return this.x; } }";
+        let spans = highlight("javascript", js);
+        assert_eq!(kind_of(js, &spans, "this"), Some(HlKind::Keyword));
     }
 
     /// The whole point of char offsets. Every span here sits after a multi-byte
@@ -935,12 +1295,25 @@ mod tests {
     /// colours are afterwards. The one thing a caller must get right is the
     /// [`Change`], so it is computed here the way core computes it.
     fn typed(session: &mut Session, lang: &str, text: &str, at: usize, insert: &str) -> (String, Vec<Span>) {
+        edited(session, lang, text, at, 0, insert)
+    }
+
+    /// The same with a deletion in front of it: delete `del` characters at
+    /// `at`, then type `insert` where they were.
+    fn edited(
+        session: &mut Session,
+        lang: &str,
+        text: &str,
+        at: usize,
+        del: usize,
+        insert: &str,
+    ) -> (String, Vec<Span>) {
         let mut next: String = text.chars().take(at).collect();
         next.push_str(insert);
-        next.extend(text.chars().skip(at));
+        next.extend(text.chars().skip(at + del));
         let change = Change {
             start: at,
-            old_end: at,
+            old_end: at + del,
             new_end: at + insert.chars().count(),
         };
         let spans = session.highlight(Some(1), lang, &next, Some(&[change]));
@@ -977,6 +1350,178 @@ mod tests {
             );
             src = next;
         }
+    }
+
+    /// The same contract for the *query*, and the only assertion that proves
+    /// it: spans spliced together out of a re-queried range must come back
+    /// **byte for byte** what a query over the whole tree would have produced.
+    /// Anything weaker buys speed with colours that are wrong only after one
+    /// particular edit, which is the bug nobody can reproduce.
+    ///
+    /// The shapes are the ones that recolour far more than they touch — a
+    /// comment or a string opened near the top of a file swallows everything
+    /// below it, and a closing brace deleted hands the rest of the parse to an
+    /// error node. `at` is *found* rather than counted, so the test keeps
+    /// meaning something as the file it reads changes underneath it.
+    #[test]
+    fn an_incremental_query_agrees_with_a_full_one() {
+        let mut session = Session::new();
+        let mut src = include_str!("lib.rs").to_string();
+        session.highlight(Some(1), "rust", &src, None);
+        // (landmark, characters into it, characters to delete, what to type)
+        for (landmark, into, del, insert) in [
+            ("fn kind_for", 3, 0, "x"),               // an ordinary mid-line insert
+            ("fn config", 0, 0, "/*"),                // opens a comment...
+            ("fn build_configs", 0, 0, "*/"),         // ...and closes it again
+            ("fn to_char_offsets", 0, 0, "\""),       // opens a string...
+            ("fn locate", 0, 0, "\""),                // ...and closes it again
+            ("}\n\n/// A grammar", 0, 1, ""),         // deletes a closing brace
+            ("fn dirty", 0, 0, "\n"),                 // whitespace between two items
+            ("//! zemacs-syntax", 0, 0, "\n"),        // the very top of the file
+            ("fn end_row", 0, 12, ""),                // deletes a whole name
+        ] {
+            let found = src.find(landmark).unwrap_or_else(|| panic!("{landmark:?} is gone"));
+            let at = src[..found].chars().count() + into;
+            let (next, incremental) = edited(&mut session, "rust", &src, at, del, insert);
+            assert_eq!(
+                incremental,
+                highlight("rust", &next),
+                "{del} deleted and {insert:?} typed at {landmark:?} disagreed with a full query"
+            );
+            src = next;
+        }
+        // The end of the file, where the last closing brace holds up everything
+        // above it and there is no following node to widen the change to.
+        let end = src.chars().count();
+        let (next, incremental) = edited(&mut session, "rust", &src, end - 2, 1, "");
+        assert_eq!(incremental, highlight("rust", &next), "the last brace deleted");
+        let (appended, incremental) = typed(&mut session, "rust", &next, next.chars().count(), "\nfn t() {}\n");
+        assert_eq!(incremental, highlight("rust", &appended), "typed past the end");
+
+        // The other grammars, including the shapes where the whole top level is
+        // a single item and there is nothing to narrow to: this file read as
+        // JSON is one enormous error node.
+        for lang in ["lisp", "python", "json", "toml", "c", "javascript"] {
+            let mut session = Session::new();
+            let mut src = include_str!("lib.rs").to_string();
+            session.highlight(Some(1), lang, &src, None);
+            for (at, del, insert) in [(0, 0, "\"("), (900, 1, ""), (400, 0, "*/\n#")] {
+                let (next, incremental) = edited(&mut session, lang, &src, at, del, insert);
+                assert_eq!(incremental, highlight(lang, &next), "{lang}: {insert:?} at {at}");
+                src = next;
+            }
+        }
+    }
+
+    /// What the tree a session is holding would colour if the query had been
+    /// run over all of it.
+    ///
+    /// This is what [`requery`] has to agree with, and it is a *different*
+    /// question from "what would a fresh parse colour": tree-sitter's error
+    /// recovery is path-dependent, so an edited tree and a from-scratch parse
+    /// of the same broken text can genuinely differ, and did — see the fuzz
+    /// below, whose junk input reaches that case regularly. Comparing against
+    /// the session's own tree asks only what this crate is answerable for.
+    fn whole_tree(session: &Session, lang: &str, text: &str) -> Vec<Span> {
+        let config = config(lang).expect("a grammar");
+        let parsed = session.parsed.last().expect("a parse to compare against");
+        let mut cursor = QueryCursor::new();
+        let mut out = spans(config, &mut cursor, &parsed.tree, text, 0..text.len());
+        to_char_offsets(text, &mut out);
+        out
+    }
+
+    /// The one generated test in the crate, and it earned its place by finding
+    /// a real one: the error-recovery hole that the test above this now pins
+    /// down deterministically. No table of edit shapes was going to reach that,
+    /// and this is here for the next hole rather than for that one.
+    ///
+    /// Fixed seed, so a failure is reproducible rather than a thing that
+    /// happened on somebody's machine once. The junk it makes is the point:
+    /// every language here is fed a file written in another one, and half the
+    /// edits leave a quote or a bracket hanging.
+    ///
+    /// It compares against [`whole_tree`] and not against a fresh parse, which
+    /// is the only honest comparison at this level of junk — see there.
+    #[test]
+    fn a_generated_run_of_edits_never_disagrees_with_a_full_query() {
+        let corpus = include_str!("lib.rs");
+        let bits = [
+            "/*", "*/", "\"", "'", "{", "}", "(", ")", ";", "#", "\n", "x", "//", "\\", "|#",
+            "#|", "[", "]", ":", "*", "-", "$", "`", "\u{e9}", "def f():", "\"\"\"", "r#\"",
+        ];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        for lang in ["rust", "python", "lisp", "json", "toml", "c", "javascript"] {
+            for round in 0..24 {
+                let mut session = Session::new();
+                let n = 200 + rng() % 2000;
+                let start = rng() % (corpus.len() - n - 1);
+                let mut src: String = corpus.chars().skip(start).take(n).collect();
+                session.highlight(Some(1), lang, &src, None);
+                for step in 0..10 {
+                    let len = src.chars().count();
+                    if len < 4 {
+                        break;
+                    }
+                    let at = rng() % len;
+                    let del = if rng() % 3 == 0 { (rng() % 40).min(len - at) } else { 0 };
+                    let insert = if rng() % 4 == 0 { "" } else { bits[rng() % bits.len()] };
+                    let (next, incremental) = edited(&mut session, lang, &src, at, del, insert);
+                    assert_eq!(
+                        incremental,
+                        whole_tree(&session, lang, &next),
+                        "{lang} round {round} step {step}: {del} deleted and {insert:?} typed at {at}"
+                    );
+                    src = next;
+                }
+            }
+        }
+    }
+
+    /// The case the fuzz found, shrunk to the sixty-nine characters that still
+    /// show it, and the reason [`dirty`] does not believe the changed ranges
+    /// around an error.
+    ///
+    /// Junk Python. Deleting the first line re-lexes the `from` near the end
+    /// from an identifier into a keyword — a change tree-sitter makes and then
+    /// does not report, because the two error subtrees over it agree on symbol,
+    /// size, parse state and error cost, which is all the changed-range walk
+    /// compares before skipping. In the file this was found in, the two were a
+    /// thousand bytes apart.
+    #[test]
+    fn a_relex_inside_an_error_is_recoloured_even_though_nothing_reports_it() {
+        let src = ") -> Option<(usize, usize)> {l(h=(M if o>{s for\ny,d///t d from d e e/";
+        let mut session = Session::new();
+        assert_eq!(kind_of(src, &session.highlight(Some(1), "python", src, None), "from"), None);
+        let (next, incremental) = edited(&mut session, "python", src, 0, 29, "");
+        // A keyword now, and stale colour is exactly what "still None" means.
+        assert_eq!(kind_of(&next, &incremental, "from"), Some(HlKind::Keyword));
+        assert_eq!(incremental, highlight("python", &next));
+    }
+
+    /// The edit that proves the changed ranges are not enough by themselves.
+    /// `(module . (expression_statement (string) @string.documentation))` is
+    /// anchored to the *first* statement of the file, so typing a statement
+    /// above a docstring recolours the docstring — a node tree-sitter reuses
+    /// byte for byte and never reports as changed. The widening in [`requery`]
+    /// is the only thing standing between that and a stale colour.
+    #[test]
+    fn a_docstring_stops_being_one_when_a_statement_is_typed_above_it() {
+        let mut session = Session::new();
+        let src = "\"\"\"Module blurb.\"\"\"\nimport os\n\n\ndef f():\n    return os\n";
+        let before = session.highlight(Some(1), "python", src, None);
+        assert_eq!(kind_of(src, &before, "Module blurb"), Some(HlKind::Comment));
+        let (next, incremental) = edited(&mut session, "python", src, 0, 0, "x = 1\n");
+        // It is prose no longer, and that is the whole point of the test: if
+        // this ever comes back `Comment` the edit has stopped biting.
+        assert_eq!(kind_of(&next, &incremental, "Module blurb"), Some(HlKind::String));
+        assert_eq!(incremental, highlight("python", &next));
     }
 
     /// Deletions and replacements, not only insertions — `old_end > start` is

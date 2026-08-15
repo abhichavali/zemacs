@@ -3,8 +3,9 @@
 //! Pure: no git, no I/O, so the whole thing is cheap to test against a
 //! hand-built [`View`]. The layout follows Magit — a short header, then the
 //! rebase todo if one is running, untracked, unstaged and staged changes, the
-//! stash, and a short log. Each section counts itself in its heading and folds
-//! shut on its own.
+//! stash, what the upstream has not got and what it has that we have not, and a
+//! short log. Each section counts itself in its heading and folds shut on its
+//! own.
 //!
 //! The load-bearing invariant is that [`render`]'s line map has one entry per
 //! line of its text: the UI indexes the map by cursor line, so a drift of one
@@ -39,6 +40,10 @@ pub enum Section {
     /// What is left of the rebase in progress.
     Rebase,
     Stashes,
+    /// Commits the upstream has not got, which is what a push would send.
+    Unpushed,
+    /// Commits the upstream has and we have not.
+    Unpulled,
     /// The short log at the bottom.
     Recent,
 }
@@ -55,14 +60,18 @@ pub enum Line {
         path: PathBuf,
         section: Section,
     },
-    /// Any line of a hunk's body, its `@@` header included: staging from
-    /// anywhere inside a hunk stages that hunk. `index` indexes
+    /// Any line of a hunk's body, its `@@` header included. `index` indexes
     /// [`FileDiff::hunks`] of the diff [`View::diff_of`] returns for
     /// `(section, path)`.
     Hunk {
         path: PathBuf,
         section: Section,
         index: usize,
+        /// Which line of [`crate::Hunk::body`] this row draws, counting the
+        /// `@@` header as 0. That header is not a change, so staging from it
+        /// means the whole hunk; every other line is one `+`, `-` or context
+        /// line that a region can pick out on its own.
+        line: usize,
     },
     /// A commit in the log. The hash is abbreviated and only means anything in
     /// this repository, which is the only place it will be used.
@@ -211,7 +220,24 @@ pub fn render(view: &View) -> (String, Vec<Line>, Vec<Span>) {
         &rows(&status.staged),
     );
     stashes(&mut buf, view, &status.stashes);
-    recent(&mut buf, view, &status.recent);
+    // Magit's wording, and it is the useful wording: what a pull would bring
+    // and what a push would send, named after the branch it would travel to.
+    let upstream = status.upstream.as_deref().unwrap_or("the upstream");
+    commits(
+        &mut buf,
+        view,
+        Section::Unpulled,
+        &format!("Unpulled from {upstream}"),
+        &status.unpulled,
+    );
+    commits(
+        &mut buf,
+        view,
+        Section::Unpushed,
+        &format!("Unmerged into {upstream}"),
+        &status.unpushed,
+    );
+    commits(&mut buf, view, Section::Recent, "Recent commits", &status.recent);
 
     if status.is_clean() {
         buf.push("", Line::Blank);
@@ -344,27 +370,37 @@ fn hunks(buf: &mut Buf, diff: &FileDiff) {
         return;
     }
     for (index, hunk) in diff.hunks.iter().enumerate() {
-        for line in hunk.body.lines() {
-            let face = match line.as_bytes().first() {
-                Some(b'@') => Some(Face::Punctuation),
-                Some(b'+') => Some(Face::String),
-                Some(b'-') => Some(Face::Keyword),
-                // "\ No newline at end of file", which is git talking rather
-                // than a change.
-                Some(b'\\') => Some(Face::Comment),
-                _ => None,
-            };
-            let text = clean(line);
-            match face {
-                Some(face) => buf.face(&text, face),
-                None => buf.put(&text),
-            }
+        // `lines()` and the `split_inclusive('\n')` the patch rewriter walks
+        // always yield the same number of pieces in the same order, which is
+        // what lets `line` name a body line the rewriter will agree about.
+        for (line, text) in hunk.body.lines().enumerate() {
+            patch_line(buf, text);
             buf.end(Line::Hunk {
                 path: diff.path.clone(),
                 section: diff.section,
                 index,
+                line,
             });
         }
+    }
+}
+
+/// One line of a patch, coloured by what it does to the file. Shared by a
+/// staged hunk and by an opened commit, which are the same text in two places.
+fn patch_line(buf: &mut Buf, line: &str) {
+    let face = match line.as_bytes().first() {
+        Some(b'@') => Some(Face::Punctuation),
+        Some(b'+') => Some(Face::String),
+        Some(b'-') => Some(Face::Keyword),
+        // "\ No newline at end of file", which is git talking rather than a
+        // change; and `commit`/`Author`/`Date`, the header of a shown commit.
+        Some(b'\\') => Some(Face::Comment),
+        _ => None,
+    };
+    let text = clean(line);
+    match face {
+        Some(face) => buf.face(&text, face),
+        None => buf.put(&text),
     }
 }
 
@@ -406,11 +442,14 @@ fn stashes(buf: &mut Buf, view: &View, entries: &[crate::Stash]) {
     }
 }
 
-fn recent(buf: &mut Buf, view: &View, commits: &[Commit]) {
+/// A list of commits — the log, or either side of the upstream. Opening one
+/// puts its patch underneath, which is `TAB` on a commit doing what `TAB` on a
+/// file already does.
+fn commits(buf: &mut Buf, view: &View, section: Section, title: &str, commits: &[Commit]) {
     if commits.is_empty() {
         return;
     }
-    if !heading(buf, view, Section::Recent, "Recent commits", commits.len()) {
+    if !heading(buf, view, section, title, commits.len()) {
         return;
     }
     for commit in commits {
@@ -420,6 +459,14 @@ fn recent(buf: &mut Buf, view: &View, commits: &[Commit]) {
         buf.end(Line::Commit {
             hash: commit.hash.clone(),
         });
+        // `Line::Text`: there is nothing to stage out of a commit, so every
+        // line of it is prose as far as the verbs are concerned.
+        if let Some(text) = view.commit_diff(&commit.hash) {
+            for line in text.lines() {
+                patch_line(buf, line);
+                buf.end(Line::Text);
+            }
+        }
     }
 }
 
@@ -434,7 +481,7 @@ fn face_of(section: Section) -> Face {
         Section::Untracked => Face::Comment,
         Section::Rebase => Face::Bold,
         Section::Stashes => Face::Comment,
-        Section::Recent => Face::Comment,
+        Section::Unpushed | Section::Unpulled | Section::Recent => Face::Comment,
     }
 }
 
@@ -552,6 +599,38 @@ mod tests {
             text.contains("@@ -1,2 +1,2 @@\n-one\n+ONE\n two\n"),
             "{text}"
         );
+    }
+
+    /// `line` is what a region hands the patch rewriter, and the rewriter walks
+    /// the body with `split_inclusive('\n')` while this walks it with `lines()`.
+    /// The two have to yield the same pieces in the same order or `s` over a
+    /// selection stages the line beside the one on screen — so the numbering is
+    /// pinned here, on a body carrying the `\r` that only one of the two keeps.
+    #[test]
+    fn a_hunk_line_is_numbered_the_way_the_patch_rewriter_numbers_it() {
+        let mut diff = diff_of_two_hunks();
+        diff.hunks[0].body = "@@ -1,2 +1,2 @@\r\n-one\r\n+ONE\r\n two\r\n".into();
+        let view = view_with(diff.clone());
+        let (_, map, _) = render(&view);
+
+        for (index, hunk) in diff.hunks.iter().enumerate() {
+            let drawn: Vec<usize> = map
+                .iter()
+                .filter_map(|line| match line {
+                    Line::Hunk { index: i, line, .. } if *i == index => Some(*line),
+                    _ => None,
+                })
+                .collect();
+            let pieces: Vec<&str> = hunk.body.split_inclusive('\n').collect();
+            assert_eq!(drawn, (0..pieces.len()).collect::<Vec<_>>());
+            // ...and the same piece, not merely the same count of them.
+            for line in drawn {
+                assert_eq!(
+                    pieces[line].as_bytes().first(),
+                    hunk.body.lines().nth(line).unwrap().as_bytes().first()
+                );
+            }
+        }
     }
 
     /// Folding is subtraction: the rows are gone, the heading and its count stay

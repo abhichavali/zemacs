@@ -584,7 +584,8 @@ fn push_and_pull_against_a_local_bare_remote() {
     let err = zemacs_git::push(repo.path()).unwrap_err().to_string();
     assert!(err.contains("upstream"), "{err}");
 
-    // The first `push -u` is deliberately outside this crate's API.
+    // `push_upstream` is the one that configures it; this is the same thing by
+    // hand, so that this test goes on testing plain `push`.
     git(repo.path(), &["push", "-q", "-u", "origin", "main"]);
     let status = zemacs_git::status(repo.path()).unwrap();
     assert_eq!(status.upstream.as_deref(), Some("origin/main"));
@@ -825,6 +826,19 @@ fn message(repo: &Path, rev: &str) -> String {
 
 fn read(repo: &Path, rel: &str) -> String {
     fs::read_to_string(repo.join(rel)).unwrap()
+}
+
+/// The bytes of a blob git is holding — `":a.txt"` is a.txt as the index has it.
+/// The only way to see what a partial stage actually put there, byte for byte,
+/// rather than what a diff of it says.
+fn blob(repo: &Path, spec: &str) -> String {
+    let out = Command::new("git")
+        .current_dir(repo)
+        .args(["show", spec])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git show {spec} failed");
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// Three commits, each adding a file of its own, so nothing conflicts with
@@ -1142,6 +1156,375 @@ fn discarding_a_hunk_throws_away_only_that_hunk() {
     assert!(body.contains("line 18"), "{body}");
 }
 
+// ------------------------------------------------------- part of one hunk
+//
+// Every test below makes the same shape of claim, and it is the only claim
+// worth making about a patch rewriter: *exactly* these lines moved to the index
+// and *exactly* those did not. `git apply` reports nothing when it stages the
+// complement of what was asked for — it is a patch, and it applies — so an
+// assertion that the call returned `Ok` would pass for the bug that matters.
+
+/// Just the `+`/`-` lines of a diff, in order: what changed, with nothing about
+/// where. The preamble's `---`/`+++` are behind the first `@@` and so are gone
+/// before the filter sees them.
+fn changes(diff: &str) -> Vec<String> {
+    diff.lines()
+        .skip_while(|l| !l.starts_with("@@"))
+        .filter(|l| l.starts_with('+') || l.starts_with('-'))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Both sides of the index for one file: `(staged, unstaged)`.
+fn sides(repo: &Path, rel: &str) -> (Vec<String>, Vec<String>) {
+    let path = Path::new(rel);
+    (
+        changes(&zemacs_git::diff(repo, path, true).unwrap()),
+        changes(&zemacs_git::diff(repo, path, false).unwrap()),
+    )
+}
+
+/// The body-line numbers of the lines reading `wanted`, in the numbering
+/// `Line::Hunk`'s `line` uses and the staging functions take. Named by their
+/// text so a test says which lines it means rather than counting them.
+fn at(diff: &zemacs_git::FileDiff, hunk: usize, wanted: &[&str]) -> Vec<usize> {
+    let body: Vec<&str> = diff.hunks[hunk].body.lines().collect();
+    wanted
+        .iter()
+        .map(|w| {
+            body.iter()
+                .position(|line| line == w)
+                .unwrap_or_else(|| panic!("no {w:?} in {body:#?}"))
+        })
+        .collect()
+}
+
+/// A repository holding `a.txt` committed as `first` and then edited to
+/// `second`, which is one unstaged file with one change to pick lines out of.
+fn edited(tag: &str, first: &str, second: &str) -> Temp {
+    let repo = init(tag);
+    write(repo.path(), "a.txt", first);
+    commit_all(repo.path(), "first");
+    write(repo.path(), "a.txt", second);
+    repo
+}
+
+fn unstaged_diff(repo: &Path) -> zemacs_git::FileDiff {
+    zemacs_git::file_diff(repo, Path::new("a.txt"), Section::Unstaged).unwrap()
+}
+
+fn staged_diff(repo: &Path) -> zemacs_git::FileDiff {
+    zemacs_git::file_diff(repo, Path::new("a.txt"), Section::Staged).unwrap()
+}
+
+#[test]
+fn staging_some_added_lines_leaves_the_others_unstaged() {
+    if no_git() {
+        return;
+    }
+    let repo = edited("part-add", "head\ntail\n", "head\nadd1\nadd2\nadd3\ntail\n");
+    let diff = unstaged_diff(repo.path());
+    assert_eq!(diff.hunks.len(), 1, "{diff:#?}");
+
+    zemacs_git::stage_lines(repo.path(), &diff, 0, &at(&diff, 0, &["+add2"])).unwrap();
+
+    let (staged, unstaged) = sides(repo.path(), "a.txt");
+    assert_eq!(staged, ["+add2"]);
+    assert_eq!(unstaged, ["+add1", "+add3"]);
+    // The working tree never moves: staging copies into the index.
+    assert_eq!(read(repo.path(), "a.txt"), "head\nadd1\nadd2\nadd3\ntail\n");
+}
+
+#[test]
+fn staging_some_removed_lines_leaves_the_others_in_the_index() {
+    if no_git() {
+        return;
+    }
+    let repo = edited("part-del", "one\ntwo\nthree\nfour\nfive\n", "one\nfive\n");
+    let diff = unstaged_diff(repo.path());
+
+    zemacs_git::stage_lines(repo.path(), &diff, 0, &at(&diff, 0, &["-three"])).unwrap();
+
+    // The two deletions nobody picked had to become *context*, not vanish: had
+    // they been dropped the patch would still apply and would still be one line
+    // shorter than the index it was built against.
+    let (staged, unstaged) = sides(repo.path(), "a.txt");
+    assert_eq!(staged, ["-three"]);
+    assert_eq!(unstaged, ["-two", "-four"]);
+}
+
+#[test]
+fn staging_part_of_a_mixed_hunk_moves_both_halves_of_the_change() {
+    if no_git() {
+        return;
+    }
+    let repo = edited(
+        "part-mixed",
+        "alpha\nbravo\ncharlie\ndelta\n",
+        "ALPHA\nbravo\nCHARLIE\ndelta\n",
+    );
+    let diff = unstaged_diff(repo.path());
+
+    let lines = at(&diff, 0, &["-charlie", "+CHARLIE"]);
+    zemacs_git::stage_lines(repo.path(), &diff, 0, &lines).unwrap();
+
+    let (staged, unstaged) = sides(repo.path(), "a.txt");
+    assert_eq!(staged, ["-charlie", "+CHARLIE"]);
+    assert_eq!(unstaged, ["-alpha", "+ALPHA"]);
+}
+
+/// A change on the first and last line of a hunk with no context on either end:
+/// the two places an index that counts the `@@` header as a body line, or one
+/// that stops a line early, would pick the wrong pair and say nothing about it.
+#[test]
+fn the_first_and_the_last_line_of_a_hunk_are_the_lines_they_look_like() {
+    if no_git() {
+        return;
+    }
+    let repo = edited("part-edges", "one\ntwo\nthree\n", "ONE\ntwo\nTHREE\n");
+    let diff = unstaged_diff(repo.path());
+    assert_eq!(diff.hunks[0].body.lines().nth(1), Some("-one"), "{diff:#?}");
+
+    zemacs_git::stage_lines(repo.path(), &diff, 0, &at(&diff, 0, &["-one", "+ONE"])).unwrap();
+    let (staged, unstaged) = sides(repo.path(), "a.txt");
+    assert_eq!(staged, ["-one", "+ONE"]);
+    assert_eq!(unstaged, ["-three", "+THREE"]);
+
+    // ...and the other end, from scratch, so neither result can be the other's.
+    let repo = edited("part-edges-2", "one\ntwo\nthree\n", "ONE\ntwo\nTHREE\n");
+    let diff = unstaged_diff(repo.path());
+    let last = at(&diff, 0, &["-three", "+THREE"]);
+    assert_eq!(*last.last().unwrap(), diff.hunks[0].body.lines().count() - 1);
+    zemacs_git::stage_lines(repo.path(), &diff, 0, &last).unwrap();
+    let (staged, unstaged) = sides(repo.path(), "a.txt");
+    assert_eq!(staged, ["-three", "+THREE"]);
+    assert_eq!(unstaged, ["-one", "+ONE"]);
+}
+
+/// One line and no region is the same call with a one-element slice, which is
+/// the gesture `s` makes when nothing is selected.
+#[test]
+fn staging_one_line_of_a_hunk_stages_that_line_and_no_other() {
+    if no_git() {
+        return;
+    }
+    let repo = edited(
+        "part-one",
+        "keep\ndrop me\nkeep2\n",
+        "keep\nadded\nkeep2\nalso added\n",
+    );
+    let diff = unstaged_diff(repo.path());
+    let lines = at(&diff, 0, &["+added"]);
+    assert_eq!(lines.len(), 1);
+    zemacs_git::stage_lines(repo.path(), &diff, 0, &lines).unwrap();
+
+    let (staged, unstaged) = sides(repo.path(), "a.txt");
+    assert_eq!(staged, ["+added"]);
+    assert_eq!(unstaged, ["-drop me", "+also added"]);
+}
+
+/// The half that is easy to get backwards: unstaging reads the *new* side of
+/// the patch as the pre-image, so the lines nobody picked swap roles. Get it
+/// wrong and this test sees the complement staged, with no error anywhere.
+#[test]
+fn unstaging_some_lines_takes_out_those_and_leaves_the_rest_staged() {
+    if no_git() {
+        return;
+    }
+    let repo = edited("part-unstage", "one\ntwo\nthree\n", "ONE\ntwo\nTHREE\n");
+    git(repo.path(), &["add", "-A"]);
+    let diff = staged_diff(repo.path());
+
+    let lines = at(&diff, 0, &["-one", "+ONE"]);
+    zemacs_git::unstage_lines(repo.path(), &diff, 0, &lines).unwrap();
+
+    let (staged, unstaged) = sides(repo.path(), "a.txt");
+    assert_eq!(staged, ["-three", "+THREE"], "the other pair stays staged");
+    assert_eq!(unstaged, ["-one", "+ONE"], "and this pair came back out");
+    // The working tree is untouched by either direction.
+    assert_eq!(read(repo.path(), "a.txt"), "ONE\ntwo\nTHREE\n");
+}
+
+/// **Destroys work**, and so does the test: the discarded line has to be gone
+/// from the file on disk and the one beside it has to still be there.
+#[test]
+fn discarding_some_lines_reverts_those_and_leaves_the_rest_edited() {
+    if no_git() {
+        return;
+    }
+    let repo = edited("part-discard", "one\ntwo\nthree\n", "ONE\ntwo\nTHREE\n");
+    let diff = unstaged_diff(repo.path());
+
+    let lines = at(&diff, 0, &["-one", "+ONE"]);
+    zemacs_git::discard_lines(repo.path(), &diff, 0, &lines).unwrap();
+
+    assert_eq!(read(repo.path(), "a.txt"), "one\ntwo\nTHREE\n");
+    assert_eq!(sides(repo.path(), "a.txt").1, ["-three", "+THREE"]);
+}
+
+/// A `\ No newline at end of file` describes the line above it. Keep it when
+/// that line is dropped and git rejects the patch; drop it when that line stays
+/// and the file quietly grows a newline it never had.
+#[test]
+fn a_file_with_no_final_newline_keeps_not_having_one() {
+    if no_git() {
+        return;
+    }
+    let repo = edited("part-nonl", "one\ntwo\nthree", "ONE\ntwo\nTHREE");
+    let diff = unstaged_diff(repo.path());
+    assert!(
+        diff.hunks[0].body.contains("\\ No newline at end of file"),
+        "{diff:#?}"
+    );
+
+    // The change *on* the unterminated line, so the marker travels with it.
+    zemacs_git::stage_lines(repo.path(), &diff, 0, &at(&diff, 0, &["-three", "+THREE"])).unwrap();
+    assert_eq!(blob(repo.path(), ":a.txt"), "one\ntwo\nTHREE");
+    let (staged, unstaged) = sides(repo.path(), "a.txt");
+    assert_eq!(staged, ["-three", "+THREE"]);
+    assert_eq!(unstaged, ["-one", "+ONE"]);
+
+    // And the change *above* it, where the marker has to survive its `-three`
+    // becoming context and the unpicked `+THREE`'s copy has to go with it.
+    let repo = edited("part-nonl-2", "one\ntwo\nthree", "ONE\ntwo\nTHREE");
+    let diff = unstaged_diff(repo.path());
+    zemacs_git::stage_lines(repo.path(), &diff, 0, &at(&diff, 0, &["-one", "+ONE"])).unwrap();
+    assert_eq!(blob(repo.path(), ":a.txt"), "ONE\ntwo\nthree");
+}
+
+/// git carries a `\r` as content, so the rewriter has to as well: rewriting a
+/// `-` to a space with anything that splits on lines would silently strip it
+/// off every line it touched and stage a whole-file line-ending change.
+#[test]
+fn crlf_line_endings_survive_a_partial_stage() {
+    if no_git() {
+        return;
+    }
+    let repo = edited(
+        "part-crlf",
+        "one\r\ntwo\r\nthree\r\n",
+        "ONE\r\ntwo\r\nTHREE\r\n",
+    );
+    let diff = unstaged_diff(repo.path());
+    // git wrote the `\r`; `lines()` — which is how the status buffer draws a
+    // body and how `at` finds one — is what would drop it.
+    assert!(diff.hunks[0].body.contains("-three\r\n"), "{diff:#?}");
+
+    let lines = at(&diff, 0, &["-three", "+THREE"]);
+    zemacs_git::stage_lines(repo.path(), &diff, 0, &lines).unwrap();
+    assert_eq!(blob(repo.path(), ":a.txt"), "one\r\ntwo\r\nTHREE\r\n");
+}
+
+/// A selection of nothing but context stages nothing, and has to say so: the
+/// patch would apply, change nothing, and look exactly like success.
+#[test]
+fn a_selection_with_no_change_in_it_is_refused() {
+    if no_git() {
+        return;
+    }
+    let repo = edited("part-empty", "one\ntwo\nthree\n", "ONE\ntwo\nthree\n");
+    let diff = unstaged_diff(repo.path());
+
+    assert!(zemacs_git::stage_lines(repo.path(), &diff, 0, &[]).is_err());
+    assert!(zemacs_git::stage_lines(repo.path(), &diff, 0, &at(&diff, 0, &[" two"])).is_err());
+    // Out-of-range indices name no line and so select nothing.
+    assert!(zemacs_git::stage_lines(repo.path(), &diff, 0, &[99]).is_err());
+    assert!(zemacs_git::stage_lines(repo.path(), &diff, 7, &[1]).is_err());
+    // ...and the wrong side of the index is refused before any of that.
+    assert!(zemacs_git::unstage_lines(repo.path(), &diff, 0, &[1]).is_err());
+    assert!(sides(repo.path(), "a.txt").0.is_empty(), "nothing staged");
+}
+
+/// The `@@` counts have to be recomputed, and a range that empties or fills has
+/// to move its start by one — `-0,0` means "before the first line". Checked on
+/// the patch itself, because a wrong count is what makes git reject a patch that
+/// was otherwise right, and a right count on a wrong start is what makes it
+/// accept one that is not.
+#[test]
+fn the_hunk_header_counts_what_the_body_now_holds() {
+    if no_git() {
+        return;
+    }
+    let repo = edited("part-header", "one\ntwo\nthree\nfour\nfive\n", "one\nfive\n");
+    let diff = unstaged_diff(repo.path());
+    let patch = diff
+        .partial(0, &at(&diff, 0, &["-three"]), false)
+        .unwrap();
+    // Five lines in, four out: the two unpicked deletions are context now.
+    assert!(patch.contains("@@ -1,5 +1,4 @@"), "{patch}");
+
+    // Reversed, the same selection keeps the *new* side whole instead.
+    let patch = diff.partial(0, &at(&diff, 0, &["-three"]), true).unwrap();
+    assert!(patch.contains("@@ -1,3 +1,2 @@"), "{patch}");
+}
+
+/// The whole chain the UI walks, end to end: draw the status, find the row the
+/// cursor would be sitting on, read the map, hand its `line` straight to the
+/// stager. An off-by-one anywhere along it stages the line *next to* the one on
+/// screen, which is a wrong commit and no error message.
+#[test]
+fn the_line_the_map_names_is_the_line_that_gets_staged() {
+    if no_git() {
+        return;
+    }
+    let repo = edited("part-map", "one\ntwo\nthree\n", "ONE\ntwo\nTHREE\n");
+    let mut view = View::load(repo.path()).unwrap();
+    view.toggle_file(repo.path(), Section::Unstaged, Path::new("a.txt"))
+        .unwrap();
+    let (text, map, _) = zemacs_git::render(&view);
+
+    // The two rows a region over the second change would cover.
+    let picked: Vec<usize> = ["-three", "+THREE"]
+        .iter()
+        .map(|wanted| text.lines().position(|l| l == *wanted).unwrap())
+        .map(|row| match &map[row] {
+            Line::Hunk { line, .. } => *line,
+            other => panic!("{other:?} is not a hunk line"),
+        })
+        .collect();
+    let Line::Hunk { path, section, index, .. } = &map[text.lines().position(|l| l == "+THREE").unwrap()]
+    else {
+        unreachable!()
+    };
+
+    let diff = view.diff_of(*section, path).unwrap();
+    zemacs_git::stage_lines(repo.path(), diff, *index, &picked).unwrap();
+
+    let (staged, unstaged) = sides(repo.path(), "a.txt");
+    assert_eq!(staged, ["-three", "+THREE"]);
+    assert_eq!(unstaged, ["-one", "+ONE"]);
+}
+
+/// The corner this deliberately does not handle, pinned so it stays *loud*.
+///
+/// A file being created or deleted has `/dev/null` on one side of its preamble,
+/// and a partial patch leaves that side non-empty — which contradicts the
+/// preamble. git refuses and touches nothing, which is the one outcome that is
+/// allowed: the failure mode worth being afraid of here is a patch that applies
+/// and stages something else.
+#[test]
+fn part_of_a_whole_file_being_added_or_removed_is_refused_and_changes_nothing() {
+    if no_git() {
+        return;
+    }
+    let repo = init("part-newfile");
+    write(repo.path(), "a.txt", "p\nq\nr\n");
+    commit_all(repo.path(), "first");
+
+    write(repo.path(), "new.txt", "p\nq\nr\n");
+    git(repo.path(), &["add", "new.txt"]);
+    let diff = zemacs_git::file_diff(repo.path(), Path::new("new.txt"), Section::Staged).unwrap();
+    let err = zemacs_git::unstage_lines(repo.path(), &diff, 0, &at(&diff, 0, &["+q"])).unwrap_err();
+    assert!(format!("{err:#}").contains("depends on old contents"), "{err:#}");
+    assert_eq!(blob(repo.path(), ":new.txt"), "p\nq\nr\n", "index untouched");
+
+    fs::remove_file(repo.path().join("a.txt")).unwrap();
+    let diff = unstaged_diff(repo.path());
+    let err = zemacs_git::stage_lines(repo.path(), &diff, 0, &at(&diff, 0, &["-q"])).unwrap_err();
+    assert!(format!("{err:#}").contains("still has contents"), "{err:#}");
+    assert_eq!(blob(repo.path(), ":a.txt"), "p\nq\nr\n", "index untouched");
+}
+
 #[test]
 fn an_open_file_shows_its_hunks_and_every_line_points_back_at_one() {
     if no_git() {
@@ -1167,6 +1550,7 @@ fn an_open_file_shows_its_hunks_and_every_line_points_back_at_one() {
         path,
         section,
         index,
+        ..
     } = &map[at]
     else {
         panic!("{:?} is not a hunk line", map[at])
@@ -1385,4 +1769,251 @@ fn a_todo_list_written_here_is_read_back_the_same() {
         "pick abc1234 a subject with spaces\nsquash def5678 another\n"
     );
     assert_eq!(zemacs_git::parse_todo(&text).unwrap(), items);
+}
+
+// ------------------------------------------------- what the upstream has not
+
+/// The two counts in the header say *how many*; these two sections say *which*,
+/// which is what you actually look at before pushing.
+#[test]
+fn unpushed_and_unpulled_list_the_commits_the_counts_promise() {
+    if no_git() {
+        return;
+    }
+    let bare = Temp::new("ahead-bare");
+    git(bare.path(), &["init", "-q", "--bare", "."]);
+    git(bare.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let origin = bare.path().to_str().unwrap();
+
+    let repo = init("ahead");
+    write(repo.path(), "a.txt", "one\n");
+    commit_all(repo.path(), "first");
+    git(repo.path(), &["remote", "add", "origin", origin]);
+    zemacs_git::push_upstream(repo.path(), "origin").unwrap();
+    let status = zemacs_git::status(repo.path()).unwrap();
+    assert_eq!(status.upstream.as_deref(), Some("origin/main"));
+    // Level with the remote: no sections, and no `git log` was run for them.
+    assert!(status.unpushed.is_empty() && status.unpulled.is_empty());
+
+    // A commit here, and another one over there, so both sides have something.
+    let clone = Temp::new("ahead-clone");
+    git(clone.path(), &["clone", "-q", origin, "."]);
+    git(clone.path(), &["config", "user.email", "t@zemacs.invalid"]);
+    git(clone.path(), &["config", "user.name", "zemacs test"]);
+    write(clone.path(), "b.txt", "two\n");
+    commit_all(clone.path(), "theirs");
+    git(clone.path(), &["push", "-q"]);
+
+    write(repo.path(), "c.txt", "three\n");
+    commit_all(repo.path(), "ours");
+    zemacs_git::fetch(repo.path()).unwrap();
+
+    let status = zemacs_git::status(repo.path()).unwrap();
+    assert_eq!((status.ahead, status.behind), (1, 1));
+    assert_eq!(status.unpushed.len(), 1);
+    assert_eq!(status.unpushed[0].subject, "ours");
+    assert_eq!(status.unpulled.len(), 1);
+    assert_eq!(status.unpulled[0].subject, "theirs");
+
+    let (text, map, spans) = draw(&status);
+    assert_eq!(text.lines().count(), map.len());
+    check_spans(&text, &spans);
+    assert!(text.contains("Unpulled from origin/main (1)"), "{text}");
+    assert!(text.contains("Unmerged into origin/main (1)"), "{text}");
+    // Every line of them is a commit, so `TAB`, `A` and `X` work there too.
+    let hash = status.unpushed[0].hash.clone();
+    assert!(map.contains(&Line::Commit { hash }), "{map:#?}");
+}
+
+/// The first push of a branch, and the one that overwrites what is there.
+#[test]
+fn push_sets_an_upstream_and_force_overwrites_a_rewritten_branch() {
+    if no_git() {
+        return;
+    }
+    let bare = Temp::new("force-bare");
+    git(bare.path(), &["init", "-q", "--bare", "."]);
+    git(bare.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    let repo = init("force");
+    write(repo.path(), "a.txt", "one\n");
+    commit_all(repo.path(), "first");
+    // Plain `push` cannot do this: there is no upstream to push to yet.
+    assert!(zemacs_git::push(repo.path()).is_err());
+    git(
+        repo.path(),
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+    zemacs_git::push_upstream(repo.path(), "origin").unwrap();
+    assert_eq!(
+        zemacs_git::status(repo.path()).unwrap().upstream.as_deref(),
+        Some("origin/main")
+    );
+
+    // Rewrite the commit that was pushed. A plain push is refused for it.
+    zemacs_git::amend(repo.path(), Some("first, reworded")).unwrap();
+    assert!(zemacs_git::push(repo.path()).is_err());
+    zemacs_git::push_force(repo.path()).unwrap();
+    assert_eq!(
+        git(bare.path(), &["log", "-1", "--format=%s", "main"]).trim(),
+        "first, reworded"
+    );
+}
+
+// ------------------------------------------------------- opening a commit
+
+#[test]
+fn a_commit_opens_its_patch_underneath_and_shuts_again() {
+    if no_git() {
+        return;
+    }
+    let repo = three("show");
+    let mut view = View::load(repo.path()).unwrap();
+    let hash = view.status.recent[0].hash.clone();
+
+    view.toggle_commit(repo.path(), &hash).unwrap();
+    let (text, map, spans) = zemacs_git::render(&view);
+    assert_eq!(text.lines().count(), map.len(), "{text}");
+    check_spans(&text, &spans);
+    assert!(text.contains("+third"), "{text}");
+    // Nothing can be staged out of a commit, so its lines act on nothing.
+    let after = map.iter().position(|l| *l == Line::Commit { hash: hash.clone() }).unwrap() + 1;
+    assert_eq!(map[after], Line::Text);
+
+    // It survives a refresh, and shuts on the second press.
+    view.refresh(repo.path()).unwrap();
+    assert!(zemacs_git::render(&view).0.contains("+third"));
+    view.toggle_commit(repo.path(), &hash).unwrap();
+    assert!(!zemacs_git::render(&view).0.contains("+third"));
+}
+
+#[test]
+fn the_log_section_grows_when_asked_and_goes_back_to_ten() {
+    if no_git() {
+        return;
+    }
+    let repo = init("loglimit");
+    for n in 0..12 {
+        write(repo.path(), "a.txt", &format!("{n}\n"));
+        commit_all(repo.path(), &format!("commit {n}"));
+    }
+    let mut view = View::load(repo.path()).unwrap();
+    assert_eq!(view.status.recent.len(), 10);
+
+    view.log_limit = 100;
+    view.refresh(repo.path()).unwrap();
+    assert_eq!(view.status.recent.len(), 12);
+    assert!(zemacs_git::render(&view).0.contains("Recent commits (12)"));
+
+    view.log_limit = 0;
+    view.refresh(repo.path()).unwrap();
+    assert_eq!(view.status.recent.len(), 10);
+}
+
+#[test]
+fn a_commits_whole_message_comes_back_for_rewriting() {
+    if no_git() {
+        return;
+    }
+    let repo = init("message");
+    write(repo.path(), "a.txt", "a\n");
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "subject", "-m", "a body"]);
+    assert_eq!(
+        zemacs_git::message_of(repo.path(), "HEAD").unwrap(),
+        "subject\n\na body"
+    );
+    assert!(zemacs_git::show(repo.path(), "HEAD").unwrap().contains("+a"));
+}
+
+// ------------------------------------------------------------- conflicts
+
+/// The four operations git spells `--continue` and `--abort` for, driven the
+/// way the status buffer drives them: one pair of verbs, and the repository
+/// says which of them is running.
+#[test]
+fn what_is_in_progress_is_continued_or_aborted_without_being_named() {
+    if no_git() {
+        return;
+    }
+    let repo = init("sequence");
+    write(repo.path(), "a.txt", "base\n");
+    commit_all(repo.path(), "first");
+    git(repo.path(), &["checkout", "-q", "-b", "other"]);
+    write(repo.path(), "a.txt", "theirs\n");
+    commit_all(repo.path(), "theirs");
+    git(repo.path(), &["checkout", "-q", "main"]);
+    write(repo.path(), "a.txt", "ours\n");
+    commit_all(repo.path(), "ours");
+
+    // Nothing running is an error rather than a silent success.
+    assert!(zemacs_git::sequence_continue(repo.path()).is_err());
+    assert!(zemacs_git::sequence_abort(repo.path()).is_err());
+
+    assert!(zemacs_git::merge(repo.path(), "other").is_err(), "conflict");
+    assert_eq!(
+        zemacs_git::status(repo.path()).unwrap().in_progress,
+        Some(InProgress::Merge)
+    );
+    zemacs_git::sequence_abort(repo.path()).unwrap();
+    let status = zemacs_git::status(repo.path()).unwrap();
+    assert_eq!(status.in_progress, None);
+    assert_eq!(read(repo.path(), "a.txt"), "ours\n");
+
+    // The same merge again, resolved this time by taking one side whole.
+    assert!(zemacs_git::merge(repo.path(), "other").is_err());
+    zemacs_git::resolve(repo.path(), Path::new("a.txt"), false).unwrap();
+    assert_eq!(read(repo.path(), "a.txt"), "theirs\n");
+    // Taking a side stages it, which is what marks it resolved.
+    let status = zemacs_git::status(repo.path()).unwrap();
+    assert!(!status.has_conflicts(), "{status:#?}");
+    zemacs_git::sequence_continue(repo.path()).unwrap();
+    assert_eq!(zemacs_git::status(repo.path()).unwrap().in_progress, None);
+    assert_eq!(log_count(repo.path()), 4);
+}
+
+/// A cherry-pick that conflicts leaves the sequencer running, and the same two
+/// verbs get out of it — which is the whole reason they do not name a command.
+#[test]
+fn a_conflicted_cherry_pick_is_aborted_by_the_same_verb_a_merge_is() {
+    if no_git() {
+        return;
+    }
+    let repo = init("pick-abort");
+    write(repo.path(), "a.txt", "base\n");
+    commit_all(repo.path(), "first");
+    git(repo.path(), &["checkout", "-q", "-b", "other"]);
+    write(repo.path(), "a.txt", "theirs\n");
+    commit_all(repo.path(), "theirs");
+    git(repo.path(), &["checkout", "-q", "main"]);
+    write(repo.path(), "a.txt", "ours\n");
+    commit_all(repo.path(), "ours");
+
+    assert!(zemacs_git::cherry_pick(repo.path(), "other").is_err());
+    assert_eq!(
+        zemacs_git::status(repo.path()).unwrap().in_progress,
+        Some(InProgress::CherryPick)
+    );
+    zemacs_git::sequence_abort(repo.path()).unwrap();
+    assert_eq!(zemacs_git::status(repo.path()).unwrap().in_progress, None);
+    assert_eq!(read(repo.path(), "a.txt"), "ours\n");
+}
+
+/// A merge with nothing in its way is not a conflict and not an error.
+#[test]
+fn a_clean_merge_just_commits() {
+    if no_git() {
+        return;
+    }
+    let repo = init("merge");
+    write(repo.path(), "a.txt", "a\n");
+    commit_all(repo.path(), "first");
+    git(repo.path(), &["checkout", "-q", "-b", "other"]);
+    write(repo.path(), "b.txt", "b\n");
+    commit_all(repo.path(), "theirs");
+    git(repo.path(), &["checkout", "-q", "main"]);
+
+    zemacs_git::merge(repo.path(), "other").unwrap();
+    assert!(repo.path().join("b.txt").exists());
+    assert_eq!(zemacs_git::status(repo.path()).unwrap().in_progress, None);
 }

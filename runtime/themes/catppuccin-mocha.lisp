@@ -24,6 +24,16 @@
 ;;;; a staged file `string' and an unstaged one `keyword'. So the same 22 lines
 ;;;; that colour a source buffer colour those too.
 ;;;;
+;;;; The other twelve are UI, and the style guide names most of them outright:
+;;;; Rosewater the cursor, Surface 1 the selection, Surface 0 the current line,
+;;;; Overlay 1 the line numbers with Lavender on the active one, Red errors,
+;;;; Yellow warnings. Four are this port's. `match' takes Surface 2, a rung past
+;;;; the selection band, where upstream blends Sky into Base. `divider' and
+;;;; `popup-border' both take Overlay 0, the guide's inactive border: Crust is
+;;;; invisible on Base, and Blue is loud on the single `popup' zemacs has where
+;;;; nvim keeps float and menu apart. `accent' is Mauve, the flavour's one
+;;;; published accent, standing in for the per-element accents upstream spends.
+;;;;
 ;;;; On weight: five faces are bold and two are italic, and that is deliberately
 ;;;; near the ceiling — a screen where everything is heavy has no emphasis in it
 ;;;; at all. Catppuccin italicises comments in every port that offers the switch
@@ -69,6 +79,8 @@
 ;;; The palette, named as Catppuccin names it.
 (let (;; Base shades and the surfaces drawn on top of them
       (base     '(0.118 0.118 0.180))  ; #1e1e2e
+      (mantle   '(0.094 0.094 0.145))  ; #181825
+      (surface2 '(0.345 0.357 0.439))  ; #585b70
       (surface1 '(0.271 0.278 0.353))  ; #45475a
       (surface0 '(0.192 0.196 0.267))  ; #313244
 
@@ -76,8 +88,10 @@
       (text     '(0.804 0.839 0.957))  ; #cdd6f4
       (overlay2 '(0.576 0.600 0.698))  ; #9399b2
       (overlay1 '(0.498 0.518 0.612))  ; #7f849c
+      (overlay0 '(0.424 0.439 0.525))  ; #6c7086
 
       ;; Accents
+      (rosewater '(0.961 0.878 0.863)) ; #f5e0dc
       (mauve    '(0.796 0.651 0.969))  ; #cba6f7
       (red      '(0.953 0.545 0.659))  ; #f38ba8
       (peach    '(0.980 0.702 0.529))  ; #fab387
@@ -114,4 +128,18 @@
   (set-face "modeline"          surface1)             ; #45475a  bar, current window
   (set-face "modeline-inactive" surface0)             ; #313244  bar, other windows
   (set-face "modeline-text"     text     :bold t)     ; #cdd6f4  what is written on it
+
+  ;; The UI 12, which a theme may leave out and this one does not.
+  (set-face "region"            surface1)             ; #45475a  Visual, Selection
+  (set-face "cursor"            rosewater)            ; #f5e0dc  Cursor
+  (set-face "current-line"      surface0)             ; #313244  CursorLine
+  (set-face "line-number"       overlay1)             ; #7f849c  Line Numbers
+  (set-face "line-number-current" lavender)           ; #b4befe  Active Line Numbers
+  (set-face "divider"           overlay0)             ; #6c7086  see the header
+  (set-face "error"             red)                  ; #f38ba8  Errors
+  (set-face "warning"           yellow)               ; #f9e2af  Warnings
+  (set-face "match"             surface2)             ; #585b70  see the header
+  (set-face "popup"             mantle)               ; #181825  NormalFloat, Secondary Panes
+  (set-face "popup-border"      overlay0)             ; #6c7086  see the header
+  (set-face "accent"            mauve)                ; #cba6f7  the flavour's accent
   )

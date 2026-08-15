@@ -50,6 +50,17 @@
 ;;;; keywords, functions and types by default. Set it to NIL for this theme as
 ;;;; Protesilaos published it — and this is the theme most worth doing that for,
 ;;;; for the reason in the paragraph above.
+;;;;
+;;;; The twelve optional UI faces are Modus' semantic mappings read straight
+;;;; down: `bg-region', `cursor', `bg-hl-line', the two `fg-line-number-'
+;;;; entries, `err', `warning', `bg-popup' — one fill here for the several
+;;;; child frames Modus dresses off it — `accent-0' of the four it grades, and
+;;;; `border', which upstream gives the divider and the popup stroke both.
+;;;; Two are this port's judgement: `match' takes `bg-search-current' over the
+;;;; lazier cyan, one band standing in for every hit and cyan sinking into the
+;;;; bluish current line; and `line-number-current' is plain where upstream's
+;;;; is bold, that bold being there to carry a gutter background zemacs has no
+;;;; face to set.
 
 (in-package :zemacs)
 
@@ -59,8 +70,10 @@
       (fg-main               '(0.000 0.000 0.000))  ; #000000
       (fg-dim                '(0.349 0.349 0.349))  ; #595959
       (fg-alt                '(0.098 0.212 0.408))  ; #193668
+      (border                '(0.624 0.624 0.624))  ; #9f9f9f
 
       ;; Accent foregrounds
+      (blue                  '(0.000 0.192 0.663))  ; #0031a9
       (blue-warmer           '(0.208 0.282 0.812))  ; #3548cf
       (blue-cooler           '(0.000 0.000 0.690))  ; #0000b0
       (cyan                  '(0.000 0.369 0.545))  ; #005e8b
@@ -69,8 +82,16 @@
       (magenta               '(0.447 0.063 0.271))  ; #721045
       (magenta-warmer        '(0.561 0.000 0.459))  ; #8f0075
       (magenta-cooler        '(0.325 0.102 0.714))  ; #531ab6
+      (red                   '(0.651 0.000 0.000))  ; #a60000
       (yellow-faint          '(0.384 0.267 0.086))  ; #624416
       (yellow-cooler         '(0.478 0.310 0.184))  ; #7a4f2f
+      (yellow-warmer         '(0.533 0.286 0.000))  ; #884900
+
+      ;; UI backgrounds
+      (bg-region             '(0.741 0.741 0.741))  ; #bdbdbd
+      (bg-hl-line            '(0.855 0.898 0.925))  ; #dae5ec
+      (bg-popup              '(0.953 0.953 0.953))  ; #f3f3f3
+      (bg-yellow-intense     '(0.953 0.816 0.000))  ; #f3d000
 
       ;; Modeline backgrounds
       (bg-mode-line-active   '(0.784 0.784 0.784))  ; #c8c8c8
@@ -105,4 +126,20 @@
   (set-face "modeline"          bg-mode-line-active)    ; #c8c8c8  Modus `bg-mode-line-active'
   (set-face "modeline-inactive" bg-mode-line-inactive)  ; #e6e6e6  Modus `bg-mode-line-inactive'
   (set-face "modeline-text"     fg-main)                ; #000000  Modus `fg-mode-line-active'
+
+  ;; The optional twelve, which this port sets rather than leave to the
+  ;; renderer's ratios — a mixed ground is the one thing that cannot be
+  ;; guaranteed AAA, and Modus publishes every one of these outright.
+  (set-face "region"               bg-region)           ; #bdbdbd  Modus `bg-region'
+  (set-face "cursor"               fg-main)             ; #000000  Modus `cursor'
+  (set-face "current-line"         bg-hl-line)          ; #dae5ec  Modus `bg-hl-line'
+  (set-face "line-number"          fg-dim)              ; #595959  Modus `fg-line-number-inactive'
+  (set-face "line-number-current"  fg-main)             ; #000000  Modus `fg-line-number-active'
+  (set-face "divider"              border)              ; #9f9f9f  Modus `border'
+  (set-face "error"                red)                 ; #a60000  Modus `err'
+  (set-face "warning"              yellow-warmer)       ; #884900  Modus `warning'
+  (set-face "match"                bg-yellow-intense)   ; #f3d000  Modus `bg-search-current'
+  (set-face "popup"                bg-popup)            ; #f3f3f3  Modus `bg-popup'
+  (set-face "popup-border"         border)              ; #9f9f9f  Modus `border'
+  (set-face "accent"               blue)                ; #0031a9  Modus `accent-0'
   )

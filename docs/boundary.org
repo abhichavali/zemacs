@@ -26,7 +26,8 @@ Concretely:
 | Reading and writing files, git, ripgrep, PTYs | Which file, which verb, and what to do next |
 | Mode *storage*: one name plus a list         | The whole mode *system*                     |
 | A child process, JSON framing, JSON decoding | Every protocol spoken down it, LSP included |
-| Walking a project's whole tree, and caching it | Which files make a directory a project, and what "build it" runs there |
+| Walking a project's whole tree, and caching it | Every =project-= verb, and which files make a directory a project |
+| Expanding the modeline's =%= codes, per frame  | What the modeline *says*, and in what order  |
 
 The subprocess row is the newest and the same argument. =crates/rpc= spawns the
 child, frames =Content-Length= messages, hands each decoded message to the image
@@ -79,13 +80,12 @@ Lisp side cannot work around.
 |--------------------------------------+-------------------------------------------------------------------------|
 | Interrupt a runaway form             | The Lisp thread evaluates one queued form at a time and nothing can preempt it. |
 | Ask a question that *guards* a command | =PromptKind::Confirm= parks an =EditorCommand= in =Editor::pending_confirm= and runs it on a full =yes=. =read-string= is the Lisp prompt and it is a continuation with no command behind it, so a Lisp guard is a callback the caller can forget to write. See below. |
-| Seed a prompt with text or candidates core owns | =open-prompt= opens one; nothing sets its =text= or refilters it. =project-open= wants =~/= expanded so the filesystem completions match, and =dired-rename= wants the current name. =completing-read= carries its own candidates and cannot borrow core's. |
 
-That table used to have seven rows. Six of them were closed by *six =%do= verbs
-and two accessors* — no new C primitive, no new =defprim=, nothing in =shim.c=
-except Lisp — which is the ladder above working exactly as intended: what looked
-like "the Lisp API needs a way in" was, every time, one arm of =command_for= and
-one arm of =Editor::apply=.
+That table used to have eight rows. Seven of them were closed by *nine =%do=
+verbs and two accessors* — no new C primitive, no new =defprim=, nothing in
+=shim.c= except Lisp — which is the ladder above working exactly as intended:
+what looked like "the Lisp API needs a way in" was, every time, one arm of
+=command_for= and one arm of =Editor::apply=.
 
 | Was missing                          | What closed it                                                          |
 |--------------------------------------+-------------------------------------------------------------------------|
@@ -94,6 +94,9 @@ one arm of =Editor::apply=.
 | Get an answer back from the user     | =(read-string label callback)= and =(completing-read label candidates callback)=, verbs ="read-from-minibuffer"= and ="prompt-item"=. See below — it is a continuation, not a blocking read. |
 | Send a keystroke to the shell        | =(term-send-key key)=, verb ="term-key"=, over =Key::from_token= — the inverse of the =Key::token= that =key-bindings= already reports. One vocabulary, both directions. |
 | Run a built-in verb by name          | =(call-command name)=, verb ="call"=. =Editor::run_action= is public and answers a *batch*, so the verb is resolved in =rs_do= beside =paste= rather than in =command_for=. |
+| Seed a prompt with text or candidates core owns | =(%do "prompt-text" …)=, =(%do "prompt-label" …)= and =(%do "prompt-source" "SOURCE ARGUMENT")=. The first two set fields; the third is the interesting one — Lisp *names* a list the app owns and the app pours it straight into the open prompt, so a repository's fifty thousand paths never become Lisp objects. This is what let every =project-= picker move to =runtime/plugins/project.lisp=; see the entry below. |
+| Hand a long candidate list to =completing-read= | =(%do "prompt-items" …)=, one newline-joined string. It used to be one =%do= per candidate, which =shim.c= said outright was fine for a few hundred and wanted another route past that. |
+| Say what the modeline says              | =(clear-modeline)= and =(modeline-segment SIDE TEMPLATE …)=, verbs ="modeline-clear"= and ="modeline-segment"=. A *format* rather than a callback — see below. |
 | Group several edits into one undo step | *Nothing, deliberately.* See below. |
 
 ** The prompt continuation, and why it is not a blocking read
@@ -173,32 +176,76 @@ the same feature and the second is not a step toward the first.
 These are deliberate shortcuts, marked =ponytail:= in the source. Each names its
 ceiling and its upgrade path where the source does.
 
-** Half of =project.rs= is in Lisp and half is not
+** Half of =project.rs= is in Lisp and half is not — *closed*
 
-=runtime/plugins/project.lisp= owns =project-root=, =project-dired=,
-=project-compile= and =project-test=; =crates/app/src/project.rs= still owns
-=project-find-file=, =project-find-dir=, =project-forget=, =project-switch= and
-=project-open=. One feature, two files, and that is a real cost when you are
-hunting for where a verb lives.
+Was: =runtime/plugins/project.lisp= owned =project-root=, =project-dired=,
+=project-compile= and =project-test=, while =crates/app/src/project.rs= still
+owned =project-find-file=, =project-find-dir=, =project-forget=,
+=project-switch= and =project-open=. One feature, two files, and a real cost
+when you are hunting for where a verb lives. The four that had not moved were a
+walk of the whole tree behind a cache that has to answer between two keystrokes,
+and two prompts that needed seeding with candidates core owns.
 
-It is the honest split rather than a stopping point. The four that moved are a
-handful of =probe-file= calls and a table, run once per command, and *which*
-command builds a Cargo project is exactly what a config has to be able to change
-— =*project-builders*= is one PUSH away from knowing about zig. The five that
-stayed are a walk of the whole tree behind a cache that has to answer between two
-keystrokes, and two prompts that need seeding with candidates core owns (the row
-above).
+What landed is the three prompt verbs in the table above, and =prompt-source= is
+the one that mattered. The naive close — a =project-files= *reader* — would have
+carried tens of thousands of paths into the image as printed source for ECL to
+parse, and then carried them straight back out again as candidates: two
+crossings of the exact list the cache exists so that nobody walks twice. So Lisp
+names the list instead. =(%do "prompt-source" "project-files /some/root")= and
+the app fills the open prompt directly, while the label, the callback and *what
+accepting one means* stay in the image, where a config can make =SPC p f= open in
+the other window by changing one symbol.
 
-Two rules for the same tree therefore exist: =%project-at= in Lisp and
-=zemacs_project::find= in Rust. They agree today —
-=crates/lisp/tests/project_plugin.rs= asserts the Lisp one against the same trees
-=crates/project/tests/project.rs= builds for the Rust one — and nothing but those
-two test files stops them drifting. Closing it means a =project-root= reader, and
-the price has come down since this was written: not in =query.rs=, which would
-invert the dependency and cost =zemacs-core= a =zemacs-project= it has no other
-use for, but as an =ask_here= arm in =crates/lisp= — the route =latex-fragments=
-and =fold-ranges= already take. Still a workspace edge to add, and still nobody's
-itch, but it is one crate line rather than an inversion.
+=project-switch= went the other way and is the contrast worth keeping: the
+projects visited before are a few dozen paths, so that one *is* a reader
+(=project-recent=, an =ask_here= arm — the route =latex-fragments= and
+=fold-ranges= take, plus the workspace edge this entry used to price). Having the
+list in the image is what lets =project-switch= notice it is empty and hand over
+to =project-open= rather than opening a picker onto nothing. **A list you only
+show goes by name; a list you have to reason about comes across.**
+
+What is left in =project.rs= is not a verb. =Cache= walks the tree,
+=search_root= is where a project-scoped ripgrep starts, and =project-forget=
+drops the cache — the one thing under =project-= with nothing in it for a config
+to bend.
+
+Two rules for the same tree still exist — =%project-at= in Lisp and
+=zemacs_project::find= in Rust — but they no longer *decide* the same thing. Lisp
+picks the root for every verb and hands it to the walk, so a disagreement can no
+longer put the picker in a different tree from the one =SPC p r= reports; the
+Rust climb survives only for =search_root=. =crates/lisp/tests/project_plugin.rs=
+still pins the Lisp rule against the trees =crates/project/tests/project.rs=
+builds for the Rust one.
+
+** The modeline is a format, not a callback
+
+=crates/core/src/modeline.rs= used to *be* the strip: a function that pushed a
+pill, then two spaces, then the buffer name, then a dot if modified, in that
+order and in those colours. Every line of it was policy and none of it was
+reachable from a config.
+
+It is now a list of templates =default-modeline= in =runtime/library.lisp= sets
+with =modeline-segment=,
+each a little string of =%= codes — =%m= the modal state, =%b= the buffer, =%l=
+the line — and the editor expands them per pane per frame. Rule 5 of the ladder
+above, exactly: the shape is Lisp's and costs nothing to change, the expansion is
+a scan of a few dozen bytes in Rust, and no frame waits on the image.
+
+A callback per frame was the other design and is the one Emacs has. It is also
+why a slow =mode-line-format= in Emacs makes the whole editor feel slow, and
+[[file:threading.org][threading.org]] is a document about never doing that.
+
+The one thing a format cannot say is =if=, and it does not need to: **a segment
+whose codes all expand to nothing is dropped whole**, so =" %P"= carries its own
+leading space and leaves with it on a buffer that has no file behind it. A format
+language with conditionals in it is a programming language written in strings,
+and the image is right there.
+
+Two ceilings, both marked =ponytail:= in the source. Which face each *mode* takes
+— insert green, visual magenta — is still a table in Rust; a config can move the
+pill, restyle it or delete it, but not recolour =INSERT=. And the codes are a
+fixed vocabulary: a field nobody thought of is a new arm in =Fields::code=
+rather than a Lisp function, which is the price of not calling Lisp per frame.
 
 ** The shim returns bytes, not characters — *closed*
 
@@ -467,10 +514,20 @@ That is now a line of Lisp rather than a hole in the boundary.
 
 ** Markers
 
-- =crates/core/src/lib.rs=, =step_history=: undo restores a whole snapshot rather
-  than replaying edits, so a marker beyond the restored end is *clamped* onto it
-  rather than restored exactly. Never outside the document, which is the
-  invariant a marker owes its holder.
+- =crates/core/src/lib.rs=, =step_history=: *closed.* Undo used to restore a whole
+  snapshot and then clamp the markers into it, so one beyond the restored end
+  landed on the end and one merely *pushed along* by the undone edit stayed
+  pushed. It now diffs the two ropes — common prefix, common suffix, one
+  contiguous range between, which is what a single undone edit differs by — and
+  splices it, so markers and overlays run backwards through the edit the way
+  they run forwards through an ordinary one.
+
+  What that was costing was not markers. A LaTeX preview is an *overlay* over
+  its fragment, and an undo anywhere above one left the image at its old offset
+  while the text slid out from under it — reported as "previews mess up undo".
+  Every fold, diagnostic mark and org-modern bullet had the same bug. The
+  change record is now the range rather than =0..old -> 0..new=, so a =u= on one
+  character is an incremental reparse and a small =didChange= as well.
 - =crates/lisp/src/shim.c=: =(make-marker)= puts one *at point* rather than
   nowhere, and the insertion type is fixed at creation — there is no
   =set-marker-insertion-type=.
@@ -802,11 +859,44 @@ rather than an oversight, and each has a different reason:
   host's mtime. This is the one that could not be skipped: it is the difference
   between a shortcut and data loss.
 
-Two smaller ones. The file prompt does not complete remote paths — a listing per
-keystroke over ssh — so what you type is what is opened. And a remote dired
-listing is read-only: =rename=, =copy=, =delete=, =x=, =+= and =C-c n= refuse by
-name. =tramp= has =rename=, =delete= and =mkdir= already, so that one is wiring
-rather than design.
+One smaller one. The file prompt does not complete remote paths — a listing per
+keystroke over ssh — so what you type is what is opened, and dired's =R= and =C=
+prompts go bare over ssh for the same reason: their candidates would be *this*
+machine's files, and =Prompt::value= prefers the highlighted candidate to the
+text, so a remote rename would submit a local path.
+
+A remote dired listing used to be read-only, and is not any more. =rename=,
+=copy=, =delete=, =x=, =+= and =C-c n= run on the host the listing came from,
+through the same =zemacs-tramp= operations =find-file= and =save-file= use, and
+— the part that mattered — through the same confirmation funnel: =D= and =x=
+arrive as one =EditorCommand::Dired=, are asked about *by name* before anything
+is sent, and both land in =remove_all=, which is still the one place in the
+editor that destroys a file. =tramp= grew the two primitives it was missing:
+=copy= (=cp -R -P=, refusing an existing destination and a directory copied into
+itself) and =create_file= (=set -C=, so an existing name fails in the kernel
+rather than being quietly truncated).
+
+They go through the *same worker* the listing does, so a wedged host is a
+message and not a frozen editor: dired pushes the [[file:../crates/tramp/src/lib.rs][=tramp::Op=]] onto =want_op=,
+=App::housekeep= drains it once a frame, and the answer lands several frames
+later — the promise [[file:threading.org][threading.org]] already makes for =find-file=. Draining once
+a *frame* rather than under =EditorCommand::Dired= is the whole of why it works:
+every one of these verbs arrives as =EditorCommand::Confirmed= or out of the
+file prompt, so a per-arm drain reached none of them, and the next verb added
+through a fourth door would have been unsent again. The count survived the move
+— =remove_all= used to write "deleted 3, failed 1" out of one =Result=, and now
+starts a =Deleting= tally that =Dired::did= closes one answer at a time, so it
+is still one sentence naming which file stayed.
+
+Two things are still not what a local verb is. Marked files are one round trip
+each — a =tramp::Op= names one path, so =x= over four of them is four =rm=s,
+queued together rather than run one after another — and the listing on screen is
+the pre-verb one until the re-read queued behind them comes back, a few frames
+of a stale row. And a remote file whose name contains a newline remains
+invisible to all of them, because it never reaches a listing at all (=entry= in
+=crates/tramp/src/lib.rs=, whose records are newline-separated): deleting the
+directory above such a file works, deleting the file does not, since there is no
+line to put the cursor on.
 
 * Every =ponytail:= in the tree
 
@@ -827,7 +917,7 @@ that show up as behaviour rather than as API.
 | ● | =lisp/lib.rs= (=command_for=)    | One primitive for every command fitting "verb + string + two integers". |
 | ● | =core/lib.rs= (=normalize_keys=) | ="gg"= is =g g=; an unseparated mix like ="g<tab>"= is unsupported.       |
 | ● | =render/lib.rs= (=line_box=)     | =scale= sizes the whole line, not a run, and is snapped to one of four steps. |
-| ● | =core/lib.rs= (=step_history=)   | Undo clamps markers rather than restoring them exactly.              |
+| ● | =core/lib.rs= (=step_history=)   | *Closed* — undo splices the range that differs, so markers and overlays run backwards through the edit. |
 |   | =core/lib.rs= (=max_scroll=)     | Scrolling past the end stops at the last *buffer line*, so a fold covering the end of the file is scrolled into and draws an empty pane. |
 | ● | =core/lib.rs= (=Key=)            | Three named keys carry modifiers; a bitset at four.                  |
 |   | =render/lib.rs= (=image_tall=)   | A fourth linear scan of a line's overlays per drawn line, guarded by =Editor::has_images= so only a session that has typeset something pays it. |
@@ -837,7 +927,7 @@ that show up as behaviour rather than as API.
 | ● | =lisp/shim.c= (=PROMPT_FORM=)    | A Lisp prompt replaced by another prompt never answers its continuation. |
 | ● | =core/lib.rs= (=create_buffer=)  | A buffer Lisp made is writable *by default*; the flag now exists, and a command that regenerates one has to claim it. |
 | ● | =runtime/rpc.lisp=             | =false=, =null=, =[]= and ={}= all decode to =NIL=; object-versus-array is inferred on encode; =json-string= encodes non-ASCII a second time. |
-| ● | =runtime/lsp.lisp=             | The buffer is still *read* whole per keystroke — the delta hook names no buffer; =textEdit= and =isIncomplete= ignored; the diagnostics listing is a plain file that does not re-read. |
+| ● | =runtime/lsp.lisp=             | The buffer is still *read* whole per keystroke — the delta hook names no buffer; a completion's `textEdit` contributes its *start* and not its end, which is stale by whatever you typed while the reply was in flight; the diagnostics listing is a plain file that does not re-read. |
 | ● | =runtime/modes/modes.lisp=     | The settings baseline starts at the factory default.                 |
 |   | =core/evil.rs=                 | No sticky desired column through a short line for some motions; with an operator pending =j=/=k= are buffer lines, not visual ones. |
 |   | =core/lib.rs= (=line_cells=)     | A =display= substitution is laid out by both sides now; an *image*'s *cells* are not, because they are pixels over a cell width core has not got. Its *rows* are — in the renderer, where all four counts of them live. |
@@ -847,11 +937,11 @@ that show up as behaviour rather than as API.
 |   | =syntax/org.rs=                | Single-line emphasis; only the two built-in todo keywords; rescan per keystroke for LaTeX. |
 |   | =render/lib.rs=                | A closed frame leaves its =TextureCreator= behind — leaked for ='static= textures, and *because* nothing drops it, =Drop= takes the SDL renderer and window down by hand; no horizontal scrolling; a wrapped line at the foot of a pane is cut; prompt lands on the focused modeline; input and path text truncate at the tail; a which-key column past the right edge is dropped rather than wrapped; highlight, shadow and divider colours hardcoded; an overlay image grows its line's row count but reflows nothing sideways, and its textures are never evicted; the *cells* it reserves are still the renderer's alone, so core's =line_cells= counts its source text; a fold at the very bottom of the row budget is not counted, and =scroll= is still a buffer line; a wide character straddling the wrap point is cut in half rather than moved down; a control character draws as nothing rather than as =^G=. |
 |   | =dired/lib.rs=, =dired/render.rs= | No watcher or caching; per-comparison allocation in the sort; no cross-device rename; no ACLs; one face for both marks; UTC timestamps. |
-|   | =git/lib.rs=, =git/rebase.rs=    | No =--set-upstream=; a cherry-pick conflict is reported as git's own words; rebase shells out to =sh= and =cp= (unix only) and skips =--rebase-merges= steps. |
+|   | =git/lib.rs=, =git/rebase.rs=, =app/magit.rs= | A cherry-pick conflict is reported as git's own words; rebase shells out to =sh= and =cp= (unix only) and skips =--rebase-merges= steps; =push-upstream= assumes the remote is =origin=; discarding a *staged* change asks you to unstage it first; the log opens in the status buffer rather than a buffer of its own. |
 |   | =latex/lib.rs=                 | =\begin{equation}= typesets at the article =\textwidth=; =DefaultHasher= for the preview cache key. |
 |   | =project/*=                    | =--cached= lists deleted-but-staged files; a fixed ignore list rather than =.gitignore=; ripgrep output is fully buffered; lossy path display; a hardcoded constant that is wrong off Apple Silicon; no project-wide replace. |
-|   | =tramp/lib.rs=                 | One worker thread, so operations are strictly ordered; =cp -p= before truncating; filenames containing newlines are lost; one timeout constant; remote-shell unquoting. |
-| ● | =app/main.rs= (=Remote=), =app/dired.rs= | A =/ssh:= buffer gets no auto-revert, no numbered backups and no changed-on-disk guard; auto-save is local and is the only crash protection. Remote dired is read-only and shows no symlink targets; the file prompt does not complete remote paths. |
+|   | =tramp/lib.rs=                 | One worker thread, so operations are strictly ordered; =cp -p= before truncating; a remote =copy= takes no =-p=, so times and owner are not preserved; filenames containing newlines are lost; one timeout constant; remote-shell unquoting. |
+| ● | =app/main.rs= (=Remote=), =app/dired.rs= | A =/ssh:= buffer gets no auto-revert, no numbered backups and no changed-on-disk guard; auto-save is local and is the only crash protection. Remote dired's write verbs are one round trip per marked file, leave the listing stale until the re-read behind them lands, and show no symlink targets; the file prompt does not complete remote paths. |
 |   | =rpc/frame.rs=, =rpc/lib.rs=     | Unrecognised header lines are skipped rather than resynchronised past; a stopped child is killed rather than given a grace period. |
 
 * Where to add things

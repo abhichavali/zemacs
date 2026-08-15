@@ -250,15 +250,20 @@ fn changes_go_out_as_ranges_counted_in_utf16() {
     //
     // Ranges in the *old* document's coordinates, which is why the shadow copy
     // exists: the buffer no longer holds that text by the time anyone asks.
-    let change = |splice: &str| {
+    // Both documents given outright, because the shapes that break a narrowing
+    // are not all shapes the buffer has — a last line with no newline after it
+    // is the obvious one. NEW is read in a `let*' after OLD, so the buffer-based
+    // spellings below still say `old' and mean it.
+    let change_of = |old: &str, new: &str| {
         format!(
-            "(let* ((old (buffer-string)) (new {splice}) (c (%lsp-content-change old new))) \
+            "(let* ((old {old}) (new {new}) (c (%lsp-content-change old new))) \
                (format nil \"~a ~a ~a ~a ~a\" \
                  (jget c \"range\" \"start\" \"line\") (jget c \"range\" \"start\" \"character\") \
                  (jget c \"range\" \"end\" \"line\") (jget c \"range\" \"end\" \"character\") \
                  (map 'list #'char-code (jget c \"text\"))))"
         )
     };
+    let change = |splice: &str| change_of("(buffer-string)", splice);
     // An insert before the `a`: character 5, code unit 6.
     says(
         &lisp,
@@ -303,6 +308,137 @@ fn changes_go_out_as_ranges_counted_in_utf16() {
         &shared,
         "(%lsp-content-change (buffer-string) (buffer-string))",
         "NIL",
+    );
+
+    // --- the shapes that break a narrowing ----------------------------------
+    //
+    // The four above are all edits in the middle of the first line, which is the
+    // case every implementation gets right. These are the ends and the empty
+    // runs. The buffer is twenty-four characters — eight, a newline, fourteen,
+    // a newline — and every number below is counted off that, so it is pinned
+    // here rather than left implied.
+    says(&lisp, &shared, "(length (buffer-string))", "24");
+    // At offset 0 there is no common prefix at all, and the common suffix is the
+    // whole of the old document.
+    says(
+        &lisp,
+        &shared,
+        &change(r#"(concatenate 'string "x" old)"#),
+        "0 0 0 0 (120)",
+    );
+    // At the very end, which is also OLD being a strict prefix of NEW — the case
+    // where the answer is OLD's own length rather than an index into it, and the
+    // one worth pinning because `string/=' and `mismatch' have to agree on it.
+    // The document ends in a newline, so the position is the start of the line
+    // after the last one.
+    says(
+        &lisp,
+        &shared,
+        &change(r#"(concatenate 'string old "x")"#),
+        "2 0 2 0 (120)",
+    );
+    // ...and the same the other way round, NEW a strict prefix of OLD: the last
+    // character is deleted, so the range covers it and the replacement is empty.
+    says(
+        &lisp,
+        &shared,
+        &change("(subseq old 0 (1- (length old)))"),
+        "1 14 2 0 NIL",
+    );
+    // A character *replaced* rather than inserted, at offset 0. Insertions and
+    // deletions leave everything after the edit aligned and are settled by the
+    // forward check on the capped suffix; a replacement is not, and falls
+    // through to the backward `mismatch'. This is that branch.
+    says(
+        &lisp,
+        &shared,
+        &change(r#"(concatenate 'string "X" (subseq old 1))"#),
+        "0 0 0 1 (88)",
+    );
+    // A last line with no newline after it. The buffer always has one, so this
+    // pair is written out: `bc' becomes `bXc' on line 1, and the line's start is
+    // found by a scan that has no trailing newline to stop on.
+    says(
+        &lisp,
+        &shared,
+        &change_of(r#"(format nil "a~%bc")"#, r#"(format nil "a~%bXc")"#),
+        "1 1 1 1 (88)",
+    );
+    // Multi-byte on *both* sides of the edit point: an emoji and an `é' before
+    // it on the same line, an `é' after it. The column is three and not two
+    // because the emoji is a surrogate pair — count characters instead of code
+    // units here and the server edits a different place than the one meant.
+    says(
+        &lisp,
+        &shared,
+        &change_of(
+            r#"(format nil "a~%~a~ax~a" (code-char 128512) (code-char 233) (code-char 233))"#,
+            r#"(format nil "a~%~a~aXx~a" (code-char 128512) (code-char 233) (code-char 233))"#,
+        ),
+        "1 3 1 3 (88)",
+    );
+    // The same document, but the `x' is replaced rather than pushed along — so
+    // the backward `mismatch' runs with multi-byte characters on both sides of
+    // where it stops, and the end column counts the emoji twice as well.
+    says(
+        &lisp,
+        &shared,
+        &change_of(
+            r#"(format nil "a~%~a~ax~a" (code-char 128512) (code-char 233) (code-char 233))"#,
+            r#"(format nil "a~%~a~aQ~a" (code-char 128512) (code-char 233) (code-char 233))"#,
+        ),
+        "1 3 1 4 (81)",
+    );
+
+    // Every offset in a small multi-byte document, inserted, deleted and
+    // replaced, in both directions, against the narrowing this file used to
+    // have — which is transcribed below rather than described, because that is
+    // the only form of it a test can compare against.
+    //
+    // The examples above are the shapes somebody thought of. This is the one
+    // that matters: a `didChange' naming the wrong range does not fail here, it
+    // fails as a wrong completion an hour later and nowhere near the edit, so
+    // what has to be true is that the faster spelling answers the *same object*
+    // as the slower one it replaced, at every offset and not at four of them.
+    says(
+        &lisp,
+        &shared,
+        r#"(labels ((refpos (text at)
+                      (jobj "line" (count #\Newline text :end at)
+                            "character"
+                            (%lsp-utf16-length
+                             text
+                             :start (let ((nl (position #\Newline text :end at :from-end t)))
+                                      (if nl (1+ nl) 0))
+                             :end at)))
+                    (refchange (old new)
+                      (let ((head (mismatch old new)))
+                        (when head
+                          (let* ((lo (length old)) (ln (length new))
+                                 (tail (min (- lo (or (mismatch old new :from-end t) 0))
+                                            (- (min lo ln) head)))
+                                 (old-end (- lo tail)))
+                            (jobj "range" (jobj "start" (refpos old head)
+                                                "end" (refpos old old-end))
+                                  "text" (subseq new head (- ln (- lo old-end)))))))))
+             (let ((doc (format nil "a~a~a~%bb~%c~a~%~%d~a"
+                                (code-char 233) (code-char 128512)
+                                (code-char 128512) (code-char 233))))
+               (loop for k from 0 to (length doc)
+                     always (let* ((n (length doc))
+                                   (ins (concatenate 'string (subseq doc 0 k) "Q" (subseq doc k)))
+                                   (del (if (< k n)
+                                            (concatenate 'string (subseq doc 0 k) (subseq doc (1+ k)))
+                                            doc))
+                                   (rep (if (< k n)
+                                            (concatenate 'string (subseq doc 0 k) "Q" (subseq doc (1+ k)))
+                                            doc)))
+                              (and (equal (refchange doc ins) (%lsp-content-change doc ins))
+                                   (equal (refchange ins doc) (%lsp-content-change ins doc))
+                                   (equal (refchange doc del) (%lsp-content-change doc del))
+                                   (equal (refchange del doc) (%lsp-content-change del doc))
+                                   (equal (refchange doc rep) (%lsp-content-change doc rep)))))))"#,
+        "T",
     );
 
     // --- the negotiation ----------------------------------------------------

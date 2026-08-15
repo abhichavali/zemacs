@@ -49,6 +49,9 @@ extern void rs_set_no_gutter_modes(const char *modes);
 extern void rs_set_minor_mode(const char *name, int on);
 /* Returns Rust-owned memory: hand it to rs_free_string, never to free(3). */
 extern char *rs_query(const char *name, long a, long b);
+/* The same, for the readers that answer text rather than source. NULL for any
+ * other name. See f_query_string. */
+extern char *rs_query_string(const char *name, long a, long b);
 /* The write half of rs_query: one verb, one optional string, two integers. */
 extern void rs_do(const char *verb, const char *arg, long a, long b);
 extern void rs_free_string(char *p);
@@ -505,6 +508,39 @@ static cl_object f_query(cl_object name, cl_object a, cl_object b) {
   return form;
 }
 
+/* The same reader, for the three answers that *are* buffer text.
+ *
+ * `%query' pays for its one-signature envelope twice on those: Rust escapes
+ * every character of the answer into a Lisp literal, and READ then walks the
+ * literal to take the escapes back out. On a 287 KB buffer that was 3.1 ms of
+ * READ against 0.3 ms to copy the same string — 85% of `(buffer-string)' spent
+ * on packaging, and part of it under the editor mutex with the render loop
+ * waiting behind it. So these hand the bytes over as themselves and `utf8_string'
+ * makes the string object out of them, which is the step `read_utf8' was doing
+ * first anyway before it called the reader.
+ *
+ * Byte-identical to the escaped path by construction, and that is the only
+ * property this shortcut has to have: both decode with the same `utf8_string',
+ * and the escaping READ takes out is exactly the escaping Rust no longer puts
+ * in. `crates/lisp/tests/utf8.rs' asserts it against a literal on both channels,
+ * because two channels agreeing is also what double-encoding on both of them
+ * looks like.
+ *
+ * NULL means there is no raw reader of that name, which answers NIL — what
+ * `%query' says to an unknown one. */
+static cl_object f_query_string(cl_object name, cl_object a, cl_object b) {
+  long ia = (a == ECL_NIL) ? 0 : (long)ecl_to_fixnum(a);
+  long ib = (b == ECL_NIL) ? 0 : (long)ecl_to_fixnum(b);
+  char *n = dup_utf8_or_empty(name);
+  char *text = rs_query_string(n, ia, ib);
+  free(n);
+  if (!text)
+    return ECL_NIL;
+  cl_object s = utf8_string(text);
+  rs_free_string(text);
+  return s;
+}
+
 /* The one writer, mirroring f_query. Every command whose arguments fit "a verb,
  * maybe a string, up to two integers" goes through here, so adding one is an arm
  * of the match in zemacs_lisp::command_for and a one-line DEFUN below — nothing
@@ -823,14 +859,21 @@ static const char *QUERIES_FORM =
     "   (let* ((name q) (sym (intern (string-upcase name) \"ZEMACS\")))"
     "     (setf (symbol-function sym) (lambda () (zemacs::%query name 0 0)))"
     "     (export sym \"ZEMACS\")))"
-    " (defun zemacs::buffer-substring (a b) (zemacs::%query \"buffer-substring\" a b))"
+    /* The three readers whose answer *is* buffer text go through `%query-string'
+     * instead — see f_query_string for what that saves. `buffer-string' is still
+     * made by the loop above like every other zero-argument reader, so that it
+     * is exported and listed in `*readers*' with the rest, and only then
+     * redefined here: its membership of that list is what keeps it out of the
+     * M-x menu, and the definition is the only part of it that differs. */
+    " (defun zemacs::buffer-string () (zemacs::%query-string \"buffer-string\" 0 0))"
+    " (defun zemacs::buffer-substring (a b) (zemacs::%query-string \"buffer-substring\" a b))"
     /* The readers that take an argument, hand-written because the loop above
      * only makes zero-argument ones. A line number is 1-based, as `line-number'
      * reports one, and NIL means the line point is on — so the zero-argument
      * spelling these three have always had still means what it did. */
     " (defun zemacs::line-start (&optional line) (zemacs::%query \"line-start\" (or line 0) 0))"
     " (defun zemacs::line-end (&optional line) (zemacs::%query \"line-end\" (or line 0) 0))"
-    " (defun zemacs::line-string (&optional line) (zemacs::%query \"line-string\" (or line 0) 0))"
+    " (defun zemacs::line-string (&optional line) (zemacs::%query-string \"line-string\" (or line 0) 0))"
     /* The other end of the bracket at POS, or just before it — which is where
      * point sits the instant you finish typing a closing one, and is the whole
      * reason this answers for two positions rather than one. NIL when there is
@@ -1677,6 +1720,7 @@ void zemacs_boot(void) {
   defprim("CLEAR-COMMANDS", (cl_objectfn_fixed)f_clear_commands, 0);
   defprim("REGISTER-COMMAND", (cl_objectfn_fixed)f_register_command, 1);
   defprim("%QUERY", (cl_objectfn_fixed)f_query, 3);
+  defprim("%QUERY-STRING", (cl_objectfn_fixed)f_query_string, 3);
   defprim("%DO", (cl_objectfn_fixed)f_do, 4);
   defprim("GOTO-CHAR", (cl_objectfn_fixed)f_goto_char, 1);
   defprim("DELETE-REGION", (cl_objectfn_fixed)f_delete_region, 2);

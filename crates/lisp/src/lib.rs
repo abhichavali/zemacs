@@ -437,6 +437,30 @@ pub extern "C" fn rs_query(name: *const c_char, a: c_long, b: c_long) -> *mut c_
         .into_raw()
 }
 
+/// Answer `name` as the text *itself*, for the readers whose answer is buffer
+/// text — see [`zemacs_core::query::query_string`] for which those are and why
+/// they are worth a second entry point. Same ownership rule as [`rs_query`]: the
+/// result is a Rust allocation and goes back to [`rs_free_string`].
+///
+/// `NULL` for any name `query_string` does not answer, which the shim turns into
+/// `NIL` — the same thing an unknown reader gets from `%query`, so a caller that
+/// guessed wrong is told nothing rather than told something wrong.
+///
+/// [`ask_here`] is deliberately not consulted: every reader living there answers
+/// a *list*, and a list is source.
+#[no_mangle]
+pub extern "C" fn rs_query_string(name: *const c_char, a: c_long, b: c_long) -> *mut c_char {
+    let name = unsafe { str_or_empty(name) };
+    let text = with_editor(|ed| zemacs_core::query::query_string(ed, &name, a as i64, b as i64))
+        .flatten();
+    // A NUL in the buffer lands here as `None` and so as NIL, which is what the
+    // escaped channel does with one as well — see [`rs_query`].
+    match text.and_then(|t| CString::new(t).ok()) {
+        Some(s) => s.into_raw(),
+        None => std::ptr::null_mut(),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn rs_free_string(p: *mut c_char) {
     if !p.is_null() {

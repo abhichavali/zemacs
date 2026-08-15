@@ -335,5 +335,67 @@ fn text_crossing_the_shim_is_characters_in_both_directions() {
         &unit_begin.to_string(),
     );
 
+    // --- the raw channel beside the source one ------------------------------
+    //
+    // `buffer-string', `buffer-substring' and `line-string' stopped being
+    // escaped into Lisp source and READ back: `%query-string' hands the bytes
+    // over and the shim makes the string object out of them directly. That skips
+    // the reader, and the reader is where the Latin-1 mis-read used to live — so
+    // the new path has to arrive at the same characters the old one did, and
+    // arriving at the same *wrong* characters would not be noticed by comparing
+    // the two channels alone. Both are therefore compared against a literal
+    // here, `%query' standing as the control that did not change.
+    for (nth, sample) in [
+        "plain ascii",
+        "em \u{2014} dash",
+        "caf\u{e9}",
+        "\u{6f22}\u{5b57}",
+        "\u{1f600}",
+        // What the escape pass existed for. On this line a raw channel that
+        // forgot it was no longer writing source would ship `\"' and `\\' as
+        // themselves, and the `string=' below is what says it did not.
+        r#"say "hi" \ bye"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        load(&shared, sample, 10 + nth);
+        let raw = asks(&shared, &lisp, "(buffer-string)");
+        assert_eq!(raw, *sample, "the raw channel answers what the buffer holds");
+        if !sample.is_ascii() {
+            assert_ne!(
+                raw,
+                twice_encoded(sample),
+                "and not its own UTF-8 read a byte at a time, which is the failure this path could reintroduce"
+            );
+        }
+        // The source channel is untouched and still agrees, character for
+        // character. `%query' is called by name because nothing in `runtime/'
+        // reaches these three through it any more.
+        says(
+            &shared,
+            &lisp,
+            "(string= (buffer-string) (%query \"buffer-string\" 0 0))",
+            "T",
+        );
+        // Characters and not bytes, which is the property the whole file is
+        // about and the one a raw path is most likely to lose.
+        says(
+            &shared,
+            &lisp,
+            "(length (buffer-string))",
+            &sample.chars().count().to_string(),
+        );
+        says(&shared, &lisp, "(= (length (buffer-string)) (point-max))", "T");
+        // The two readers that moved with it, on the same sample.
+        says(
+            &shared,
+            &lisp,
+            "(string= (buffer-string) (buffer-substring 0 (point-max)))",
+            "T",
+        );
+        says(&shared, &lisp, "(string= (buffer-string) (line-string 1))", "T");
+    }
+
     let _ = std::fs::remove_file(&init);
 }

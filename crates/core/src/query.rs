@@ -13,6 +13,21 @@
 //! ceiling is arguments: two integers is all a query gets. Anything needing a
 //! string argument is a *command*, and commands already have a channel.
 //!
+//! The *other* ceiling was measured rather than argued about, and
+//! [`query_string`] is the half of it that has been paid off. An answer that is
+//! buffer text pays for the envelope twice — once here, escaping every
+//! character of it into a literal, and once in the image, handing that literal
+//! to READ to take the escapes back out — and on a 287 KB buffer the packaging
+//! was 85% of `(buffer-string)`: 3.1 ms of READ against 0.3 ms to copy the same
+//! string. It is charged where it hurts most, too, since the escape pass runs
+//! with the editor mutex held and the render loop waits behind it.
+//!
+//! So the three readers whose answer *is* buffer text are also reachable
+//! through `%query-string`, which hands the bytes over as themselves and lets
+//! the shim make a string object out of them directly. Nothing else moved: an
+//! answer that is a list or a number genuinely is source, needs a reader, and is
+//! a few dozen bytes whatever the buffer holds.
+//!
 //! Unknown names answer `NIL` rather than erroring, so a config written against
 //! a newer zemacs degrades instead of failing to load.
 
@@ -20,16 +35,18 @@ use crate::{CompletionStyle, Editor, HlKind, LineOverflow, Mode};
 
 /// Answer `name`, with up to two integer arguments, as readable Lisp source.
 pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
+    // The text readers are spelled once, in `query_string`, and escaped into a
+    // literal here. So `%query` answers exactly the source it always did — a
+    // config calling it by hand is unaffected by any of this — while
+    // `%query-string` gets the same text with neither the escape pass nor the
+    // READ, which is the whole of the saving.
+    if let Some(text) = query_string(ed, name, a, b) {
+        return string(&text);
+    }
     let buf = &ed.buffer;
     let n = buf.len_chars();
     let (line, col) = buf.cursor_line_col();
-    // A 1-based line number, spelled the way `line-number` answers one. Zero is
-    // "the line point is on", which is what the zero-argument call sends — so
-    // `(line-start)` keeps meaning what it always did and `(line-start 7)` is new.
-    let at = |a: i64| match a {
-        v if v > 0 => ((v - 1) as usize).min(buf.len_lines().saturating_sub(1)),
-        _ => line,
-    };
+    let at = |a: i64| line_at(buf, a);
     match name {
         "point" => buf.cursor.to_string(),
         "point-min" => "0".into(),
@@ -40,15 +57,6 @@ pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
         "line-start" => buf.line_start(at(a)).to_string(),
         "line-end" => buf.line_end(at(a)).to_string(),
 
-        "buffer-string" => string(&buf.slice_string(0, n)),
-        "buffer-substring" => {
-            let (start, end) = clamp(a, b, n);
-            string(&buf.slice_string(start, end))
-        }
-        "line-string" => {
-            let l = at(a);
-            string(&buf.slice_string(buf.line_start(l), buf.line_end(l)))
-        }
         // The bracket matching the one at `a`, or NIL. Zero means point, the
         // way every other position argument here does.
         //
@@ -283,6 +291,51 @@ pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
         },
 
         _ => "nil".into(),
+    }
+}
+
+/// The readers whose answer is buffer text, handed back *raw* — not escaped into
+/// a Lisp literal, because `%query-string` makes a string object out of these
+/// bytes directly rather than READing them.
+///
+/// `None` for every other name, which is what makes it safe for [`query`] to try
+/// this first: a reader that is not here has not moved, and falls through to the
+/// source channel unchanged.
+///
+/// The three are together because what they have in common is *size*. A buffer,
+/// a region of one and a line of one are the only answers in this file that grow
+/// with the document, so they are the only ones where the escape pass and the
+/// READ cost more than a second entry point does. `buffer-name`, `status` and
+/// the rest are strings too, and are a dozen bytes each; moving them would buy
+/// nothing and would spend a DEFUN apiece.
+pub fn query_string(ed: &Editor, name: &str, a: i64, b: i64) -> Option<String> {
+    let buf = &ed.buffer;
+    let n = buf.len_chars();
+    Some(match name {
+        "buffer-string" => buf.slice_string(0, n),
+        "buffer-substring" => {
+            let (start, end) = clamp(a, b, n);
+            buf.slice_string(start, end)
+        }
+        "line-string" => {
+            let l = line_at(buf, a);
+            buf.slice_string(buf.line_start(l), buf.line_end(l))
+        }
+        _ => return None,
+    })
+}
+
+/// A 1-based line number, spelled the way `line-number` answers one. Zero is
+/// "the line point is on", which is what the zero-argument call sends — so
+/// `(line-start)` keeps meaning what it always did and `(line-start 7)` is new.
+///
+/// A free function rather than the closure it used to be because `line-string`
+/// reads it from the other channel now, and two spellings of "which line did you
+/// mean" is how `(line-start 7)` and `(line-string 7)` come to disagree.
+fn line_at(buf: &crate::Buffer, a: i64) -> usize {
+    match a {
+        v if v > 0 => ((v - 1) as usize).min(buf.len_lines().saturating_sub(1)),
+        _ => buf.cursor_line_col().0,
     }
 }
 

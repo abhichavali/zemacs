@@ -1,120 +1,312 @@
 //! What the modeline says.
 //!
-//! A list of [`Segment`]s rather than one formatted string, because the parts
-//! want different weights and colours — the mode indicator bold and tinted, the
-//! file name bold, the permissions dim — and a single string can only ever be
-//! drawn one way.
+//! **The shape is Lisp's and the expansion is Rust's**, which is rule 5 of
+//! `docs/boundary.org` — *"is it hot enough that Lisp doing it per keystroke
+//! would be felt? Then it is Rust, and Lisp gets a knob rather than a hook"* —
+//! applied to the one strip on screen that every config wants to bend.
 //!
-//! Split left and right so position and mode sit against the right edge the way
-//! Emacs puts them, instead of drifting with the length of the file name.
+//! This file used to *be* the modeline: a function that pushed a pill, then two
+//! spaces, then the buffer name, then a dot if modified, in that order, in those
+//! colours. Everything about that was policy and none of it was reachable. It is
+//! now a list of [`Spec`]s the image sets once with `modeline-segment`, each a
+//! little template of `%` codes; [`segments`] expands them per pane per frame,
+//! which is a scan of a few dozen bytes and no Lisp call at all.
+//!
+//! A callback per frame was the other design and is the one Emacs has. It is
+//! also why a slow `mode-line-format` in Emacs makes the whole editor feel slow,
+//! and `docs/threading.org` is a document about never doing that.
+//!
+//! # The codes
+//!
+//! | Code | Expands to                                          |
+//! |------|-----------------------------------------------------|
+//! | `%m` | The modal state — `NORMAL`, `INSERT`. Active pane only. |
+//! | `%b` | The buffer's name.                                  |
+//! | `%f` | Its path, or the name again when it has none.       |
+//! | `%+` | `●` when the buffer has unsaved changes.            |
+//! | `%r` | `◈` when it is read-only *and* unmodified.          |
+//! | `%s` | The last message. Active pane only.                 |
+//! | `%k` | The half-typed key sequence. Active pane only.      |
+//! | `%P` | Unix permissions, when there is a file behind it.   |
+//! | `%M` | The major mode, as a word: `Rust`.                  |
+//! | `%n` | The minor modes, `+each` in turn.                   |
+//! | `%l` | The line number, 1-based.                           |
+//! | `%c` | The column, 1-based.                                |
+//! | `%p` | Where you are: `Top`, `Bot`, `All`, or a percentage. |
+//! | `%%` | A literal `%`.                                      |
+//!
+//! **A segment whose codes all expand to nothing is dropped whole**, and that is
+//! the whole of the conditional logic — it is what lets `"  %P"` put two spaces
+//! before the permissions *and* disappear with them when the buffer has no file.
+//! Without it a format language needs `if`, and a format language with `if` in it
+//! is a programming language written in strings.
 
 use crate::{Buffer, Editor, HlKind, Mode};
 
-/// A run of modeline text drawn as one piece.
+/// Which colour a segment takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Face {
+    /// The strip's own foreground.
+    #[default]
+    Default,
+    Named(HlKind),
+    /// *The colour of the mode you are in* — the one face that cannot be named
+    /// ahead of time, since it is a different one in each state.
+    ///
+    /// This is what makes the pill work. Modal editing's one recurring cost is
+    /// losing track of which mode you are in, and the thing that fixes it is a
+    /// shape at the left edge that is a different colour in each — recognisable
+    /// at the edge of vision, which a word is not.
+    Mode,
+}
+
+// ponytail: which face each mode takes is the table below and is not settable —
+// a config can move the pill, restyle it or delete it, but not recolour INSERT.
+// Ceiling: someone who wants visual and insert swapped. Upgrade path: a
+// `modeline-mode-face` verb keyed by the state name `set-evil-state` already
+// takes.
+fn mode_face(mode: Mode) -> HlKind {
+    match mode {
+        Mode::Insert => HlKind::String,
+        Mode::Visual | Mode::VisualLine | Mode::VisualBlock => HlKind::Keyword,
+        Mode::Terminal => HlKind::Function,
+        Mode::Magit | Mode::Dired | Mode::Dashboard => HlKind::Type,
+        Mode::Normal => HlKind::Constant,
+    }
+}
+
+/// One entry of the format: a template and how to draw what it expands to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spec {
+    /// Literal text with `%` codes in it — see the module docs.
+    pub template: String,
+    pub face: Face,
+    pub bold: bool,
+    /// Paint the face as a *block* behind the text instead of on it, and knock
+    /// the text out to the strip's own colour.
+    ///
+    /// A second boolean rather than a `fill: Option<HlKind>`, because the two
+    /// would never differ: a filled segment is the same claim as a coloured one
+    /// — "this is what mode you are in" — stated loudly. Two faces would be two
+    /// things for a theme to keep in agreement and no way to be in disagreement
+    /// usefully.
+    ///
+    /// Knocked out rather than drawn over: a colour chosen to be legible *on*
+    /// the bar is by construction not legible *as* the bar, so the text has to
+    /// swap to the ground it is now sitting on. That ground is the strip, which
+    /// is why the renderer resolves it and this file does not.
+    pub filled: bool,
+}
+
+impl Spec {
+    /// A plain run of literal text.
+    pub fn text(template: &str) -> Self {
+        Self {
+            template: template.into(),
+            face: Face::Default,
+            bold: false,
+            filled: false,
+        }
+    }
+}
+
+/// The whole strip, in two groups.
+///
+/// Split left and right so position and mode sit against the right edge the way
+/// Emacs puts them, instead of drifting with the length of the file name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Format {
+    pub left: Vec<Spec>,
+    pub right: Vec<Spec>,
+}
+
+/// What a modeline nobody has configured says.
+///
+/// Deliberately almost nothing — the shipped strip is `runtime/init.lisp`'s, and
+/// this is what a headless [`Editor`] or a checkout with a broken config shows.
+/// The two facts worth having with no config at all are which buffer you are
+/// looking at and whether you have saved it.
+impl Default for Format {
+    fn default() -> Self {
+        Self {
+            left: vec![
+                Spec {
+                    template: "  %b".into(),
+                    face: Face::Default,
+                    bold: true,
+                    filled: false,
+                },
+                Spec {
+                    template: " %+%r".into(),
+                    face: Face::Named(HlKind::Warning),
+                    bold: false,
+                    filled: false,
+                },
+            ],
+            right: vec![Spec::text("%l:%c  ")],
+        }
+    }
+}
+
+impl Format {
+    /// Take both sides down, so `modeline-segment` can build a strip from
+    /// scratch rather than appending to whatever was there.
+    pub fn clear(&mut self) {
+        self.left.clear();
+        self.right.clear();
+    }
+
+    pub fn push(&mut self, right: bool, spec: Spec) {
+        match right {
+            true => self.right.push(spec),
+            false => self.left.push(spec),
+        }
+    }
+}
+
+/// One expanded segment, ready to draw.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Segment {
     pub text: String,
     pub bold: bool,
     /// `None` takes the modeline's own foreground.
     pub face: Option<HlKind>,
-}
-
-impl Segment {
-    fn plain(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            bold: false,
-            face: None,
-        }
-    }
-
-    fn bold(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            bold: true,
-            face: None,
-        }
-    }
-
-    fn faced(text: impl Into<String>, face: HlKind, bold: bool) -> Self {
-        Self {
-            text: text.into(),
-            bold,
-            face: Some(face),
-        }
-    }
+    pub filled: bool,
 }
 
 /// The modeline for one pane: the segments that hug the left edge, and the ones
 /// that hug the right.
 pub fn segments(editor: &Editor, buf: &Buffer, active: bool) -> (Vec<Segment>, Vec<Segment>) {
-    let (line, col) = buf.cursor_line_col();
-    let lines = buf.len_lines().max(1);
+    let fields = Fields::of(editor, buf, active);
+    let expand = |specs: &[Spec]| -> Vec<Segment> {
+        specs
+            .iter()
+            .filter_map(|s| {
+                let text = fields.expand(&s.template)?;
+                Some(Segment {
+                    text,
+                    bold: s.bold,
+                    face: match s.face {
+                        Face::Default => None,
+                        Face::Named(k) => Some(k),
+                        Face::Mode => Some(mode_face(editor.mode)),
+                    },
+                    filled: s.filled,
+                })
+            })
+            .collect()
+    };
+    (
+        expand(&editor.modeline.left),
+        expand(&editor.modeline.right),
+    )
+}
 
-    let mut left = Vec::new();
-    if active {
-        // The modal state, in the colour that state is drawn in elsewhere, so
-        // the eye can read the mode without reading the word.
-        let face = match editor.mode {
-            Mode::Insert => HlKind::String,
-            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => HlKind::Keyword,
-            Mode::Terminal => HlKind::Function,
-            Mode::Magit | Mode::Dired | Mode::Dashboard => HlKind::Type,
-            Mode::Normal => HlKind::Constant,
+/// Everything a code can name, gathered once per pane rather than once per
+/// segment — `%l` and `%c` come off the same cursor lookup, and a format is
+/// free to mention either of them twice.
+struct Fields<'a> {
+    editor: &'a Editor,
+    buf: &'a Buffer,
+    active: bool,
+    line: usize,
+    col: usize,
+    lines: usize,
+}
+
+impl<'a> Fields<'a> {
+    fn of(editor: &'a Editor, buf: &'a Buffer, active: bool) -> Self {
+        let (line, col) = buf.cursor_line_col();
+        Self {
+            editor,
+            buf,
+            active,
+            line,
+            col,
+            lines: buf.len_lines().max(1),
+        }
+    }
+
+    /// What one code stands for. `""` means "nothing to say", which is what
+    /// [`Fields::expand`] counts to decide whether a segment survives.
+    fn code(&self, c: char) -> Option<String> {
+        // Everything about the *focused window* is blank in an inactive pane:
+        // the mode, the messages and the half-typed key describe a window this
+        // pane is not, and repeating them in every pane is the same lie N times.
+        let live = |s: String| match self.active {
+            true => s,
+            false => String::new(),
         };
-        left.push(Segment::faced(
-            format!(" {} ", editor.mode.label()),
-            face,
-            true,
-        ));
+        Some(match c {
+            'm' => live(self.editor.mode.label().to_string()),
+            's' => live(self.editor.status.clone()),
+            'k' => live(self.editor.pending_hint().to_string()),
+            'b' => self.buf.name(),
+            'f' => match &self.buf.path {
+                Some(p) => p.display().to_string(),
+                None => self.buf.name(),
+            },
+            // Modified beats read-only: a generated buffer cannot be modified,
+            // so the two rarely compete, and a buffer a mode froze *can* have
+            // been edited before it was frozen — which is the case where they
+            // do, and unsaved work is the more urgent fact.
+            '+' => match self.buf.modified {
+                true => "●".into(),
+                false => String::new(),
+            },
+            'r' => match !self.buf.modified && self.buf.read_only() != crate::ReadOnly::No {
+                true => "◈".into(),
+                false => String::new(),
+            },
+            'P' => self.buf.file_mode.map(permissions).unwrap_or_default(),
+            'M' => major_mode_label(self.buf),
+            'n' => self.buf.minor_modes.iter().map(|m| format!("+{m} ")).collect(),
+            'l' => (self.line + 1).to_string(),
+            'c' => (self.col + 1).to_string(),
+            'p' => scroll_label(self.line, self.lines),
+            _ => return None,
+        })
     }
 
-    left.push(Segment::plain("  "));
-    left.push(Segment::bold(buf.name()));
-    // Modified beats read-only: a generated buffer cannot be modified, so the
-    // two never compete, and showing "unsaved" matters more than showing why a
-    // buffer cannot be saved.
-    //
-    // A buffer a mode has frozen *can* have been modified before it was frozen,
-    // which is the one case where they do compete — and the dot still wins, for
-    // the same reason: unsaved work is the more urgent fact.
-    if buf.modified {
-        left.push(Segment::faced(" ●", HlKind::Bold, false));
-    } else if buf.read_only() != crate::ReadOnly::No {
-        left.push(Segment::faced(" ◈", HlKind::Comment, false));
-    }
-
-    // The message the last command produced, and the half-typed key sequence.
-    // Both belong on the left, after the file, because both are transient and
-    // pushing the position around as they come and go is exactly what the
-    // right-hand group avoids.
-    if active {
-        let pending = editor.pending_hint();
-        if !editor.status.is_empty() {
-            left.push(Segment::plain("  "));
-            left.push(Segment::faced(&editor.status, HlKind::Comment, false));
+    /// Expand one template, or `None` when the whole segment should be dropped.
+    ///
+    /// Dropped when it mentioned at least one code and every code it mentioned
+    /// came back empty — see the module docs. A template of pure literal text is
+    /// never dropped, which is what keeps a separator a separator.
+    fn expand(&self, template: &str) -> Option<String> {
+        let mut out = String::with_capacity(template.len());
+        let mut chars = template.chars();
+        let (mut codes, mut filled) = (0usize, 0usize);
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                None => out.push('%'),
+                Some('%') => out.push('%'),
+                Some(k) => match self.code(k) {
+                    Some(v) => {
+                        codes += 1;
+                        filled += usize::from(!v.is_empty());
+                        out.push_str(&v);
+                    }
+                    // An unknown code stays as it was typed. A modeline reading
+                    // `%z` is how someone finds out they invented a code; a
+                    // modeline that silently ate it is how they file a bug about
+                    // a missing field.
+                    None => {
+                        out.push('%');
+                        out.push(k);
+                    }
+                },
+            }
         }
-        if !pending.is_empty() {
-            left.push(Segment::plain("  "));
-            left.push(Segment::faced(pending, HlKind::Constant, true));
+        match codes > 0 && filled == 0 {
+            true => None,
+            false => Some(out),
         }
     }
-
-    let mut right = Vec::new();
-    if let Some(mode) = buf.file_mode {
-        right.push(Segment::faced(permissions(mode), HlKind::Comment, false));
-        right.push(Segment::plain("  "));
-    }
-    right.push(Segment::faced(major_mode_label(buf), HlKind::Type, false));
-    right.push(Segment::plain("  "));
-    for m in &buf.minor_modes {
-        right.push(Segment::faced(format!("+{m} "), HlKind::Comment, false));
-    }
-    right.push(Segment::bold(format!("{}:{}", line + 1, col + 1)));
-    right.push(Segment::plain("  "));
-    right.push(Segment::faced(scroll_label(line, lines), HlKind::Number, false));
-    right.push(Segment::plain(" "));
-    (left, right)
 }
 
 /// `rust-mode` reads better as `Rust` on a strip this narrow, and the `-mode`
@@ -182,6 +374,21 @@ mod tests {
     use super::*;
     use crate::{BufferKind, EditorCommand};
 
+    /// The shipped strip lives in `runtime/init.lisp`, so the tests that are
+    /// about *it* are in `crates/lisp/tests/modeline.rs` where the image can be
+    /// asked. What is here is the expander those specs are fed to.
+    fn joined(ed: &Editor, active: bool) -> String {
+        let (left, right) = segments(ed, &ed.buffer, active);
+        left.iter()
+            .chain(right.iter())
+            .map(|s| s.text.clone())
+            .collect()
+    }
+
+    fn only(ed: &Editor, template: &str) -> Option<String> {
+        Fields::of(ed, &ed.buffer, true).expand(template)
+    }
+
     #[test]
     fn permissions_read_the_way_ls_writes_them() {
         assert_eq!(permissions(0o644), "rw-r--r--");
@@ -214,55 +421,107 @@ mod tests {
         assert_eq!(major_mode_label(&buf), "Fundamental");
     }
 
+    /// The whole of the conditional logic, and the reason the format needs no
+    /// `if`: a segment carries its own separators and leaves with them.
+    #[test]
+    fn a_segment_whose_codes_all_came_back_empty_is_dropped() {
+        let mut ed = Editor::new();
+        ed.load("hello", None, None);
+
+        // No file behind the buffer, so no mode bits — and the two spaces that
+        // would have separated them go too.
+        assert_eq!(only(&ed, "  %P"), None);
+        ed.buffer.file_mode = Some(0o644);
+        assert_eq!(only(&ed, "  %P").as_deref(), Some("  rw-r--r--"));
+
+        // One code answering is enough to keep the rest of the segment.
+        assert_eq!(only(&ed, "%+%P").as_deref(), Some("rw-r--r--"));
+
+        // Literal text is never dropped: a separator with nothing to separate is
+        // still what the author wrote.
+        assert_eq!(only(&ed, "  ").as_deref(), Some("  "));
+        // ...and `%%` is an escape rather than a code, so it does not keep a
+        // segment alive on its own.
+        ed.buffer.file_mode = None;
+        assert_eq!(only(&ed, "%%%P"), None);
+        assert_eq!(only(&ed, "%%").as_deref(), Some("%"));
+    }
+
+    #[test]
+    fn an_unknown_code_survives_as_itself() {
+        let ed = Editor::new();
+        assert_eq!(only(&ed, "%z").as_deref(), Some("%z"));
+        // ...and a trailing `%` is a `%`, not a panic.
+        assert_eq!(only(&ed, "100%").as_deref(), Some("100%"));
+    }
+
     #[test]
     fn an_unsaved_buffer_is_marked_and_a_generated_one_is_not() {
         let mut ed = Editor::new();
         ed.load("hello", None, None);
         ed.apply(EditorCommand::SetMode(Mode::Normal));
-        let joined = |ed: &Editor| {
-            let (left, _) = segments(ed, &ed.buffer, true);
-            left.iter().map(|s| s.text.clone()).collect::<String>()
-        };
-        assert!(!joined(&ed).contains('●'));
+        assert!(!joined(&ed, true).contains('●'));
         ed.apply(EditorCommand::InsertChar('x'));
-        assert!(joined(&ed).contains('●'), "an edited buffer says so");
+        assert!(joined(&ed, true).contains('●'), "an edited buffer says so");
 
         ed.show_special(BufferKind::Dired, "listing");
-        let text = joined(&ed);
-        assert!(text.contains('◈') && !text.contains('●'));
+        let text = joined(&ed, true);
+        assert!(text.contains('◈') && !text.contains('●'), "{text}");
     }
 
-    /// The mode indicator is the first thing on the strip and is bold, so the
-    /// state is readable at a glance rather than by reading a word.
+    /// Everything about the focused window is blank in a pane that is not it.
     #[test]
-    fn the_modal_state_leads_and_is_emphasised() {
+    fn an_inactive_pane_says_nothing_about_the_window_it_is_not() {
         let mut ed = Editor::new();
         ed.load("hello", None, None);
         ed.apply(EditorCommand::SetMode(Mode::Insert));
-        let (left, right) = segments(&ed, &ed.buffer, true);
-        assert!(left[0].text.contains("INSERT"));
-        assert!(left[0].bold);
-        assert_eq!(left[0].face, Some(HlKind::String));
+        ed.status = "saved".into();
+        assert_eq!(only(&ed, "%m").as_deref(), Some("INSERT"));
+        assert_eq!(only(&ed, "%s").as_deref(), Some("saved"));
 
-        // ...and an inactive pane drops it entirely: only one pane has a mode.
-        let (left, _) = segments(&ed, &ed.buffer, false);
-        assert!(!left.iter().any(|s| s.text.contains("INSERT")));
-
-        // Position rides on the right, so it does not move when the file name
-        // or the status message changes length.
-        assert!(right.iter().any(|s| s.text == "1:1"));
+        let f = Fields::of(&ed, &ed.buffer, false);
+        assert_eq!(f.expand("%m"), None);
+        assert_eq!(f.expand("%s"), None);
+        // ...but the buffer's own facts are the pane's own and stay.
+        assert_eq!(f.expand("%b").as_deref(), Some(ed.buffer.name().as_str()));
     }
 
+    /// The mode's colour is the one face a format cannot name, because it is a
+    /// different one in each state.
     #[test]
-    fn permissions_appear_only_when_there_is_a_file() {
+    fn the_mode_face_follows_the_mode() {
         let mut ed = Editor::new();
         ed.load("hello", None, None);
-        let has_perms = |ed: &Editor| {
-            let (_, right) = segments(ed, &ed.buffer, true);
-            right.iter().any(|s| s.text.len() == 9 && s.text.contains('r'))
-        };
-        assert!(!has_perms(&ed), "a buffer with no file has no mode bits");
-        ed.buffer.file_mode = Some(0o644);
-        assert!(has_perms(&ed));
+        ed.modeline.clear();
+        ed.modeline.push(
+            false,
+            Spec {
+                template: " %m ".into(),
+                face: Face::Mode,
+                bold: true,
+                filled: true,
+            },
+        );
+        let face = |ed: &Editor| segments(ed, &ed.buffer, true).0[0].face;
+        ed.apply(EditorCommand::SetMode(Mode::Insert));
+        assert_eq!(face(&ed), Some(HlKind::String));
+        ed.apply(EditorCommand::SetMode(Mode::Normal));
+        assert_eq!(face(&ed), Some(HlKind::Constant));
+        // ...and the pill leaves with the mode when the pane is not the focused
+        // one, because `%m` is the only code in it.
+        assert!(segments(&ed, &ed.buffer, false).0.is_empty());
+    }
+
+    /// A modeline nobody configured still says which buffer you are in and
+    /// whether it is saved — a headless editor, or a config that failed to load.
+    #[test]
+    fn the_default_format_names_the_buffer_and_its_state() {
+        let mut ed = Editor::new();
+        ed.load("hello", None, None);
+        ed.apply(EditorCommand::InsertChar('x'));
+        let text = joined(&ed, true);
+        assert!(text.contains(&ed.buffer.name()), "{text}");
+        assert!(text.contains('●'), "{text}");
+        assert!(text.contains("1:2"), "{text}");
     }
 }

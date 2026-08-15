@@ -53,14 +53,14 @@ use sdl3::surface::Surface;
 use sdl3::ttf::{Font, Hinting, Sdl3TtfContext};
 use sdl3::video::WindowContext;
 use zemacs_core::display::{
-    char_cells, display_subs, expand_line, str_cells, substitute, visual_col, wrap_breaks,
+    char_cells, display_subs, expand_line, on_line, str_cells, substitute, visual_col, wrap_breaks,
     wrap_row_of, wrap_row_range,
 };
 use zemacs_core::modeline;
 use zemacs_core::{
     dashboard::Row as Dash, fold_hiding, fold_starts_in, Buffer, BufferId, BufferKind,
     CompletionStyle, Editor, FaceStyle, HlKind, Image, ImageId, LineOverflow, Mode, Overlay,
-    Completion, ContextMenu, Settings, Span, Window,
+    Completion, ContextMenu, Settings, Span, Theme, Window,
 };
 // `zemacs_gui::Rect` is deliberately not imported: `Rect` in this file is
 // SDL's, and three rectangle types in one namespace is how a blit ends up in
@@ -91,6 +91,17 @@ const CENTER_MAX_COLS: i32 = 100;
 /// Alpha of the scrim painted over the frame before a popup. Enough to push the
 /// document back, not enough to hide it.
 const DIM_ALPHA: u8 = 130;
+
+/// Corner radius of a floating panel, in physical pixels.
+///
+/// One number for every panel, because they are one surface — a reader who has
+/// learnt what a floating box looks like in this editor should not have to learn
+/// it again for the next one. Six: enough to read as deliberate at any density,
+/// small enough that a panel eight text rows tall does not start to look like a
+/// lozenge. Not scaled by DPI, and that is on purpose — a radius is a *shape*
+/// rather than a measure of text, and the same six pixels reads as the same
+/// softness on a 1× display and a 2× one, where twelve would read as a bubble.
+const PANEL_RADIUS: i32 = 6;
 
 /// Drawn on the visible head of a fold. Emacs writes `...`; one ellipsis costs
 /// one column instead of three and reads the same, which matters because it is
@@ -225,6 +236,20 @@ pub struct Renderer {
     /// the texture then sits there costing a few hundred KB of VRAM until exit.
     /// Upgrade path: drop entries `editor.image` no longer resolves.
     images: HashMap<ImageId, Option<Texture<'static>>>,
+    /// One alpha mask per corner radius — see [`corner_texture`].
+    ///
+    /// Keyed by radius and not by anything else, which is the whole reason a
+    /// rounded box costs a lookup rather than a rasteriser: the mask is white,
+    /// and the colour arrives at blit time through `set_color_mod`, exactly as a
+    /// glyph's does. So every panel on screen at every colour shares one 2r×2r
+    /// texture, and in practice there is exactly one entry in here.
+    ///
+    /// Not dropped by [`Renderer::sync`], unlike the font caches: a radius is in
+    /// physical pixels and does not move when the point size or the DPI does.
+    /// `None` records a mask that would not upload, so it is not retried every
+    /// frame — and a box whose mask is missing draws square rather than not at
+    /// all, which is the same failure contract [`Renderer::blit_image`] has.
+    corners: HashMap<i32, Option<Texture<'static>>>,
     /// The last scene laid out, and the fingerprint of what it was laid out
     /// *for* — see [`scene_key`], which is where the staleness question is
     /// actually decided.
@@ -386,6 +411,7 @@ impl Renderer {
             bold,
             faces: HashMap::new(),
             images: HashMap::new(),
+            corners: HashMap::new(),
             scenes: None,
             font_path,
             prose_path,
@@ -400,30 +426,57 @@ impl Renderer {
         })
     }
 
-    /// Re-open the font when `settings.font_size` changes or the window moves to
-    /// a display with a different scale factor. Resizes need no work: the canvas
-    /// tracks the window, so this is a no-op for them.
+    /// Re-open the font when `settings.font_size` or `settings.font_path`
+    /// changes, or the window moves to a display with a different scale factor.
+    /// Resizes need no work: the canvas tracks the window, so this is a no-op
+    /// for them.
+    ///
+    /// A font that will not open leaves the one on screen alone and reports the
+    /// path, rather than propagating: `sync` runs at the top of every frame, so
+    /// returning `Err` here would take the editor down over a typo in a picker.
+    /// Refusing in place is also what makes the font preview safe to hold a key
+    /// down through — a file in one of the font directories that SDL_ttf cannot
+    /// parse is a candidate you scroll past, not the end of the session.
     pub fn sync(&mut self, editor: &Editor) -> anyhow::Result<()> {
         let want = scale_point_size(editor.settings.font_size, dpi_scale(&self.canvas));
-        if want == self.point_size {
+        let path = match editor.settings.font_path.as_deref() {
+            Some(p) => PathBuf::from(p),
+            None => find_font()?,
+        };
+        if want == self.point_size && path == self.font_path {
             return Ok(());
         }
-        let path = self.font_path.clone();
+        // Both faces before either is installed: a family with a regular but no
+        // bold would otherwise leave the two fields set from different fonts.
+        let opened = open_face(&path, FaceKey::body(want, false))
+            .and_then(|body| Ok((body, open_face(&path, FaceKey::body(want, true))?)));
+        let (body, bold) = match opened {
+            Ok(pair) => pair,
+            Err(e) => {
+                // Remembered as the current path anyway, so this complains once
+                // rather than on all sixty frames a second.
+                self.font_path = path.clone();
+                eprintln!("zemacs: cannot open font {}: {e}", path.display());
+                return Ok(());
+            }
+        };
         // Replaced whole rather than re-opened and then emptied: a `Face` is a
         // font *and* the textures rasterised out of it, so handing the field a
         // new one is what throws the stale glyphs away. That is the invariant
         // written on [`Face`], spent here.
-        self.body = open_face(&path, FaceKey::body(want, false))?;
-        self.bold = open_face(&path, FaceKey::body(want, true))?;
+        self.body = body;
+        self.bold = bold;
+        self.font_path = path;
         self.point_size = want;
         // The scaled faces are stale doubly: their *point sizes* were derived
-        // from the old one, so both the fonts and their glyphs are wrong.
+        // from the old one, so both the fonts and their glyphs are wrong. A
+        // family change invalidates them for the plainer reason.
         self.faces.clear();
         let (cell_w, line_h) = metrics(&self.body.font);
         self.cell_w = cell_w;
         self.line_h = line_h;
         self.ascent = self.body.font.ascent();
-        // Images are rasterised to match the *text*, so a font-size change makes
+        // Images are rasterised to match the *text*, so a font change makes
         // every one of them the wrong size — but they are core's, produced by
         // whoever asked for them, so this only drops the uploads. The next
         // preview renders at the new size and the stale entries are unreachable.
@@ -559,7 +612,7 @@ impl Renderer {
                 .and_then(|(id, scroll)| {
                     let buf = editor.buffer_by_id(id)?;
                     let set = &editor.settings;
-                    let doc = doc_rect(pane, status_h, measure_px(set, cell_w));
+                    let doc = doc_rect(pane, status_h, measure_px(buf, set, cell_w));
                     let text_w = doc.w - gutter_w(buf, set, cell_w);
                     let cols = visible_cols(text_w, cell_w);
                     // The same `Metrics` the draw pass builds for this pane, so
@@ -648,7 +701,7 @@ impl Renderer {
             self.clear_clip();
         }
 
-        let div_c = rgb(divider_shade(&editor.settings));
+        let div_c = rgb(divider_shade(editor));
         for d in &dividers {
             let r = area_of(d.rect);
             self.fill(r.x, r.y, r.w, r.h, div_c);
@@ -957,7 +1010,7 @@ impl Renderer {
         let zoom = win.zoom.max(100);
         let (cell_w, line_h) = (scaled(self.cell_w, zoom), scaled(self.line_h, zoom));
         let pane = area_of(p.rect);
-        let doc = doc_rect(pane, status_h, measure_px(&editor.settings, cell_w));
+        let doc = doc_rect(pane, status_h, measure_px(buf, &editor.settings, cell_w));
         let gutter = gutter_w(buf, &editor.settings, cell_w);
         if gutter == 0 || x < doc.x - PAD || x >= doc.x + gutter {
             return None;
@@ -1018,7 +1071,7 @@ impl Renderer {
         // counting functions take them — the same values they are handed by
         // `render` and `click_target`, so all four spend rows identically.
         let metrics = Metrics { editor, cell_w, line_h, ascent: self.ascent };
-        let doc = doc_rect(pane, status_h, measure_px(set, cell_w));
+        let doc = doc_rect(pane, status_h, measure_px(buf, set, cell_w));
         let (cur_line, cur_col) = line_col(buf, win.cursor);
         // The selection and the highlight spans both describe `editor.buffer`
         // as the focused window sees it, and there is exactly one of each in
@@ -1031,6 +1084,21 @@ impl Renderer {
         } else {
             Vec::new()
         };
+        // Search hits, for this pane's own window into its own buffer — *every*
+        // pane, unlike the selection above, because a hit is a fact about the
+        // text rather than about where the keyboard is, and a split showing the
+        // same file should show the same matches.
+        //
+        // Asked for the rows this pane has rather than for the file: see
+        // `Editor::search_hits`. `+ 1` because a wrapped line spends several
+        // rows on one buffer line, so the last row's line is never past
+        // `scroll + rows` and asking for one more costs a line and closes the
+        // off-by-one at the bottom edge.
+        let hits: Vec<(usize, usize)> = editor.search_hits(
+            buf,
+            win.scroll,
+            win.scroll + doc_lines(pane, status_h, line_h) + 1,
+        );
         // Every pane draws its own buffer's spans. Handing an empty slice to
         // anything but the live buffer is what used to make a split lose its
         // colours the moment focus moved.
@@ -1065,15 +1133,27 @@ impl Renderer {
         let text_w = doc.w - gutter;
         let wrap = set.line_overflow == LineOverflow::Wrap;
 
-        let sel_bg = rgb(mix(bg, fg, 0.28));
-        let cur_bg = rgb(mix(bg, fg, 0.05));
-        let cursor_c = rgb(mix(bg, fg, 0.85));
-        let num_c = rgb(mix(bg, fg, 0.35));
-        let num_cur_c = rgb(mix(bg, fg, 0.7));
+        // Five shades of the ground and the body colour, and five faces that
+        // override them. The ratios are what the renderer mixed before any of
+        // these faces existed, which is what makes them the right *fallback*
+        // and not merely a plausible one: a theme that names none of them draws
+        // exactly what it drew before, so eleven ported themes became
+        // cursor-themeable without one of them being touched. See `HlKind`'s UI
+        // faces for why they are optional and what `load-theme` does about it.
+        let sel_bg = rgb(editor.theme.color(HlKind::Region, mix(bg, fg, 0.28)));
+        // A shade of the *accent* rather than of the body colour, which is the
+        // one fallback here that is not a grey: a search hit is the editor
+        // answering a question you asked, and a theme that never named `match`
+        // should still let you tell one from the selection at a glance.
+        let hit_bg = rgb(editor.theme.color(HlKind::Match, mix(bg, accent(editor), 0.38)));
+        let cur_bg = rgb(editor.theme.color(HlKind::CurrentLine, mix(bg, fg, 0.05)));
+        let cursor_c = rgb(editor.theme.color(HlKind::Cursor, mix(bg, fg, 0.85)));
+        let num_c = rgb(editor.theme.color(HlKind::LineNumber, mix(bg, fg, 0.35)));
+        let num_cur_c = rgb(editor.theme.color(HlKind::LineNumberCurrent, mix(bg, fg, 0.7)));
         // The truncation marker is chrome, not a character in the file, so it
         // gets the accent hue rather than a shade of the text colour — dimmed,
         // so it does not out-shout the line it is annotating.
-        let marker_c = rgb(mix(bg, editor.theme.color(HlKind::Function, fg), 0.75));
+        let marker_c = rgb(mix(bg, accent(editor), 0.75));
 
         // Highlight spans are whole-buffer char offsets and sorted, so one
         // monotonic cursor walks them alongside the lines — no rescan per line.
@@ -1208,6 +1288,19 @@ impl Renderer {
                     )
                 })
                 .collect();
+            // The same conversion for the search hits, and deliberately not the
+            // same *clamp*: a hit ends where the text it matched ends, so there
+            // is no newline to swallow and nothing that should reach the margin.
+            let hit_cells: Vec<(usize, usize)> = hits
+                .iter()
+                .filter(|&&(s, e)| e > start && s < end)
+                .map(|&(s, e)| {
+                    (
+                        visual_col(&cells, s.max(start) - start),
+                        visual_col(&cells, e.min(end) - start),
+                    )
+                })
+                .collect();
 
             // Rows this line wants. Three claims, resolved as a `max` on one
             // integer rather than a table: what its text needs at its own type
@@ -1302,10 +1395,26 @@ impl Renderer {
                 // config painting a range must not be able to hide where the
                 // editor thinks you are.
                 for (col, &(_, src)) in cells[rs..rs + shown].iter().enumerate() {
-                    if let (_, Some(k)) = overlay_face(&ov_runs, src) {
+                    if let (_, _, Some(c)) = overlay_face(&ov_runs, src, &editor.theme, fg) {
                         let x = lx0 + col as i32 * lb.cw;
-                        let c = rgb(editor.theme.color(k, fg));
-                        self.fill(x, y, lb.cw, row_h, c);
+                        self.fill(x, y, lb.cw, row_h, rgb(c));
+                    }
+                }
+                // Search hits, under the selection and over an overlay's
+                // background. Under the selection because the two mean
+                // different things and only one of them is where you are: a
+                // visual block over a run of matches has to stay legible as a
+                // block. Over the overlay background for the reason the
+                // selection is: a config painting a range must not be able to
+                // hide what the editor is telling you about your own search.
+                //
+                // This is the face `HlKind::Match` was reserved for and left
+                // undrawn — every shipped theme has named it since before
+                // anything painted it.
+                for &h in &hit_cells {
+                    if let Some((a, b)) = row_span(h, rs, rs + lb.cols) {
+                        let x = lx0 + a as i32 * lb.cw;
+                        self.fill(x, y, (b - a) as i32 * lb.cw, row_h, hit_bg);
                     }
                 }
                 // Clipped to the pane's edge rather than to `re`, deliberately:
@@ -1412,11 +1521,12 @@ impl Renderer {
                     // questions, because a face is one thing — one that is
                     // purple and bold cannot take its hue from this entry of the
                     // theme and its weight from that one.
-                    let face = overlay_face(&ov_runs, src).0.unwrap_or(kind);
+                    let (of, ofg, _) = overlay_face(&ov_runs, src, &editor.theme, fg);
+                    let face = of.unwrap_or(kind);
                     let color = if block_cursor && cursor_col == Some(col) {
                         rgb(bg) // knocked out of the cursor block
                     } else {
-                        rgb(editor.theme.color(face, fg))
+                        rgb(ofg.unwrap_or_else(|| editor.theme.color(face, fg)))
                     };
                     // Weight and slant are per *cell*, unlike the size: they pick
                     // which face rasterises the glyph and change no metric, so
@@ -1500,7 +1610,7 @@ impl Renderer {
     /// buffer — `doc` is that pane's text rectangle, not the window's.
     fn draw_dashboard(&mut self, editor: &Editor, doc: Area) {
         let (bg, fg) = (editor.settings.background, editor.settings.foreground);
-        let accent = editor.theme.color(HlKind::Function, fg);
+        let accent = accent(editor);
         let banner_c = rgb(mix(bg, fg, 0.72));
         let head_c = rgb(editor.theme.color(HlKind::Keyword, fg));
         // Full foreground for a label, not a shade of it. The rows *are* the
@@ -1673,6 +1783,16 @@ impl Renderer {
         // others get only their own buffer, because every other field in that
         // line describes the focused window and would be the same lie repeated
         // in every pane.
+        // Inside the bevel, not over it: a pill that painted the full height
+        // would cut the lit and shadowed edges wherever it fell, which is the
+        // one place on the strip where a missing pixel row is obvious.
+        let bw = bevel_width(rect, relief);
+        let strip = Strip {
+            ground: rgb(bg),
+            y: rect.y + bw,
+            h: (rect.h - 2 * bw).max(0),
+        };
+
         let (left, right) = modeline::segments(editor, buf, is_active);
         // The right group is placed from the edge inwards, so the position and
         // the mode stay put as the file name and the status message change
@@ -1680,10 +1800,10 @@ impl Renderer {
         // to hold both: half a percentage is worse than none.
         let right_cols: usize = right.iter().map(|s| str_cells(&s.text)).sum();
         let left_budget = cols.saturating_sub(right_cols + 1);
-        self.draw_segments(&left, x, y, left_budget, color, editor);
+        self.draw_segments(&left, x, y, left_budget, color, strip, editor);
         if right_cols + 1 <= cols {
             let rx = rect.x + rect.w - inset - right_cols as i32 * self.cell_w;
-            self.draw_segments(&right, rx, y, right_cols, color, editor);
+            self.draw_segments(&right, rx, y, right_cols, color, strip, editor);
         }
     }
 
@@ -1692,6 +1812,9 @@ impl Renderer {
     /// `default` is the strip's own foreground; a segment naming a face takes
     /// that face's colour, which is what lets the theme drive the modeline
     /// through the `set-syntax-color` it already has.
+    ///
+    /// `strip` is needed only by the filled segments — see [`Strip`].
+    #[allow(clippy::too_many_arguments)]
     fn draw_segments(
         &mut self,
         segments: &[modeline::Segment],
@@ -1699,6 +1822,7 @@ impl Renderer {
         y: i32,
         cols: usize,
         default: Color,
+        strip: Strip,
         editor: &Editor,
     ) {
         let mut x = x;
@@ -1734,6 +1858,19 @@ impl Renderer {
                     editor.theme.style(kind),
                 ),
                 None => (default, FaceStyle::default()),
+            };
+            // A filled segment swaps the two: the face becomes a block the
+            // height of the whole strip, and the ink becomes the strip. Full
+            // height rather than the text row, so the pill meets the bevel at
+            // both edges and reads as part of the bar rather than as a label
+            // floating in it — which also means it is drawn from the strip's own
+            // top, not from `y`, which has already been centred.
+            let color = if seg.filled && !text.is_empty() {
+                let w = used as i32 * self.cell_w;
+                self.fill(x, strip.y, w, strip.h, color);
+                strip.ground
+            } else {
+                color
             };
             // Through `draw_run` rather than `draw_weighted`, because italic is
             // a face out of the on-demand map and only the [`Cut`] path can name
@@ -1782,21 +1919,25 @@ impl Renderer {
         };
 
         let (bg, fg) = (editor.settings.background, editor.settings.foreground);
-        let accent = editor.theme.color(HlKind::Function, fg);
-        let panel_c = rgb(mix(bg, fg, 0.07));
+        let accent = accent(editor);
+        let panel_c = rgb(popup_bg(editor, 0.0));
         let rule_c = rgb(mix(bg, fg, 0.20));
-        let border_c = rgb(mix(bg, accent, 0.50));
+        let border_c = rgb(popup_border(editor, 0.50));
         let sel_bg = rgb(mix(bg, accent, 0.22));
         let row_c = rgb(mix(bg, fg, 0.78));
         let label_c = rgb(editor.theme.color(HlKind::Keyword, fg));
         let count_c = rgb(mix(bg, fg, 0.45));
         let none_c = rgb(editor.theme.color(HlKind::Comment, fg));
+        // `match` is a *background*, which is what the face has always said it
+        // was and what it has been waiting for something to draw. A band behind
+        // the characters the query hit is the only way to show it that survives
+        // a row already painted in syntax colours or in the selection's accent.
+        let hit_c = rgb(editor.theme.color(HlKind::Match, mix(bg, fg, 0.30)));
 
         // Scrim over everything drawn so far, so the popup reads as floating.
         // Tinting *towards the theme background* rather than towards black is
         // what makes this work on a light theme too.
         self.fill(0, 0, w, h, rgba(bg, DIM_ALPHA));
-        self.fill(b.x, b.y, b.w, b.h, panel_c);
 
         let inset = if framed { 1 } else { 0 };
         let x0 = b.x + inset + PAD;
@@ -1806,10 +1947,16 @@ impl Renderer {
 
         let mut y = b.y;
         if framed {
-            self.fill(b.x, b.y, b.w, 1, border_c);
-            self.fill(b.x, bottom - 1, b.w, 1, border_c);
-            self.fill(b.x, b.y, 1, b.h, border_c);
-            self.fill(b.x + b.w - 1, b.y, 1, b.h, border_c);
+            // Rounded, and the four edge fills that used to draw the border are
+            // gone with the corners: `panel` paints the border by filling the
+            // larger rounded shape underneath, which is the only way to get a
+            // one-pixel outline that follows a curve.
+            //
+            // Only in this branch. The unframed style is a strip growing off the
+            // bottom edge of the window, and a strip with rounded corners meeting
+            // a straight edge is a strip that looks broken rather than soft.
+            self.drop_shadow(b.x, b.y, b.w, b.h);
+            self.panel(b.x, b.y, b.w, b.h, panel_c, border_c);
 
             y += PADV;
             self.draw_str(&truncate(title_of(&p.label), cols), x0, y, rgb(accent));
@@ -1818,6 +1965,7 @@ impl Renderer {
             self.fill(b.x + inset, y, b.w - 2 * inset, 1, rule_c);
             y += 1 + PADV;
         } else {
+            self.fill(b.x, b.y, b.w, b.h, panel_c);
             self.fill(b.x, b.y, b.w, 1, rule_c); // top edge of the panel
             y += PADV;
         }
@@ -1871,6 +2019,21 @@ impl Renderer {
             let shown = truncate(text, text_cols);
             let runs = candidate_runs(editor, p, item, &shown);
             let rx = x0 + 2 * self.cell_w;
+            // Behind the glyphs, so a hit is legible without taking a colour
+            // away from whatever the row was already saying. Cells rather than
+            // measured advances: this is a monospace grid, and the one thing it
+            // gets wrong is a double-width glyph before the hit.
+            // ponytail: CJK in a candidate shifts the band by a cell per wide
+            // glyph. Upgrade path: ask `draw_str` where it got to, once it can
+            // answer that for a prefix.
+            let visible = shown.chars().count();
+            for (s, e) in p.match_spans(text) {
+                let (s, e) = (s.min(visible), e.min(visible));
+                if e > s {
+                    let w = (e - s) as i32 * self.cell_w;
+                    self.fill(rx + s as i32 * self.cell_w, ry, w, self.line_h, hit_c);
+                }
+            }
             match runs.is_empty() {
                 true => {
                     self.draw_str(&shown, rx, ry, c);
@@ -1947,7 +2110,7 @@ impl Renderer {
             return;
         }
         let (bg, fg) = (editor.settings.background, editor.settings.foreground);
-        let panel_c = rgb(mix(bg, fg, 0.07));
+        let panel_c = rgb(popup_bg(editor, 0.0));
         let rule_c = rgb(mix(bg, fg, 0.20));
         let key_c = rgb(editor.theme.color(HlKind::Keyword, fg));
         let label_c = rgb(mix(bg, fg, 0.78));
@@ -2032,13 +2195,15 @@ impl Renderer {
         }
 
         let (bg, fg) = (editor.settings.background, editor.settings.foreground);
-        let accent = editor.theme.color(HlKind::Function, fg);
-        // A shade lighter than the which-key panel's 0.07: that one sits against
-        // the status strip and this one floats over live code, so it has to be
-        // told apart from the text under it rather than from the chrome beside
-        // it. The border does the rest.
-        let panel_c = rgb(mix(bg, fg, 0.11));
-        let border_c = rgb(mix(bg, accent, 0.45));
+        let accent = accent(editor);
+        // A shade lighter than the which-key panel: that one sits against the
+        // status strip and this one floats over live code, so it has to be told
+        // apart from the text under it rather than from the chrome beside it.
+        // The border does the rest. An *elevation* off the shared `popup` face
+        // rather than its own ratio, so a theme that recolours panels moves this
+        // one with the others and keeps the gap between them.
+        let panel_c = rgb(popup_bg(editor, 0.04));
+        let border_c = rgb(popup_border(editor, 0.45));
         // Deeper than the old 0.22 and no longer the only mark of the selection:
         // the accent bar down the left edge is what your eye actually lands on,
         // and it survives a theme whose function colour is close to the panel.
@@ -2047,8 +2212,7 @@ impl Renderer {
         let dim_c = rgb(mix(bg, fg, 0.45));
 
         self.drop_shadow(b.x, b.y, b.w, b.h);
-        self.fill(b.x, b.y, b.w, b.h, panel_c);
-        self.stroke(b.x, b.y, b.w, b.h, border_c);
+        self.panel(b.x, b.y, b.w, b.h, panel_c, border_c);
 
         let x0 = b.x + PAD;
         let cols = ((b.w - 2 * PAD).max(0) / self.cell_w.max(1)) as usize;
@@ -2134,8 +2298,7 @@ impl Renderer {
         if c.doc.is_empty() {
             return;
         }
-        let (bg, fg) = (editor.settings.background, editor.settings.foreground);
-        let accent = editor.theme.color(HlKind::Function, fg);
+        let fg = editor.settings.foreground;
         let widest = c.doc.iter().map(|s| str_cells(s)).max().unwrap_or(0);
         let cols = widest.clamp(1, DOC_POPUP_COLS);
         let box_w = cols as i32 * self.cell_w + 2 * PAD;
@@ -2156,8 +2319,16 @@ impl Renderer {
         let box_h = 2 * PADV + rows as i32 * self.line_h;
 
         self.drop_shadow(x, list.y, box_w, box_h);
-        self.fill(x, list.y, box_w, box_h, rgb(mix(bg, fg, 0.09)));
-        self.stroke(x, list.y, box_w, box_h, rgb(mix(bg, accent, 0.30)));
+        // Sunk a touch below the list it hangs off, which is what says "this is
+        // about that" rather than "this is a second menu".
+        self.panel(
+            x,
+            list.y,
+            box_w,
+            box_h,
+            rgb(popup_bg(editor, 0.02)),
+            rgb(popup_border(editor, 0.30)),
+        );
 
         // `doc_spans` are offsets into the doc joined by newlines, which is the
         // form the parser was handed — so the running total is what turns a
@@ -2202,11 +2373,17 @@ impl Renderer {
         };
         let b = context_menu_box(menu, w, h, self.cell_w, self.line_h);
         let (bg, fg) = (editor.settings.background, editor.settings.foreground);
-        let accent = editor.theme.color(HlKind::Function, fg);
+        let accent = accent(editor);
 
         self.drop_shadow(b.x, b.y, b.w, b.h);
-        self.fill(b.x, b.y, b.w, b.h, rgb(mix(bg, fg, 0.13)));
-        self.stroke(b.x, b.y, b.w, b.h, rgb(mix(bg, accent, 0.45)));
+        self.panel(
+            b.x,
+            b.y,
+            b.w,
+            b.h,
+            rgb(popup_bg(editor, 0.06)),
+            rgb(popup_border(editor, 0.45)),
+        );
 
         for (i, (label, _)) in menu.items.iter().enumerate() {
             let ry = b.y + PADV + i as i32 * self.line_h;
@@ -2265,8 +2442,18 @@ impl Renderer {
 
         let (bg, fg) = (editor.settings.background, editor.settings.foreground);
         self.drop_shadow(b.x, b.y, b.w, b.h);
-        self.fill(b.x, b.y, b.w, b.h, rgb(mix(bg, fg, 0.13)));
-        self.stroke(b.x, b.y, b.w, b.h, rgb(mix(bg, fg, 0.30)));
+        // No accent in this border, unlike every other panel — see above. Not
+        // `popup-border`, either, for the same reason: the face is the colour a
+        // theme picked to say "this box is the thing you are looking at", and
+        // this box is not.
+        self.panel(
+            b.x,
+            b.y,
+            b.w,
+            b.h,
+            rgb(popup_bg(editor, 0.06)),
+            rgb(mix(bg, fg, 0.30)),
+        );
         for (i, row) in rows.iter().take(b.rows).enumerate() {
             let ry = b.y + PADV + i as i32 * self.line_h;
             self.draw_str(row, b.x + PAD, ry, rgb(mix(bg, fg, 0.88)));
@@ -2279,15 +2466,14 @@ impl Renderer {
     /// Three rings rather than a blur: the canvas is in [`BlendMode::Blend`], so
     /// stacking three cheap rectangles at a low alpha gives a falloff for the
     /// price of three fills, and a real blur would mean a texture.
+    ///
+    /// Rounded to the same radius as the panel that will land on top. Square
+    /// ones were fine when the panels were square; under a rounded panel the
+    /// four corners of the shadow stick out past the curve as three little
+    /// grey steps, which is more visible than the shadow itself.
     fn drop_shadow(&mut self, x: i32, y: i32, w: i32, h: i32) {
         for (i, a) in [(1, 40u8), (2, 26), (3, 14)] {
-            self.fill(
-                x + i,
-                y + i,
-                w,
-                h,
-                Color::RGBA(0, 0, 0, a),
-            );
+            self.fill_rounded(x + i, y + i, w, h, PANEL_RADIUS, Color::RGBA(0, 0, 0, a));
         }
     }
 
@@ -2370,9 +2556,15 @@ impl Renderer {
                 if cell_bg != bg {
                     self.fill(x, y, self.cell_w, self.line_h, cell_bg);
                 }
-                self.draw_char(cell.c, x, y, Color::RGB(cell.fg[0], cell.fg[1], cell.fg[2]));
+                let cell_fg = Color::RGB(cell.fg[0], cell.fg[1], cell.fg[2]);
+                self.draw_char(cell.c, x, y, cell_fg);
+                // The *foreground*. It was `cell_bg`, which drew every underline
+                // in the colour of the thing behind it — and since almost every
+                // cell keeps the pane's own background, that is an underline
+                // painted in the background over the background. Invisible, on
+                // exactly the cells where an underline is most often asked for.
                 if cell.underline {
-                    self.fill(x, y + self.line_h - 1, self.cell_w, 1, cell_bg);
+                    self.fill(x, y + self.line_h - 1, self.cell_w, 1, cell_fg);
                 }
             }
         }
@@ -2476,6 +2668,86 @@ impl Renderer {
         let _ = canvas.copy(tex, None, Rect::new(x, y, w, h));
         self.mark([id, pack(x, y), pack(w as i32, h as i32), 0]);
         self.draws += 1;
+    }
+
+    /// [`Renderer::fill`] with its corners taken off.
+    ///
+    /// Three rectangles and four blits. The rectangles are the box minus its
+    /// corner squares — a full-width band through the middle, and a narrowed
+    /// band at the top and at the bottom — and the four blits are the quadrants
+    /// of one cached alpha mask, tinted to `color` on the way down. The mask is
+    /// the only antialiased thing in this renderer that is not a glyph, and it
+    /// is antialiased for the same reason: a stair-stepped curve at this size is
+    /// not a rounded corner, it is a chipped one.
+    ///
+    /// Falls back to a square [`Renderer::fill`] when the radius is zero, when
+    /// the box is too small to hold one, or when the mask will not upload. A
+    /// panel that draws square is a panel that draws.
+    fn fill_rounded(&mut self, x: i32, y: i32, w: i32, h: i32, radius: i32, color: Color) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        // Never more than half the shorter side, or the two corners on that side
+        // would overlap and the bands between them would have negative width.
+        let r = radius.min(w / 2).min(h / 2);
+        if r <= 0 {
+            return self.fill(x, y, w, h, color);
+        }
+
+        // Split borrows, as `blit_image` does: the cache needs `&mut corners`
+        // and the blit needs `&mut canvas`.
+        let Renderer {
+            corners,
+            textures,
+            canvas,
+            ..
+        } = self;
+        let Some(tex) = corners.entry(r).or_insert_with(|| corner_texture(textures, r)) else {
+            return self.fill(x, y, w, h, color);
+        };
+        tex.set_color_mod(color.r, color.g, color.b);
+        tex.set_alpha_mod(color.a);
+        let rw = r as u32;
+        for (sx, sy, dx, dy) in [
+            (0, 0, x, y),                            // top-left
+            (r, 0, x + w - r, y),                    // top-right
+            (0, r, x, y + h - r),                    // bottom-left
+            (r, r, x + w - r, y + h - r),            // bottom-right
+        ] {
+            let _ = canvas.copy(tex, Rect::new(sx, sy, rw, rw), Rect::new(dx, dy, rw, rw));
+        }
+        self.draws += 4;
+        // The colour goes in the digest by hand. `fill` folds its own in, but
+        // these four blits do not go through `fill` — and a parameter that
+        // reaches the canvas without reaching `mark` does not produce a wrong
+        // pixel, it produces a frame that is never presented. See `mark`.
+        self.mark([
+            pack(x, y),
+            pack(w, h),
+            r as u64,
+            u32::from_be_bytes([color.r, color.g, color.b, color.a]) as u64,
+        ]);
+
+        // The three bands, after the corners so their own `mark` calls fold in
+        // too — and it does not matter which order the pixels land in, since
+        // none of these four regions overlaps another.
+        self.fill(x, y + r, w, h - 2 * r, color);
+        self.fill(x + r, y, w - 2 * r, r, color);
+        self.fill(x + r, y + h - r, w - 2 * r, r, color);
+    }
+
+    /// A floating box: a rounded panel with a one-pixel rounded border.
+    ///
+    /// Two fills rather than a fill and a [`Renderer::stroke`], because a stroke
+    /// is four straight rectangles and would leave four square tabs sticking out
+    /// past a rounded fill's corners. Painting the border colour at the full
+    /// size and the panel colour one pixel inside it gives a border that follows
+    /// the curve, antialiased, for the price of one extra rounded fill — and it
+    /// is the same trick as knocking a glyph out of a pill: the outline is what
+    /// is left of the larger shape.
+    fn panel(&mut self, x: i32, y: i32, w: i32, h: i32, fill: Color, border: Color) {
+        self.fill_rounded(x, y, w, h, PANEL_RADIUS, border);
+        self.fill_rounded(x + 1, y + 1, w - 2, h - 2, PANEL_RADIUS - 1, fill);
     }
 
     fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color) {
@@ -2967,6 +3239,107 @@ fn open_face(path: &std::path::Path, key: FaceKey) -> anyhow::Result<Face> {
     })
 }
 
+/// Where a font file lives on this machine. Searched in order, and the *user's*
+/// directory is first so a face installed by hand wins a name collision with a
+/// system one — which is the whole reason anybody installs one there.
+const FONT_DIRS: &[&str] = &[
+    "~/Library/Fonts",
+    "/Library/Fonts",
+    "/System/Library/Fonts",
+    "/System/Library/Fonts/Supplemental",
+    "~/.local/share/fonts",
+    "~/.fonts",
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
+];
+
+/// Every fixed-width face installed on this machine, as `(family, path)`,
+/// sorted by family and with duplicate families dropped.
+///
+/// Monospace only, and tested by *opening* each file rather than by guessing
+/// from its name: "Menlo" and "Andale Mono" agree about nothing except being
+/// monospace, and a name-pattern filter is the kind of heuristic that offers you
+/// Helvetica and hides Iosevka. `face_is_fixed_width` is FreeType's answer to
+/// exactly this question and it is already linked in.
+///
+/// The cost is opening every font file once — a few hundred on a full macOS,
+/// and a few hundred milliseconds. Paid on the first `M-x choose-font` of a
+/// session and never again, because the caller caches it; that is why this is a
+/// plain function rather than a `OnceLock`, since a user who installs a font
+/// mid-session should be able to get a fresh list without restarting.
+///
+/// One entry per *file*: a `.ttc` collection holds several faces and only face
+/// zero is opened, which is the regular in every collection that matters here.
+/// Its ceiling is a family whose regular lives at a non-zero index, which would
+/// show up under the collection's first family name.
+///
+/// ponytail: no recursion into subdirectories. Ceiling: a Linux box that files
+/// fonts under `/usr/share/fonts/truetype/dejavu/`, where this finds nothing.
+/// The upgrade path is `walkdir`, or six lines of manual stack — worth adding
+/// the day somebody runs this on Linux, and not before.
+pub fn monospace_fonts() -> Vec<(String, PathBuf)> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // The bool is "not the regular weight", which is what the sort below wants.
+    let mut found: Vec<(String, PathBuf, bool)> = Vec::new();
+    for dir in FONT_DIRS {
+        let dir = match dir.strip_prefix("~/") {
+            Some(rest) => match &home {
+                Some(h) => h.join(rest),
+                None => continue,
+            },
+            None => PathBuf::from(dir),
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !matches!(ext.as_str(), "ttf" | "ttc" | "otf" | "otc") {
+                continue;
+            }
+            // At a fixed, small size: this only asks the face two questions
+            // about itself, and rasterising it at the body size to throw it away
+            // would multiply the scan's cost for nothing.
+            let Ok(ctx) = ttf() else { continue };
+            let Ok(font) = ctx.load_font(&path, 12.0) else {
+                continue; // a file in a font directory that is not a font
+            };
+            if !font.face_is_fixed_width() {
+                continue;
+            }
+            if let Some(family) = font.face_family_name() {
+                // A family arrives once per *file*, and a family shipped as
+                // separate weights is several files: "Courier New" is
+                // `Courier New.ttf` and `Courier New Bold.ttf`, both answering
+                // the same family name. Keeping whichever sorted first set the
+                // editor in Courier New Bold. The style name is the tiebreak,
+                // and the regular is the one anybody choosing a family means —
+                // bold is synthesised from it anyway, see `open_face`.
+                let regular = font
+                    .face_style_name()
+                    .is_none_or(|s| s.eq_ignore_ascii_case("regular"));
+                found.push((family, path, !regular));
+            }
+        }
+    }
+    // Family first, then the regular ahead of the rest of its weights, so the
+    // `dedup` below keeps the one to open. `sort_by` is stable, so files within
+    // one weight stay in directory order — which is the order `FONT_DIRS` puts
+    // the user's own directory first in.
+    found.sort_by(|a, b| {
+        a.0.to_lowercase()
+            .cmp(&b.0.to_lowercase())
+            .then(a.2.cmp(&b.2))
+    });
+    found.dedup_by(|a, b| a.0 == b.0);
+    found.into_iter().map(|(name, path, _)| (name, path)).collect()
+}
+
 /// The process's SDL_ttf context.
 ///
 /// One for the whole process rather than one leaked per [`Renderer`], which is
@@ -3089,6 +3462,60 @@ fn glyph_texture(
 /// layout `zemacs_latex::Preview` documents. No `darken_stems`: dvipng already
 /// antialiased against the colour it was given, and a gamma meant for a font
 /// rasteriser's linear coverage would only smear an equation.
+/// The alpha mask a rounded corner is cut with: a white disc of radius `r`,
+/// centred in a `2r × 2r` square.
+///
+/// One texture holds all four corners, because the four corners of a rounded
+/// box *are* the four quadrants of one circle — so `fill_rounded` blits four
+/// sub-rects of this rather than needing four masks or a rotation the canvas
+/// does not offer. White so that `set_color_mod` supplies the colour, exactly as
+/// it does for a glyph; the shape lives in the alpha channel alone.
+///
+/// Coverage is the distance from the centre, clamped across one pixel: a pixel
+/// whose centre is a full pixel inside the disc is opaque, one a full pixel
+/// outside is clear, and the band between them ramps. Not an exact area
+/// integral — the error is a fraction of one pixel on a curve four to eight
+/// pixels long — and visibly better than the alternative, which is a staircase.
+/// No [`darken_stems`]: that gamma is tuned for a font rasteriser's stem
+/// coverage and would fatten a curve that is already the right weight.
+fn corner_texture(
+    textures: &'static TextureCreator<WindowContext>,
+    r: i32,
+) -> Option<Texture<'static>> {
+    let side = (r * 2) as u32;
+    let mut pixels = corner_mask(r);
+    let surface = Surface::from_data(&mut pixels, side, side, side * 4, PixelFormat::ABGR8888).ok()?;
+    let mut tex = textures.create_texture_from_surface(&surface).ok()?;
+    tex.set_blend_mode(BlendMode::Blend);
+    Some(tex)
+}
+
+/// The pixels of [`corner_texture`], as `RGBA` rows of a `2r × 2r` square.
+///
+/// Split out from the upload so it can be tested: a mask whose quadrants come
+/// out mirrored uploads perfectly happily and draws a panel with four bites
+/// taken out of it, which is a bug you can only find by looking at a screen —
+/// and only if you happen to have a panel on it.
+fn corner_mask(r: i32) -> Vec<u8> {
+    let side = (r * 2) as u32;
+    let mut pixels = vec![0u8; (side * side * 4) as usize];
+    let rf = r as f32;
+    for py in 0..side {
+        for px in 0..side {
+            // Pixel *centres*, which is what puts the disc's edge between
+            // samples rather than on one and keeps the ramp symmetric.
+            let (dx, dy) = (px as f32 + 0.5 - rf, py as f32 + 0.5 - rf);
+            let coverage = (rf - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+            let i = ((py * side + px) * 4) as usize;
+            pixels[i] = 255;
+            pixels[i + 1] = 255;
+            pixels[i + 2] = 255;
+            pixels[i + 3] = (coverage * 255.0).round() as u8;
+        }
+    }
+    pixels
+}
+
 fn image_texture(
     textures: &'static TextureCreator<WindowContext>,
     image: &zemacs_core::Image,
@@ -3314,13 +3741,21 @@ fn terminal_grid(cell_w: i32, line_h: i32, set: &Settings, pane: Area) -> (usize
     (cols, rows)
 }
 
-/// The measure in pixels, from the setting's columns and the font's cell.
+/// The measure in pixels, from the columns this *buffer* is held to and the
+/// font's cell.
 ///
 /// Columns rather than pixels is the setting's whole point — see
 /// [`Settings::text_width`] — so this is the one place the two units meet, and
 /// every caller of [`doc_rect`] that draws a *document* goes through it.
-fn measure_px(set: &Settings, cell_w: i32) -> i32 {
-    set.text_width as i32 * cell_w.max(1)
+///
+/// The buffer's own measure wins over the editor's, exactly as `gutter_w` takes
+/// the buffer's own gutter: a measure is drawn per *pane*, and two panes
+/// routinely show different kinds of thing. Reading only the setting here is
+/// what made focusing a terminal in a split un-centre the org document beside
+/// it — nothing about that pane had changed but the one global number it was
+/// measured by. See [`Buffer::text_width`].
+fn measure_px(buf: &Buffer, set: &Settings, cell_w: i32) -> i32 {
+    buf.text_width.unwrap_or(set.text_width) as i32 * cell_w.max(1)
 }
 
 /// Colour runs for one candidate row, as `(start, end, kind)` in **char**
@@ -3464,7 +3899,7 @@ fn offset_at(
     y: i32,
 ) -> usize {
     let (cell_w, line_h) = (m.cell_w, m.line_h);
-    let doc = doc_rect(pane, status_h, measure_px(set, cell_w));
+    let doc = doc_rect(pane, status_h, measure_px(buf, set, cell_w));
     let gutter = gutter_w(buf, set, cell_w);
     let text_w = doc.w - gutter;
     let wrap = set.line_overflow == LineOverflow::Wrap;
@@ -3604,16 +4039,65 @@ fn modeline_bg(editor: &Editor, is_active: bool) -> [f32; 3] {
 
 /// Text colour on the strip. Inactive windows get a dimmer label, which is most
 /// of what separates them at a glance. `"modeline-text"` overrides it.
+///
+/// Both bars, which it did not used to be: the face was consulted when active
+/// and ignored when not, so a theme could colour the focused strip and watch
+/// every other one stay a grey it had not chosen. Dimming is the *relationship*
+/// between the two bars, not a licence to pick the second colour — so an
+/// inactive strip is now the theme's own text sunk 45% of the way back into the
+/// bar it sits on, which keeps the contrast the derived pair had and keeps the
+/// hue the theme asked for.
 fn modeline_fg(editor: &Editor, is_active: bool) -> [f32; 3] {
     let derived = mix(
         editor.settings.background,
         editor.settings.foreground,
         if is_active { 0.92 } else { 0.55 },
     );
+    let text = editor.theme.color(HlKind::ModelineText, derived);
     match is_active {
-        true => editor.theme.color(HlKind::ModelineText, derived),
-        false => derived,
+        true => text,
+        false => mix(modeline_bg(editor, false), text, 0.55),
     }
+}
+
+/// The colour the *editor's own* chrome accents with: the bar down the side of
+/// a selected completion row, an LSP kind chip, the dashboard's rule, the arrow
+/// at the end of a truncated line.
+///
+/// Every one of those reached for `HlKind::Function` before this existed, and
+/// it mostly worked — a function name is the accent colour in a good many
+/// themes — but "mostly" was doing real work there, and in the themes where it
+/// was wrong there was nothing to say so with. `accent` is the theme saying
+/// which colour it meant, and `function` stays the fallback because that is
+/// what every theme shipped before today was implicitly choosing.
+fn accent(editor: &Editor) -> [f32; 3] {
+    let function = editor
+        .theme
+        .color(HlKind::Function, editor.settings.foreground);
+    editor.theme.color(HlKind::Accent, function)
+}
+
+/// The fill of a floating panel — completion, corfu, which-key, the context
+/// menu, a tooltip.
+///
+/// One face for surfaces that used to mix their own shade five different ways
+/// (0.07, 0.09, 0.11, 0.13), and `elevation` is what is left of that: a panel
+/// stacked on top of another panel still has to be told apart from it, so the
+/// ratio survives as a nudge *relative to the base* rather than as five
+/// unrelated constants. A theme sets `popup` once and the whole stack moves
+/// with it.
+fn popup_bg(editor: &Editor, elevation: f32) -> [f32; 3] {
+    let bg = editor.settings.background;
+    let base = editor.theme.color(HlKind::Popup, mix(bg, editor.settings.foreground, 0.07));
+    mix(base, editor.settings.foreground, elevation)
+}
+
+/// The 1px stroke around a panel. `t` is how much of the accent is in it: a
+/// panel that is the thing you are looking at gets more, a tooltip that is
+/// merely explaining something gets none.
+fn popup_border(editor: &Editor, t: f32) -> [f32; 3] {
+    let derived = mix(editor.settings.background, accent(editor), t);
+    editor.theme.color(HlKind::PopupBorder, derived)
 }
 
 /// The lit edge: the strip's background pushed toward white.
@@ -3638,11 +4122,31 @@ fn shadow_shade(base: [f32; 3]) -> [f32; 3] {
 /// more chrome, and derived from the theme for the same reason [`modeline_bg`]
 /// is — on a light theme a fixed grey would be the darkest thing on screen.
 ///
-/// ponytail: not settable. Ceiling: a theme that wants a coloured seam. Upgrade
-/// path: a `HlKind::Divider` face, which is a one-line change here plus an
-/// entry in `HlKind::ALL` — and that lives in core.
-fn divider_shade(settings: &Settings) -> [f32; 3] {
-    mix(settings.background, settings.foreground, 0.22)
+/// Settable now, by the upgrade path the note that used to be here named: the
+/// `divider` face, with the old ratio as its fallback.
+/// The modeline strip a run of segments is being drawn onto, for the segments
+/// that need to know.
+///
+/// Only the filled ones do: a pill paints its face as a block and knocks its
+/// text out to whatever is underneath, so it needs the bar's colour and the
+/// bar's vertical extent — neither of which a segment can work out from the `x`
+/// and `y` it is handed, since `y` has already been centred in a box whose
+/// height nobody passed down.
+///
+/// Carried as one value rather than three more arguments because the three are
+/// one fact, and because a `Copy` struct can be handed to both the left group
+/// and the right group without either being able to change it.
+#[derive(Clone, Copy)]
+struct Strip {
+    ground: Color,
+    y: i32,
+    h: i32,
+}
+
+fn divider_shade(editor: &Editor) -> [f32; 3] {
+    let settings = &editor.settings;
+    let derived = mix(settings.background, settings.foreground, 0.22);
+    editor.theme.color(HlKind::Divider, derived)
 }
 
 /// Total height of a modeline: one text line, its padding, and the box on both
@@ -4411,25 +4915,40 @@ type OverlayRun<'a> = (usize, usize, &'a Overlay);
 fn overlays_for_line<'a>(overlays: &'a [Overlay], start: usize, end: usize) -> Vec<OverlayRun<'a>> {
     overlays
         .iter()
-        .filter(|o| o.end > start && o.start < end)
+        .filter(|o| on_line(o, start, end))
         .map(|o| (o.start.max(start) - start, o.end.min(end) - start, o))
         .collect()
 }
 
-/// The foreground and background in force at line-relative source char `src`.
+/// The foreground and background in force at line-relative source char `src`,
+/// each as the colour to use — `None` where no overlay claimed one.
 ///
 /// Later beats earlier, and *per attribute*: an overlay that sets only a
 /// background leaves an earlier one's foreground alone, which is what makes a
 /// highlight and a face stack rather than fight.
-fn overlay_face(runs: &[OverlayRun], src: usize) -> (Option<HlKind>, Option<HlKind>) {
-    let (mut fg, mut bg) = (None, None);
+///
+/// A literal colour outranks a face name on the same overlay, per
+/// [`Overlay::fg_rgb`] — a terminal's grid is the one producer that has no face
+/// to name. The `HlKind`s come back too, because the *font* is picked from the
+/// face and only the ink comes from here.
+fn overlay_face(
+    runs: &[OverlayRun],
+    src: usize,
+    theme: &Theme,
+    fallback: [f32; 3],
+) -> (Option<HlKind>, Option<[f32; 3]>, Option<[f32; 3]>) {
+    let (mut face, mut fg, mut bg) = (None, None, None);
     for &(s, e, o) in runs {
         if s <= src && src < e {
-            fg = o.face.or(fg);
-            bg = o.background.or(bg);
+            face = o.face.or(face);
+            fg = o.fg_rgb.or_else(|| o.face.map(|k| theme.color(k, fallback))).or(fg);
+            bg = o
+                .bg_rgb
+                .or_else(|| o.background.map(|k| theme.color(k, fallback)))
+                .or(bg);
         }
     }
-    (fg, bg)
+    (face, fg, bg)
 }
 
 /// Whether the text at line-relative source char `src` is set bold and italic,
@@ -4524,7 +5043,7 @@ struct LineStyle<'a> {
 /// line below.
 fn line_style<'a>(overlays: &'a [Overlay], start: usize, end: usize) -> LineStyle<'a> {
     let mut style = LineStyle::default();
-    for o in overlays.iter().filter(|o| o.end > start && o.start < end) {
+    for o in overlays.iter().filter(|o| on_line(o, start, end)) {
         if let Some(s) = o.scale {
             style.scale = style.scale.max(scale_step(s));
         }
@@ -4637,7 +5156,7 @@ fn image_tall(m: Metrics, buf: &Buffer, l: usize) -> usize {
     let start = buf.line_start(l);
     let end = start + buf.line_len(l);
     let mut tall = 1usize;
-    for o in buf.overlays().iter().filter(|o| o.end > start && o.start < end) {
+    for o in buf.overlays().iter().filter(|o| on_line(o, start, end)) {
         // A continuation row: the bitmap is the earlier line's, and this row is
         // one of the blank ones the substitution left behind.
         if o.start < start {
@@ -5559,6 +6078,8 @@ mod tests {
             end,
             face: None,
             background: None,
+            fg_rgb: None,
+            bg_rgb: None,
             display: None,
             image: None,
             scale: None,
@@ -5645,6 +6166,56 @@ mod tests {
         );
     }
 
+    /// An empty line is `[start, start)`, so the half-open test rejects every
+    /// overlay ever made and a blank line could carry none: the diagnostic on
+    /// the empty line where the bracket went unclosed, the band org draws behind
+    /// a separator, the mark in the gutter. Emacs draws all three.
+    #[test]
+    fn an_overlay_on_an_empty_line_is_still_on_it() {
+        // Line 2 of "a\n\nb" is the blank one: chars [2, 2), with the newline it
+        // owns at 2. An overlay put there spans that newline, because there is
+        // nothing else on the line to span.
+        let overlays = vec![overlay(1, 2, 3)];
+        let runs = overlays_for_line(&overlays, 2, 2);
+        // Zero-width, and that is the honest answer: there is no cell under it,
+        // so a *face* still paints nothing. What this feeds is the payloads that
+        // never needed a character — the band, the prefix, the gutter mark.
+        assert_eq!(
+            runs.iter().map(|&(s, e, o)| (o.id, s, e)).collect::<Vec<_>>(),
+            vec![(1, 0, 0)]
+        );
+        // The sibling loop has to agree, or the line is styled by one of them
+        // and measured by the other.
+        let mut band = overlay(2, 2, 3);
+        band.line_background = Some(HlKind::Code);
+        band.gutter = Some("!".into());
+        let banded = [band];
+        let style = line_style(&banded, 2, 2);
+        assert_eq!(style.background, Some(HlKind::Code));
+        assert_eq!(style.gutter, Some(("!", None)));
+    }
+
+    /// The other three quarters of the same test: an empty line is the *only*
+    /// place the half-open rule bends, and every boundary it protects is still
+    /// where it was.
+    #[test]
+    fn the_empty_line_rule_does_not_leak_onto_lines_with_width() {
+        // Ends exactly where the line starts: it belongs to the line before,
+        // empty line or not.
+        assert!(overlays_for_line(&[overlay(1, 0, 2)], 2, 2).is_empty());
+        assert!(overlays_for_line(&[overlay(1, 0, 2)], 2, 6).is_empty());
+        // Starts exactly at the end of a line that has width: it is on the
+        // newline, which is the next line's business.
+        assert!(overlays_for_line(&[overlay(1, 6, 8)], 2, 6).is_empty());
+        assert_eq!(line_style(&[overlay(1, 6, 8)], 2, 6), LineStyle::default());
+        // Zero-length, on the empty line, at its start: still nothing. It ends
+        // where it begins, and "ended before this line" is the same rule.
+        assert!(overlays_for_line(&[overlay(1, 2, 2)], 2, 2).is_empty());
+        // An overlay reaching *through* the blank line from an earlier one was
+        // never the broken case, and is still found.
+        assert_eq!(overlays_for_line(&[overlay(1, 0, 9)], 2, 2).len(), 1);
+    }
+
     #[test]
     fn the_most_recent_overlay_wins_per_attribute() {
         let mut first = overlay(1, 0, 4);
@@ -5654,18 +6225,43 @@ mod tests {
         second.background = Some(HlKind::Comment); // no face of its own
         let overlays = vec![first, second];
         let runs = overlays_for_line(&overlays, 0, 4);
+        let theme = Theme::default();
+        let ink = |k| Some(theme.color(k, [0.0; 3]));
+        let at = |src| overlay_face(&runs, src, &theme, [0.0; 3]);
         // Only the first covers cell 0.
         assert_eq!(
-            overlay_face(&runs, 0),
-            (Some(HlKind::Keyword), Some(HlKind::Modeline))
+            at(0),
+            (Some(HlKind::Keyword), ink(HlKind::Keyword), ink(HlKind::Modeline))
         );
         // Both cover cell 2: the later background wins, and the earlier
         // foreground survives because the later one never claimed it.
         assert_eq!(
-            overlay_face(&runs, 2),
-            (Some(HlKind::Keyword), Some(HlKind::Comment))
+            at(2),
+            (Some(HlKind::Keyword), ink(HlKind::Keyword), ink(HlKind::Comment))
         );
-        assert_eq!(overlay_face(&[], 0), (None, None));
+        assert_eq!(overlay_face(&[], 0, &theme, [0.0; 3]), (None, None, None));
+    }
+
+    /// A literal colour is the terminal's, and it outranks a face for the same
+    /// reason it exists: the child chose `#112233` and no entry of `face-list`
+    /// says that. The face is still reported, because it picks the *font* — an
+    /// overlay that is bold by face and red by grid is both.
+    #[test]
+    fn a_literal_colour_beats_a_face_name_on_the_same_overlay() {
+        let mut o = overlay(1, 0, 4);
+        o.face = Some(HlKind::Keyword);
+        o.fg_rgb = Some([0.1, 0.2, 0.3]);
+        o.bg_rgb = Some([0.4, 0.5, 0.6]);
+        let overlays = vec![o];
+        let runs = overlays_for_line(&overlays, 0, 4);
+        assert_eq!(
+            overlay_face(&runs, 0, &Theme::default(), [0.0; 3]),
+            (
+                Some(HlKind::Keyword),
+                Some([0.1, 0.2, 0.3]),
+                Some([0.4, 0.5, 0.6])
+            )
+        );
     }
 
     /// A pane's [`Metrics`] for the three counting functions, in the 20/15 em
@@ -6722,11 +7318,11 @@ mod tests {
 
         // ...including in relative mode, which is the case that was wrong: this
         // used to be `r == 0 || relative`, so every row got one.
-        let rel = Settings { relative_line_numbers: true, ..on };
+        let rel = Settings { relative_line_numbers: true, ..on.clone() };
         assert!(numbered(0, &rel));
         assert!(!numbered(1, &rel));
 
-        let off = Settings { line_numbers: false, ..on };
+        let off = Settings { line_numbers: false, ..on.clone() };
         assert!(!numbered(0, &off));
     }
 
@@ -6837,6 +7433,37 @@ mod tests {
         assert_eq!(hit(2, 0), buf.line_start(1));
     }
 
+    /// The bug: focus a terminal in a split and the org document beside it
+    /// stops being centred.
+    ///
+    /// A measure is drawn per *pane* and there was one in the editor, resolved
+    /// by `runtime/modes/modes.lisp` from whichever mode was entered last — so
+    /// giving the keyboard to a shell re-resolved it to "no measure" and took
+    /// the centring off a pane nobody had touched. The buffer's own measure
+    /// wins now, exactly as its own gutter already did.
+    #[test]
+    fn a_pane_keeps_its_own_measure_when_another_takes_the_keyboard() {
+        // What the editor is set to *now*, which is what a terminal claiming no
+        // measure leaves behind.
+        let set = Settings { text_width: 0, ..Settings::default() };
+        let mut org = Buffer::from_str("a paragraph of prose\n");
+        org.text_width = Some(20);
+        let shell = Buffer::from_str("$ ls\n");
+
+        // The org pane is still measured at 20 columns...
+        assert_eq!(measure_px(&org, &set, CW), 20 * CW);
+        // ...while the terminal beside it takes the editor's none, which is
+        // what a terminal wants: a grid the child owns, full width.
+        assert_eq!(measure_px(&shell, &set, CW), 0);
+
+        // And a buffer no mode has spoken for follows the editor, which is the
+        // fallback that keeps `(set-text-width n)` in a config meaningful.
+        let plain = Buffer::from_str("");
+        let wide = Settings { text_width: 80, ..Settings::default() };
+        assert_eq!(measure_px(&plain, &wide, CW), 80 * CW);
+    }
+
+
     /// A centred measure is only worth having if the mouse agrees with it, so
     /// this is the same click test one pane-width to the right: with
     /// `text_width` set, column zero is no longer at the pane's left edge, and
@@ -6870,7 +7497,9 @@ mod tests {
             zoom: 100,
         };
 
-        let doc = doc_rect(pane, STATUS, measure_px(&set, CW));
+        // The buffer has no measure of its own, so it takes the editor's — the
+        // fallback half of `measure_px`.
+        let doc = doc_rect(pane, STATUS, measure_px(&buf, &set, CW));
         assert_eq!(doc.w, 20 * CW, "the measure is the text column's width");
         assert_eq!(doc.x, PAD + 20 * CW, "...and it is centred in the pane");
 
@@ -6902,7 +7531,7 @@ mod tests {
         // Turning the measure off moves the *same pixel* twenty columns along
         // the line, which is the proof that the two layouts really do differ
         // and that `doc_rect` is the only thing that made them.
-        let full = Settings { text_width: 0, ..set };
+        let full = Settings { text_width: 0, ..set.clone() };
         assert_eq!(
             offset_at(m, &buf, &win, &full, pane, STATUS,
                       doc.x + CW / 2, doc.y + LH / 2),
@@ -6985,7 +7614,7 @@ mod tests {
         assert_eq!(gutter_w(&short, &set, CW), 4 * CW);
         assert_eq!(gutter_w(&long, &set, CW), 5 * CW);
         // Off: the text starts at the document edge and gets those columns back.
-        let off = Settings { line_numbers: false, ..set };
+        let off = Settings { line_numbers: false, ..set.clone() };
         assert_eq!(gutter_w(&long, &off, CW), 0);
     }
 
@@ -7006,7 +7635,7 @@ mod tests {
 
         // ...and the buffer can dissent the other way too, so turning numbers
         // off globally still leaves a buffer able to ask for them.
-        let off = Settings { line_numbers: false, ..set };
+        let off = Settings { line_numbers: false, ..set.clone() };
         let mut wants = Buffer::from_str("1\n2\n");
         wants.line_numbers = Some(true);
         assert_eq!(gutter_w(&code, &off, CW), 0);
@@ -7055,7 +7684,7 @@ mod tests {
 
         // ...and the other three corners of the same matrix, including a buffer
         // dissenting *into* a gutter the editor has turned off.
-        let off = Settings { line_numbers: false, ..set };
+        let off = Settings { line_numbers: false, ..set.clone() };
         let mut wants = Buffer::from_str("1\n2\n");
         wants.line_numbers = Some(true);
         for (buf, s) in [(&wants, &off), (&wants, &set), (&org, &off)] {
@@ -7071,6 +7700,86 @@ mod tests {
             b.line_numbers = Some(true);
             assert!(!gutter_on(&b, &set), "{kind:?}");
             assert_eq!(gutter_w(&b, &set, CW), 0, "{kind:?}");
+        }
+    }
+
+    /// The corner mask has its round side facing out, in all four quadrants.
+    ///
+    /// `fill_rounded` blits the four quadrants of one disc into the four corners
+    /// of a box, and the whole scheme rests on each quadrant already being the
+    /// right way round — there is no rotation and no flip on this canvas, so a
+    /// mask built wrong cannot be corrected at blit time. It would also upload
+    /// and draw without complaint: the result is a panel with four bites out of
+    /// it, visible only if somebody happens to be looking at a popup.
+    ///
+    /// So: for each quadrant, the pixel at the box's *outer* corner must be
+    /// clear and the one at its *inner* corner opaque. Four assertions that
+    /// between them pin the orientation on both axes.
+    #[test]
+    fn a_corner_mask_is_round_on_the_outside_of_every_quadrant() {
+        let r = PANEL_RADIUS;
+        let side = (r * 2) as usize;
+        let mask = corner_mask(r);
+        let alpha = |x: usize, y: usize| mask[(y * side + x) * 4 + 3];
+        let last = side - 1;
+
+        // The four outer corners of the square are the four points furthest from
+        // the disc's centre — `r * sqrt(2)` away — so all four are cut.
+        for (name, x, y) in [
+            ("top-left", 0, 0),
+            ("top-right", last, 0),
+            ("bottom-left", 0, last),
+            ("bottom-right", last, last),
+        ] {
+            assert_eq!(alpha(x, y), 0, "{name} corner is not cut away");
+        }
+        // The four pixels around the centre are the innermost of each quadrant
+        // and are all fully covered.
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let (x, y) = (r as usize - 1 + dx, r as usize - 1 + dy);
+            assert_eq!(alpha(x, y), 255, "the mask is hollow at ({x}, {y})");
+        }
+        // Symmetric on both axes, which is what makes one disc serve as four
+        // corners in the first place.
+        for y in 0..side {
+            for x in 0..side {
+                assert_eq!(alpha(x, y), alpha(last - x, y), "asymmetric across x");
+                assert_eq!(alpha(x, y), alpha(x, last - y), "asymmetric across y");
+            }
+        }
+        // Antialiased rather than a staircase: the diagonal from the centre out
+        // has to pass through at least one partly covered pixel, or the curve is
+        // being drawn with a hard edge and there was no point building a mask.
+        assert!(
+            (0..side).any(|i| (1..255).contains(&alpha(i, i))),
+            "no partial coverage anywhere on the diagonal"
+        );
+    }
+
+    /// A radius never eats more than half the box.
+    ///
+    /// The three bands `fill_rounded` paints are the box minus its corner
+    /// squares, so a radius past half the shorter side gives the middle band a
+    /// negative height and the top and bottom bands a negative width — and makes
+    /// the four corner blits overlap in the middle, each one painting its own
+    /// antialiased edge over the others. `fill` drops a non-positive rectangle,
+    /// so the failure is not a crash but a panel with a translucent seam through
+    /// the centre of it.
+    #[test]
+    fn a_corner_radius_is_clamped_to_half_the_shorter_side() {
+        // The clamp as `fill_rounded` spells it.
+        let clamp = |radius: i32, w: i32, h: i32| radius.min(w / 2).min(h / 2);
+
+        // Wide enough for the full radius.
+        assert_eq!(clamp(PANEL_RADIUS, 200, 80), PANEL_RADIUS);
+        // A strip shorter than two radii: the corners meet and stop there.
+        assert_eq!(clamp(PANEL_RADIUS, 200, 6), 3);
+        assert_eq!(clamp(PANEL_RADIUS, 5, 200), 2);
+        // ...and the bands are never negative at the clamped value, which is the
+        // property the clamp exists for.
+        for (w, h) in [(200, 80), (200, 6), (5, 200), (1, 1), (13, 13)] {
+            let r = clamp(PANEL_RADIUS, w, h);
+            assert!(h - 2 * r >= 0 && w - 2 * r >= 0, "{w}x{h} r={r}");
         }
     }
 
@@ -7600,7 +8309,17 @@ mod tests {
 
     #[test]
     fn an_inactive_pane_names_its_own_buffer() {
-        let ed = Editor::new();
+        let mut ed = Editor::new();
+        // The shipped strip is `runtime/init.lisp`'s now, so a test about what a
+        // pane says has to say what this one's format is. `%m` is the code that
+        // belongs to the *focused* window; `%b` and `%+` belong to whichever
+        // buffer the pane is showing.
+        ed.modeline.clear();
+        ed.modeline
+            .push(false, zemacs_core::modeline::Spec::text(" %m "));
+        ed.modeline
+            .push(false, zemacs_core::modeline::Spec::text("  %b %+"));
+        let ed = ed;
         let mut other = Buffer::from_str("");
         other.id = 9;
         other.modified = true;
@@ -7633,7 +8352,7 @@ mod tests {
                 foreground: [1.0 - background[0]; 3],
                 ..Settings::default()
             };
-            let d = divider_shade(&ed.settings);
+            let d = divider_shade(&ed);
             // Distinct from the buffer it sits between and from both modeline
             // faces, or a split has no visible seam at all.
             assert_ne!(luma(d), luma(background), "{background:?}");
@@ -7997,6 +8716,39 @@ mod scenes {
     /// arithmetic while everything around it measures in a real font, and a
     /// second key holding a second copy of the monospace file. Both are avoided
     /// by the prose bit simply not surviving [`on_this_box`].
+    /// The picker's list, which is only useful if it is both *complete* enough
+    /// to contain the font you want and *narrow* enough not to bury it.
+    ///
+    /// Asserted against the box rather than against a fixture, because the thing
+    /// that can break is the scan: a directory list that misses the user's own
+    /// `~/Library/Fonts`, or an extension filter that drops `.ttc` and so drops
+    /// Menlo. Every machine this runs on has a monospace font — `find_font`
+    /// treats not having one as fatal — so "at least one" is a real floor and
+    /// not a tautology.
+    #[test]
+    fn the_font_scan_finds_monospace_faces_and_only_those() {
+        let fonts = monospace_fonts();
+        assert!(!fonts.is_empty(), "no monospace font found anywhere on this box");
+        for (family, path) in &fonts {
+            assert!(!family.is_empty(), "{path:?} came back with no family name");
+            assert!(path.is_file(), "{path:?} is not a file");
+        }
+        // Sorted and deduplicated, since it is drawn as a list and scrolled.
+        let names: Vec<String> = fonts.iter().map(|(n, _)| n.to_lowercase()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(names, sorted, "the list is shown as-is: {names:?}");
+        // ...and it really is filtered. A full macOS carries several hundred
+        // faces and only a few dozen of them are monospace; a scan that had
+        // stopped testing `face_is_fixed_width` would return everything.
+        assert!(
+            fonts.len() < 200,
+            "{} fonts is the whole font book, not the monospace ones",
+            fonts.len()
+        );
+    }
+
     #[test]
     fn a_prose_face_with_no_font_behind_it_becomes_the_mono_face_and_not_nothing() {
         let mono = face_key(18, scene_cut(in_family(100, Family::Mono)));

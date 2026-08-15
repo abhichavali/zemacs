@@ -103,6 +103,20 @@ pub struct Overlay {
     pub face: Option<HlKind>,
     /// Background, from the same table. `None` leaves the pane's.
     pub background: Option<HlKind>,
+    /// Foreground as a literal colour, outranking [`Overlay::face`] where both
+    /// are set — and the exception the ponytail note at the top of this file
+    /// named, arriving for the one producer that cannot use the rule.
+    ///
+    /// A face name follows a theme change, which is why everything a *config*
+    /// puts on a buffer says one. A terminal's grid is 24-bit colour chosen by
+    /// the child: `face-list` has no word for `#5f8700`, there is no theme
+    /// change that should move it, and the frozen scrollback has to be the same
+    /// colours the live grid was drawing a moment earlier. So this pair is
+    /// written by `zemacs-app`'s terminal and by nothing else; no `OverlayEdit`
+    /// carries it, so Lisp still speaks only in face names.
+    pub fg_rgb: Option<[f32; 3]>,
+    /// Background, same rule, outranking [`Overlay::background`].
+    pub bg_rgb: Option<[f32; 3]>,
     /// Drawn *instead of* the covered text — org-modern bullets, org-appear,
     /// ghost text. The cells are replaced, so wrapping and the cursor follow.
     pub display: Option<String>,
@@ -213,6 +227,8 @@ impl Overlay {
             end,
             face: None,
             background: None,
+            fg_rgb: None,
+            bg_rgb: None,
             display: None,
             image: None,
             scale: None,
@@ -303,11 +319,35 @@ pub enum OverlayEdit {
 #[derive(Default)]
 pub struct Overlays {
     live: Vec<Overlay>,
+    /// Whether an edit has collapsed an overlay out of existence since anyone
+    /// last asked. See [`Overlays::take_dropped`].
+    dropped: bool,
 }
 
 impl Overlays {
     pub fn add(&mut self, id: OverlayId, start: usize, end: usize) {
         self.live.push(Overlay::new(id, start, end));
+    }
+
+    /// [`Overlays::add`] with the payload filled in before it lands.
+    ///
+    /// The bulk path, and it exists for a cost rather than for taste: [`edit`]
+    /// finds its overlay by scanning the list, which is nothing for the handful
+    /// a config places by hand and quadratic for the thousands a frozen terminal
+    /// places at once — one per coloured run of its scrollback, four attributes
+    /// each. Same overlay, same list, no scan.
+    ///
+    /// [`edit`]: Overlays::edit
+    pub fn add_with(
+        &mut self,
+        id: OverlayId,
+        start: usize,
+        end: usize,
+        f: impl FnOnce(&mut Overlay),
+    ) {
+        let mut o = Overlay::new(id, start, end);
+        f(&mut o);
+        self.live.push(o);
     }
 
     /// In creation order, which is the order the renderer resolves them in:
@@ -318,6 +358,17 @@ impl Overlays {
 
     pub fn span(&self, id: OverlayId) -> Option<(usize, usize)> {
         self.live.iter().find(|o| o.id == id).map(|o| (o.start, o.end))
+    }
+
+    /// The bitmap this overlay names, if it is live and names one.
+    ///
+    /// Two `None`s in one answer, and the caller that wanted this cares about
+    /// the difference: the outer says there is no such overlay, the inner says
+    /// there is one and it carries no image. [`Editor::apply`] asks on the way
+    /// *into* an [`OverlayEdit::Image`] to find out whether the edit displaces a
+    /// bitmap or merely puts the first one on.
+    pub fn image(&self, id: OverlayId) -> Option<Option<ImageId>> {
+        self.live.iter().find(|o| o.id == id).map(|o| o.image)
     }
 
     /// Everything overlapping `[start, end)`, in creation order.
@@ -393,26 +444,63 @@ impl Overlays {
     /// `make-overlay` takes in Emacs. Nothing has wanted the other three
     /// combinations; adding them is two booleans on [`Overlay`] and two
     /// arguments on the primitive.
-    pub fn adjust(&mut self, start: usize, removed: usize, inserted: usize) {
+    ///
+    /// Answers whether an overlay went, because the caller's real question is
+    /// "could this edit have orphaned a bitmap" and this is the only place that
+    /// knows.
+    pub fn adjust(&mut self, start: usize, removed: usize, inserted: usize) -> bool {
         for o in &mut self.live {
             o.start = adjust_pos(o.start, Insertion::Stay, start, removed, inserted);
             o.end = adjust_pos(o.end, Insertion::Stay, start, removed, inserted);
         }
-        // An edit that swallowed the whole range collapses both ends onto its
-        // own start. Emacs would keep the empty overlay; we drop it, because
-        // every payload here is *about* the text underneath — a `display` string
-        // over no text would still be drawn, which is a ghost nobody asked for.
-        self.live.retain(|o| o.start < o.end);
+        self.drop_collapsed()
     }
 
     /// Pull every overlay back inside a document that was replaced under them —
-    /// undo restores a whole snapshot, so positions are all that survive.
-    pub fn clamp(&mut self, len: usize) {
+    /// undo restores a whole snapshot, so positions are all that survive. Same
+    /// answer as [`Overlays::adjust`], for the same reason.
+    pub fn clamp(&mut self, len: usize) -> bool {
         for o in &mut self.live {
             o.start = o.start.min(len);
             o.end = o.end.min(len);
         }
+        self.drop_collapsed()
+    }
+
+    /// Throw away the overlays whose two ends have just met, and say whether
+    /// there were any.
+    ///
+    /// An edit that swallowed the whole range collapses both ends onto its own
+    /// start. Emacs would keep the empty overlay; we drop it, because every
+    /// payload here is *about* the text underneath — a `display` string over no
+    /// text would still be drawn, which is a ghost nobody asked for.
+    ///
+    /// The *answer* is worth returning because one of those payloads is an
+    /// image, and the overlay that just went may have been the last thing
+    /// naming a few hundred KB of rasterised LaTeX. Sweeping for that costs a
+    /// walk over every buffer, so it must happen when an overlay actually went
+    /// and not on every keystroke.
+    fn drop_collapsed(&mut self) -> bool {
+        let before = self.live.len();
         self.live.retain(|o| o.start < o.end);
+        let dropped = self.live.len() < before;
+        self.dropped |= dropped;
+        dropped
+    }
+
+    /// Has an edit dropped an overlay since this was last asked?
+    ///
+    /// The flag exists because the two ends of the question are five frames
+    /// apart: the drop happens in `Buffer::splice`, and the bitmaps belong to
+    /// the `Editor` above it, so the answer cannot simply be returned up a
+    /// stack of private edit methods that all return `()`. It waits here.
+    ///
+    /// *Taken* rather than read, so a sweep that has already happened does not
+    /// happen again on the next edit. Being taken late is harmless — a sweep
+    /// walks every buffer, so it frees exactly the same bitmaps whenever it
+    /// runs — which is what makes leaving the flag on a parked buffer safe.
+    pub fn take_dropped(&mut self) -> bool {
+        std::mem::take(&mut self.dropped)
     }
 }
 
@@ -492,6 +580,35 @@ mod tests {
         assert_eq!(o.span(1), Some((5, 7)));
         o.clamp(3);
         assert_eq!(o.span(1), None, "nothing left for it to be about");
+    }
+
+    /// The signal the image sweep hangs off. It has to be *exact* in both
+    /// directions: a false "yes" is a walk over every buffer on a keystroke,
+    /// and a false "no" is a bitmap that is never freed.
+    #[test]
+    fn an_edit_says_whether_it_dropped_an_overlay() {
+        let dropped = |edit: (usize, usize, usize)| overlay(5, 10).adjust(edit.0, edit.1, edit.2);
+        assert!(!dropped((0, 0, 3)), "an edit before it only slid it");
+        assert!(!dropped((8, 5, 0)), "and one over the tail only clipped it");
+        assert!(dropped((0, 20, 0)), "this one swallowed it whole");
+
+        let mut o = overlay(5, 10);
+        assert!(o.adjust(0, 20, 0));
+        assert!(!o.adjust(0, 20, 0), "and there is nothing left to drop twice");
+
+        let mut o = overlay(5, 10);
+        assert!(!o.clamp(7));
+        assert!(o.clamp(3));
+
+        // Taken, not read: the sweep the first answer bought must not be paid
+        // for again on the next edit.
+        let mut o = overlay(5, 10);
+        assert!(!o.take_dropped(), "nothing has happened yet");
+        o.adjust(0, 0, 3);
+        assert!(!o.take_dropped(), "and an edit that dropped nothing is nothing");
+        o.adjust(0, 20, 0);
+        assert!(o.take_dropped());
+        assert!(!o.take_dropped(), "asked twice, answered once");
     }
 
     #[test]

@@ -122,7 +122,28 @@ pub fn expand_line(line: &str, tab_width: usize) -> Vec<Cell> {
 /// Offsets in, offsets out: nothing here invents a character, so a substitution
 /// hides text from the *screen* and never from an edit. The buffer is still the
 /// truth about what `x` deletes.
+///
+/// A line with no cells at all is the degenerate entry rather than a second
+/// shape: the walk below is driven by cells and a blank line has none, so the
+/// first substitution is emitted and the loop is never entered.
 pub fn substitute(cells: &[Cell], subs: &[(usize, usize, String)]) -> Vec<Cell> {
+    // The blank line. A `display` string is drawn *instead of* what it covers,
+    // and on an empty line what it covers is nothing — which is a range worth
+    // drawing over anyway: ghost text where a body has yet to be typed, a
+    // separator rule, an equation on a line of its own. Without this the walk
+    // has no first cell to hang off and the string is silently dropped, which
+    // is what made an overlay on a blank line invisible even after the renderer
+    // started handing one over (`on_line`).
+    //
+    // The first substitution wins, which is the same rule the loop applies when
+    // two claim one column — and on a blank line every sub claims that one
+    // column, [`display_subs`] having rebased them all onto `(0, 0)`.
+    if cells.is_empty() {
+        return match subs.first() {
+            Some((s, _, text)) => text.chars().map(|c| (c, *s)).collect(),
+            None => Vec::new(),
+        };
+    }
     let mut out = Vec::with_capacity(cells.len());
     let (mut i, mut si) = (0usize, 0usize);
     while i < cells.len() {
@@ -151,6 +172,33 @@ pub fn substitute(cells: &[Cell], subs: &[(usize, usize, String)]) -> Vec<Cell> 
     out
 }
 
+/// Whether `o` claims any of the buffer line spanning chars `[start, end)`.
+///
+/// Half-open like every offset here: an overlay ending exactly at `start`
+/// stopped on the line before, and one starting exactly at `end` sits on the
+/// newline and belongs to the line after — a diagnostic on the end of one line
+/// must not smear onto the next.
+///
+/// `o.start == start` is the exception a **blank** line forces. An empty line
+/// has `start == end`, so `o.start < end` is false for every overlay ever made
+/// and such a line could carry nothing at all: no ghost text, no separator, no
+/// diagnostic band. On a line with any width the extra clause is already implied
+/// by `o.start < end`, so it costs those lines nothing. What it does *not*
+/// re-admit is the zero-length overlay — `o.end > start` still rejects one that
+/// begins and ends at `start`, exactly as "ended on the line before" does.
+///
+/// Public because the renderer asks the same question, about the payloads that
+/// need no character underneath them (`line_background`, `line_prefix`,
+/// `gutter`), while this asks it about the one that replaces cells. The two
+/// answering differently is precisely the disagreement [`line_cells`] exists to
+/// prevent — the cursor's column and the drawn column would come from two
+/// different ideas of which overlays are on the line. So there is one
+/// definition and render imports it, rather than a copy per crate that is only
+/// correct while both are remembered together.
+pub fn on_line(o: &Overlay, start: usize, end: usize) -> bool {
+    o.end > start && (o.start < end || o.start == start)
+}
+
 /// The substitutions the overlays touching one buffer line — chars
 /// `[start, end)` — ask for, rebased onto it and sorted for [`substitute`].
 ///
@@ -176,7 +224,7 @@ pub fn display_subs<'a>(
 ) -> Vec<(usize, usize, String)> {
     let mut subs: Vec<(usize, usize, String)> = overlays
         .into_iter()
-        .filter(|o| o.end > start && o.start < end && o.display.is_some())
+        .filter(|o| on_line(o, start, end) && o.display.is_some())
         .map(|o| {
             let text = match o.start < start {
                 true => String::new(),
@@ -598,6 +646,40 @@ mod tests {
         assert_eq!(text_of(&line_cells("def", 4, ovs.all(), 4, 7)), "f");
         // ...and a line the overlay does not touch is untouched.
         assert_eq!(text_of(&line_cells("ghi", 4, ovs.all(), 8, 11)), "ghi");
+    }
+
+    /// A line with no characters is the one place a substitution had nothing to
+    /// attach to, and it was invisible twice over: the filter dropped the
+    /// overlay because `o.start < end` cannot hold when `start == end`, and
+    /// [`substitute`] walks cells, of which a blank line has none. So ghost text
+    /// on an empty line, a separator rule, an equation on a line of its own —
+    /// all drew nothing at all.
+    #[test]
+    fn a_display_string_draws_on_a_line_with_no_characters() {
+        // "a\n\nb": line 1 is the blank one, chars [2, 2), and an overlay on it
+        // can only be the newline it ends with — which is how Lisp makes one.
+        let ovs = overlays(&[(1, 2, 3, "— — —")]);
+        let cells = line_cells("", 4, ovs.all(), 2, 2);
+        assert_eq!(text_of(&cells), "— — —");
+        // The cursor on that line is on char 0 of it, which is the front of what
+        // replaced nothing, and the line is as wide as what is drawn.
+        assert_eq!(visual_col(&cells, 0), 0);
+        assert_eq!(char_at_cell(&cells, 3, 0), 0);
+        motion_is_total(&cells, 0);
+
+        // ...and the bend is only for the blank line. A zero-length overlay is
+        // still nothing — it "ended on the line before" like any other — and so
+        // is one that merely ends where this line starts.
+        let mut empty = Overlays::default();
+        empty.add(1, 2, 2);
+        empty.edit(OverlayEdit::Display(1, Some("x".into())));
+        assert!(text_of(&line_cells("", 4, empty.all(), 2, 2)).is_empty());
+        assert!(text_of(&line_cells("", 4, overlays(&[(1, 0, 2, "x")]).all(), 2, 2)).is_empty());
+
+        // An overlay *through* the blank line is a continuation row: it draws on
+        // its own first line and blanks the rest, and a row that is blank on
+        // screen has to stay blank here or a cursor would be reported inside it.
+        assert!(text_of(&line_cells("", 4, overlays(&[(1, 0, 5, "x")]).all(), 2, 2)).is_empty());
     }
 
     /// The documented ceiling, asserted so it is a decision and not a surprise:

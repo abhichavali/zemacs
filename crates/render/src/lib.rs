@@ -231,10 +231,8 @@ pub struct Renderer {
     /// the whole reason the id is a hash of the job and not a counter.
     ///
     /// `None` records an upload that failed, so it is not retried every frame.
-    /// ponytail: nothing evicts, for the same reason nothing evicts core's
-    /// bitmaps — core drops an image when the last overlay naming it goes, and
-    /// the texture then sits there costing a few hundred KB of VRAM until exit.
-    /// Upgrade path: drop entries `editor.image` no longer resolves.
+    /// Swept once a frame by [`evict_images`], which is where the lifetime of an
+    /// entry is written down: core's bitmap is the only thing keeping one alive.
     images: HashMap<ImageId, Option<Texture<'static>>>,
     /// One alpha mask per corner radius — see [`corner_texture`].
     ///
@@ -548,6 +546,10 @@ impl Renderer {
         terminals: &[(BufferId, Screen)],
     ) -> anyhow::Result<()> {
         self.sync(editor)?; // cheap no-op; makes an app-side `sync` call optional
+        // Before anything is drawn, and after `sync` has had its say about a font
+        // change: a preview core has finished with must not keep its pixels in
+        // VRAM for the rest of the session. See [`evict_images`].
+        evict_images(&mut self.images, editor);
         // Start this frame's digest from the two things that move *every* glyph
         // rather than one of them: the size the font is open at, and the size of
         // the canvas they land on. A resize that happens to leave the same
@@ -3536,6 +3538,29 @@ fn image_texture(
     Some(tex)
 }
 
+/// Drop the textures for bitmaps core no longer holds.
+///
+/// The counterpart of [`image_texture`], and the whole of the cache's eviction:
+/// core owns the pixels, so core owns the answer to "is this id still a thing",
+/// and this asks rather than re-deriving it. That is not tidiness. Core keeps a
+/// bitmap alive from three separate roots — a buffer's overlays, a buffer's
+/// *scene*, and the dashboard's logo — and any retain written here from a
+/// narrower reading of "live" would be *stricter* than core's and would throw
+/// away a texture whose bitmap is still on screen. The failure is not a crash:
+/// the image simply stops being drawn, which is `Editor::prune_images`'s own
+/// warning inherited one crate downstream. So there is exactly one predicate,
+/// and it is core's.
+///
+/// Safe to run whenever, because a cache entry is only ever reachable *through*
+/// core: every [`Renderer::blit_image`] caller gets its `&Image` out of
+/// `editor.image`, so an id core has dropped can no longer be drawn and its
+/// texture is unreachable VRAM. Once a frame is soon enough — a texture outlives
+/// its bitmap by at most one frame — and a hash lookup per cached image against
+/// a frame that is already uploading and blitting them does not show up.
+fn evict_images(cache: &mut HashMap<ImageId, Option<Texture<'static>>>, editor: &Editor) {
+    cache.retain(|id, _| editor.has_image(*id));
+}
+
 /// Apply [`STEM_GAMMA`] to a glyph's coverage.
 ///
 /// Done once per glyph, on the way into the cache, so this costs nothing per
@@ -6352,6 +6377,39 @@ mod tests {
             zemacs_core::OverlayEdit::Image(ov, Some(1)),
         ));
         ed
+    }
+
+    /// Both halves of [`evict_images`], and the second is the one worth a test.
+    ///
+    /// A texture for a bitmap core has finished with must go, or a session that
+    /// previews its way down a long org file holds every equation it has ever
+    /// shown in VRAM until it exits. That is the half a `retain` obviously does.
+    ///
+    /// The half a *wrong* retain gets wrong is the logo: it is live, and it is
+    /// live through none of the roots a renderer would think to walk — no overlay
+    /// and no scene names it, it simply belongs to the editor. Anything here that
+    /// re-derived "still in use" from the buffer would evict it, and the symptom
+    /// would be the dashboard's picture going missing some frames after startup,
+    /// nowhere near this function. So the predicate is core's own answer and this
+    /// is what pins it there.
+    ///
+    /// `None` textures throughout: the entries are what is being evicted, and a
+    /// real one would need a window.
+    #[test]
+    fn a_texture_survives_exactly_as_long_as_the_bitmap_it_was_uploaded_from() {
+        // Image 1 is live through an overlay; image 2 through the dashboard's
+        // logo and nothing else; image 3 is an id core no longer has at all.
+        let mut ed = typeset("$x^2$\n", 55, (0, 6));
+        ed.add_image(2, zemacs_core::Image { width: 8, height: 8, depth: 0, rgba: Vec::new() });
+        ed.dashboard.logo = Some(2);
+        assert!(ed.has_image(1) && ed.has_image(2) && !ed.has_image(3));
+
+        let mut cache: HashMap<ImageId, Option<Texture<'static>>> =
+            [1, 2, 3].into_iter().map(|id| (id, None)).collect();
+        evict_images(&mut cache, &ed);
+        assert!(cache.contains_key(&1), "evicted a texture an overlay still names");
+        assert!(cache.contains_key(&2), "evicted the dashboard's logo");
+        assert!(!cache.contains_key(&3), "kept a texture whose bitmap core has dropped");
     }
 
     /// The counting side of an inline image, which is the half that was missing:

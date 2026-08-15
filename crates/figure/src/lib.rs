@@ -37,11 +37,15 @@
 //! rasters *embedded in* an SVG, so the shape is there.
 //!
 //! ponytail: no cache. `zemacs-latex` keeps one on disk because a cold render
-//! shells out to TeX twice and costs a few hundred milliseconds; reading a file
-//! and rasterising it is a millisecond or two, and the in-memory dedupe by id
-//! one layer up already stops it happening twice for the same figure.
+//! shells out to TeX twice and costs a few hundred milliseconds; reading a PNG
+//! and decoding it is a millisecond or two, an SVG of a page's worth of shapes
+//! and labels is a few more, and the in-memory dedupe by id one layer up
+//! already stops either happening twice for the same figure. The one cost here
+//! that was never a millisecond is the *font* scan an SVG needs, which is
+//! hundreds of them and is why [`fonts`] exists.
 
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{bail, Context, Result};
 
@@ -135,24 +139,21 @@ fn is_svg(path: &Path, bytes: &[u8]) -> bool {
 /// directory, which is wherever the editor happened to be launched from.
 ///
 /// System fonts are loaded because a chart's axis labels are text and a figure
-/// whose labels silently vanished is worse than an error. It costs one scan of
-/// the font directories on the first figure of a session; `fontdb` is what
-/// `usvg` caches it in, and `Options` is rebuilt per call — see the ceiling
-/// below.
-///
-/// ponytail: that font scan happens once *per figure*, not once per session,
-/// because `usvg::Options` is built here rather than kept. It is tens of
-/// milliseconds on a machine with a lot of fonts, on the Lisp thread, and only
-/// on a buffer full of SVGs. The fix is a `OnceLock<Arc<fontdb::Database>>`
-/// beside this function the day a curriculum full of plots feels slow to open.
+/// whose labels silently vanished is worse than an error. `Options` is still
+/// rebuilt per call — it is a handful of fields and one of them, the resources
+/// directory, differs per figure — but the expensive field is borrowed from
+/// [`fonts`] rather than filled in again.
 fn render_svg(path: &Path, bytes: &[u8], cap: u32, scale: f32) -> Result<Figure> {
     use resvg::{tiny_skia, usvg};
 
-    let mut opt = usvg::Options {
+    let opt = usvg::Options {
         resources_dir: path.parent().map(|p| p.to_path_buf()),
+        // Not `fontdb_mut()`: that is `Arc::make_mut`, which would deep-copy
+        // every one of the 1693 faces the moment the handle is shared — the
+        // cure costing more than the disease.
+        fontdb: fonts(),
         ..usvg::Options::default()
     };
-    opt.fontdb_mut().load_system_fonts();
 
     let tree = usvg::Tree::from_data(bytes, &opt)
         .with_context(|| format!("cannot parse {}", path.display()))?;
@@ -188,6 +189,48 @@ fn render_svg(path: &Path, bytes: &[u8], cap: u32, scale: f32) -> Result<Figure>
         height: ph,
         rgba: demultiply(&pixmap),
     })
+}
+
+/// The system's fonts, scanned once for the life of the process.
+///
+/// The scan is the whole cost of an SVG figure. Measured on a 420×200 diagram
+/// at 2×, it is a few hundred milliseconds against a cold page cache and 40 ms
+/// warm, where parsing and rasterising the diagram itself is 4 ms — so a
+/// section with ten plots in it spent nearly half a second walking
+/// `/System/Library/Fonts` ten times over, on the Lisp thread, for ten
+/// identical answers. `usvg::Options::fontdb` is an
+/// `Arc<fontdb::Database>` precisely so that answer can be shared, and `usvg`
+/// only ever reads it: a custom `font_resolver` that wants to add a face during
+/// parsing clones the database first, which is a path this crate never takes.
+/// `OnceLock` makes the sharing sound from the Lisp thread, the image thread
+/// and whatever calls this next — the losers of the race drop their own scan
+/// and take the winner's.
+///
+/// The first figure of a session still pays, and pays on whichever thread
+/// happens to draw it. That is tolerable where it lands today because it lands
+/// on the Lisp thread during `org-inline-images`, which is already the slow
+/// part of opening a document full of figures and is not a keystroke. If a
+/// half-second stall on the *first* `.org` file ever gets noticed, the fix is
+/// to call [`load`] on anything at all from `zemacs-app`'s startup — this is
+/// deliberately not done here, because a library crate that spawns a thread on
+/// first use is a library crate you cannot reason about.
+///
+/// ponytail: one database for every figure, so a per-document font path — a
+/// `#+FONTS:` header, a figure that ships its own `.ttf` — would have to bypass
+/// this rather than extend it. Nothing passes per-figure font configuration
+/// today ([`load`] takes a path, a width and a scale, and its one caller is
+/// `rs_image_file`), so there is nothing to break. The upgrade is `usvg`'s own
+/// `font_resolver`, which is built for exactly that and takes this database as
+/// its base.
+fn fonts() -> Arc<resvg::usvg::fontdb::Database> {
+    static FONTS: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
+    FONTS
+        .get_or_init(|| {
+            let mut db = resvg::usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            Arc::new(db)
+        })
+        .clone()
 }
 
 /// tiny-skia paints in premultiplied alpha and `zemacs_core::Image` is straight,
@@ -353,6 +396,52 @@ mod tests {
         // and the cap says 3, so it comes back at 3 rather than at 4 or at 1.
         let capped = load(&path, 3, 2.0).expect("capped");
         assert_eq!(capped.width, 3);
+    }
+
+    /// The shared font database is shared, and sharing it changes no pixels.
+    ///
+    /// Two halves of one claim. That [`fonts`] hands back the same allocation
+    /// twice is the whole point of the `OnceLock` and is checked by pointer
+    /// rather than by clock — a timing assertion would say the same thing and
+    /// would say it flakily on a machine with three fonts installed, where the
+    /// scan this saves costs nothing to begin with.
+    ///
+    /// That the sharing is *inert* is the risk it introduced, so a second
+    /// figure with different text and a different directory is rendered in
+    /// between, and the first one is rendered again afterwards and must come
+    /// back byte for byte. Text on purpose: a figure with no `<text>` in it
+    /// never touches the database and would prove nothing.
+    #[test]
+    fn one_font_database_is_shared_and_leaks_nothing_between_figures() {
+        let dir = std::env::temp_dir().join("zemacs_figure_fonts_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let label = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    r##"<svg xmlns="http://www.w3.org/2000/svg" width="60" height="20">
+                          <text x="2" y="14" font-family="serif" font-size="12"
+                                fill="#000000">{text}</text>
+                        </svg>"##
+                ),
+            )
+            .unwrap();
+            path
+        };
+
+        assert!(
+            Arc::ptr_eq(&fonts(), &fonts()),
+            "the font database was scanned twice"
+        );
+
+        let a = label("a.svg", "one");
+        let first = load(&a, 0, 2.0).expect("a");
+        let _other = load(&label("b.svg", "two"), 0, 1.0).expect("b");
+        let again = load(&a, 0, 2.0).expect("a again");
+
+        assert_eq!((first.width, first.height), (again.width, again.height));
+        assert_eq!(first.rgba, again.rgba, "a figure changed under a sibling");
     }
 
     /// The maximum is a maximum: a figure narrower than it is untouched, and a

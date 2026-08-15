@@ -18,7 +18,7 @@
 ;;;;   (lsp-goto-definition)      jump to the definition under the cursor
 ;;;;   (lsp-diagnostics-at-point) echo the diagnostic on this line
 ;;;;   (lsp-list-diagnostics)     every diagnostic, in a buffer
-;;;;   (lsp-status)               what is running
+;;;;   (lsp-status)               what is running, and which binary it is
 ;;;;   (lsp-diagnostics &optional path)   the data, for anything that draws it
 ;;;;   (lsp-complete)             ask for completions here, and pop them up
 ;;;;   (lsp-complete-next) (lsp-complete-previous)
@@ -209,8 +209,10 @@ would `probe-file' its way to the root of the disk. A project that grows a
            ;; The mode names we already know a language id for. Not a closed set
            ;; — nothing is required to match, so registering for a mode that is
            ;; not in the table is still a matter of typing it.
-           (list (cons "Mode: " (lambda () (mapcar #'car *lsp-language-ids*)))
-                 (cons "Program: " :string))))
+           ;; `(LABEL SOURCE PREVIEW)', the shape the macro builds — a third slot
+           ;; because a candidate prompt can preview, and neither of these does.
+           (list (list "Mode: " (lambda () (mapcar #'car *lsp-language-ids*)) nil)
+                 (list "Program: " :string nil))))
 
 (defvar *lsp-language-ids*
   '(("python-mode" . "python") ("c-mode" . "c") ("rust-mode" . "rust")
@@ -290,6 +292,23 @@ which is the only answer an editor with no half-characters can give."
   "Point as an LSP `Position'. LSP counts lines from 0 and `line-number' from 1."
   (jobj "line" (1- (line-number))
         "character" (%lsp-utf16-column (line-string) (column))))
+
+(defun %lsp-offset-at (position)
+  "The buffer offset of an LSP `Position', or NIL when it names no line here.
+
+The inverse of `%lsp-point-position', against the *live* buffer. `line-start'
+and `line-string' both count from 1 and LSP counts from 0, and the column
+arrives in UTF-16 code units — see the note above — so this is the one place
+both conversions happen and every caller gets a character offset like everything
+else in the image.
+
+NIL rather than a clamp for a line past the end: a range naming a line the
+buffer has not got is a reply about a document that has moved on, and a caller
+that silently used the last line would edit the wrong place rather than none."
+  (let ((line (1+ (or (jget position "line") 0)))
+        (units (or (jget position "character") 0)))
+    (when (<= line (line-count))
+      (+ (line-start line) (%lsp-char-column (line-string line) units)))))
 
 (defun %lsp-position-in (text at)
   "The LSP `Position' of the character offset AT in TEXT, a whole document."
@@ -386,22 +405,115 @@ along with the rest of a session's state.")
         "workspace" (jobj "workspaceFolders" :false
                           "configuration" :false)))
 
+;;; ---------------------------------------------------------------------------
+;;; The project's own tools
+;;;
+;;; A language server started off `$PATH' is the *editor's* server, and for
+;;; Python that is nearly always the wrong one: `pylsp' resolves imports against
+;;; the interpreter it is installed under, so a globally-installed one reports
+;;; every dependency in your `uv' project as missing and offers completions from
+;;; a site-packages nobody asked about.
+;;;
+;;; Two answers, and both are needed because they fix different halves.
+;;;
+;;;   1. *Run the project's copy when there is one.* `.venv/bin/pylsp' is the
+;;;      server that already knows about the project, and running it needs no
+;;;      configuration at either end. Generalised past Python on purpose: the
+;;;      same rule finds `node_modules/.bin/typescript-language-server', which
+;;;      is the same problem in another ecosystem.
+;;;
+;;;   2. *Tell a global one where the interpreter is.* `uv` installs no server
+;;;      into a project by default, so the common case is a global `pylsp' and a
+;;;      local `.venv'. `pylsp' reads `pylsp.plugins.jedi.environment' — a path
+;;;      to the venv's `python' — and that reaches it through the settings below.
+
+(defparameter *lsp-local-bin* '(".venv/bin" "venv/bin" ".direnv/python/bin"
+                                "node_modules/.bin")
+  "Directories under a project root that may hold the project's own tools, in
+precedence order. A server found in one of these is used instead of the one on
+`$PATH', because it is by construction the one that knows about this project.
+
+`uv', `venv' and `virtualenv' all write `.venv/'; `poetry' can be pointed at it
+with `virtualenvs.in-project'. A poetry install left in poetry's cache is not
+found and is the case `*lsp-settings*' covers instead.")
+
+(defun %lsp-venv (root)
+  "The virtualenv for ROOT, as a directory, or NIL.
+
+Looked for in the project rather than in the environment, deliberately: the
+editor was started from your login shell and `$VIRTUAL_ENV' there — if it is set
+at all — names whichever project you last activated, which is the wrong answer
+in every window but one. A `.venv' beside the `pyproject.toml' is a fact about
+the project and is right in all of them."
+  (dolist (dir '(".venv" "venv"))
+    (let ((python (merge-pathnames (format nil "~a/bin/python" dir)
+                                   (%lsp-directory root))))
+      (when (probe-file python)
+        (return (namestring (merge-pathnames (format nil "~a/" dir)
+                                             (%lsp-directory root))))))))
+
+(defun %lsp-directory (path)
+  "PATH as a directory pathname, whether or not it was spelled with a slash."
+  (let ((s (namestring path)))
+    (pathname (if (and (plusp (length s)) (char= (char s (1- (length s))) #\/))
+                  s
+                  (concatenate 'string s "/")))))
+
+(defun %lsp-program-for (program root)
+  "PROGRAM as it should be run for ROOT: the project's copy when there is one.
+
+An absolute path when it is found and the bare name otherwise, which is what
+leaves a machine with no virtualenv behaving exactly as it did."
+  (or (dolist (dir *lsp-local-bin*)
+        (let ((candidate (merge-pathnames (format nil "~a/~a" dir program)
+                                          (%lsp-directory root))))
+          (when (probe-file candidate) (return (namestring candidate)))))
+      program))
+
+(defparameter *lsp-settings* (make-hash-table :test #'equal)
+  "MODE -> a function of ROOT answering this server's settings, as a JSON object
+keyed by the *section* a server asks for: `(jobj \"pylsp\" (jobj ...))'.
+
+Sent as `workspace/didChangeConfiguration' once the handshake is done, and used
+to answer `workspace/configuration' when a server asks instead. Both, because
+servers differ about which they read and neither costs anything.
+
+  (setf (gethash \"go-mode\" *lsp-settings*)
+        (lambda (root) (declare (ignore root)) (jobj \"gopls\" (jobj \"usePlaceholders\" t))))")
+
+(defun %lsp-settings-for (key)
+  "The settings object for a session, or NIL when its mode declares none."
+  (let ((f (gethash (%lsp-get key :mode) *lsp-settings*)))
+    (and f (ignore-errors (funcall f (%lsp-get key :root))))))
+
 (defun %lsp-start (mode root)
   "Spawn the server for MODE at ROOT and begin the handshake. Answers the
 session KEY, or NIL if the program could not be started."
   (let* ((spec (gethash mode *lsp-servers*))
          (key (%lsp-key mode root))
+         ;; The project's own copy when there is one — see `%lsp-program-for'.
+         ;; Resolved per *root* rather than once at registration, because the
+         ;; whole point is that two projects want two different binaries.
+         (program (and spec (%lsp-program-for (getf spec :program) root)))
          (conn (and spec
-                    (rpc-start (getf spec :program)
+                    (rpc-start program
                                :args (getf spec :args)
                                :cwd root
+                               ;; The bare name in the report: an absolute path
+                               ;; to a `.venv' is forty characters of noise in a
+                               ;; status line that has to fit a message beside it.
                                :name (getf spec :program)
                                :on-notify #'%lsp-notification
                                :on-request #'%lsp-request
                                :on-exit #'%lsp-exit))))
     (when conn
       (setf (gethash key *lsp-sessions*)
+            ;; `:program' is the *resolved* one — `.venv/bin/pylsp' where the
+            ;; project has its own copy — and is kept because it is the answer
+            ;; `lsp-status' exists to give. The bare name in `:name' above goes
+            ;; to the status line; this is the one that says which binary.
             (list :conn conn :mode mode :root root :state :starting
+                  :program program
                   :queue nil :opened nil :versions nil))
       (setf (gethash conn *lsp-conn-keys*) key)
       (rpc-request conn "initialize"
@@ -433,6 +545,16 @@ never acts on would be writing down its own wishes."
        (%lsp-forget key))
       (t
        (rpc-notify conn "initialized" :empty-object)
+       ;; What this project's server should know about this project — the venv,
+       ;; mostly. Sent unconditionally rather than waiting to be asked, because
+       ;; `pylsp' reads this notification and only *some* servers ask with
+       ;; `workspace/configuration'; the ones that ask get the same answer from
+       ;; `%lsp-request'. Straight after `initialized', which is the first
+       ;; moment anything may be sent at all.
+       (let ((settings (%lsp-settings-for key)))
+         (when settings
+           (rpc-notify conn "workspace/didChangeConfiguration"
+                       (jobj "settings" settings))))
        ;; `completionProvider' is an *object* when the server completes and
        ;; absent when it does not, so its presence is the whole test. Recorded
        ;; rather than asked per keystroke, and honoured rather than ignored:
@@ -454,6 +576,14 @@ never acts on would be writing down its own wishes."
                    (if (eql 2 (if (integerp sync) sync (jget sync "change")))
                        :incremental
                        :full)))
+       ;; `serverInfo' is optional and most servers send it. Kept for the
+       ;; listing and nothing else: knowing you are talking to pylsp 1.12
+       ;; rather than 1.9 is half of every "that used to work" report.
+       (%lsp-set key :server-info
+                 (let ((info (jget result "serverInfo")))
+                   (when info
+                     (format nil "~a~@[ ~a~]"
+                             (jget info "name") (jget info "version")))))
        (%lsp-set key :state :ready)
        ;; In order: the didOpen that started all this has to precede the
        ;; didChanges that piled up behind it.
@@ -477,10 +607,30 @@ buffer had become."
 
 (defun %lsp-forget (key)
   "Drop the session without talking to the child — for a server that has already
-died or never came up."
+died or never came up.
+
+**Its diagnostics go with it**, and that is the whole of `lsp-stop' actually
+stopping. A server's findings live in `*lsp-diagnostics*' and are drawn from
+there, so hanging up the process left every error it had ever published on
+screen: `SPC l q' in a Python buffer took `pylsp' down and the ruff plugin's
+complaints stayed in the gutter, which reads as a server that would not quit.
+Nothing was still running — the marks were a photograph.
+
+Here rather than in `lsp-stop' because this is the funnel: a server that dies on
+its own comes through the same door, and a crashed `clangd' leaving its last
+opinion pinned to your file is the same bug arrived at without anyone pressing a
+key.
+
+The clearing is `%lsp-drop-diagnostics', which lives with the table it empties
+rather than here — a *forward* call, which is ordinary in Common Lisp where a
+forward reference to a variable would not be: this file is loaded as source, so
+the function is resolved when it is called and everything below has been read by
+then."
   (let ((conn (%lsp-get key :conn)))
     (when conn (remhash conn *lsp-conn-keys*))
-    (dolist (path (%lsp-get key :opened)) (remhash path *lsp-shadow*))
+    (dolist (path (%lsp-get key :opened))
+      (remhash path *lsp-shadow*)
+      (%lsp-drop-diagnostics path))
     (remhash key *lsp-sessions*)))
 
 ;;; ---------------------------------------------------------------------------
@@ -577,6 +727,27 @@ it without touching a character — those used to cost a whole document each."
                                       (%lsp-content-change old new))
                                  (jobj "text" new))))))))
 
+(defvar *lsp-stopped* (make-hash-table :test #'equal)
+  "Session keys you stopped *on purpose*, which `lsp-ensure' will not start again.
+
+`lsp-ensure' is on `after-change-hook' and starts a server for any buffer that
+has none, which is what makes a server appear without being asked for — and what
+made `lsp-stop' last exactly until the next keystroke. Something has to remember
+that you meant it.
+
+A key and not a buffer, because a key is `(MODE ROOT)': stopping `pylsp' in one
+checkout leaves the one in another running, and stopping it once covers every
+Python file in that project rather than the one you happened to be in.
+
+**Only `lsp-stop' writes here.** A server that *died* is not a server you
+stopped, and the self-repair on the next keystroke that `%lsp-forget' exists for
+is worth keeping — a crashed `clangd' coming back on its own is the behaviour,
+not a bug. `lsp' and `lsp-restart' clear the entry, because asking for one by
+name is how you say you have changed your mind.
+
+DEFVAR and not DEFPARAMETER: a config reload re-reads this file, and forgetting
+which servers you had stopped would start them all again on your next keystroke.")
+
 (defun lsp-ensure ()
   "Make sure the live buffer's server is running and has the buffer's text.
 
@@ -588,7 +759,12 @@ and a mode with no server registered all fall out on the first test."
     (when (and path (not (buffer-read-only-p)) (gethash mode *lsp-servers*))
       (let* ((root (%lsp-root-for path))
              (key (%lsp-key mode root)))
-        (unless (gethash key *lsp-sessions*) (setf key (%lsp-start mode root)))
+        (unless (gethash key *lsp-sessions*)
+          ;; Stopped by hand: leave it stopped. `lsp' and `lsp-restart' are the
+          ;; two ways back, and both of them say so out loud.
+          (when (gethash key *lsp-stopped*)
+            (return-from lsp-ensure nil))
+          (setf key (%lsp-start mode root)))
         (when key
           (if (member path (%lsp-get key :opened) :test #'string=)
               (%lsp-did-change key path)
@@ -715,6 +891,20 @@ new wrong one; zeroing it would be worse than both."
       (when (equal path (buffer-file-name)) (%lsp-echo-summary rows))
       (dolist (f *lsp-diagnostics-functions*) (ignore-errors (funcall f path))))))
 
+(defun %lsp-drop-diagnostics (path)
+  "Forget everything said about PATH and tell the gutter so.
+
+The other end of `%lsp-publish-diagnostics', and announced the same way — the
+marks come off through the code that put them on, rather than through a second
+route that would have to be kept in step with it. Called when a session goes,
+which is `%lsp-forget' and is where the reason is written down.
+
+`ignore-errors' per handler, as the publish does: a config's own function
+signalling must cost it the repaint and not the rest of the shutdown."
+  (remhash path *lsp-diagnostics*)
+  (dolist (f *lsp-diagnostics-functions*) (ignore-errors (funcall f path)))
+  nil)
+
 (defun %lsp-echo-summary (rows)
   (let ((errors (count 1 rows :key #'third))
         (warnings (count 2 rows :key #'third)))
@@ -747,15 +937,24 @@ same answer back."
 ;;; the sketch there says: the seam fires with a path, this repaints if that
 ;;; path is the one on screen, and not a line above this point knows it exists.
 ;;;
-;;; A *mark in the margin* rather than a colour on the offending text, and the
-;;; reason is the face list. An overlay's colours are named from `face-list' so
-;;; that a theme change recolours them for free — which is the right trade
-;;; everywhere else and is the wrong one here, because there is no `error' face
-;;; in that list and there is no room to add one from Lisp. Colouring
-;;; diagnostics would mean spending `keyword' or `string' on them with
-;;; `set-syntax-color', and that changes what every keyword in every buffer
-;;; looks like. Severity goes in the *shape* of the mark instead, which no theme
-;;; can take away and which reads the same in a light theme and a dark one.
+;;; A *mark in the margin* rather than a colour on the offending text, and that
+;;; half has not changed: a mark moves nothing and covers nothing, and its shape
+;;; reads the same in a light theme as in a dark one.
+;;;
+;;; What has changed is that the mark now has a colour of its own. This note used
+;;; to say it could not: an overlay's colours are named from `face-list', there
+;;; was no `error' face in that list and no room to add one from Lisp, so
+;;; colouring a diagnostic meant spending `keyword' or `string' on it and
+;;; changing what every keyword in every buffer looked like. `error' and
+;;; `warning' are in the list now — added for this, and for dired's deletion
+;;; flag, which was stuck on the same rock.
+;;;
+;;; Shape *and* colour, not colour instead of shape. The two say different
+;;; things: the glyph survives a theme that leaves both faces unset (they are
+;;; optional, and fall back to a shade of the body colour), and the colour is
+;;; what makes an error findable in a file with forty hints in it. Information
+;;; and hint stay uncoloured on purpose — a gutter where every row is painted is
+;;; a gutter with nothing in it that stands out.
 ;;;
 ;;; `gutter' is the property, and it used to be `line-prefix' — which was a bug
 ;;; and a visible one. A prefix *pushes its line right by its own width*, which
@@ -803,6 +1002,14 @@ Severities are 1 error, 2 warning, 3 information, 4 hint, as `*lsp-diagnostics*'
 records them. A `defparameter' because it is the whole of the taste here: change
 the strings, or set it to NIL to stop drawing marks at all.")
 
+(defparameter *lsp-diagnostic-faces*
+  '((1 . "error") (2 . "warning"))
+  "Severity -> the face its gutter mark is drawn in.
+Severities absent from this list take the gutter's own colour, which is what
+information and hint want: a margin where every row is painted has nothing in it
+that stands out. Both faces are optional in a theme and fall back to a shade of
+the body colour, so a theme that names neither loses the hue and keeps the mark.")
+
 (defvar *lsp-diagnostic-overlays* (make-hash-table :test #'equal)
   "Path -> the overlay handles drawn in that path's buffer.
 Per path rather than one list, because an overlay belongs to exactly one buffer
@@ -830,6 +1037,8 @@ nothing there to mark."
     (when ov
       (overlay-put ov 'gutter
                    (or (cdr (assoc severity *lsp-diagnostic-marks*)) "?"))
+      (let ((face (cdr (assoc severity *lsp-diagnostic-faces*))))
+        (when face (overlay-put ov 'face face)))
       ;; What the pointer resting on that mark says. The same string `SPC l e'
       ;; echoes, from the same function, because the shape of the mark tells you
       ;; only *that* something is wrong and both of these tell you what.
@@ -936,8 +1145,20 @@ has to be answered or the server waits forever."
   (cond ((string= method "window/workDoneProgress/create") (rpc-respond conn id nil))
         ((string= method "client/registerCapability") (rpc-respond conn id nil))
         ((string= method "workspace/configuration")
-         ;; One null per requested item: "no setting, use your default".
-         (rpc-respond conn id (mapcar (constantly nil) (jget params "items"))))
+         ;; One answer per requested item, in the order asked. A server names
+         ;; the *section* it wants — `pylsp', `gopls' — and gets that key out of
+         ;; whatever `*lsp-settings*' answered for its mode, or NIL for "no
+         ;; setting, use your default", which is what every item used to get.
+         ;;
+         ;; The same object the `didChangeConfiguration' above sent, so a server
+         ;; that reads one, the other, or both cannot be told two different
+         ;; things about the same project.
+         (let ((settings (%lsp-settings-for (gethash conn *lsp-conn-keys*))))
+           (rpc-respond conn id
+                        (mapcar (lambda (item)
+                                  (let ((section (jget item "section")))
+                                    (and settings section (jget settings section))))
+                                (jget params "items")))))
         (t (rpc-respond conn id nil
                         (jobj "code" -32601
                               "message" (format nil "~a is not implemented" method))))))
@@ -960,7 +1181,12 @@ has to be answered or the server waits forever."
           ((null (gethash mode *lsp-servers*))
            (message (format nil "lsp: no server registered for ~a" mode)))
           ((lsp-session-for-buffer) (message "lsp: already running"))
-          (t (lsp-ensure))))
+          (t
+           ;; Asking for one by name is how you take a deliberate stop back —
+           ;; see `*lsp-stopped*'. Cleared *before* the start, or `lsp-ensure'
+           ;; would decline the very thing it was just told to do.
+           (remhash (%lsp-key mode (%lsp-root-for path)) *lsp-stopped*)
+           (lsp-ensure))))
   nil)
 
 (defun lsp-stop ()
@@ -978,22 +1204,137 @@ has to be answered or the server waits forever."
           (rpc-notify conn "exit")
           (rpc-stop conn)
           (%lsp-forget key)
-          (message (format nil "lsp: stopped ~a" key)))))
+          ;; And remember that you meant it. `lsp-ensure' is on
+          ;; `after-change-hook' and starts a server for any buffer without one,
+          ;; so without this line stopping lasted until the next keystroke — you
+          ;; would stop it, type a character, and watch it come back.
+          (setf (gethash key *lsp-stopped*) t)
+          (message (format nil "lsp: stopped ~a — `M-x lsp' to start it again"
+                           key)))))
   nil)
 
 (defun lsp-restart ()
   "Stop and start again — what you reach for after changing a server's config."
   (lsp-stop)
-  (lsp-ensure)
+  ;; Through `lsp' rather than `lsp-ensure', so the stop `lsp-stop' just
+  ;; recorded is taken back. Restarting is the one gesture that says both
+  ;; things at once.
+  (lsp)
   nil)
 
+(defparameter *lsp-status-buffer* "*lsp*"
+  "The status listing. One buffer, refilled: a second `SPC l s' is a newer
+answer to the same question rather than a second window to close.")
+
+(defun %lsp-status-where (program)
+  "PROGRAM as an answer to \"which binary\".
+
+An absolute path is already the answer — that is `%lsp-program-for' having found
+the project's own copy. A bare name is the case this listing exists for: `pylsp'
+says nothing about *which* pylsp, and the one on `$PATH' is very often not the
+one the project wanted. Resolved when somebody looks rather than remembered at
+start, because a `$PATH' lookup per session is not worth carrying around.
+
+`executable-find' is `modes.lisp''s, which is loaded above this file by the
+shipped config and by the tests — but not necessarily by someone loading the
+client on its own, so it is called the way `%interactive' is."
+  (cond ((null program) "?")
+        ((find #\/ program) program)
+        (t (let ((found (and (fboundp 'executable-find)
+                             (ignore-errors (funcall 'executable-find program)))))
+             (if found
+                 (namestring found)
+                 (format nil "~a (not found on $PATH)" program))))))
+
+(defun %lsp-status-lines (key)
+  "The block describing one running session."
+  (let* ((root (%lsp-get key :root))
+         (where (%lsp-status-where (%lsp-get key :program)))
+         (venv (ignore-errors (%lsp-venv root)))
+         (sync (%lsp-get key :sync))
+         (opened (%lsp-get key :opened))
+         (problems (let ((n 0))
+                     (dolist (path opened n)
+                       (incf n (length (gethash path *lsp-diagnostics*)))))))
+    (list
+     (format nil "~a — ~a" (%lsp-get key :mode)
+             (string-downcase (%lsp-get key :state)))
+     (format nil "  ~10a ~a" "root" root)
+     (format nil "  ~10a ~a" "program" where)
+     ;; The line this whole command was rewritten for. Two ways a server can
+     ;; know about a virtualenv and they are not the same fact: one *inside* it
+     ;; resolves imports against it by construction, where a global one only
+     ;; knows because `*lsp-settings*' told it — see "The project's own tools".
+     ;; A project with a `.venv' and neither is the shape where every import
+     ;; reads as missing, and now it says so instead of you guessing.
+     (format nil "  ~10a ~a" "venv"
+             (cond ((null venv) "none in this project")
+                   ((search venv where)
+                    (format nil "~a  (the server runs from it)" venv))
+                   (t (format nil "~a  (the server was told about it)" venv))))
+     (format nil "  ~10a ~a" "server" (or (%lsp-get key :server-info) "did not say"))
+     (format nil "  ~10a ~a sync, completion ~a" "protocol"
+             (if sync (string-downcase sync) "not negotiated yet")
+             (if (%lsp-get key :completion) "yes" "no"))
+     (format nil "  ~10a ~a open, ~a diagnostic~:p" "documents"
+             (length opened) problems)
+     "")))
+
 (defun lsp-status ()
-  "What is running, and where."
-  (let (rows)
-    (maphash (lambda (key plist)
-               (push (format nil "~a [~a]" key (getf plist :state)) rows))
+  "Every server that is running, where its binary came from, and what it agreed
+to. Bound to `SPC l s'.
+
+A buffer rather than the one-line message this used to echo, because the
+question it is asked is nearly always \"why is this server behaving like that\"
+and the answer is a *path*. A Python project with a `.venv' and a globally
+installed `pylsp' reports every import in it as missing when the two do not
+meet, and neither half of that fits in a status line beside a message.
+
+An ordinary read-only buffer, for `xref-show''s reason: this is a snapshot of an
+answer rather than a view of live state, and re-rendering it would mean asking
+every server again.
+
+ponytail: no `q' and no major mode, so it is left by switching buffers like any
+other. A mode wants `define-derived-mode', which is a macro this file cannot use
+at the top level — see the note on `lsp-register-server' — and one binding is
+not yet worth the escape hatch."
+  (let ((lines (list "zemacs LSP" ""))
+        (keys nil))
+    (maphash (lambda (key plist) (declare (ignore plist)) (push key keys))
              *lsp-sessions*)
-    (message (if rows (format nil "lsp: ~{~a~^, ~}" rows) "lsp: nothing running"))))
+    (if (null keys)
+        (setf lines (append lines (list "No server is running." "")))
+        (dolist (key (sort keys #'string<))
+          (setf lines (append lines (%lsp-status-lines key)))))
+    ;; What *could* run, which is the other half of "why is nothing happening in
+    ;; this buffer": a mode with no entry at all reads differently from one you
+    ;; stopped by hand, and both read differently from one that simply has no
+    ;; file open yet.
+    (let (rows)
+      (maphash (lambda (mode spec)
+                 (push (format nil "  ~16a ~a~{ ~a~}" mode
+                               (getf spec :program) (getf spec :args))
+                       rows))
+               *lsp-servers*)
+      (setf lines (append lines (list "Registered for" "")
+                          (sort rows #'string<))))
+    (let (rows)
+      (maphash (lambda (key value)
+                 (declare (ignore value))
+                 (push (format nil "  ~a" key) rows))
+               *lsp-stopped*)
+      (when rows
+        (setf lines (append lines
+                            (list "" "Stopped by hand — `M-x lsp' takes it back" "")
+                            (sort rows #'string<)))))
+    (create-buffer *lsp-status-buffer*)
+    (set-buffer-read-only nil)
+    (delete-region (point-min) (point-max))
+    ;; One `insert' for the whole listing — the same reason `xref-show' gives.
+    (insert (format nil "~{~a~%~}" lines))
+    (goto-char (point-min))
+    (set-buffer-read-only t))
+  nil)
 
 (defun %lsp-goto-location (loc)
   "Jump to a Location or a LocationLink. `find-file-at' is the only way to open
@@ -1028,6 +1369,575 @@ cursor in the buffer being left."
                  ((consp result) (%lsp-goto-location (first result)))
                  (t (message "lsp: no definition found")))))))
   nil)
+
+;;; ---------------------------------------------------------------------------
+;;; The rest of the jumps
+;;;
+;;; Four methods with one shape. `definition' answers where a thing is written;
+;;; `declaration' where it was announced (a C header, an `extern'), and the two
+;;; differ in exactly the languages where the distinction is the point;
+;;; `typeDefinition' where the *type* of the expression under point is written,
+;;; which is how you get from a `let x = foo()' to the struct without reading
+;;; `foo'; `implementation' the other way down, from a trait or an interface to
+;;; the things that satisfy it.
+;;;
+;;; Written as a table rather than four near-identical functions, and then four
+;;; `defun's over it, because `M-x' finds its candidates by asking ECL for a
+;;; symbol's lambda list — a closure stuffed into `fdefinition' has none to
+;;; report and would never be offered. Same reason `define-derived-mode' spells
+;;; its commands out.
+
+(defun %lsp-jump (method what)
+  "Ask METHOD for a place and go there. WHAT names it in the failure message."
+  (let ((key (lsp-session-for-buffer))
+        (path (buffer-file-name)))
+    (if (null key)
+        (message "lsp: no server for this buffer")
+        (rpc-request
+         (%lsp-get key :conn) method
+         (jobj "textDocument" (jobj "uri" (lsp-path-uri path))
+               "position" (%lsp-point-position))
+         (lambda (result error)
+           (cond (error (message (format nil "lsp: ~a" (jget error "message"))))
+                 ((null result) (message (format nil "lsp: no ~a found" what)))
+                 ;; A Location has a `uri'; a list of them, or of LocationLinks,
+                 ;; does not — take the first, which is what every editor does.
+                 ((jget result "uri") (%lsp-goto-location result))
+                 ((jget result "targetUri") (%lsp-goto-location result))
+                 ((consp result) (%lsp-goto-location (first result)))
+                 (t (message (format nil "lsp: no ~a found" what))))))))
+  nil)
+
+(defun lsp-goto-declaration ()
+  "Jump to where the thing under the cursor was *declared*."
+  (%lsp-jump "textDocument/declaration" "declaration"))
+
+(defun lsp-goto-type-definition ()
+  "Jump to the definition of the *type* of the thing under the cursor."
+  (%lsp-jump "textDocument/typeDefinition" "type definition"))
+
+(defun lsp-goto-implementation ()
+  "Jump to what implements the thing under the cursor."
+  (%lsp-jump "textDocument/implementation" "implementation"))
+
+;;; ---------------------------------------------------------------------------
+;;; Hover
+;;;
+;;; The signature and the docstring of whatever is under the cursor, which is
+;;; the single most-used thing an IDE does and had no way to be asked for here.
+;;;
+;;; A *buffer*, and the entry above this one is why the shape took a while to
+;;; settle: this file used to say hover wanted "a transient paragraph near
+;;; point, which is neither the one-line echo area nor a box you navigate", and
+;;; went looking for a surface. It does not need one. Documentation is prose of
+;;; unbounded length that you read and then dismiss, which is a *buffer* — it is
+;;; what Emacs' `describe-function' has always used, it scrolls, you can yank
+;;; from it, and `q' puts it away. The echo area gets the first line, because a
+;;; signature is usually the whole answer and a buffer that opens for one line
+;;; is a buffer that gets in the way.
+
+(defparameter *lsp-help-buffer* "*lsp-help*")
+
+(define-derived-mode lsp-help-mode nil
+  "Documentation from a language server. `q' puts it away."
+  (set-buffer-read-only t))
+
+(define-mode-key "lsp-help-mode" "q" "lsp-help-quit")
+
+(defun lsp-help-quit ()
+  "Dismiss the documentation buffer."
+  (kill-buffer *lsp-help-buffer*)
+  nil)
+
+(defun %lsp-hover-text (result)
+  "The prose out of a `Hover', whatever of the three shapes it arrived in.
+
+`contents' is a `MarkupContent', a `MarkedString' (a bare string, or an object
+with `language' and `value'), or an array of those — every one of which is
+shipped by something, which is why this is a function and not a `jget'."
+  (let ((c (jget result "contents")))
+    (labels ((one (x)
+               (cond ((stringp x) x)
+                     ((null x) nil)
+                     ((jget x "value"))
+                     (t nil))))
+      (let ((parts (if (and (consp c) (not (%json-object-p c)))
+                       (remove nil (mapcar #'one c))
+                       (remove nil (list (one c))))))
+        (when parts
+          (format nil "~{~a~^~%~%~}" parts))))))
+
+(defun lsp-hover ()
+  "Show what the server knows about the thing under the cursor. Bound to `K'.
+
+One line goes to the echo area and the whole of it to a buffer, which is not two
+answers to one question: the first line of a hover is the signature and is what
+you wanted nine times in ten, and the rest is a paragraph you asked for by
+looking at the buffer that is now open behind it."
+  (let ((key (lsp-session-for-buffer))
+        (path (buffer-file-name)))
+    (if (null key)
+        (message "lsp: no server for this buffer")
+        (rpc-request
+         (%lsp-get key :conn) "textDocument/hover"
+         (jobj "textDocument" (jobj "uri" (lsp-path-uri path))
+               "position" (%lsp-point-position))
+         (lambda (result error)
+           (let ((text (and (null error) result (%lsp-hover-text result))))
+             (cond
+               (error (message (format nil "lsp: ~a" (jget error "message"))))
+               ((or (null text) (zerop (length (string-trim '(#\Space #\Newline) text))))
+                (message "lsp: nothing to say about this"))
+               (t (%lsp-help-show text))))))))
+  nil)
+
+(defun %lsp-help-show (text)
+  "Put TEXT in the documentation buffer, and its first line in the echo area."
+  (let* ((lines (remove "" (split-string text #\Newline) :test #'string=))
+         (first-line (or (first lines) "")))
+    ;; The buffer is opened *before* the message, so the message is what is left
+    ;; on the status line rather than being overwritten by the switch.
+    (create-buffer *lsp-help-buffer*)
+    (set-buffer-read-only nil)
+    (delete-region (point-min) (point-max))
+    (insert text)
+    (goto-char (point-min))
+    (lsp-help-mode)
+    (message first-line))
+  nil)
+
+;;; ---------------------------------------------------------------------------
+;;; Symbols — go to one in this file, or anywhere in the project
+;;;
+;;; `completing-read' over a list the server built, which is the shape every
+;;; picker in this editor has and the reason these are eight lines each rather
+;;; than a feature. The candidate carries its own destination in the text —
+;;; `NAME<TAB>PATH:LINE' — and the callback splits it back out, which is the
+;;; same trick `M-x' plays with its annotations and needs no table beside the
+;;; list.
+
+(defparameter *lsp-symbol-kinds*
+  '((5 . "class") (6 . "method") (9 . "constructor") (11 . "interface")
+    (12 . "function") (13 . "variable") (14 . "constant") (23 . "struct"))
+  "`SymbolKind' -> a word, for the ones worth naming in a picker. Anything else
+is shown without one rather than with a number nobody reads.")
+
+(defun %lsp-symbol-rows (symbols path)
+  "(LABEL . PATH:LINE:) for each `DocumentSymbol' or `SymbolInformation'.
+
+Both shapes are legal and servers ship both: the first nests its children under
+`children' and puts the range on `selectionRange', the second is flat and puts a
+whole `location' on each entry. PATH is the fallback for the flat shape's
+cousin, which may omit the uri."
+  (let (rows)
+    (labels ((walk (list prefix)
+               (dolist (s list)
+                 (let* ((name (or (jget s "name") "?"))
+                        (kind (cdr (assoc (jget s "kind") *lsp-symbol-kinds*)))
+                        (loc (jget s "location"))
+                        (uri (and loc (jget loc "uri")))
+                        (range (or (jget s "selectionRange") (jget s "range")
+                                   (and loc (jget loc "range"))))
+                        (line (1+ (or (jget range "start" "line") 0)))
+                        (where (or (and uri (lsp-uri-path uri)) path))
+                        (label (format nil "~a~a~a" prefix name
+                                       (if kind (format nil "  [~a]" kind) ""))))
+                   (when where
+                     (push (cons label (format nil "~a:~a:" where line)) rows))
+                   ;; Children keep their parent's name in front of them, which
+                   ;; is what makes a method findable by typing the class.
+                   (walk (jget s "children")
+                         (format nil "~a~a." prefix name))))))
+      (walk symbols ""))
+    (nreverse rows)))
+
+(defun %lsp-symbol-pick (rows label)
+  "Offer ROWS — (LABEL . PLACE) — and jump to the one picked."
+  (if (null rows)
+      (message "lsp: no symbols")
+      ;; The place rides on the candidate, after a tab: the picker draws the
+      ;; whole row and the callback keeps the half in front of it.
+      (let ((candidates (mapcar (lambda (r) (format nil "~a~c~a" (car r) #\Tab (cdr r)))
+                                rows)))
+        (completing-read label candidates
+          (lambda (answer)
+            (when answer
+              (let ((tab (position #\Tab answer)))
+                (when tab (find-file-at (subseq answer (1+ tab))))))))))
+  nil)
+
+(defun lsp-document-symbols ()
+  "Pick a symbol in this file and go to it. Bound to `SPC l o'."
+  (let ((key (lsp-session-for-buffer))
+        (path (buffer-file-name)))
+    (if (null key)
+        (message "lsp: no server for this buffer")
+        (rpc-request
+         (%lsp-get key :conn) "textDocument/documentSymbol"
+         (jobj "textDocument" (jobj "uri" (lsp-path-uri path)))
+         (lambda (result error)
+           (cond (error (message (format nil "lsp: ~a" (jget error "message"))))
+                 (t (%lsp-symbol-pick (%lsp-symbol-rows result path)
+                                      "Symbol: ")))))))
+  nil)
+
+(defun lsp-workspace-symbols ()
+  "Search every symbol the server knows about in the project. Bound to `SPC l w'.
+
+Asked with an empty query, which is what the protocol says means "everything"
+and what every server answers with a capped list for — the narrowing then
+happens in the picker, where it is instant, rather than a round trip per
+keystroke."
+  (let ((key (lsp-session-for-buffer)))
+    (if (null key)
+        (message "lsp: no server for this buffer")
+        (rpc-request
+         (%lsp-get key :conn) "workspace/symbol" (jobj "query" "")
+         (lambda (result error)
+           (cond (error (message (format nil "lsp: ~a" (jget error "message"))))
+                 (t (%lsp-symbol-pick (%lsp-symbol-rows result nil)
+                                      "Project symbol: ")))))))
+  nil)
+
+;;; ---------------------------------------------------------------------------
+;;; Rewriting a file nobody has open
+;;;
+;;; Two commands in this editor do that — `lsp-rename' below and `xref-replace'
+;;; in `modes/xref.lisp' — and between them they are the only writers that can go
+;;; through a whole project on one keystroke. Both spelled the write
+;;; `:if-exists :supersede', which truncates the file and *then* fills it: an
+;;; interrupt in between leaves half a source file and nothing that remembers the
+;;; other half. The two writers that most needed the protection were the two that
+;;; had none of it.
+;;;
+;;; `crates/app/src/main.rs' has answered this for `save-file' from the start —
+;;; `backup' and then `write_file': a numbered copy into `~/.zemacs.d/backup/',
+;;; and a temp file beside the target renamed over it. The answer is repeated
+;;; here in Lisp rather than reached for as a new primitive because ECL already
+;;; has every piece of it, and because the naming has to agree with the Rust side
+;;; exactly — the two write into the same directory, and a backup you cannot find
+;;; by eye beside the others is a backup you do not know you have.
+;;;
+;;; It lives in *this* file rather than in `xref.lisp' for one reason, and it is
+;;; not taste: `*runtime-modules*' loads `lsp.lisp' first, so a definition here is
+;;; in hand over there and not the other way round.
+
+(defparameter *backup-keep* 20
+  "How many past versions of one file to keep. `BACKUP_KEEP' in
+`crates/app/src/main.rs' says twenty and this has to say the same thing, because
+both prune the same directory — two numbers would mean how much history you have
+depended on which half of the editor happened to write last.")
+
+(defun %backup-version (type)
+  "The N out of a `~N~' backup extension, or NIL for anything else.
+
+A pathname *type* rather than a whole name, because that is what ECL hands back:
+`#!home!me!x.rs#.~3~' splits at the last dot, so the stem survives intact as the
+name and the version arrives here on its own."
+  (and (stringp type)
+       (> (length type) 2)
+       (char= (char type 0) #\~)
+       (char= (char type (1- (length type))) #\~)
+       (ignore-errors (parse-integer type :start 1 :end (1- (length type))))))
+
+(defun %backup-file (path)
+  "Copy PATH's current contents aside as the next numbered version. T, or NIL.
+
+The naming is `backup_into''s and has to be: the whole path with `/' turned into
+`!', wrapped in `#', and `.~N~' after it. Same directory, same shape, so
+`~/.zemacs.d/backup/' reads as one list whichever half of the editor filled it.
+
+The count is read off the directory each time rather than remembered, for the
+same reason it is there: the numbering then survives a restart, and a directory
+somebody has pruned by hand.
+
+**This one answers.** The Rust side is deliberately silent on every failure —
+the save it belongs to is about to report for itself and the file is still on
+screen — and that reasoning does not survive the trip here, where a caller is
+already several files into a project and will not be looking."
+  (let* ((dir (zemacs-file "backup/"))
+         (stem (format nil "#~a#" (substitute #\! #\/ (namestring path)))))
+    (ignore-errors
+      (ensure-directories-exist dir)
+      (let ((versions (sort (loop for p in (directory (make-pathname :name :wild :type :wild
+                                                                    :defaults dir))
+                                  for n = (and (equal (pathname-name p) stem)
+                                               (%backup-version (pathname-type p)))
+                                  when n collect n)
+                            #'<)))
+        (flet ((version (n)
+                 (make-pathname :name stem :type (format nil "~~~a~~" n) :defaults dir)))
+          (unless (ext:copy-file path (version (1+ (or (car (last versions)) 0))))
+            (return-from %backup-file nil))
+          ;; Oldest first, so a file worked on for months keeps its last twenty
+          ;; versions rather than the first twenty it ever had. One more exists
+          ;; than this list knows about — the copy just taken — which is what
+          ;; makes the count `(1- *backup-keep*)'.
+          (dolist (old (butlast versions (1- *backup-keep*)))
+            (ignore-errors (delete-file (version old))))
+          t)))))
+
+(defun %write-file-safely (path text)
+  "Put TEXT in PATH without ever leaving PATH half-written. T, or NIL and a message.
+
+Two promises, and they are separate things: one is that the previous contents
+survive, the other that the write cannot tear. Neither is optional for a command
+that rewrites a project at once.
+
+**A file that could not be backed up is not written at all.** That is the whole
+of why this answers instead of pressing on: protection that quietly degrades to
+none is worse than none, because you stop checking for it.
+
+The temp file goes *beside* the target and never in a temp directory, for
+`write_file''s reason — `rename' is atomic only within one filesystem, and `/tmp'
+is routinely a different one, which would silently turn this back into a copy
+that can tear. `truename' first so a save through a symlink rewrites what the
+link points at rather than replacing the link with a real file.
+
+ponytail: the target's permission bits are lost — the temp file is created at the
+umask's mercy, and ECL can *set* a mode (`ext:chmod') but not read one, as
+`%mw-mode-string' in `modes/math-written.lisp' found out. Ceiling: an executable
+script rewritten by `lsp-rename' or `xref-replace' comes back non-executable.
+The upgrade path is already written — that function, which shells out to `ls -l'
+— and is deliberately not taken here, because it is a subprocess per file and
+these two callers are counted in files-per-project. The cheaper upgrade is the
+mode `write_file' already reads on the Rust side, offered as one primitive.
+
+ponytail: no `fsync' either, ECL exposing none, so a power cut in the instant
+after the rename can still lose the write whole. Never half of it, which is the
+property being bought."
+  (let* ((real (or (ignore-errors (truename path)) (pathname path)))
+         ;; The pid keeps two zemacs processes rewriting one project out of each
+         ;; other's way, which is `write_file''s reason and the same name it uses.
+         (tmp (make-pathname :name (format nil ".#~a.zemacs~a#"
+                                           (file-namestring real) (ext:getpid))
+                             :type nil :version nil :defaults real)))
+    (cond ((and (probe-file real) (not (%backup-file path)))
+           (message (format nil "no backup for ~a — not rewritten" path))
+           nil)
+          ((ignore-errors
+             (with-open-file (o tmp :direction :output :if-exists :supersede
+                                    :if-does-not-exist :create
+                                    :external-format :utf-8)
+               (write-string text o))
+             (rename-file tmp real :if-exists :supersede)
+             t))
+          (t
+           ;; The target has not been touched — the rename is last — so all that
+           ;; is left is not to litter somebody's source directory.
+           (ignore-errors (delete-file tmp))
+           (message (format nil "could not write ~a" path))
+           nil))))
+
+;;; ---------------------------------------------------------------------------
+;;; Rename
+;;;
+;;; The one command here that *writes*, and the reason it is worth the code: a
+;;; rename across a project is the operation you cannot do with search and
+;;; replace, because the server knows which `count' is the field and which is a
+;;; local in another function.
+;;;
+;;; The edits are applied **to the files** rather than to buffers, which is the
+;;; same decision `xref-replace' makes and for the same reason: a `WorkspaceEdit'
+;;; usually names files nothing has open, and opening each one to edit it would
+;;; be a buffer per file and a round trip per edit for text nobody is looking at.
+;;; A buffer that *is* open goes stale and the auto-revert sweep picks it up
+;;; within its own interval — the same contract every external write in this
+;;; editor has.
+;;;
+;;; ponytail: no undo across the rename — undo is per buffer and these files have
+;;; none. The way back is `~/.zemacs.d/backup/', which `%write-file-safely' above
+;;; now fills for every file this touches, and it is a copy per file rather than
+;;; one gesture: the ceiling is that undoing a rename over forty files is forty
+;;; copies back. Upgrade path: a command that reads a whole numbered generation
+;;; out of that directory at once, which nothing has wanted yet.
+
+(defun %lsp-offset-in (text line character)
+  "The character offset of an LSP position in TEXT, a whole document.
+
+The inverse of `%lsp-position-in', and separate from `%lsp-offset-at' because
+that one asks the *live buffer* — here the document is a string that was read
+from disk and may not be open at all."
+  (let ((at 0) (n (length text)))
+    (dotimes (i line)
+      (declare (ignore i))
+      (let ((nl (position #\Newline text :start at)))
+        (if nl (setf at (1+ nl)) (return))))
+    (let ((eol (or (position #\Newline text :start at) n)))
+      (min n (+ at (%lsp-char-column (subseq text at eol) character))))))
+
+(defun %lsp-apply-edits (path edits)
+  "Apply a list of `TextEdit' to PATH. Answers how many, or NIL if unreadable.
+
+*Back to front.* Every range is expressed against the document as it was, so
+applying the earliest first moves every offset after it; sorting descending
+makes each edit land on text no previous edit has touched. That is the standard
+way to apply a `WorkspaceEdit' and it is the whole of why this is not a loop
+over `replace-region'."
+  (let ((text (ignore-errors
+                (with-open-file (in path :direction :input :external-format :utf-8)
+                  (let ((s (make-string (file-length in))))
+                    (subseq s 0 (read-sequence s in)))))))
+    (when text
+      (let ((ranged (sort (mapcar (lambda (e)
+                                    (list (%lsp-offset-in text
+                                                          (or (jget e "range" "start" "line") 0)
+                                                          (or (jget e "range" "start" "character") 0))
+                                          (%lsp-offset-in text
+                                                          (or (jget e "range" "end" "line") 0)
+                                                          (or (jget e "range" "end" "character") 0))
+                                          (or (jget e "newText") "")))
+                                  edits)
+                          #'> :key #'first)))
+        (dolist (r ranged)
+          (setf text (concatenate 'string
+                                  (subseq text 0 (first r))
+                                  (third r)
+                                  (subseq text (min (length text) (second r))))))
+        ;; Zero when the write was refused — a file that could not be backed up
+        ;; is a file this did not change, which is exactly what the count means
+        ;; and is why `%lsp-apply-workspace-edit' needs no branch for it. The
+        ;; refusal has already said so on the status line.
+        (if (and ranged (not (%write-file-safely path text)))
+            0
+            (length ranged))))))
+
+(defun %lsp-apply-workspace-edit (edit)
+  "Apply a `WorkspaceEdit', in either of its two shapes, and report.
+
+`changes' is a uri -> edits map and `documentChanges' is an array of
+`TextDocumentEdit'. Servers ship both; a client that advertises neither
+capability gets `changes', which is why it is tried first."
+  (let ((files 0) (count 0))
+    (flet ((apply-to (uri edits)
+             (let* ((path (lsp-uri-path uri))
+                    (n (and path (%lsp-apply-edits path edits))))
+               (cond ((null n) (message (format nil "lsp: cannot write ~a" (or path uri))))
+                     ((plusp n) (incf files) (incf count n))))))
+      (let ((changes (jget edit "changes")))
+        (if changes
+            (dolist (pair changes) (apply-to (car pair) (cdr pair)))
+            (dolist (d (jget edit "documentChanges"))
+              (apply-to (jget d "textDocument" "uri") (jget d "edits"))))))
+    (message (format nil "renamed ~a occurrence~:p in ~a file~:p" count files))))
+
+(defun lsp-rename ()
+  "Rename the symbol under the cursor, everywhere. Bound to `SPC l n'."
+  (let ((key (lsp-session-for-buffer))
+        (path (buffer-file-name)))
+    (if (null key)
+        (message "lsp: no server for this buffer")
+        ;; The position is read *now* and carried into the callback, because by
+        ;; the time the answer is typed the cursor may be somewhere else — a
+        ;; prompt is a continuation and the user has the keyboard while it is up.
+        (let ((position (%lsp-point-position)))
+          (read-string "Rename to: "
+            (lambda (new)
+              (when (and new (plusp (length new)))
+                (rpc-request
+                 (%lsp-get key :conn) "textDocument/rename"
+                 (jobj "textDocument" (jobj "uri" (lsp-path-uri path))
+                       "position" position
+                       "newName" new)
+                 (lambda (result error)
+                   (cond (error (message (format nil "lsp: ~a" (jget error "message"))))
+                         ((null result) (message "lsp: nothing to rename"))
+                         (t (%lsp-apply-workspace-edit result)))))))))))
+  nil)
+
+;;; ---------------------------------------------------------------------------
+;;; Find references — xref
+;;;
+;;; The other half of go-to-definition, and the one that needed somewhere to put
+;;; an answer: a definition is a place and a reference list is a *list* of them.
+;;; That place is `runtime/modes/xref.lisp', which is an ordinary buffer holding
+;;; `PATH:LINE:TEXT' rows — the format ripgrep prints and `find-file-at' parses,
+;;; so the listing needs no table beside it and this needs no new shape to
+;;; produce.
+;;;
+;;; The text of each line is read *from disk*, which is the one thing here worth
+;;; arguing about. A `Location' carries a file and a range and no content, and a
+;;; list of bare `path:120:' rows is a list you have to open one at a time to
+;;; read — which is what a picker already does, and the reason to have a buffer
+;;; is to read the answer without opening anything. So the files are read, once
+;;; each, grouped, and only the lines that were asked for are kept.
+
+(defun %xref-lines-of (path wanted)
+  "Read PATH and answer (LINE-NUMBER . TEXT) for each 1-based line in WANTED.
+NIL for a file that cannot be read, which is reported by the caller rather than
+here — a reference into a generated file is a fact about the answer, not an
+error in this function."
+  (ignore-errors
+    (with-open-file (in path :direction :input :external-format :utf-8)
+      (loop for n from 1
+            for text = (read-line in nil nil)
+            while text
+            when (member n wanted) collect (cons n text)))))
+
+(defun %xref-rows (locations)
+  "`PATH:LINE:TEXT' for each Location, files read once and in order.
+
+Grouped by file first: a hundred references in one file is one `open' rather
+than a hundred, and the sort inside a group is what makes the listing read down
+the file the way the file does."
+  (let ((by-file nil))
+    (dolist (loc locations)
+      (let* ((path (lsp-uri-path (or (jget loc "uri") (jget loc "targetUri"))))
+             (range (or (jget loc "range") (jget loc "targetSelectionRange")
+                        (jget loc "targetRange")))
+             (line (1+ (or (jget range "start" "line") 0))))
+        (when path
+          (let ((cell (assoc path by-file :test #'string=)))
+            (if cell
+                (push line (cdr cell))
+                (push (cons path (list line)) by-file))))))
+    (setf by-file (nreverse by-file))
+    (let (rows)
+      (dolist (cell by-file (nreverse rows))
+        (let* ((path (car cell))
+               (wanted (sort (remove-duplicates (cdr cell)) #'<))
+               (found (%xref-lines-of path wanted)))
+          (dolist (n wanted)
+            (let ((text (cdr (assoc n found))))
+              (push (format nil "~a:~a:~a" path n
+                            ;; A line the file no longer has — the server's index
+                            ;; is older than the file — still names a place worth
+                            ;; jumping to, so the row keeps its position and says
+                            ;; what happened instead of being dropped.
+                            (or text "(file has changed)"))
+                    rows))))))))
+
+(defun lsp-find-references ()
+  "Every use of the symbol under the cursor, in a buffer you can walk.
+
+Bound to `g r', beside `g d'. `includeDeclaration' is on, which is Emacs'
+default and the useful one: the definition is the reference you most often want
+to get back to from the list."
+  (let ((key (lsp-session-for-buffer))
+        (path (buffer-file-name)))
+    (if (null key)
+        (message "lsp: no server for this buffer")
+        (rpc-request
+         (%lsp-get key :conn) "textDocument/references"
+         (jobj "textDocument" (jobj "uri" (lsp-path-uri path))
+               "position" (%lsp-point-position)
+               "context" (jobj "includeDeclaration" t))
+         (lambda (result error)
+           (cond
+             (error (message (format nil "lsp: ~a" (jget error "message"))))
+             ;; A bare `Location' rather than a list, which is not what the spec
+             ;; says and is what a server or two sends anyway.
+             ((jget result "uri") (%lsp-references-show (list result)))
+             ((consp result) (%lsp-references-show result))
+             (t (message "lsp: no references found")))))))
+  nil)
+
+(defun %lsp-references-show (locations)
+  "Put LOCATIONS in the xref listing, or say there were none."
+  (let ((rows (%xref-rows locations)))
+    (if (null rows)
+        (message "lsp: no references found")
+        (xref-show (format nil "~a reference~:p" (length rows)) rows))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Completion at point — corfu
@@ -1210,13 +2120,41 @@ Two shapes are legal — a bare string, and a `MarkupContent' with `kind' and
           ((null doc) nil)
           (t (jget doc "value")))))
 
+(defun %lsp-edit-range (item)
+  "Where ITEM's `textEdit' says the completion goes, as a buffer offset, or NIL.
+
+*Only the start.* LSP's range is expressed against the document as it was when
+the request went out, and by the time you accept you have typed more of the
+word — so the end is stale by however many characters that was, and point is the
+answer that is current by construction. The start is not stale in the same way:
+it is where the *word* began, and typing further into a word does not move that.
+
+Which is also why this is worth having at all. The range's start is regularly
+*earlier* than the prefix we computed — clangd replacing a whole call, a server
+completing across a `.' or a `::' that `%lsp-word-char-p' stops at — and
+inserting at our own anchor there leaves the leading half of the symbol behind:
+`std::ve' completing to `vector' produced `std::vector' only by luck and
+`foo.ba' -> `bar()' produced `foo.bar()' or `foo.barbar()' depending on the
+server.
+
+`insertReplaceEdit' is the other shape a server may send. Its `insert' range is
+taken: `replace' would eat the identifier to the *right* of point, which is a
+different feature and one nobody asked for by pressing RET.
+
+NIL for a range this buffer has no line for — a reply about a document that has
+moved on — which puts the caller back on the anchor it computed itself."
+  (let* ((edit (jget item "textEdit"))
+         (range (and edit (or (jget edit "range") (jget edit "insert")))))
+    (and range (%lsp-offset-at (jget range "start")))))
+
 (defun %lsp-completion-row (item)
-  "(INSERT FILTER ROW DOC) for one `CompletionItem', or NIL for one with no label.
+  "(INSERT FILTER ROW DOC BEG) for one `CompletionItem', or NIL for a labelless one.
 
 INSERT is what goes in the buffer, FILTER is what the prefix is tested against,
-ROW is what is drawn and DOC is what the panel beside the list shows — four
-fields because LSP says the first three can differ, and a server that sets
-`filterText' has told us the label is not what to match on.
+ROW is what is drawn, DOC is what the panel beside the list shows, and BEG is
+where the server says the text goes — five fields because LSP says the first
+three can differ, and a server that sets `filterText' has told us the label is
+not what to match on.
 
 ROW is tab-separated into KIND, LABEL and DETAIL, which the renderer draws as
 three aligned columns. Tabs and not spaces because the *alignment* has to be
@@ -1224,22 +2162,24 @@ done where cells can be measured, and this side of the boundary cannot measure
 one — the old two-space join is exactly what that produced: a ragged second
 column.
 
-ponytail: `textEdit' is ignored, so a server whose edit range is not exactly
-[anchor, point) — clangd replacing a whole call, a server that completes past a
-`.' — inserts the plain label instead. Ceiling: those completions come out
-slightly wrong rather than not at all. Upgrade path: read `textEdit.range',
-convert its line/character pair through `line-start', and pass that range to
-`replace-region' instead of the anchor. `snippetSupport' is declined in
-`%lsp-capabilities' precisely so nothing arrives with `$1' in it meanwhile."
+INSERT prefers `textEdit.newText' over `insertText' over the label, which is
+LSP's own precedence: a server that sent an edit meant the edit's text, and
+taking the label beside it is how a completion comes out with the signature its
+label carried for the eye. `snippetSupport' is declined in `%lsp-capabilities',
+so nothing arrives with `$1' in it either way."
   (let* ((label (or (jget item "label") ""))
-         (insert (or (jget item "insertText") label))
+         (edit (jget item "textEdit"))
+         (insert (or (and edit (jget edit "newText"))
+                     (jget item "insertText")
+                     label))
          (filter (or (jget item "filterText") label))
          (detail (or (jget item "detail") "")))
     (when (plusp (length label))
       (list insert filter
             (format nil "~a~c~a~c~a"
                     (%lsp-completion-kind item) #\Tab label #\Tab detail)
-            (%lsp-doc-string item)))))
+            (%lsp-doc-string item)
+            (%lsp-edit-range item)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The documentation panel
@@ -1373,6 +2313,20 @@ typing a word at all. Nothing is retried, because the next keystroke asks again.
             (loop for item in (%lsp-completion-items result)
                   for row = (%lsp-completion-row item)
                   when row collect row))
+      ;; `isIncomplete' means "this is not the whole answer, ask me again".
+      ;; Recorded here and spent in `lsp-complete-maybe', which otherwise
+      ;; narrows the list it already has and would keep narrowing a *truncated*
+      ;; one — so a huge namespace two characters in would stay truncated for
+      ;; the rest of the word, and the candidate you were typing towards would
+      ;; never appear however much of it you typed.
+      ;;
+      ;; A bare array of items is a complete list by definition: only a
+      ;; `CompletionList' has the flag, and `%lsp-completion-items' accepts
+      ;; both shapes.
+      (setf (getf *lsp-completion* :incomplete)
+            (and (%json-object-p result)
+                 (jget result "isIncomplete")
+                 t))
       (let ((where (%lsp-completion-prefix)))
         (if (and where (eql (car where) at))
             (%lsp-completion-filter (cdr where))
@@ -1384,9 +2338,21 @@ typing a word at all. Nothing is retried, because the next keystroke asks again.
 The old popup is replaced *before* the request goes out rather than left up
 until the reply, so the anchor recorded here is what the reply is checked
 against. A popup showing the previous word's candidates while the next word's
-are in flight is the one stale state worth spending a frame of emptiness on."
-  (let ((key (lsp-session-for-buffer))
-        (path (buffer-file-name)))
+are in flight is the one stale state worth spending a frame of emptiness on.
+
+Except when the anchor has not moved, which is the `isIncomplete' path: there
+the word is the same word and the candidates on screen are about it, so they are
+kept and narrowed locally while the fresh answer is in flight. Emptying them
+would blink the box once per keystroke for the whole of a word — the flicker
+this function's own rule is meant to prevent, arrived at from the other side."
+  (let* ((key (lsp-session-for-buffer))
+         (path (buffer-file-name))
+         (same (and *lsp-completion*
+                    (eql at (getf *lsp-completion* :at))
+                    (equal path (getf *lsp-completion* :path))))
+         (items (and same (getf *lsp-completion* :items)))
+         (shown (and same (getf *lsp-completion* :shown)))
+         (index (if same (getf *lsp-completion* :index) 0)))
     (cond
       ;; No server, or one that declined to complete. The old popup still has to
       ;; come down: point has moved to a word this list is not about, and
@@ -1394,7 +2360,7 @@ are in flight is the one stale state worth spending a frame of emptiness on."
       ((not (and key path (%lsp-get key :completion))) (%lsp-completion-hide))
       (t
        (setf *lsp-completion*
-             (list :at at :path path :items nil :shown nil :index 0))
+             (list :at at :path path :items items :shown shown :index index))
        (rpc-request
         (%lsp-get key :conn) "textDocument/completion"
         (jobj "textDocument" (jobj "uri" (lsp-path-uri path))
@@ -1415,10 +2381,14 @@ one string compare on the mode, then one hash lookup, and out.
 Re-asks the server only when the word *starts* somewhere new. Typing further
 into a word we already have candidates for narrows them locally, which is what
 makes the popup feel instant — and is legitimate, because the server's list for
-`fo' contains its list for `foo'. ponytail: `isIncomplete' is ignored, so a
-server that truncated its answer is not asked again and the list can be short by
-whatever it left out. Ceiling: a huge global namespace two characters in.
-Upgrade path is one `jget' and a flag on the plist that forces the re-ask."
+`fo' contains its list for `foo'.
+
+*Unless the server said otherwise.* `isIncomplete' on the reply means the list
+was truncated, so it does not contain the list for the longer prefix and
+narrowing it is narrowing the wrong set: the candidate you are typing towards
+was cut off two characters in and no amount of further typing would bring it
+back. Those re-ask on every keystroke, which is what the flag is asking for and
+is why a server only sets it when it had to."
   (when (string= (evil-state) "insert")
     (let ((where (and (lsp-session-for-buffer) (%lsp-completion-prefix))))
       (cond
@@ -1427,6 +2397,7 @@ Upgrade path is one `jget' and a flag on the plist that forces the re-ask."
          (%lsp-completion-hide))
         ((and *lsp-completion*
               (not force)
+              (not (getf *lsp-completion* :incomplete))
               (eql (car where) (getf *lsp-completion* :at))
               (equal (buffer-file-name) (getf *lsp-completion* :path)))
          (%lsp-completion-filter (cdr where)))
@@ -1497,15 +2468,22 @@ have. NIL means there is nothing to accept."
                        (getf *lsp-completion* :shown)))))
     (cond ((or (null at) (null row)) (%lsp-completion-hide))
           (t
-           ;; One primitive over the whole range: `docs/threading.org'. A
-           ;; `delete-region' and an `insert' would be two undo steps with a
-           ;; keystroke's width between them.
-           ;;
-           ;; ponytail: `at' and `(point)' are two reads, so a keystroke landing
-           ;; between them widens the range by a character. Same window every
-           ;; two-reader command in this editor has; closing it means the range
-           ;; travelling with the command.
-           (replace-region at (point) (first row))
+           ;; The server's own start when it sent one and it reaches further
+           ;; back than the word we found — see `%lsp-edit-range'. `min' rather
+           ;; than a plain override, because a start *after* our anchor would
+           ;; leave the characters between them in the buffer, and a completion
+           ;; that only half-replaces what you typed is worse than one that
+           ;; replaces a little too much.
+           (let ((beg (min at (or (fifth row) at))))
+             ;; One primitive over the whole range: `docs/threading.org'. A
+             ;; `delete-region' and an `insert' would be two undo steps with a
+             ;; keystroke's width between them.
+             ;;
+             ;; ponytail: `beg' and `(point)' are two reads, so a keystroke
+             ;; landing between them widens the range by a character. Same
+             ;; window every two-reader command in this editor has; closing it
+             ;; means the range travelling with the command.
+             (replace-region beg (point) (first row)))
            (%lsp-completion-hide))))
   nil)
 
@@ -1530,6 +2508,31 @@ have. NIL means there is nothing to accept."
 ;;; third is one line, and belongs in your config rather than here.
 
 (lsp-register-server 'python-mode "pylsp")
+
+;;; Python's server has to be told which interpreter the project uses, and it is
+;;; the one language where getting this wrong is *loud*: every import in a `uv'
+;;; or `poetry' project is reported as missing, because a globally-installed
+;;; `pylsp' resolves them against the interpreter it was installed under.
+;;;
+;;; `.venv/bin/pylsp' is preferred over this — see `%lsp-program-for' — and needs
+;;; no settings at all, since a server inside the venv is already looking at the
+;;; right site-packages. This is the other case, and the common one: `uv' puts no
+;;; server in the project, so what you have is a global `pylsp' and a local
+;;; `.venv'. `jedi.environment' is the field that joins them.
+;;;
+;;; NIL when there is no virtualenv, which sends no settings and leaves a
+;;; system-Python project behaving exactly as it did.
+(setf (gethash "python-mode" *lsp-settings*)
+      (lambda (root)
+        (let ((venv (%lsp-venv root)))
+          (when venv
+            (jobj "pylsp"
+                  (jobj "plugins"
+                        (jobj "jedi" (jobj "environment" venv)
+                              ;; The same path again under `pylint', which reads
+                              ;; its own key and is off by default — harmless
+                              ;; when it is, and right when a config turns it on.
+                              "pylint" (jobj "enabled" nil))))))))
 (lsp-register-server 'c-mode "clangd" "--background-index")
 
 ;;; Readers and internals are not commands: running `lsp-diagnostics' by hand
@@ -1549,6 +2552,9 @@ have. NIL means there is nothing to accept."
     (pushnew n (symbol-value '*hidden-commands*) :test #'string=)))
 
 (export '(lsp lsp-stop lsp-restart lsp-status lsp-goto-definition
+          lsp-find-references lsp-goto-declaration lsp-goto-type-definition
+          lsp-goto-implementation lsp-hover lsp-help-quit lsp-rename
+          lsp-document-symbols lsp-workspace-symbols
           lsp-diagnostics lsp-diagnostics-at-point lsp-list-diagnostics
           lsp-register-server lsp-project-root lsp-path-uri lsp-uri-path
           lsp-severity-name *lsp-diagnostics-functions* *lsp-servers*

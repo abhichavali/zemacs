@@ -134,7 +134,8 @@ Some *bold* text and a [[https://x/a/b][link]].
 
 #[test]
 fn org_markup_is_drawn_as_glyphs_and_revealed_under_the_cursor() {
-    let init = std::env::temp_dir().join("zemacs_test_org_modern_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_org_modern_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(
@@ -189,7 +190,10 @@ fn org_markup_is_drawn_as_glyphs_and_revealed_under_the_cursor() {
         "●",    // `*` — level 1: no padding
         "bold", // `*bold*` — markers gone, one overlay over the whole run
         "link", // `[[https://x/a/b][link]]` — the description alone
-        " ○",   // `**` — level 2: one space, so the heading text does not move
+        "○ ",   // `**` — level 2: bullet first, then the space that keeps the
+        // heading text where it was. The space *trails* the glyph so that a
+        // level-2 bullet lines up with a level-1 one instead of sitting a
+        // column to its right.
         "•",    // `- item one`
         "•",    // `- [X] done`
         "✓",    // `[X]`
@@ -279,6 +283,67 @@ fn org_markup_is_drawn_as_glyphs_and_revealed_under_the_cursor() {
     });
     assert_eq!(left[0], (3, 6, Some("XX".into())), "the foreign overlay survives");
     says(&shared, &lisp, "(if (minor-mode-p 'org-modern) t nil)", "NIL");
+
+    // --- a paste is not a keystroke ------------------------------------------
+    //
+    // The change hook's unit used to be *the line point is on*, which is
+    // everything a keystroke can dirty and nothing like what `p` lands. A
+    // linewise paste leaves point on the **first** line of the block, so every
+    // line below it kept the punctuation it arrived with — paste a section of
+    // org into an org buffer and one line of it came out drawn.
+    //
+    // A fresh buffer, because this is about counts and the one above has been
+    // edited by every section since it was loaded. Hooks called by hand rather
+    // than pumped from a thread, as everywhere else in this file: what is being
+    // asserted is *when* the hook ran relative to the paste, and a poller cannot
+    // say that.
+    load(&shared, "* One\n", 1);
+    lisp.eval("(progn (goto-char (point-min)) (org-mode-hook))".into());
+    // One change hook before the paste, which is what a file arriving fires. It
+    // is where the buffer's size is first remembered, and the paste is measured
+    // against it — the first change seen in a buffer has nothing to compare
+    // with and redraws one line, exactly as it always did.
+    lisp.eval("(after-change-hook)".into());
+    // A barrier as well as an assertion: `says` waits for the queue to drain
+    // past both evaluations above, so the paste below cannot overtake them.
+    says(&shared, &lisp, "(if (minor-mode-p 'org-modern) t nil)", "T");
+
+    {
+        let mut ed = shared.lock().unwrap();
+        ed.apply(EditorCommand::SetRegister {
+            text: "* Two\n- two\n** Three\n".into(),
+            linewise: true,
+        });
+        ed.apply(EditorCommand::Paste { after: true });
+    }
+    lisp.eval("(after-change-hook)".into());
+
+    // Byte offsets stand in for character ones because this buffer is ASCII —
+    // the glyphs live in the overlays, not in the text.
+    let at = |needle: &str| {
+        let text = shared.lock().unwrap().buffer.text.to_string();
+        text.find(needle)
+            .unwrap_or_else(|| panic!("the paste landed: {needle} not in {text:?}"))
+    };
+    let (one, two, bullet, three) = (at("* One"), at("* Two"), at("- two"), at("** Three"));
+    wait(&shared, "every line of the paste to be drawn", |ed| {
+        (displays(ed).len() == 4).then_some(())
+    });
+    {
+        let ed = shared.lock().unwrap();
+        assert_eq!(display_at(&ed, one).as_deref(), Some("●"), "the line above the paste");
+        // The line point landed on, which is the only one that used to be drawn.
+        assert_eq!(display_at(&ed, two).as_deref(), Some("●"), "the first pasted line");
+        // ...and the two it did not, which are the bug.
+        assert_eq!(display_at(&ed, bullet).as_deref(), Some("•"), "the second pasted line");
+        assert_eq!(display_at(&ed, three).as_deref(), Some("○ "), "the third pasted line");
+    }
+
+    // ...and the window collapses to one line when nothing was pasted, which is
+    // what keeps the per-keystroke path costing what it cost before: another
+    // change hook with the line count unmoved redraws the same four and no more.
+    lisp.eval("(after-change-hook)".into());
+    says(&shared, &lisp, "(length (%org-modern-overlays))", "7");
 
     // --- the scanner, without the editor -------------------------------------
     //

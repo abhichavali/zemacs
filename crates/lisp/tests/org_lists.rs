@@ -284,6 +284,14 @@ fn meta_return_continues_a_list_and_leaves_prose_alone() {
     // are in Normal state — and each of them displaces something. `M-<left>` is
     // word-wise motion everywhere else, `C-c C-c` is `eval-dwim`, `<tab>` is
     // `fold-dwim`. Binding any of them globally is the thing not to do.
+    //
+    // Three of them are *dispatchers* rather than the command they name, and
+    // that is what `org-table.lisp` costs: `<tab>`, `<backtab>` and `<ret>` are
+    // table keys in a table and hand themselves straight on to `org-cycle`,
+    // `org-global-cycle` and `org-open-at-point` everywhere else. There is no
+    // way to decline a keystroke once a binding has swallowed it, so a key that
+    // only sometimes applies has to be claimed whole and forwarded — which is
+    // why the fall-through is pinned in `org_table.rs` rather than assumed.
     let org_keys = probe(
         &lisp,
         &shared,
@@ -298,7 +306,7 @@ fn meta_return_continues_a_list_and_leaves_prose_alone() {
     );
     assert_eq!(
         org_keys,
-        "<backtab>=org-global-cycle <ret>=org-open-at-point <tab>=org-cycle \
+        "<backtab>=org-table-backtab <ret>=org-table-return <tab>=org-table-tab \
          C-c C-c=org-ctrl-c-ctrl-c C-c C-t=org-todo \
          C-c R=org-latex-preview-clear C-c r=org-latex-preview \
          M-<left>=org-do-promote M-<ret>=org-meta-return M-<right>=org-do-demote \

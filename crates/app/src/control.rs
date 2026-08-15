@@ -356,6 +356,13 @@ impl Control {
     /// request time instead would save whatever was on screen *before* the
     /// keystroke that the same client had just sent, which is the one picture
     /// nobody wants.
+    /// A screenshot is queued, so this frame has to be drawn whether or not
+    /// anything changed: [`Control::shoot`] reads the frame buffer back, and
+    /// reading back one the loop declined to fill hands out whatever was in it.
+    pub fn shooting(&self) -> bool {
+        !self.shots.is_empty()
+    }
+
     pub fn shoot(&mut self, app: &mut App, editor: &Editor) {
         for (id, path) in std::mem::take(&mut self.shots) {
             let i = editor.focus_frame.min(app.renderers.len().saturating_sub(1));

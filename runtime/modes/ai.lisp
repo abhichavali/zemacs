@@ -127,6 +127,28 @@ entire contribution is one line of text."
     (format nil "terminal-run:~a:~a~{ ~a~}"
             name program (if resume resume-args new-args))))
 
+(defun %ai-pane ()
+  "Stand in a window that is not the one you are reading, making one if need be.
+
+Side by side, because the whole point of an agent is reading what it says
+against the code it is saying it about — taking over the window you were reading
+is the one layout that cannot do that.
+
+But *only if there is not already a second pane*. This used to split
+unconditionally, so asking an agent something with a file open beside its own
+notes cut the frame into three and left every column too narrow to read: a
+harness draws a full-screen TUI and gets a third of the width. With a split
+already open the answer is to take the other half over, which is what
+`display-buffer' does in Emacs and what you meant by putting a split there.
+
+`other-window' rather than a named window: with exactly two panes it is the one
+you are not in, which is the case this is about, and with more it is the next
+one round — a rule you can predict beats one that picks a pane by size."
+  (if (< (length (window-list)) 2)
+      (split-window-right)
+      (other-window))
+  nil)
+
 (defun %ai-start (harness resume)
   "Fork HARNESS beside the current window. RESUME picks its argument lists."
   (if (null (executable-find (second harness)))
@@ -135,12 +157,9 @@ entire contribution is one line of text."
       ;; buffer that appeared and vanished.
       (message (format nil "~a is not installed — no ~a on $PATH"
                        (first harness) (second harness)))
-      ;; Side by side, because the whole point of an agent is reading what it
-      ;; says against the code it is saying it about — taking over the window
-      ;; you were reading is the one layout that cannot do that.
-      ;; `split-window-right' focuses the new pane and the verb travels the
-      ;; same queue behind it, so the session lands there.
-      (progn (split-window-right)
+      ;; Both verbs travel the same queue, so the session lands in whichever
+      ;; pane `%ai-pane' left us standing in.
+      (progn (%ai-pane)
              (call-command (%ai-verb harness resume)))))
 
 ;;; ---------------------------------------------------------------------------
@@ -199,7 +218,10 @@ in the `C-a' menu."
            ;; Cancelled, or entered empty. Neither is an error and neither is a
            ;; question, so neither forks anything.
            (when (and prompt (plusp (length (string-trim " " prompt))))
-             (split-window-right)
+             ;; The same rule the menu's harnesses take — see `%ai-pane'. A
+             ;; one-shot answer is still a thing you read beside your code, and
+             ;; still not a reason to cut the frame into three.
+             (%ai-pane)
              (call-command
               (format nil "terminal-rerun:~a-p:~a ~a ~a"
                       (first harness) (second harness) *ai-prompt-flag*

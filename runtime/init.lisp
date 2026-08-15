@@ -248,6 +248,27 @@
 (set-completion-style "center")
 
 ;;; ---------------------------------------------------------------------------
+;;; Modeline
+;;;
+;;; What the strip says is a list of little templates, and the shipped list is
+;;; `default-modeline' in `library.lisp' — which has already run by the time you
+;;; read this. To change it, clear it and say your own:
+;;;
+;;;   (clear-modeline)
+;;;   (modeline-segment :left  " %m " :face :mode :bold t :filled t)
+;;;   (modeline-segment :left  "  %b" :bold t)
+;;;   (modeline-segment :right "%l:%c" :bold t)
+;;;
+;;; %m is the modal state, %b the buffer, %+ the unsaved dot, %M the major mode,
+;;; %l and %c the position, %p Top/Bot/All/a percentage. `modeline-segment' in
+;;; `library.lisp' documents all of them. A segment whose codes all come back
+;;; empty disappears with its own separators, so nothing needs a condition around
+;;; it — "  %P" carries its two spaces and leaves with them on a buffer that has
+;;; no file behind it.
+;;;
+;;; To keep the shipped strip and only add to it, skip the `clear-modeline'.
+
+;;; ---------------------------------------------------------------------------
 ;;; Dashboard
 ;;;
 ;;; The banner is plain text and the renderer centres it; the logo goes above it.
@@ -327,7 +348,13 @@
 (define-leader "SPC p c" "project-compile")   ; cargo build, npm run build, make
 (define-leader "SPC p t" "project-test")
 (define-leader "SPC p r" "project-root")      ; echo it, with what identified it
-(define-leader "SPC p g" "project-forget")    ; re-walk after creating files
+;;; `SPC p g' greps into a *buffer* — every hit at once, `RET' to open one and
+;;; `r' to replace across the lot. `SPC /' is the same ripgrep through a picker,
+;;; for when you want one hit and not the list. `project-forget' moved to
+;;; `SPC p F': re-walking the file cache is a thing you do once a month and this
+;;; is a thing you do all day.
+(define-leader "SPC p g" "project-grep")
+(define-leader "SPC p F" "project-forget")    ; re-walk after creating files
 (define-key-everywhere "C-M-p" "project-find-file")
 (define-leader "SPC w w" "ace-window")
 
@@ -341,6 +368,10 @@
 ;;; in Emacs is dismissed with — the window goes, the buffer and the child stay,
 ;;; so a build you dismissed early is still in the switcher when you want to
 ;;; know how it ended.
+;;;
+;;; It opens *below* rather than beside: compiler output is lines, a rustc error
+;;; is a path and a caret and a note wrapped to whatever width it is given, and
+;;; half a frame is not enough of one.
 (define-leader "SPC p m" "project-make")
 (define-key "terminal-output-mode" "q" "delete-window")
 
@@ -374,8 +405,22 @@
 ;;; Bracketing is decided by the child: `terminal-paste' marks the text as a
 ;;; paste when the program asked for that mode, so a multi-line yank lands in
 ;;; the line editor instead of running every line but the last.
-(define-key "terminal" "M-v" "terminal-paste")
+;;;
+;;; **It is `terminal-paste-image' on the key and not `terminal-paste'**, and
+;;; the two are one gesture rather than two: a screenshot in the clipboard is
+;;; written out and its *path* typed into the child, and anything else falls
+;;; through to the ordinary text paste. That is what a coding agent takes a
+;;; picture as — every harness reads one from a path in its prompt — so ⌘V into
+;;; an agent means "here is what I am looking at" without a second key to
+;;; remember or a decision to make about which one this is.
+;;;
+;;; Dragging a file from Finder onto a terminal pane does the same thing, and
+;;; needs no binding: the drop is an event, and over a session it types the path
+;;; instead of opening the file in a pane, which is not what anyone means by
+;;; dragging a PNG onto a chat.
+(define-key "terminal" "M-v" "terminal-paste-image")
 (pushnew "terminal-paste" *extra-commands* :test #'string=)
+(pushnew "terminal-paste-image" *extra-commands* :test #'string=)
 
 ;;; Dired. `SPC f d' opens the directory of the current file; in a listing,
 ;;; the keys are Emacs' own.
@@ -434,25 +479,29 @@
 (define-key "magit" "u" "magit-unstage")
 (define-key "magit" "S" "magit-stage-all")
 (define-key "magit" "U" "magit-unstage-all")
-(define-key "magit" "c" "magit-commit")
-(define-key "magit" "P" "magit-push")
-(define-key "magit" "F" "magit-pull")
 (define-key "magit" "g r" "magit-refresh")   ; `g' stays a prefix, so `gg' works
 (define-key "magit" "q" "show-dashboard")
 ;;; `TAB' is the one that makes it a buffer rather than a list: on a section it
-;;; folds, on a file it opens the diff. With a diff open, `s' and `u' act on the
-;;; *hunk* under the cursor — staging part of a file is what magit is used for
-;;; more than anything else.
+;;; folds, on a file it opens the diff, on a commit it opens that commit. With a
+;;; diff open, `s' and `u' act on the *hunk* under the cursor — staging part of
+;;; a file is what magit is used for more than anything else.
 (define-key "magit" "<tab>" "magit-toggle")
-(define-key "magit" "c a" "magit-amend")
-(define-key "magit" "f f" "magit-fetch")
-(define-key "magit" "z z" "magit-stash")
-(define-key "magit" "z p" "magit-stash-pop")
 ;;; A rebase in flight. Stopping on a conflict is ordinary progress, not an
 ;;; error: fix the files, stage them, then `r c'.
 (define-key "magit" "r c" "magit-rebase-continue")
 (define-key "magit" "r s" "magit-rebase-skip")
 (define-key "magit" "r a" "magit-rebase-abort")   ; throws the rebase away
+
+;;; The rest of the keymap — commit, branch, stash, push, merge, reset, the
+;;; conflict keys and the four commands that ask for a name — is in
+;;; `modes/magit.lisp', which ships with the editor rather than with this file.
+;;; It is one keymap either way: a binding is a name in a table, and both files
+;;; write to the same one.
+;;;
+;;; `c', `P' and `F' are *prefixes* there and are deliberately not bound whole
+;;; here. Core resolves an exact binding before it asks whether a sequence is a
+;;; prefix, so a bare `c' would make `c a' unreachable — which is exactly what
+;;; had quietly happened to `c a' before magit grew the rest of its `c' family.
 
 ;;; C-c stays one binding — `eval-dwim' — and finishes the commit when the
 ;;; buffer is a commit message. Binding C-c to `magit-commit-finish' outright
@@ -571,6 +620,20 @@
 (define-key "org-mode" "SPC m l" "org-latex-preview")
 (define-key "org-mode" "SPC m L" "org-latex-preview-clear")
 
+;;; The agenda — every unfinished item across `*org-agenda-files*', or across
+;;; the buffer you are in when that is unset. It answers into the `*xref*'
+;;; listing, so `RET' on a row opens the headline and `q' puts the list away.
+;;;
+;;; `g' for aGenda and not `a', which `org-modern-appear' has: every letter that
+;;; says "agenda" is taken in org buffers, and a binding that quietly replaced
+;;; another mode's is worse than one you have to learn.
+(define-key "org-mode" "SPC m g" "org-todo-list")
+(define-key "org-mode" "SPC m G" "org-agenda-tags")
+
+;;; Tables need no key of their own. `TAB' aligns on its way between cells, and
+;;; `C-c C-c' on a table aligns it where it stands — org's own gesture, added to
+;;; the front of `org-ctrl-c-ctrl-c'.
+
 ;;; ---------------------------------------------------------------------------
 ;;; The dashboard menu
 ;;;
@@ -618,9 +681,23 @@
 ;;; spelling for the rest. Guarded because a config may have dropped `lsp.lisp'
 ;;; from `*runtime-modules*', or the load may have failed and said so.
 (when (fboundp 'lsp-goto-definition)
+  ;; The `g' family is the vim spelling and the one your hands already know:
+  ;; `g d' definition, `g r' references, `g D' declaration, `g i'
+  ;; implementation, `g y' the type. `K' is documentation, which is what `K' has
+  ;; meant in vim since before any of this existed — it ran `man'.
   (define-key "normal" "g d" "lsp-goto-definition")
+  (define-key "normal" "g r" "lsp-find-references")
+  (define-key "normal" "g D" "lsp-goto-declaration")
+  (define-key "normal" "g i" "lsp-goto-implementation")
+  (define-key "normal" "g y" "lsp-goto-type-definition")
+  (define-key "normal" "K" "lsp-hover")
   (define-leader "SPC l l" "lsp")
   (define-leader "SPC l d" "lsp-goto-definition")
+  (define-leader "SPC l R" "lsp-find-references")
+  (define-leader "SPC l k" "lsp-hover")
+  (define-leader "SPC l n" "lsp-rename")
+  (define-leader "SPC l o" "lsp-document-symbols")   ; a symbol in this file
+  (define-leader "SPC l w" "lsp-workspace-symbols")  ; one anywhere in the project
   (define-leader "SPC l e" "lsp-diagnostics-at-point")
   (define-leader "SPC l E" "lsp-list-diagnostics")
   (define-leader "SPC l r" "lsp-restart")

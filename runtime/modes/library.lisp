@@ -97,6 +97,28 @@
 ;;; Lisp indents by two, and `eval-dwim' — the built-in verb behind `C-c' —
 ;;; earns a mode-local spelling in the buffers where it means something.
 (set-mode-local 'lisp-mode 'tab-width 2)
+
+;;; What opens a block, per language, for the auto-indent on `Enter'. A suffix
+;;; test rather than a parse — see `set-indent-openers' — so what goes here is
+;;; the *last thing on the line* when the next line is inside something.
+;;;
+;;; Claimed per mode rather than globally, because they genuinely differ: a `:'
+;;; opens a suite in Python and ends a keyword in Lisp, and a `{' means nothing
+;;; at the end of a line of prose.
+;;;
+;;; Not on `prog-mode', deliberately: a language nobody has taught this about
+;;; gets the plain copy-the-previous-indent, which is never wrong. Adding one is
+;;; a line in your init:
+;;;
+;;;   (set-mode-local 'go-mode 'indent-openers '("{" "(" "["))
+(set-mode-local 'python-mode 'indent-openers '(":"))
+;;; The brace languages. `(' and `[' as well as `{', so a call or a literal
+;;; broken across lines indents its continuation.
+(dolist (mode '(rust-mode c-mode javascript-mode json-mode))
+  (set-mode-local mode 'indent-openers '("{" "(" "[")))
+;;; Lisp is `parinfer.lisp''s business when that is on, and an open paren is
+;;; still the right answer when it is not.
+(set-mode-local 'lisp-mode 'indent-openers '("("))
 ;;; `lisp-eval-dwim' rather than the built-in `eval-dwim' verb: same three-way
 ;;; decision, but the value goes to the transcript. Defined in `repl.lisp',
 ;;; which loads after this — a binding names a command by string and is looked

@@ -351,6 +351,45 @@ fn ai_mode_is_data_in_lisp() {
         "[]"
     );
 
+    // --- where an agent lands -----------------------------------------------
+    //
+    // Beside what you are reading, and *only* by splitting when there is not
+    // already something to sit beside. `%ai-start` used to split every time, so
+    // asking an agent something with a file open next to its notes cut the
+    // frame into three columns too narrow for a harness to draw a TUI in.
+    //
+    // The window commands are core's and are applied on the spot, so this is
+    // the real path with nothing standing in for it — only the `terminal-run:`
+    // that would follow is left out, since a PTY wants an application loop.
+    // Down to one first: this test is long and what ran above it is entitled to
+    // leave a split behind.
+    probe(
+        &lisp,
+        &shared,
+        "w0",
+        "(progn (loop while (> (length (window-list)) 1) do (delete-window))
+                (length (window-list)))",
+    );
+    assert_eq!(probe(&lisp, &shared, "w0b", "(length (window-list))"), "1");
+    // One window: make the second.
+    probe(&lisp, &shared, "w1", "(progn (%ai-pane) (length (window-list)))");
+    assert_eq!(probe(&lisp, &shared, "w2", "(length (window-list))"), "2");
+    let first = probe(&lisp, &shared, "id1", "(window-id)");
+
+    // Two windows: take the other one over rather than making a third.
+    probe(&lisp, &shared, "w3", "(progn (%ai-pane) (length (window-list)))");
+    assert_eq!(probe(&lisp, &shared, "w4", "(length (window-list))"), "2");
+    let second = probe(&lisp, &shared, "id2", "(window-id)");
+    assert_ne!(first, second, "it should have moved to the other pane");
+
+    // ...and again, for ever: this is the case that used to grow a column per
+    // press.
+    probe(&lisp, &shared, "w5", "(progn (%ai-pane) (%ai-pane) (length (window-list)))");
+    assert_eq!(probe(&lisp, &shared, "w6", "(length (window-list))"), "2");
+
+    // Back to one, so nothing below inherits a split.
+    probe(&lisp, &shared, "w7", "(progn (delete-window) (length (window-list)))");
+
     // --- live: the flags are still the flags --------------------------------
     //
     // Skipped per harness when the binary is absent. This is the only thing

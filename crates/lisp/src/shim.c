@@ -21,6 +21,7 @@ extern void rs_set_background(double r, double g, double b);
 extern void rs_set_foreground(double r, double g, double b);
 extern void rs_set_syntax_color(const char *face, double r, double g, double b);
 extern void rs_set_face_style(const char *face, int bold, int italic);
+extern void rs_reset_faces(void);
 extern void rs_set_line_numbers(int on);
 extern void rs_set_tab_width(long n);
 extern void rs_set_text_width(long n);
@@ -283,6 +284,14 @@ static cl_object f_set_face_style(cl_object face, cl_object bold,
   char *f = dup_utf8_or_empty(face);
   rs_set_face_style(f, bold != ECL_NIL, italic != ECL_NIL);
   free(f);
+  return ECL_NIL;
+}
+
+/* Empties the face table. Only `load-theme' has any business calling it: on
+ * its own it is not "go back to the defaults" but "have no colours at all",
+ * and what makes that safe is that the next form after it is a theme. */
+static cl_object f_reset_faces(void) {
+  rs_reset_faces();
   return ECL_NIL;
 }
 
@@ -979,6 +988,23 @@ static const char *LIBRARY_FORM =
     " (defun zemacs::set-buffer-read-only (&optional (on t))"
     "   (zemacs::%do \"set-read-only\" nil (if on 1 0) 0)"
     "   on)"
+    /* What, at the end of a line, means the next line is *inside* something —
+     * `'(":")' for Python, `'("{" "(" "[")' for the C family, NIL for only
+     * copying the previous line's indent. `Enter', `o' and `O' read it.
+     *
+     * Here rather than in `runtime/library.lisp' because it is a *mode setting*:
+     * `%wrap-setting-primitives' in `modes/modes.lisp' takes the `fdefinition'
+     * of every primitive in `*mode-settings*' as that file loads, and
+     * `library.lisp' loads after it. Every one of its siblings — `set-tab-width',
+     * `set-text-width' — is defined here for the same reason, and this is the
+     * one of them that needed no C: the envelope carries a string, and a list
+     * of openers joined by spaces is one.
+     *
+     * One argument and a list, not `&rest': the wrapper calls every setting
+     * primitive with exactly one value. */
+    " (defun zemacs::set-indent-openers (openers)"
+    "   (zemacs::%do \"indent-openers\" (format nil \"~{~a~^ ~}\" openers) 0 0)"
+    "   nil)"
     /* Emacs' `inhibit-read-only', and the reason a *renderer* mode is usable at
      * all: read-only has to mean "the user cannot type here", not "nothing can
      * ever write here". A maths curriculum is displayed frozen and is still the
@@ -1230,6 +1256,7 @@ static const char *LIBRARY_FORM =
     /* lisp-api */
     "              \"CREATE-BUFFER\" \"KILL-BUFFER\" \"SET-LANGUAGE\""
     "              \"SET-BUFFER-READ-ONLY\" \"CALL-WITH-INHIBITED-READ-ONLY\""
+    "              \"SET-INDENT-OPENERS\""
     "              \"WITH-INHIBITED-READ-ONLY\""
     "              \"CALL-COMMAND\" \"TERM-SEND-KEY\" \"GRAB-KEY\"))"
     "   (export (intern n \"ZEMACS\") \"ZEMACS\")))";
@@ -1389,10 +1416,19 @@ static const char *OVERLAY_FORM =
      * policy, and policy is `org-fold.lisp''s. A buffer with no grammar answers
      * `()', which is the honest structure of plain text. */
     " (defun zemacs::fold-ranges () (zemacs::%query \"fold-ranges\" 0 0))"
+    /* And the third: the directories the editor has opened a file in, newest
+     * first, off the list `crates/project' persists. `project-switch' is a
+     * `completing-read' over this and nothing more, which is the shape every
+     * picker in the image should have — the two that cannot are the project's
+     * *files* and *directories*, where the list is tens of thousands long and
+     * goes into the prompt without passing through here. See
+     * `runtime/plugins/project.lisp'. */
+    " (defun zemacs::project-recent () (zemacs::%query \"project-recent\" 0 0))"
     /* A reader is a noun, not a command: keep it out of the M-x list the same
      * way every other reader is kept out. */
     " (pushnew \"latex-fragments\" zemacs::*readers* :test #'string=)"
     " (pushnew \"fold-ranges\" zemacs::*readers* :test #'string=)"
+    " (pushnew \"project-recent\" zemacs::*readers* :test #'string=)"
     /* The other producer of an `image' id: a *file*, rather than a LaTeX run.
      * WIDTH is in ems and may be fractional, which is why the primitive
      * underneath takes hundredths — the same percentage `overlay-scale' sends
@@ -1443,6 +1479,7 @@ static const char *OVERLAY_FORM =
     "              \"FOLD-REGION\" \"FOLDS-IN\" \"FOLDED-P\" \"UNFOLD-REGION\""
     "              \"UNFOLD-ALL\""
     "              \"LATEX-PREVIEW\" \"LATEX-FRAGMENTS\" \"HIGHLIGHT\""
+    "              \"FOLD-RANGES\" \"PROJECT-RECENT\""
     "              \"*OVERLAY-PROPERTIES*\"))"
     "   (export (intern n \"ZEMACS\") \"ZEMACS\")))";
 
@@ -1484,6 +1521,8 @@ static const char *PROMPT_FORM =
     "(progn"
     " (defparameter zemacs::*prompt-continuations* (make-hash-table)"
     "   \"Prompt id -> the closure waiting for that answer.\")"
+    " (defparameter zemacs::*prompt-previews* (make-hash-table)"
+    "   \"Prompt id -> the closure shown each candidate as the highlight moves.\")"
     " (defparameter zemacs::*prompt-next-id* 0)"
     " (defun zemacs::%prompt-park (k)"
     "   (setf (gethash (incf zemacs::*prompt-next-id*)"
@@ -1496,10 +1535,30 @@ static const char *PROMPT_FORM =
     " (defun zemacs::%prompt-reply (id answer)"
     "   (let ((k (gethash id zemacs::*prompt-continuations*)))"
     "     (remhash id zemacs::*prompt-continuations*)"
+    "     (remhash id zemacs::*prompt-previews*)"
     "     (when k"
     "       (handler-case (funcall k answer)"
     "         (error (e) (zemacs::message"
     "                     (format nil \"prompt handler error: ~a\" e))))))"
+    "   nil)"
+    /* Called by the editor every time the highlight moves in a previewing
+     * picker, with the candidate now under it. The other half of
+     * `%prompt-reply', and guarded the same way: a preview that signals must
+     * cost you that one frame's preview rather than the editor.
+     *
+     * Its own table rather than the continuation's, because the two have
+     * different lifetimes in the one direction that matters — the preview fires
+     * many times and the reply exactly once, and the reply is what clears both.
+     *
+     * Deliberately *not* cleared here on a NIL: cancelling is delivered as a
+     * reply, so the callback that has been previewing gets the NIL through its
+     * own `%prompt-reply' and is the thing that puts back whatever it changed. */
+    " (defun zemacs::%prompt-preview (id candidate)"
+    "   (let ((k (gethash id zemacs::*prompt-previews*)))"
+    "     (when k"
+    "       (handler-case (funcall k candidate)"
+    "         (error (e) (zemacs::message"
+    "                     (format nil \"preview handler error: ~a\" e))))))"
     "   nil)"
     /* CALLBACK is called with the string typed, or NIL if the prompt was
      * cancelled — so `(when answer ...)' is the idiom, as it is for every other
@@ -1512,16 +1571,33 @@ static const char *PROMPT_FORM =
      * uses. Nothing is required to match: with no hit the answer is what was
      * typed, which is Emacs' `require-match' NIL and the useful default.
      *
-     * The candidates go over one at a time because the write envelope carries a
-     * single string — N locks for N candidates, each of which appends without
-     * re-ranking. Fine for the few hundred a command offers; a list long enough
-     * for that to be felt wants a reader on the Rust side instead. */
-    " (defun zemacs::completing-read (label candidates callback)"
+     * The candidates go over as *one* newline-joined string, which is one lock
+     * and one crossing however long the list is. It used to be one `%do' each,
+     * with a note here saying that was fine for the few hundred a command offers
+     * and that a longer list wanted another route; the route is `prompt-items',
+     * and it is the same one `project-find-file' takes to fill a picker with
+     * fifty thousand paths. A candidate is a row in a one-line-per-row popup, so
+     * it has nowhere to put a newline of its own. */
+    /* PREVIEW is optional and is what makes this a *live* picker: it is called
+     * with each candidate as the highlight moves over it, and with NIL never —
+     * cancelling arrives at CALLBACK, which is where the undo belongs, since
+     * only the caller knows what it was showing before the prompt opened.
+     *
+     * `load-theme' and `choose-font' are the two that pass one, and they are
+     * the argument for the feature: a list of theme names tells you nothing
+     * about the themes. */
+    " (defun zemacs::completing-read (label candidates callback &optional preview)"
     "   (let ((id (zemacs::%prompt-park callback)))"
-    "     (zemacs::%do \"read-from-minibuffer\" (string label) id 1)"
-    "     (dolist (c candidates) (zemacs::%do \"prompt-item\" (string c) 0 0))"
+    "     (when preview (setf (gethash id zemacs::*prompt-previews*) preview))"
+    "     (zemacs::%do \"read-from-minibuffer\" (string label) id"
+    "                  (if preview 2 1))"
+    "     (when candidates"
+    "       (zemacs::%do \"prompt-items\""
+    "                    (format nil \"~{~a~^~%~}\" (mapcar #'string candidates))"
+    "                    0 0))"
     "     id))"
-    " (dolist (n '(\"READ-STRING\" \"COMPLETING-READ\" \"*PROMPT-CONTINUATIONS*\"))"
+    " (dolist (n '(\"READ-STRING\" \"COMPLETING-READ\" \"*PROMPT-CONTINUATIONS*\""
+    "              \"*PROMPT-PREVIEWS*\"))"
     "   (export (intern n \"ZEMACS\") \"ZEMACS\")))";
 
 /* --- end of the lisp-api block -------------------------------------------- */
@@ -1568,6 +1644,7 @@ void zemacs_boot(void) {
   defprim("SET-FOREGROUND", (cl_objectfn_fixed)f_set_foreground, 3);
   defprim("SET-SYNTAX-COLOR", (cl_objectfn_fixed)f_set_syntax_color, 4);
   defprim("SET-FACE-STYLE", (cl_objectfn_fixed)f_set_face_style, 3);
+  defprim("RESET-FACES", (cl_objectfn_fixed)f_reset_faces, 0);
   defprim("SET-LINE-NUMBERS", (cl_objectfn_fixed)f_set_line_numbers, 1);
   defprim("SET-TAB-WIDTH", (cl_objectfn_fixed)f_set_tab_width, 1);
   defprim("SET-TEXT-WIDTH", (cl_objectfn_fixed)f_set_text_width, 1);

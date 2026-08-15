@@ -26,6 +26,12 @@ zemacs-figure.workspace = true
 # `scene.rs`, and it lives here rather than in `crates/gui` because that crate
 # deliberately has no dependencies at all and no idea an image of Lisp exists.
 zemacs-gui.workspace = true
+# One reader: the projects visited before, which `project-switch' offers. A
+# short persisted list rather than a tree walk, so it can cross the shim as a
+# Lisp list and the picker over it is an ordinary `completing-read' in
+# `runtime/plugins/project.lisp'. `docs/boundary.org' named this crate edge as
+# the price of closing that split, and this is it.
+zemacs-project.workspace = true
 
 [build-dependencies]
 cc = "1"

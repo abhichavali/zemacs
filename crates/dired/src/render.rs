@@ -68,6 +68,9 @@ pub enum Face {
     Comment,
     /// A mark in the left column.
     Constant,
+    /// A *deletion* flag in the left column, which is the one mark that is not
+    /// merely a selection.
+    Error,
     /// The `->` of a symlink.
     Punctuation,
 }
@@ -137,12 +140,15 @@ pub fn render(listing: &Listing, marks: &[Option<char>]) -> (String, Vec<Line>, 
 /// `{mark} {perms}  {size:>8}  {date}  {name}`, written a column at a time so
 /// each one's span falls out of writing it rather than out of counting columns.
 fn row(buf: &mut Buf, entry: &Entry, mark: char) {
-    // ponytail: one face for both marks, so `*` and `D` are the same colour and
-    // only the letter tells them apart. Emacs gives deletion its own red; that
-    // needs a face this crate cannot reach, since the shared enum is a closed
-    // set of *syntax* classes and there is no spare one that means "danger".
+    // Deletion gets its own colour, as it does in Emacs. It used not to, and the
+    // note that stood here said why: the shared enum was a closed set of *syntax*
+    // classes with no spare one meaning "danger". There is one now — `error`,
+    // which the LSP layer wanted for the same reason — and a `D` that reads as
+    // red rather than as "the same as `*`, but a different letter" is the whole
+    // difference between a mark you skim and a mark you check.
     match mark {
         ' ' => buf.put(" "),
+        'D' => buf.face("D", Face::Error),
         _ => buf.face(&mark.to_string(), Face::Constant),
     }
     buf.put(" ");

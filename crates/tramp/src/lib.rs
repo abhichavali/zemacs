@@ -9,8 +9,8 @@
 //!   or `None` for the local path that it almost always is. Nothing there
 //!   touches the network.
 //! * **Doing** (this module): [`read`], [`write()`], [`list`], [`stat`],
-//!   [`mkdir`], [`delete`] and [`rename`], each one `ssh` invocation. A
-//!   [`Worker`] runs the same operations off the UI thread.
+//!   [`mkdir`], [`create_file`], [`delete`], [`rename`] and [`copy`], each one
+//!   `ssh` invocation. A [`Worker`] runs the same operations off the UI thread.
 //!
 //! Everything shells out to the system `ssh`. No `libssh`, no `russh`: `ssh`
 //! already reads the user's `~/.ssh/config`, talks to the agent, knows the
@@ -273,6 +273,16 @@ pub fn mkdir(p: &RemotePath) -> Result<()> {
     ssh(p, &format!("mkdir -- {}", quote(p.path())), &[], "creating").map(drop)
 }
 
+/// Create one empty remote file. **Never truncates**: an existing name is an
+/// error rather than a silently emptied file, which is exactly what
+/// `zemacs-dired`'s local `create_file` promises and the difference between
+/// `C-c n` on the wrong name and losing somebody's config.
+///
+/// Not [`write`] with no bytes, which would happily overwrite.
+pub fn create_file(p: &RemotePath) -> Result<()> {
+    ssh(p, &create_script(p), &[], "creating").map(drop)
+}
+
 /// Delete a remote path, recursively when `recursive`.
 ///
 /// Refuses a path with no final component — `/`, `~`, anything ending in `..` —
@@ -299,19 +309,61 @@ pub fn delete(p: &RemotePath, recursive: bool) -> Result<()> {
     .map(drop)
 }
 
-/// Rename a remote path. Both ends must be on the same host — a cross-host
-/// move is a read plus a write plus a delete, and that is the caller's
-/// decision to make, not something to do silently.
+/// Rename a remote path. Both ends must be on the same host — see
+/// [`same_host`].
 ///
 /// Refuses an existing destination rather than clobbering it, because `mv`
 /// would delete it without a word and the caller has a user to ask.
 pub fn rename(from: &RemotePath, to: &RemotePath) -> Result<()> {
-    if (&from.host, &from.user, from.port) != (&to.host, &to.user, to.port) {
+    same_host("rename", from, to)?;
+    ssh(from, &rename_script(from, to), &[], "renaming").map(drop)
+}
+
+/// Copy a remote path to another on the same host, recursively for a directory.
+///
+/// `-P` so that a symlink is copied as a symlink rather than followed. That is
+/// what `zemacs-dired::copy` does locally, and it is also what keeps the
+/// recursion finite: a link pointing back at an ancestor cannot become an
+/// infinite walk. An existing destination is refused, exactly as in [`rename`].
+///
+/// ponytail: no `-p`, so the copy takes the mode bits the remote `cp` gives it
+/// and not the source's times or owner. `cp -p` as a login that does not own
+/// the file fails its `chown` and reports the whole copy as an error, which is
+/// a worse lie than a fresh mtime; the upgrade is `-p` behind a `stat` of who
+/// owns what, for a column nobody sorts a remote listing by.
+pub fn copy(from: &RemotePath, to: &RemotePath) -> Result<()> {
+    same_host("copy", from, to)?;
+    if within(from.path(), to.path()) {
         return Err(Error::Refused(format!(
-            "cannot rename {from} to {to}: different hosts"
+            "refusing to copy {from} into itself ({to})"
         )));
     }
-    ssh(from, &rename_script(from, to), &[], "renaming").map(drop)
+    ssh(from, &copy_script(from, to), &[], "copying").map(drop)
+}
+
+/// Is `to` inside `from`, or `from` itself?
+///
+/// `a` into `a/b` copies `b` into `b/b` into `b/b/b` until the disk fills, and
+/// this is `zemacs-dired::copy`'s `within` check with no round trip in it: the
+/// paths as *written*, not as the host would resolve them. The `/` is what
+/// makes it compare whole components, so `/srv/apple` is not inside `/srv/app`.
+/// A symlink pointing back into the source still gets past this, and there
+/// `cp`'s own detection is the one that has to stop.
+fn within(from: &str, to: &str) -> bool {
+    let from = from.trim_end_matches('/');
+    to == from || to.starts_with(&format!("{from}/"))
+}
+
+/// Both ends of a two-name operation have to be the same login on the same
+/// host: a cross-host move is a read plus a write plus a delete, and that is
+/// the caller's decision to make, not something to do silently.
+fn same_host(what: &str, from: &RemotePath, to: &RemotePath) -> Result<()> {
+    if (&from.host, &from.user, from.port) != (&to.host, &to.user, to.port) {
+        return Err(Error::Refused(format!(
+            "cannot {what} {from} to {to}: different hosts"
+        )));
+    }
+    Ok(())
 }
 
 /// Drop the multiplexed connection to this host, if there is one.
@@ -391,6 +443,28 @@ fn rename_script(from: &RemotePath, to: &RemotePath) -> String {
         quote(from.path()),
         quote(to.path())
     )
+}
+
+/// Exit 4 is "the destination is already there", as in [`rename_script`], and
+/// `cp` would have eaten it just as quietly as `mv`.
+fn copy_script(from: &RemotePath, to: &RemotePath) -> String {
+    format!(
+        "set -e\n\
+         a={}\n\
+         b={}\n\
+         if [ -e \"$b\" ] || [ -L \"$b\" ]; then printf '%s\\n' 'destination exists' >&2; exit 4; fi\n\
+         cp -R -P -- \"$a\" \"$b\"\n",
+        quote(from.path()),
+        quote(to.path())
+    )
+}
+
+/// `set -C` is the shell's noclobber, and the whole of [`create_file`]'s
+/// promise: the redirection opens with `O_EXCL`, so an existing file fails in
+/// the kernel rather than being emptied — no window between a test and a write,
+/// which a `[ -e ]` guard would have left open.
+fn create_script(p: &RemotePath) -> String {
+    format!("set -C\n: > {}\n", quote(p.path()))
 }
 
 /// Ask the remote for `mode size mtime` in one line, from either flavour of
@@ -730,8 +804,10 @@ pub enum Op {
     List(RemotePath),
     Stat(RemotePath),
     Mkdir(RemotePath),
+    CreateFile(RemotePath),
     Delete { path: RemotePath, recursive: bool },
     Rename { from: RemotePath, to: RemotePath },
+    Copy { from: RemotePath, to: RemotePath },
 }
 
 /// What an [`Op`] produced. `Done` covers everything whose only answer is
@@ -754,8 +830,10 @@ pub fn execute(op: Op) -> Result<Reply> {
         Op::List(p) => list(&p).map(Reply::List),
         Op::Stat(p) => stat(&p).map(Reply::Stat),
         Op::Mkdir(p) => mkdir(&p).map(|()| Reply::Done),
+        Op::CreateFile(p) => create_file(&p).map(|()| Reply::Done),
         Op::Delete { path, recursive } => delete(&path, recursive).map(|()| Reply::Done),
         Op::Rename { from, to } => rename(&from, &to).map(|()| Reply::Done),
+        Op::Copy { from, to } => copy(&from, &to).map(|()| Reply::Done),
     }
 }
 
@@ -984,6 +1062,30 @@ mod tests {
         // the same host under a different login is a different host too
         assert!(rename(&p("/ssh:a:/x"), &p("/ssh:root@a:/x")).is_err());
         assert!(rename(&p("/ssh:a#22:/x"), &p("/ssh:a:/y")).is_err());
+        // ...and `copy` shares the check, so it cannot grow its own answer
+        assert!(copy(&p("/ssh:a:/x"), &p("/ssh:b:/x"))
+            .unwrap_err()
+            .to_string()
+            .contains("different hosts"));
+    }
+
+    /// The runaway: `cp -R a a/b` fills the disk. Refused before ssh is
+    /// spawned, so nothing here touches a network.
+    #[test]
+    fn copying_a_directory_into_itself_is_refused() {
+        for (from, to) in [
+            ("/ssh:host:/srv/app", "/ssh:host:/srv/app/backup"),
+            ("/ssh:host:/srv/app/", "/ssh:host:/srv/app/deep/er"),
+            ("/ssh:host:/srv/app", "/ssh:host:/srv/app"),
+        ] {
+            let err = copy(&p(from), &p(to)).unwrap_err().to_string();
+            assert!(err.contains("into itself"), "{from} -> {to}: {err}");
+        }
+        // ...and the check compares whole components, so a sibling whose name
+        // merely starts the same way is a perfectly good destination.
+        assert!(!within("/srv/app", "/srv/apple"));
+        assert!(!within("/srv/app", "/srv"));
+        assert!(within("/srv/app", "/srv/app/x"));
     }
 
     #[test]
@@ -1082,8 +1184,10 @@ mod tests {
             scripts.push(write_script(target));
             scripts.push(list_script(target));
             scripts.push(stat_script(target));
+            scripts.push(create_script(target));
         }
         scripts.push(rename_script(&ugly, &home));
+        scripts.push(copy_script(&ugly, &home));
         for script in scripts {
             let out = std::process::Command::new("sh")
                 .args(["-n", "-c", &script])
@@ -1131,10 +1235,33 @@ mod tests {
         let stated = parse_records(&run(&stat_script(&file), b""));
         assert_eq!(stated[0].mode, 0o600);
 
+        // A copy of that same hostile name, and then a refusal to clobber it.
+        let twin = file.parent().unwrap().join("twin");
+        run(&copy_script(&file, &twin), b"");
+        assert_eq!(std::fs::read(dir.join("twin")).unwrap(), b"again");
+        assert!(failing(&copy_script(&file, &twin)).contains("destination exists"));
+
+        // `set -C` is the whole of `create_file`: a new name, then a refusal.
+        let fresh = file.parent().unwrap().join("fresh");
+        run(&create_script(&fresh), b"");
+        assert_eq!(std::fs::read(dir.join("fresh")).unwrap(), b"");
+        assert!(!failing(&create_script(&fresh)).is_empty(), "it truncated");
+        assert_eq!(std::fs::read(dir.join("fresh")).unwrap(), b"");
+
         let moved = file.parent().unwrap().join("moved");
         run(&rename_script(&file, &moved), b"");
         assert!(dir.join("moved").exists() && !dir.join(name).exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A script that must *not* succeed, and what it said about why.
+    fn failing(script: &str) -> String {
+        let out = std::process::Command::new("sh")
+            .args(["-c", script])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{script}\n{out:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
     }
 
     fn run(script: &str, stdin: &[u8]) -> Vec<u8> {

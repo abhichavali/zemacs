@@ -41,6 +41,15 @@
 ;;;; keywords, functions and types by default. That is zemacs' taste rather than
 ;;;; Modus', and it is a variable for exactly that reason — set it to NIL for
 ;;;; this theme as Protesilaos published it.
+;;;;
+;;;; The twelve optional UI faces read straight down the same palette:
+;;;; `bg-region', `bg-hl-line' and `bg-popup' from its special-purpose block,
+;;;; `border' for the pane rule and the popup stroke both, and `cursor', `err'
+;;;; and `warning' from its mappings — the caret magenta here where the plain
+;;;; theme's is white, Modus' own choice rather than a liberty taken. Three are
+;;;; this port's: one `popup' against Modus' separate company, corfu and
+;;;; posframe grounds, one `accent' against its graded `accent-0' to `accent-3'
+;;;; — both take the first — and `match' on `bg-search-current' alone.
 
 (in-package :zemacs)
 
@@ -48,7 +57,12 @@
 (let (;; Basic values
       (bg-main               '(0.051 0.055 0.110))  ; #0d0e1c
       (fg-main               '(1.000 1.000 1.000))  ; #ffffff
-      (fg-dim                '(0.616 0.616 0.667))  ; #9d9d9daa -> #9d9d9d
+      ;; `#9d9d9d' is a grey, so all three components are equal. The blue used
+      ;; to read 0.667, which is 0xaa/255 — the *alpha* byte of the source value
+      ;; `#9d9d9daa', copied into the channel below it. A grey with a blue cast,
+      ;; on the face this theme dims half its furniture with.
+      (fg-dim                '(0.616 0.616 0.616))  ; #9d9d9d (from #9d9d9daa)
+      (border                '(0.380 0.392 0.478))  ; #61647a
 
       ;; Accent foregrounds. Identical to plain vivendi: the accents are chosen
       ;; against `fg-main', and the ground moving does not move them.
@@ -61,10 +75,21 @@
       (magenta               '(0.996 0.675 0.816))  ; #feacd0
       (magenta-warmer        '(0.969 0.561 0.906))  ; #f78fe7
       (magenta-cooler        '(0.714 0.627 1.000))  ; #b6a0ff
+      (magenta-intense       '(1.000 0.400 1.000))  ; #ff66ff
+      (red                   '(1.000 0.373 0.349))  ; #ff5f59
+      (yellow-warmer         '(0.996 0.769 0.247))  ; #fec43f
       (yellow-faint          '(0.824 0.710 0.502))  ; #d2b580
 
+      ;; Accent backgrounds
+      (bg-yellow-intense     '(0.478 0.380 0.000))  ; #7a6100
+
+      ;; Special purpose
+      (bg-popup              '(0.078 0.086 0.173))  ; #14162c
+      (bg-hl-line            '(0.188 0.227 0.435))  ; #303a6f
+      (bg-region             '(0.333 0.353 0.400))  ; #555a66
+
       ;; Modeline backgrounds — tinted, which is the whole point of the variant.
-      (bg-mode-line-active   '(0.267 0.243 0.376))  ; #443f60
+      (bg-mode-line-active   '(0.267 0.247 0.376))  ; #443f60
       (bg-mode-line-inactive '(0.157 0.157 0.208))  ; #282835
       )
 
@@ -96,4 +121,20 @@
   (set-face "modeline"          bg-mode-line-active)    ; #443f60  Modus `bg-mode-line-active'
   (set-face "modeline-inactive" bg-mode-line-inactive)  ; #282835  Modus `bg-mode-line-inactive'
   (set-face "modeline-text"     fg-main)                ; #ffffff  Modus `fg-mode-line-active'
+
+  ;; The twelve optional ones. Left unset they fall back to a ratio the renderer
+  ;; mixes off the ground — a guess, in the one theme that publishes a measured
+  ;; value for every band it draws.
+  (set-face "region"              bg-region)          ; #555a66  Modus `bg-region'
+  (set-face "cursor"              magenta-intense)    ; #ff66ff  Modus `cursor'
+  (set-face "current-line"        bg-hl-line)         ; #303a6f  Modus `bg-hl-line'
+  (set-face "line-number"         fg-dim)             ; #9d9d9d  Modus `fg-line-number-inactive'
+  (set-face "line-number-current" fg-main)            ; #ffffff  Modus `fg-line-number-active'
+  (set-face "divider"             border)             ; #61647a  Modus `border'
+  (set-face "error"               red)                ; #ff5f59  Modus `err'
+  (set-face "warning"             yellow-warmer)      ; #fec43f  Modus `warning'
+  (set-face "match"               bg-yellow-intense)  ; #7a6100  Modus `bg-search-current'
+  (set-face "popup"               bg-popup)           ; #14162c  Modus `bg-popup'
+  (set-face "popup-border"        border)             ; #61647a  Modus `child-frame-border'
+  (set-face "accent"              blue-cooler)        ; #00bcff  Modus `accent-0'
   )

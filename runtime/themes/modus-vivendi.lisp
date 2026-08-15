@@ -48,6 +48,15 @@
 ;;;; loaded and bolds keywords, functions and types by default. That is zemacs'
 ;;;; taste, not Modus', and it is a variable for exactly that reason — set it to
 ;;;; NIL for this theme as Protesilaos published it.
+;;;;
+;;;; The twelve optional UI faces read straight down the same palette: `bg-region',
+;;;; `bg-hl-line' and `bg-popup' from its special-purpose block, `border' for both
+;;;; the pane rule and the popup stroke, and `cursor', `err' and `warning' from its
+;;;; mappings. `bg-hl-line' is a navy, not a few percent off black — louder than the
+;;;; usual stripe, and published. Two are this port's: zemacs has one `popup' where
+;;;; Modus dresses company, corfu and posframe apart, and one `accent' where Modus
+;;;; grades `accent-0' through `accent-3', so both take the first of their series;
+;;;; and `match' is `bg-search-current' alone, the lazy-hit cyan having no band.
 
 (in-package :zemacs)
 
@@ -56,6 +65,7 @@
       (bg-main               '(0.000 0.000 0.000))  ; #000000
       (fg-main               '(1.000 1.000 1.000))  ; #ffffff
       (fg-dim                '(0.596 0.596 0.596))  ; #989898
+      (border                '(0.392 0.392 0.392))  ; #646464
 
       ;; Accent foregrounds
       (blue-warmer           '(0.475 0.659 1.000))  ; #79a8ff
@@ -67,7 +77,17 @@
       (magenta               '(0.996 0.675 0.816))  ; #feacd0
       (magenta-warmer        '(0.969 0.561 0.906))  ; #f78fe7
       (magenta-cooler        '(0.714 0.627 1.000))  ; #b6a0ff
+      (red                   '(1.000 0.373 0.349))  ; #ff5f59
+      (yellow-warmer         '(0.996 0.769 0.247))  ; #fec43f
       (yellow-faint          '(0.824 0.710 0.502))  ; #d2b580
+
+      ;; Accent backgrounds
+      (bg-yellow-intense     '(0.478 0.380 0.000))  ; #7a6100
+
+      ;; Special purpose
+      (bg-popup              '(0.047 0.047 0.047))  ; #0c0c0c
+      (bg-hl-line            '(0.184 0.220 0.286))  ; #2f3849
+      (bg-region             '(0.353 0.353 0.353))  ; #5a5a5a
 
       ;; Modeline backgrounds
       (bg-mode-line-active   '(0.314 0.314 0.314))  ; #505050
@@ -102,4 +122,20 @@
   (set-face "modeline"          bg-mode-line-active)    ; #505050  Modus `bg-mode-line-active'
   (set-face "modeline-inactive" bg-mode-line-inactive)  ; #2d2d2d  Modus `bg-mode-line-inactive'
   (set-face "modeline-text"     fg-main)                ; #ffffff  Modus `fg-mode-line-active'
+
+  ;; The twelve optional ones. Left unset they fall back to a ratio the renderer
+  ;; mixes off the ground, which is a guess in the one theme that measured every
+  ;; value it publishes.
+  (set-face "region"              bg-region)          ; #5a5a5a  Modus `bg-region'
+  (set-face "cursor"              fg-main)            ; #ffffff  Modus `cursor'
+  (set-face "current-line"        bg-hl-line)         ; #2f3849  Modus `bg-hl-line'
+  (set-face "line-number"         fg-dim)             ; #989898  Modus `fg-line-number-inactive'
+  (set-face "line-number-current" fg-main)            ; #ffffff  Modus `fg-line-number-active'
+  (set-face "divider"             border)             ; #646464  Modus `border'
+  (set-face "error"               red)                ; #ff5f59  Modus `err'
+  (set-face "warning"             yellow-warmer)      ; #fec43f  Modus `warning'
+  (set-face "match"               bg-yellow-intense)  ; #7a6100  Modus `bg-search-current'
+  (set-face "popup"               bg-popup)           ; #0c0c0c  Modus `bg-popup'
+  (set-face "popup-border"        border)             ; #646464  Modus `child-frame-border'
+  (set-face "accent"              blue-cooler)        ; #00bcff  Modus `accent-0'
   )

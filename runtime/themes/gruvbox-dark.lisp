@@ -51,6 +51,15 @@
 ;;;;   share a buffer.
 ;;;; * `punctuation' — neither upstream links a generic `Delimiter'. It takes
 ;;;;   `light3', the step vim spends on markdown's structural delimiters.
+;;;;
+;;;; The twelve UI faces are upstream's wherever upstream has one: `region' and
+;;;; `cursor' from gruvbox-theme.el, `current-line', `line-number', `divider' and
+;;;; `line-number-current' from vim's CursorLine, LineNr, VertSplit and its yellow
+;;;; CursorLineNr — vim again where the Emacs port says orange. Three are not.
+;;;; `match' is a bare band here, and upstream's solid yellow would swallow the
+;;;; text on it, so it takes `dark3': vim's MatchParen ground, one rung past the
+;;;; selection. `popup-border' is a step up off the Pmenu fill, gruvbox publishing
+;;;; none. `accent' is the orange — one accent where upstream has a per-element one.
 
 (in-package :zemacs)
 
@@ -59,7 +68,9 @@
       ;; variants move only this one value.
       (dark0         '(0.157 0.157 0.157))  ; #282828
       (dark1         '(0.235 0.220 0.212))  ; #3c3836
+      (dark2         '(0.314 0.286 0.271))  ; #504945
       (dark3         '(0.400 0.361 0.329))  ; #665c54
+      (dark4         '(0.486 0.435 0.392))  ; #7c6f64
       (gray          '(0.573 0.514 0.455))  ; #928374
       (light3        '(0.741 0.682 0.576))  ; #bdae93
       (light2        '(0.835 0.769 0.631))  ; #d5c4a1
@@ -105,4 +116,18 @@
   (set-face "modeline"          dark3)                  ; #665c54  `mode-line' bg
   (set-face "modeline-inactive" dark1)                  ; #3c3836  `mode-line-inactive' bg
   (set-face "modeline-text"     light2)                 ; #d5c4a1  `mode-line' fg
+
+  ;; The UI 12, which a theme may leave out and this one does not.
+  (set-face "region"              dark2)                ; #504945  `region'
+  (set-face "cursor"              light1)               ; #ebdbb2  `cursor'
+  (set-face "current-line"        dark1)                ; #3c3836  `CursorLine', `hl-line'
+  (set-face "line-number"         dark4)                ; #7c6f64  `LineNr'
+  (set-face "line-number-current" bright-yellow)        ; #fabd2f  `CursorLineNr'
+  (set-face "divider"             dark3)                ; #665c54  `VertSplit'
+  (set-face "error"               bright-red)           ; #fb4934  `GruvboxRed'
+  (set-face "warning"             bright-yellow)        ; #fabd2f  `warning'
+  (set-face "match"               dark3)                ; #665c54  see the header
+  (set-face "popup"               dark2)                ; #504945  `Pmenu' bg
+  (set-face "popup-border"        dark4)                ; #7c6f64  see the header
+  (set-face "accent"              bright-orange)        ; #fe8019  see the header
   )

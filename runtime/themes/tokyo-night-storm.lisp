@@ -53,6 +53,15 @@
 ;;;;   bars, so the separation has to move into the background: the active bar
 ;;;;   takes `fg_gutter' and the inactive one `bg_statusline', which is the
 ;;;;   two-tier arrangement the shipped lualine theme uses.
+;;;;
+;;;; The twelve UI faces are folke's own groups; three of the values are mixes
+;;;; he computes rather than publishes — the selection band is `blue0' at forty
+;;;; percent on the ground, the window edge the ground at eighty on black, the
+;;;; float stroke `blue1' at eighty on the ground. Two are this port's: the
+;;;; gutter digit under point keeps his orange but drops its bold, and `accent'
+;;;; is `blue', which he spends one element at a time on `Title', `Directory'
+;;;; and `todo'. zemacs has one popup face where he has a float group and a
+;;;; menu group, and it sinks below the buffer, `bg_popup' being `bg_dark'.
 
 (in-package :zemacs)
 
@@ -60,6 +69,7 @@
 (let (;; The ground and the greys mixed from it — the storm variant proper.
       (bg           '(0.141 0.157 0.231))  ; #24283b
       (bg-dark      '(0.122 0.137 0.208))  ; #1f2335  also `bg_statusline'
+      (bg-highlight '(0.161 0.180 0.259))  ; #292e42
       (fg-gutter    '(0.231 0.259 0.380))  ; #3b4261
       (fg           '(0.753 0.792 0.961))  ; #c0caf5
       (fg-dark      '(0.663 0.694 0.839))  ; #a9b1d6
@@ -68,14 +78,21 @@
       ;; The accents. Shared with `night' and `moon' unchanged: they are chosen
       ;; against `fg', and moving the ground does not move them.
       (blue         '(0.478 0.635 0.969))  ; #7aa2f7
+      (blue0        '(0.239 0.349 0.631))  ; #3d59a1
       (blue1        '(0.165 0.765 0.871))  ; #2ac3de
       (blue5        '(0.537 0.867 1.000))  ; #89ddff
       (green        '(0.620 0.808 0.416))  ; #9ece6a
       (magenta      '(0.733 0.604 0.969))  ; #bb9af7
       (orange       '(1.000 0.620 0.392))  ; #ff9e64
       (purple       '(0.616 0.486 0.847))  ; #9d7cd8
+      (red1         '(0.859 0.294 0.294))  ; #db4b4b
       (teal         '(0.102 0.737 0.612))  ; #1abc9c
       (yellow       '(0.878 0.686 0.408))  ; #e0af68
+
+      ;; Three folke mixes rather than publishes, and so this ground's alone.
+      (bg-visual    '(0.180 0.235 0.392))  ; #2e3c64  `blue0' at 40% on `bg'
+      (border       '(0.114 0.125 0.184))  ; #1d202f  `bg' at 80% on black
+      (border-hl    '(0.161 0.643 0.741))  ; #29a4bd  `blue1' at 80% on `bg'
       )
 
   (apply #'set-background bg)
@@ -104,4 +121,18 @@
   (set-face "modeline"          fg-gutter)              ; #3b4261  lualine's raised segment
   (set-face "modeline-inactive" bg-dark)                ; #1f2335  `bg_statusline'
   (set-face "modeline-text"     fg-dark)                ; #a9b1d6  `StatusLine' fg
+
+  ;; The UI 12, which a theme may leave out and this one does not.
+  (set-face "region"              bg-visual)            ; #2e3c64  `Visual'
+  (set-face "cursor"              fg)                   ; #c0caf5  `Cursor', the block
+  (set-face "current-line"        bg-highlight)         ; #292e42  `CursorLine'
+  (set-face "line-number"         fg-gutter)            ; #3b4261  `LineNr'
+  (set-face "line-number-current" orange)               ; #ff9e64  `CursorLineNr', unbolded
+  (set-face "divider"             border)               ; #1d202f  `WinSeparator'
+  (set-face "error"               red1)                 ; #db4b4b  folke's `error'
+  (set-face "warning"             yellow)               ; #e0af68  folke's `warning'
+  (set-face "match"               blue0)                ; #3d59a1  `Search' ground
+  (set-face "popup"               bg-dark)              ; #1f2335  `bg_popup', see the header
+  (set-face "popup-border"        border-hl)            ; #29a4bd  `FloatBorder'
+  (set-face "accent"              blue)                 ; #7aa2f7  see the header
   )

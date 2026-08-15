@@ -59,6 +59,19 @@
 ;;;; (#b57614) is 3.3:1 on `light0', and it is the darkest yellow Pertsev
 ;;;; published — there is no lower step to move `type' to. Upstream lives with
 ;;;; it, and inventing a hue to fix it would stop this being gruvbox.
+;;;;
+;;;; The twelve optional UI faces are gruvbox.vim's own — `Cursor' inverted,
+;;;; `Visual', `CursorLine', `LineNr', `CursorLineNr', `VertSplit', `Pmenu' —
+;;;; and spend the light ramp in order, `light1' down to `light4'. Four are this
+;;;; port's. `match' is `light4', not the yellow an inverted `Search' resolves
+;;;; to, since zemacs bands a hit without repainting the glyph and #3c3836 on
+;;;; #b57614 is 2.2:1; a rung past `region' keeps a hit inside a selection
+;;;; legible. `warning' takes ALE's yellow over Coc's orange, #af3a03 beside
+;;;; #9d0006 being two dark red-browns. `accent' is one colour where gruvbox
+;;;; picks a hue per element, and takes `faded-orange' over the blue of
+;;;; `PmenuSel'; `popup' is one panel where upstream has several; and
+;;;; `popup-border' has no upstream at all, gruvbox.vim predating floating
+;;;; windows, so it borrows `PmenuThumb'.
 
 (in-package :zemacs)
 
@@ -67,7 +80,9 @@
       ;; variants move only this one value.
       (light0        '(0.984 0.945 0.780))  ; #fbf1c7
       (light1        '(0.922 0.859 0.698))  ; #ebdbb2
+      (light2        '(0.835 0.769 0.631))  ; #d5c4a1
       (light3        '(0.741 0.682 0.576))  ; #bdae93
+      (light4        '(0.659 0.600 0.518))  ; #a89984
       (dark4         '(0.486 0.435 0.392))  ; #7c6f64
       (dark3         '(0.400 0.361 0.329))  ; #665c54
       (dark2         '(0.314 0.286 0.271))  ; #504945
@@ -112,4 +127,18 @@
   (set-face "modeline"          light3)                 ; #bdae93  `mode-line' bg
   (set-face "modeline-inactive" light1)                 ; #ebdbb2  `mode-line-inactive' bg
   (set-face "modeline-text"     dark2)                  ; #504945  `mode-line' fg
+
+  ;; The twelve UI faces a theme may leave out. This one names them.
+  (set-face "region"            light3)                 ; #bdae93  `Visual'
+  (set-face "cursor"            dark1)                  ; #3c3836  `Cursor', inverted
+  (set-face "current-line"      light1)                 ; #ebdbb2  `CursorLine'
+  (set-face "line-number"       light4)                 ; #a89984  `LineNr'
+  (set-face "line-number-current" faded-yellow)         ; #b57614  `CursorLineNr'
+  (set-face "divider"           light3)                 ; #bdae93  `VertSplit'
+  (set-face "error"             faded-red)              ; #9d0006  `Error', `ErrorMsg'
+  (set-face "warning"           faded-yellow)           ; #b57614  `ALEWarningSign'
+  (set-face "match"             light4)                 ; #a89984  see the header
+  (set-face "popup"             light2)                 ; #d5c4a1  `Pmenu'
+  (set-face "popup-border"      light4)                 ; #a89984  `PmenuThumb', see the header
+  (set-face "accent"            faded-orange)           ; #af3a03  see the header
   )

@@ -47,6 +47,15 @@
 ;;;;   takes `dracula-current' (#353747) instead, the port's own darker
 ;;;;   current-line value, and stays visible.
 ;;;;
+;;;; The twelve UI faces are that same file read down: `region', `hl-line' for
+;;;; the cursor line, `vertical-border', `error', `warning', `tooltip' for the
+;;;; panels, `line-number' with its italic slant kept. Five are the port's. The
+;;;; caret takes #f8f8f0, what vim, VS Code and Sublime agree on, not upstream's
+;;;; dimmer fg3; `line-number-current' upstream never defines, so the bright
+;;;; foreground fills it; a search hit takes `lazy-highlight's grey, not `match's
+;;;; solid yellow, which would swallow every string on it; and upstream having no
+;;;; tooltip border and no one accent, those two take the comment blue and purple.
+;;;;
 ;;;; Comments are not italic, which surprises people who expect Dracula to
 ;;;; italicise everything. `font-lock-comment-face' inherits `shadow', which
 ;;;; sets a colour and nothing else, and the specification asks for no slant
@@ -74,11 +83,14 @@
       ;; in the palette dark enough to be an inactive mode line and still a bar.
       (dracula-region  '(0.267 0.278 0.353))  ; #44475a
       (dracula-current '(0.208 0.216 0.278))  ; #353747
+
+      ;; Two greys the official eleven do not carry. `alt-bg' is
+      ;; `dracula-theme.el's own name for the one it writes gutter digits and
+      ;; lazy highlights in; the caret colour has no name upstream anywhere,
+      ;; only literals.
+      (alt-bg          '(0.337 0.341 0.380))  ; #565761  dracula-theme.el's alt-bg
+      (dracula-cursor  '(0.973 0.973 0.941))  ; #f8f8f0  the caret, every port
       )
-  ;; zemacs has no error or warning face, so the red goes unspent. It is bound
-  ;; anyway: the palette above is worth checking against the specification line
-  ;; by line, and a hole in the middle of it is one more thing to wonder about.
-  (declare (ignorable dracula-red))
 
   (apply #'set-background dracula-bg)
   (apply #'set-foreground dracula-fg)
@@ -108,4 +120,20 @@
   (set-face "modeline"          dracula-region)            ; #44475a  mode-line background
   (set-face "modeline-inactive" dracula-current)           ; #353747  see the header
   (set-face "modeline-text"     dracula-fg)                ; #f8f8f2  mode-line foreground
+
+  ;; The UI 12, which a theme may leave out and this one does not. Their column
+  ;; sits two past the block above: the longest name here is longer than any
+  ;; name upstream needed a face for.
+  (set-face "region"              dracula-region)          ; #44475a  region
+  (set-face "cursor"              dracula-cursor)          ; #f8f8f0  see the header
+  (set-face "current-line"        dracula-current)         ; #353747  hl-line
+  (set-face "line-number"         alt-bg :italic t)        ; #565761  line-number
+  (set-face "line-number-current" dracula-fg)              ; #f8f8f2  see the header
+  (set-face "divider"             dracula-current)         ; #353747  vertical-border
+  (set-face "error"               dracula-red)             ; #ff5555  error
+  (set-face "warning"             dracula-orange)          ; #ffb86c  warning
+  (set-face "match"               alt-bg)                  ; #565761  lazy-highlight
+  (set-face "popup"               dracula-region)          ; #44475a  tooltip, company-tooltip
+  (set-face "popup-border"        dracula-comment)         ; #6272a4  see the header
+  (set-face "accent"              dracula-purple)          ; #bd93f9  see the header
   )

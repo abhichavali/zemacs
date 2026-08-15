@@ -70,29 +70,45 @@
 ;;;;   in the body colour. The deviation is the other half of the face, since
 ;;;;   zemacs also spends `variable' on tree-sitter's `property' captures, which
 ;;;;   the guide paints Blue. The plain case is much the commoner, so it wins.
+;;;;
+;;;; The twelve optional UI faces are set as well, eight of them the style
+;;;; guide's UI table read down. `region' takes the nvim theme's Surface 1, the
+;;;; guide's Overlay 2 at a quarter opacity being a blend and not a shade, and
+;;;; `divider' and `popup-border' share its Inactive Border, no rule here ever
+;;;; being the focused one. Four are judgement: `current-line' is Mantle,
+;;;; between the guide's Text at ten percent and the lighter mix nvim gives
+;;;; Latte; `match' is Surface 2, a rung past the selection, a solid Teal band
+;;;; behind unchanged text being 2.1:1; `popup' is Crust, Mantle being spent
+;;;; and one face here covering upstream's float and menu groups both; and
+;;;; `accent' is Mauve, upstream's default, where upstream accents per element.
 
 (in-package :zemacs)
 
 ;;; The palette, named as Catppuccin names it.
 (let (;; Base shades and the surfaces drawn on top of them
-      (base     '(0.937 0.945 0.961))  ; #eff1f5
-      (surface1 '(0.737 0.753 0.800))  ; #bcc0cc
-      (surface0 '(0.800 0.816 0.855))  ; #ccd0da
+      (base      '(0.937 0.945 0.961))  ; #eff1f5
+      (surface1  '(0.737 0.753 0.800))  ; #bcc0cc
+      (surface0  '(0.800 0.816 0.855))  ; #ccd0da
+      (mantle    '(0.902 0.914 0.937))  ; #e6e9ef
+      (crust     '(0.863 0.878 0.910))  ; #dce0e8
+      (surface2  '(0.675 0.690 0.745))  ; #acb0be
 
       ;; Text, and the overlays that step up from it toward the ground
-      (text     '(0.298 0.310 0.412))  ; #4c4f69
-      (overlay2 '(0.486 0.498 0.576))  ; #7c7f93
-      (overlay1 '(0.549 0.561 0.631))  ; #8c8fa1
+      (text      '(0.298 0.310 0.412))  ; #4c4f69
+      (overlay2  '(0.486 0.498 0.576))  ; #7c7f93
+      (overlay1  '(0.549 0.561 0.631))  ; #8c8fa1
+      (overlay0  '(0.612 0.627 0.690))  ; #9ca0b0
 
       ;; Accents
-      (mauve    '(0.533 0.224 0.937))  ; #8839ef
-      (red      '(0.824 0.059 0.224))  ; #d20f39
-      (peach    '(0.996 0.392 0.043))  ; #fe640b
-      (yellow   '(0.875 0.557 0.114))  ; #df8e1d
-      (green    '(0.251 0.627 0.169))  ; #40a02b
-      (sky      '(0.016 0.647 0.898))  ; #04a5e5
-      (blue     '(0.118 0.400 0.961))  ; #1e66f5
-      (lavender '(0.447 0.529 0.992))  ; #7287fd
+      (rosewater '(0.863 0.541 0.471))  ; #dc8a78
+      (mauve     '(0.533 0.224 0.937))  ; #8839ef
+      (red       '(0.824 0.059 0.224))  ; #d20f39
+      (peach     '(0.996 0.392 0.043))  ; #fe640b
+      (yellow    '(0.875 0.557 0.114))  ; #df8e1d
+      (green     '(0.251 0.627 0.169))  ; #40a02b
+      (sky       '(0.016 0.647 0.898))  ; #04a5e5
+      (blue      '(0.118 0.400 0.961))  ; #1e66f5
+      (lavender  '(0.447 0.529 0.992))  ; #7287fd
       )
 
   (apply #'set-background base)
@@ -121,4 +137,18 @@
   (set-face "modeline"          surface1)             ; #bcc0cc  bar, current window
   (set-face "modeline-inactive" surface0)             ; #ccd0da  bar, other windows
   (set-face "modeline-text"     text     :bold t)     ; #4c4f69  what is written on it
+
+  ;; The UI 12, which a theme may leave out and this one does not.
+  (set-face "region"              surface1)           ; #bcc0cc  Visual
+  (set-face "cursor"              rosewater)          ; #dc8a78  Cursor
+  (set-face "current-line"        mantle)             ; #e6e9ef  see the header
+  (set-face "line-number"         overlay1)           ; #8c8fa1  Line Numbers
+  (set-face "line-number-current" lavender)           ; #7287fd  Active Line Number
+  (set-face "divider"             overlay0)           ; #9ca0b0  Inactive Border
+  (set-face "error"               red)                ; #d20f39  Errors
+  (set-face "warning"             yellow)             ; #df8e1d  Warnings
+  (set-face "match"               surface2)           ; #acb0be  see the header
+  (set-face "popup"               crust)              ; #dce0e8  see the header
+  (set-face "popup-border"        overlay0)           ; #9ca0b0  Inactive Border
+  (set-face "accent"              mauve)              ; #8839ef  the default accent
   )

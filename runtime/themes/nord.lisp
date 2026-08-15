@@ -54,6 +54,15 @@
 ;;;;   zemacs does not underline. It takes nord8, which is the colour Nord uses
 ;;;;   for `button', `org-date' and `org-footnote', i.e. for the things that are
 ;;;;   somewhere you can go.
+;;;;
+;;;; The twelve UI faces are `nord-theme.el' where it has one: nord2 `region'
+;;;; and `divider', nord4 `cursor', nord1 `hl-line', nord3 `linum', nord11 and
+;;;; nord13 the diagnostics, upright where upstream bolds them. Three are the
+;;;; port's: `line-number-current', which upstream never separates, takes
+;;;; nord4; `match' takes nord3, a rung past the selection, isearch being nord0
+;;;; on nord8, a pairing and not a band; and one `popup' stands for several
+;;;; tooltip groups, so it drops off their nord2, already `region', to nord1,
+;;;; `popup-border' nord3. One `accent' covers a per-element one: nord8.
 
 (in-package :zemacs)
 
@@ -86,12 +95,13 @@
       ;; for comments, because nord3 on nord0 is not legible enough to read.
       (nord-comment '(0.380 0.431 0.533))  ; #616e88
       )
-  ;; Nord numbers sixteen colours and zemacs spends nine of them. The rest are
+  ;; Nord numbers sixteen colours and zemacs spends twelve of them. The rest are
   ;; bound anyway so the palette above can be read straight down against the
-  ;; spec; a list with gaps in it is a list nobody can check. Most of what goes
-  ;; unspent is diagnostics — nord11 error, nord13 warning, nord12 deprecation —
-  ;; which zemacs has no faces for yet.
-  (declare (ignorable nord2 nord5 nord6 nord10 nord11 nord12 nord13))
+  ;; spec; a list with gaps in it is a list nobody can check. Unspent are nord5
+  ;; and nord6, the two brighter snows, which have nothing to be brighter than
+  ;; nord4 for here; nord10, the dark end of Frost, which upstream keeps for the
+  ;; preprocessor; and nord12, which it keeps for escapes and deprecation.
+  (declare (ignorable nord5 nord6 nord10 nord12))
 
   (apply #'set-background nord0)
   (apply #'set-foreground nord4)
@@ -121,4 +131,18 @@
   (set-face "modeline"          nord3)             ; #4c566a  mode-line background
   (set-face "modeline-inactive" nord1)             ; #3b4252  mode-line-inactive bg
   (set-face "modeline-text"     nord8)             ; #88c0d0  mode-line foreground
+
+  ;; The UI 12, which a theme may leave out. This one cannot afford to.
+  (set-face "region"              nord2)           ; #434c5e  region, default
+  (set-face "cursor"              nord4)           ; #d8dee9  cursor
+  (set-face "current-line"        nord1)           ; #3b4252  hl-line
+  (set-face "line-number"         nord3)           ; #4c566a  linum
+  (set-face "line-number-current" nord4)           ; #d8dee9  see the header
+  (set-face "divider"             nord2)           ; #434c5e  vertical-border
+  (set-face "error"               nord11)          ; #bf616a  error, upright
+  (set-face "warning"             nord13)          ; #ebcb8b  warning, upright
+  (set-face "match"               nord3)           ; #4c566a  see the header
+  (set-face "popup"               nord1)           ; #3b4252  see the header
+  (set-face "popup-border"        nord3)           ; #4c566a  see the header
+  (set-face "accent"              nord8)           ; #88c0d0  see the header
   )

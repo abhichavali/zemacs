@@ -70,6 +70,15 @@
 ;;;; the ones that are something in particular — a property, a parameter, a
 ;;;; builtin. The theme is vivid because of what it marks, not because it marks
 ;;;; everything.
+;;;;
+;;;; The twelve UI faces a theme may leave out are set below too, nearly all
+;;;; straight off a folke group — Visual, CursorLine, LineNr, Cursor, Search,
+;;;; ErrorMsg, WarningMsg. `popup' is `bg_popup', sunk below the buffer rather
+;;;; than raised off it, one face for the several floats and menus folke draws
+;;;; on `bg_dark', as `accent' is one Blue where he spends an accent per element.
+;;;; Three are the port's own: `divider' and `popup-border' share `fg_gutter',
+;;;; his `border' #15161e being lost as a rule and his `border_highlight' too
+;;;; loud a cyan on every panel; and the gutter digit under point drops his bold.
 
 (in-package :zemacs)
 
@@ -78,14 +87,17 @@
       (bg           '(0.102 0.106 0.149))  ; #1a1b26
       (bg-dark      '(0.086 0.086 0.118))  ; #16161e
       (bg-highlight '(0.161 0.180 0.259))  ; #292e42
+      (bg-visual    '(0.157 0.204 0.341))  ; #283457  blue0 at 40% on the ground
 
       ;; Foregrounds
       (fg           '(0.753 0.792 0.961))  ; #c0caf5
       (fg-dark      '(0.663 0.694 0.839))  ; #a9b1d6
       (comment      '(0.337 0.373 0.537))  ; #565f89
+      (fg-gutter    '(0.231 0.259 0.380))  ; #3b4261
 
       ;; Accents
       (blue         '(0.478 0.635 0.969))  ; #7aa2f7
+      (blue0        '(0.239 0.349 0.631))  ; #3d59a1
       (blue5        '(0.537 0.867 1.000))  ; #89ddff
       (cyan         '(0.490 0.812 1.000))  ; #7dcfff
       (magenta      '(0.733 0.604 0.969))  ; #bb9af7
@@ -94,6 +106,7 @@
       (green        '(0.620 0.808 0.416))  ; #9ece6a
       (green1       '(0.451 0.855 0.792))  ; #73daca  (bbatsov's port calls this `teal')
       (teal         '(0.102 0.737 0.612))  ; #1abc9c
+      (red1         '(0.859 0.294 0.294))  ; #db4b4b
       )
 
   (apply #'set-background bg)
@@ -122,4 +135,18 @@
   (set-face "modeline"          bg-highlight)          ; #292e42  bar, current window
   (set-face "modeline-inactive" bg-dark)               ; #16161e  bar, other windows
   (set-face "modeline-text"     fg       :bold t)      ; #c0caf5  what is written on it
+
+  ;; The other twelve, which a theme may leave out and this one does not.
+  (set-face "region"              bg-visual)           ; #283457  `Visual'
+  (set-face "cursor"              fg)                  ; #c0caf5  `Cursor', the block
+  (set-face "current-line"        bg-highlight)        ; #292e42  `CursorLine'
+  (set-face "line-number"         fg-gutter)           ; #3b4261  `LineNr'
+  (set-face "line-number-current" orange)              ; #ff9e64  `CursorLineNr', unbolded
+  (set-face "divider"             fg-gutter)           ; #3b4261  see the header
+  (set-face "error"               red1)                ; #db4b4b  `ErrorMsg', `DiagnosticError'
+  (set-face "warning"             yellow)              ; #e0af68  `WarningMsg', `DiagnosticWarn'
+  (set-face "match"               blue0)               ; #3d59a1  `Search', folke's `bg_search'
+  (set-face "popup"               bg-dark)             ; #16161e  `Pmenu', `NormalFloat'
+  (set-face "popup-border"        fg-gutter)           ; #3b4261  see the header
+  (set-face "accent"              blue)                ; #7aa2f7  selection bars, kind chips, the rule
   )

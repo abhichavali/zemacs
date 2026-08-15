@@ -44,7 +44,18 @@ pub enum PromptKind {
     /// `EditorCommand::PromptItem` each — and the renderer asks
     /// [`PromptKind::completes`] on the frame in between. A `read-string` that
     /// flashed an empty "no matches" box would be a bug nobody could reproduce.
-    Lisp { id: u64, completing: bool },
+    ///
+    /// `previewing` opts the picker into consult's live preview, the thing the
+    /// buffer switcher has always had: every time the highlight moves, the
+    /// candidate under it goes back to the image as `%prompt-preview`. What that
+    /// *means* is Lisp's — loading a theme, opening a font — which is the whole
+    /// reason this is a flag here and a closure there. Core owns "the selection
+    /// moved" and knows nothing else about it.
+    Lisp {
+        id: u64,
+        completing: bool,
+        previewing: bool,
+    },
     /// A yes-or-no question guarding something that can lose work, whose "yes"
     /// runs a command parked in [`crate::Editor::pending_confirm`] when the
     /// question was asked.
@@ -167,6 +178,22 @@ pub struct Prompt {
     /// gives it back. Without it, glancing at the last command costs you the
     /// filter you had already narrowed to.
     pub stash: String,
+    /// Answers already given to prompts of this kind, newest first — what
+    /// [`Editor::prompt_history`](crate::Editor::prompt_history) holds, handed
+    /// over when the prompt opens.
+    ///
+    /// It is a *ranking* input and not only what `M-p` walks: a candidate that
+    /// has been chosen before gets [`RECENT`] added to its score, decayed by how
+    /// far back it was, so `M-x` opens on the handful of commands you actually
+    /// run and keeps them near the top as you narrow. That is the whole of what
+    /// makes a command list of four hundred usable — the answer is nearly always
+    /// something you have run this week, and nothing else in the score knows
+    /// that.
+    ///
+    /// Matched against [`Prompt::name_of`], not the whole row, because that is
+    /// what [`Prompt::submitted`] filed: an `M-x` row carries a docstring the
+    /// image padded on, and it is not part of the answer.
+    pub recent: Vec<String>,
     /// This prompt wants free text, whatever its kind would normally complete.
     ///
     /// dired's `+` and `C-c n` are a [`PromptKind::File`] asking for a *name*:
@@ -201,9 +228,20 @@ impl PromptKind {
         // of consult-buffer's usefulness. It restores through
         // [`Prompt::origin_buffer`] rather than [`Prompt::origin`] — the thing
         // to put back is a buffer, not an offset.
+        //
+        // A Lisp picker joins them when it asked to. It restores nothing
+        // through `origin` — what a theme or a font preview disturbed is not an
+        // offset and not a buffer, so putting it back is the *callback's* job,
+        // on the NIL it gets when the prompt is cancelled.
         matches!(
             self,
-            PromptKind::Line | PromptKind::Search | PromptKind::Buffer
+            PromptKind::Line
+                | PromptKind::Search
+                | PromptKind::Buffer
+                | PromptKind::Lisp {
+                    previewing: true,
+                    ..
+                }
         )
     }
 }
@@ -223,6 +261,7 @@ impl Prompt {
             prefix: 0,
             history: 0,
             stash: String::new(),
+            recent: Vec::new(),
             bare: false,
         };
         p.refilter();
@@ -235,7 +274,42 @@ impl Prompt {
         !self.bare && self.kind.completes()
     }
 
+    /// The part of a candidate that *names* it, as opposed to the annotation
+    /// drawn after it.
+    ///
+    /// An `M-x` row is `find-file    Open a file   C-x C-f`: the name is the
+    /// first word and the rest is chrome the image padded on. The switcher's
+    /// rows are a name, a run of padding, and the major mode.
+    ///
+    /// Matching cares because a hit in the name is worth far more than a hit in
+    /// a docstring — see [`Prompt::refilter`] — and because this is what goes in
+    /// the history, so it is also what recency is looked up by.
+    pub fn name_of<'a>(&self, item: &'a str) -> &'a str {
+        match self.kind {
+            PromptKind::Command => item.split_whitespace().next().unwrap_or(""),
+            // The padding `buffer_candidates` inserts is at least two spaces,
+            // and a buffer name does not contain a run of them.
+            PromptKind::Buffer => item.split("  ").next().unwrap_or(item),
+            _ => item,
+        }
+    }
+
     /// Recompute `matches` for the current `text`.
+    ///
+    /// Ranking is three questions, in order:
+    ///
+    /// 1. **Did the *name* match, or only the annotation?** Every candidate
+    ///    matched on its name outranks every candidate matched only on its
+    ///    docstring. `M-x file` is asking about commands called file-something;
+    ///    that some other command's help text mentions files is worth showing
+    ///    and never worth showing first.
+    /// 2. **How well did it match** — [`crate::fuzzy`]'s alignment score, plus
+    ///    a decaying bonus for having been chosen before ([`Prompt::recent`]).
+    /// 3. **How much of the candidate is left over.** `find-file` beats
+    ///    `find-file-at-point` on an equal score, because the query covered more
+    ///    of it. Not for [`PromptKind::Line`], where the index is the line
+    ///    number and document order is the only sensible tie-break — sorting
+    ///    the buffer's lines by length is nobody's idea of a search result.
     ///
     /// The selection resets to the best match. Holding it on whatever was
     /// previously highlighted would mean typing more of a name walks *away*
@@ -251,17 +325,82 @@ impl Prompt {
             self.selected = 0;
             return;
         }
-        let orderless = self.kind.orderless();
-        let mut scored: Vec<(u32, usize)> = self
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(i, item)| score(&self.text, item, orderless).map(|s| (s, i)))
-            .collect();
-        // Best score first, then original order so equal matches stay stable.
-        scored.sort_by_key(|&(s, i)| (std::cmp::Reverse(s), i));
-        self.matches = scored.into_iter().map(|(_, i)| i).collect();
+        let mut ms = self.matchers();
+        // Nothing typed means nothing to say: the list keeps the order it
+        // arrived in — Lisp's own, or the switcher's most-recently-used — and
+        // preferring the shorter of two unranked candidates would shuffle it
+        // for no reason. `Line` never takes the length tie-break at all.
+        let by_length = !self.text.trim().is_empty() && self.kind != PromptKind::Line;
+        type Key = (std::cmp::Reverse<bool>, std::cmp::Reverse<i32>, usize, usize);
+        let mut scored: Vec<Key> = Vec::with_capacity(self.items.len());
+        for (i, item) in self.items.iter().enumerate() {
+            let name = self.name_of(item);
+            let Some((named, mut total)) = rate(&mut ms, name, item) else {
+                continue;
+            };
+            // Decayed by how far back it was, but never below half: *having*
+            // run something is the signal, and how recently only orders the
+            // handful at the top. A bonus that faded to nothing would make the
+            // history useless by the twentieth entry, which is a Tuesday.
+            if let Some(r) = self.recent.iter().position(|e| e == name) {
+                total += (RECENT - r as i32).max(RECENT / 2);
+            }
+            let len = if by_length { item.len() } else { 0 };
+            scored.push((
+                std::cmp::Reverse(named),
+                std::cmp::Reverse(total),
+                len,
+                i,
+            ));
+        }
+        // Unstable, and the trailing index is why it can be: every key ends in
+        // the candidate's own position, so no two of them compare equal and the
+        // order is total. That buys the sort its scratch-free path, which is
+        // the difference between one allocation and none on a list the size of
+        // a buffer's lines.
+        scored.sort_unstable();
+        self.matches = scored.into_iter().map(|(.., i)| i).collect();
         self.selected = 0;
+    }
+
+    /// One matcher per query component. Orderless splits on spaces so every
+    /// component narrows on its own in whatever order they were typed; the
+    /// other kinds are one query, spaces and all.
+    fn matchers(&self) -> Vec<crate::fuzzy::Matcher> {
+        match self.kind.orderless() {
+            true => self
+                .text
+                .split_whitespace()
+                .map(crate::fuzzy::Matcher::new)
+                .collect(),
+            false => vec![crate::fuzzy::Matcher::new(&self.text)],
+        }
+    }
+
+    /// Where the current query matches inside one candidate row, as half-open
+    /// character ranges — what a renderer underlines to show *why* a row is on
+    /// screen.
+    ///
+    /// Recomputed per call, for the rows being drawn. Keeping positions for
+    /// every candidate would mean a vector per line of the buffer on every
+    /// keystroke of a `consult-line`, to show forty of them.
+    pub fn match_spans(&self, item: &str) -> Vec<(usize, usize)> {
+        if self.kind == PromptKind::Grep {
+            return Vec::new();
+        }
+        let mut ms = self.matchers();
+        let name = self.name_of(item);
+        // Whichever half `refilter` scored it on, so the paint agrees with the
+        // ranking rather than lighting up a docstring the score ignored.
+        let hay = match ms.iter_mut().all(|m| m.score(name).is_some()) {
+            true => name,
+            false => item,
+        };
+        let mut spans: Vec<(usize, usize)> =
+            ms.iter_mut().flat_map(|m| m.spans(hay)).collect();
+        spans.sort_unstable();
+        spans.dedup();
+        spans
     }
 
     /// The highlighted candidate, if the filter matched anything.
@@ -279,12 +418,12 @@ impl Prompt {
 
     /// What accepting this prompt *means*, as opposed to what it shows.
     ///
-    /// The two differ for `Command`, whose candidates carry an annotation the
-    /// image pads onto the row — a docstring and a key. A command name never
-    /// contains a space, so the first word is the whole of the answer and the
-    /// rest is chrome. This is also what goes in the history, which is why it
-    /// is one function and not a split at each call site: recalling `M-x` has to
-    /// give back the command, not the row it was read off.
+    /// The two differ wherever a row carries an annotation the image or the
+    /// switcher padded onto it — a docstring and a key after an `M-x` command,
+    /// the major mode after a buffer name. This is also what goes in the
+    /// history, which is why it is one function and not a split at each call
+    /// site: recalling `M-x` has to give back the command, not the row it was
+    /// read off.
     ///
     /// `Ex` and `Search` answer with the text as typed. Both have no candidate
     /// list, and `value` would fall back to `text` anyway — saying so here means
@@ -292,13 +431,13 @@ impl Prompt {
     pub fn submitted(&self) -> String {
         match self.kind {
             PromptKind::Ex | PromptKind::Search => self.text.clone(),
-            PromptKind::Command => self
-                .value()
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string(),
-            _ => self.value(),
+            // [`Prompt::name_of`] is the one place that knows which part of a
+            // row is the answer and which part is chrome, so recency looks the
+            // history up by exactly what got filed in it.
+            _ => {
+                let v = self.value();
+                self.name_of(&v).to_string()
+            }
         }
     }
 
@@ -336,10 +475,28 @@ impl Prompt {
     /// gave, which is what a hand-written list means; the first keystroke
     /// re-ranks properly.
     pub fn push_item(&mut self, item: String) {
-        if score(&self.text, &item, self.kind.orderless()).is_some() {
+        let mut ms = self.matchers();
+        if rate(&mut ms, self.name_of(&item), &item).is_some() {
             self.matches.push(self.items.len());
         }
         self.items.push(item);
+    }
+
+    /// The same for a whole list, building the matchers once instead of once per
+    /// candidate — which is what [`Prompt::push_item`] does, and is why a list of
+    /// fifty thousand wants this door and not that one.
+    ///
+    /// Still an append and still in the order given, for [`Prompt::push_item`]'s
+    /// reason: nothing has been typed yet, so there is nothing to rank by, and
+    /// the caller's order is the meaningful one until there is.
+    pub fn extend_items(&mut self, items: impl Iterator<Item = String>) {
+        let mut ms = self.matchers();
+        for item in items {
+            if rate(&mut ms, self.name_of(&item), &item).is_some() {
+                self.matches.push(self.items.len());
+            }
+            self.items.push(item);
+        }
     }
 
     /// Tab: adopt the highlighted candidate as the input.
@@ -387,65 +544,51 @@ impl Prompt {
     }
 }
 
-/// Score `haystack` against a whole query — what the filter actually asks for.
+/// What having been chosen before is worth, before the decay by how long ago.
 ///
-/// With `orderless`, the query is split on spaces and every component has to
-/// match the candidate on its own, in whatever order they were typed. That is
-/// what makes `fn main` find `pub fn main` and `buffer switch` find
-/// `switch-to-buffer`, neither of which is a subsequence of the query as one
-/// string.
+/// Tuned against the alignment scores it is added to: a matched character is
+/// worth 16 and a word boundary 8, so this is about two extra characters of
+/// evidence. Enough that among the commands that match `buf` the one you ran
+/// this morning comes up first, and not enough that a command you once ran
+/// beats a candidate the query actually spells out.
+const RECENT: i32 = 36;
+
+/// Score one candidate against every query component: `(matched the name, how
+/// well)`, or `None` when any component missed both halves.
+///
+/// Components are matched against the whole of the candidate rather than
+/// against what is left after the previous one. Consuming the match would put
+/// them back in order, which is the thing orderless removes. The price is that
+/// `fn fn` is satisfied by a line holding one `fn` — orderless pays it too.
 ///
 /// Scores add rather than being taken best-of, so a candidate that matches each
 /// component at a word boundary still outranks one that scrapes each of them
-/// together — the existing ranking survives, it just runs several times. Every
-/// candidate is scored against the same number of components, so the totals
-/// stay comparable.
+/// together. Every candidate is scored against the same number of components,
+/// so the totals stay comparable.
 ///
-/// Components are matched against the whole candidate rather than against what
-/// is left after the previous one. Consuming the match would put them back in
-/// order, which is the thing being removed. The price is that `fn fn` is
-/// satisfied by a line holding one `fn` — orderless pays it too.
+/// `name` is the part of `item` that names it and is usually all of it — see
+/// [`Prompt::name_of`]. Falling back to the whole row is what lets `M-x
+/// clipboard` find a command whose *docstring* says clipboard, one tier below
+/// everything whose name matched.
 // ponytail: no way to escape a space, so a completing prompt cannot look for
 // one. Orderless spells it `\ `; add that when a candidate set with spaces in
 // it makes the ceiling hurt.
-fn score(needle: &str, haystack: &str, orderless: bool) -> Option<u32> {
-    // Lowered once per candidate, not once per component — a `consult-line`
-    // prompt runs this over every line in the buffer on every keystroke.
-    let hay: Vec<char> = haystack.chars().flat_map(char::to_lowercase).collect();
-    if !orderless {
-        return subsequence(needle, &hay);
-    }
-    // No components at all — nothing typed, or nothing but spaces — matches
-    // everything, which is what an empty needle already meant.
+fn rate(ms: &mut [crate::fuzzy::Matcher], name: &str, item: &str) -> Option<(bool, i32)> {
     let mut total = 0;
-    for part in needle.split_whitespace() {
-        total += subsequence(part, &hay)?;
-    }
-    Some(total)
-}
-
-/// Case-insensitive subsequence match, scored so that better matches sort
-/// first: a prefix beats a word-boundary hit, which beats a scattered one.
-/// `None` means no match at all. `hay` arrives lowercased — see [`score`].
-fn subsequence(needle: &str, hay: &[char]) -> Option<u32> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    let mut score = 0;
-    let mut at = 0;
-    for want in needle.chars().flat_map(char::to_lowercase) {
-        let found = hay[at..].iter().position(|&c| c == want)? + at;
-        if found == 0 {
-            score += 8; // matches the very start
-        } else if !hay[found - 1].is_alphanumeric() {
-            score += 4; // start of a word: `s-b` finds `switch-buffer`
-        } else if found == at {
-            score += 2; // contiguous with the previous match
+    let mut named = true;
+    for m in ms.iter_mut() {
+        match m.score(name) {
+            Some(s) => total += s,
+            // Only worth a second look when there is more of the row to look
+            // at; for most kinds the name *is* the row.
+            None if name.len() < item.len() => {
+                total += m.score(item)?;
+                named = false;
+            }
+            None => return None,
         }
-        at = found + 1;
     }
-    // Prefer shorter candidates when scores tie: `find-file` over `find-file-at-point`.
-    Some(score * 100 + (100u32.saturating_sub(hay.len() as u32)))
+    Some((named, total))
 }
 
 #[cfg(test)]
@@ -552,6 +695,7 @@ mod tests {
             PromptKind::Lisp {
                 id: 1,
                 completing: false,
+                previewing: false,
             },
             "Name: ",
             Vec::new(),
@@ -564,6 +708,7 @@ mod tests {
             PromptKind::Lisp {
                 id: 2,
                 completing: true,
+                previewing: false,
             },
             "Pick: ",
             Vec::new(),
@@ -620,6 +765,72 @@ mod tests {
         p.selected = 19;
         assert_eq!(p.visible(5).len(), 5);
         assert_eq!(p.visible(0).len(), 0);
+    }
+
+    /// An `M-x` row is a name and then prose. The prose is searchable — you do
+    /// not always remember what a command is called — but it never comes first.
+    #[test]
+    fn a_name_that_matched_outranks_a_docstring_that_did() {
+        let mut p = prompt(&[
+            "kill-ring-save         Copy the region to the clipboard",
+            "clipboard-yank         Paste",
+        ]);
+        p.text = "clip".into();
+        p.refilter();
+        assert_eq!(p.matches.len(), 2, "the docstring hit is still offered");
+        assert_eq!(p.current(), Some("clipboard-yank         Paste"));
+    }
+
+    /// The point of a history: four hundred commands, and the answer is nearly
+    /// always one of the six you use.
+    #[test]
+    fn what_you_ran_last_comes_back_first() {
+        let mut p = prompt(&["buffer-menu", "kill-buffer", "buffer-list"]);
+        // With nothing typed the list is as it arrived...
+        assert_eq!(p.current(), Some("buffer-menu"));
+        // ...and with a history it opens on the newest entry instead, even
+        // though that one buries its match in the middle of a word.
+        p.recent = vec!["kill-buffer".into()];
+        p.refilter();
+        assert_eq!(p.current(), Some("kill-buffer"));
+
+        // Narrowing keeps it, because recency is part of the score rather than
+        // a pre-sort that the first keystroke throws away.
+        p.text = "buf".into();
+        p.refilter();
+        assert_eq!(p.current(), Some("kill-buffer"));
+
+        // But it does not beat a candidate the query actually spells out.
+        p.text = "buffer-m".into();
+        p.refilter();
+        assert_eq!(p.current(), Some("buffer-menu"));
+    }
+
+    /// Recency is looked up by the *answer*, which for `M-x` is the first word
+    /// — the history never held the docstring, so nothing would ever match.
+    #[test]
+    fn recency_matches_the_answer_and_not_the_row() {
+        let mut p = prompt(&["find-file    Open a file", "save-buffer  Write it"]);
+        p.recent = vec!["save-buffer".into()];
+        p.refilter();
+        assert_eq!(p.current(), Some("save-buffer  Write it"));
+        assert_eq!(p.submitted(), "save-buffer");
+    }
+
+    /// What the renderer paints. The spans have to be indices into the row as
+    /// drawn, and they have to point at the match the ranking actually used.
+    #[test]
+    fn the_matched_characters_come_back_for_painting() {
+        let mut p = prompt(&["switch-to-buffer"]);
+        p.text = "buf".into();
+        p.refilter();
+        assert_eq!(p.match_spans("switch-to-buffer"), vec![(10, 13)]);
+
+        // Orderless: one span per component, in row order rather than typed
+        // order, because they are positions and not keystrokes.
+        p.text = "buffer switch".into();
+        p.refilter();
+        assert_eq!(p.match_spans("switch-to-buffer"), vec![(0, 6), (10, 16)]);
     }
 
     #[test]

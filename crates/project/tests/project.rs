@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use zemacs_project::{Cache, Marker, Project};
 
@@ -420,6 +421,52 @@ fn a_pattern_that_will_not_compile_reports_ripgreps_own_complaint() {
     let temp = Temp::new("badregex");
     temp.write("src/lib.rs", "fn one() {}\n");
     assert!(zemacs_project::search(temp.path(), "a(b").is_err());
+}
+
+/// The limit stops ripgrep rather than slicing what it already finished writing.
+///
+/// Every file here matches, so the two-thousandth hit exists once ripgrep has
+/// read a fortieth of the tree — which is what makes the clock the assertion. A
+/// search that stops at the limit beats a scan of the same tree that has no
+/// limit to stop at; one that waits for ripgrep to finish and then takes 2000
+/// lines loses to it, having done that same scan plus written and buffered
+/// every hit it then threw away. Both numbers come off the same machine a
+/// moment apart, so it is a ratio and not a wall-clock guess: measured 10 ms
+/// against 25 ms, where buffering the lot was 65 ms.
+#[test]
+fn the_limit_stops_ripgrep_instead_of_waiting_for_it() {
+    if !have("rg") {
+        return;
+    }
+    const NOTHING: &str = "zzz-nothing-in-this-tree-matches-this";
+    let temp = Temp::new("limit");
+    // Far more hits than the limit — 2000 files, of which `--max-count` takes 50
+    // each — and spread so that no order ripgrep walks them in delivers them
+    // late. Long lines because the scan being outrun is bytes, not files.
+    let body: String = (0..60)
+        .map(|i| format!("fn needle_{i}() {{ /* {} */ }}\n", "x".repeat(160)))
+        .collect();
+    for f in 0..2000 {
+        temp.write(&format!("f{f:04}.rs"), &body);
+    }
+    // Cold pages would be charged to whichever search ran first.
+    let _ = zemacs_project::search(temp.path(), NOTHING);
+
+    let clock = Instant::now();
+    let hits = zemacs_project::search(temp.path(), "needle").unwrap();
+    let limited = clock.elapsed();
+    assert_eq!(hits.len(), zemacs_project::SEARCH_LIMIT);
+
+    let clock = Instant::now();
+    assert!(zemacs_project::search(temp.path(), NOTHING).unwrap().is_empty());
+    let whole = clock.elapsed();
+
+    assert!(
+        limited < whole,
+        "stopping at {} hits took {limited:?}, longer than scanning the whole \
+         tree ({whole:?}) — ripgrep is being waited for, not stopped",
+        zemacs_project::SEARCH_LIMIT,
+    );
 }
 
 /// A leading dash is a pattern, not a flag, and nothing reaches a shell.

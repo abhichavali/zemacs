@@ -112,7 +112,8 @@ fn wait_for_log(lisp: &zemacs_lisp::Lisp, needle: &str) {
 
 #[test]
 fn the_lsp_client_talks_to_a_server() {
-    let server = std::env::temp_dir().join("zemacs_fake_lsp.sh");
+    let server = std::env::temp_dir()
+        .join(format!("zemacs_fake_lsp-{}.sh", std::process::id()));
     std::fs::write(&server, FAKE_SERVER).unwrap();
     #[cfg(unix)]
     {
@@ -122,7 +123,8 @@ fn the_lsp_client_talks_to_a_server() {
     let _ = std::fs::remove_file(LOG);
     std::fs::write(FILE, SOURCE).unwrap();
 
-    let init = std::env::temp_dir().join("zemacs_test_lsp_init.lisp");
+    let init = std::env::temp_dir()
+        .join(format!("zemacs_test_lsp_init-{}.lisp", std::process::id()));
     std::fs::write(
         &init,
         format!(
@@ -309,6 +311,30 @@ fn the_lsp_client_talks_to_a_server() {
         }
     }
 
+    // --- the status listing --------------------------------------------------
+    //
+    // Asserted on the block of text rather than through the buffer it goes in:
+    // the buffer is four primitives that cannot be individually wrong, and
+    // every bug this command can have is in the lines.
+    //
+    // `program` is the line it exists for. A language server is only ever
+    // suspected once you cannot see *which binary* it is — a global `pylsp`
+    // against a project `.venv` reports every import as missing, and the two
+    // halves of that are this line and the next one.
+    says(
+        &shared,
+        &lisp,
+        &format!(
+            "(let ((block (format nil \"~{{~a~%}}~}}\"
+                                 (%lsp-status-lines (lsp-session-for-buffer)))))
+               (if (and (search {:?} block)
+                        (search \"none in this project\" block))
+                   \"named\" \"vague\"))",
+            server.to_string_lossy()
+        ),
+        "named",
+    );
+
     // --- shutting down ------------------------------------------------------
     //
     // didClose, shutdown and exit all reach the server, because `rpc-stop`
@@ -319,13 +345,95 @@ fn the_lsp_client_talks_to_a_server() {
     assert!(log_contains(r#""method":"shutdown""#), "the polite sequence goes out");
     assert!(log_contains(r#""method":"exit""#));
     says(&shared, &lisp, "(lsp-session-for-buffer)", "NIL");
-    lisp.eval("(lsp-status)".into());
-    wait(&shared, &lisp, "the status", |m| m == "lsp: nothing running");
+    says(&shared, &lisp, "(hash-table-count *lsp-sessions*)", "0");
+
+    // --- and it stays stopped -----------------------------------------------
+    //
+    // `lsp-ensure` is on `after-change-hook` and starts a server for any buffer
+    // that has none, so a stop used to last exactly one keystroke: you stopped
+    // it, typed a character, and watched it come back. `*lsp-stopped*` is the
+    // memory of having meant it.
+    after_change(&lisp);
+    says(&shared, &lisp, "(lsp-session-for-buffer)", "NIL");
+
+    // **But only a stop you asked for.** A server that *died* is not one you
+    // stopped, and the repair on the next keystroke is the behaviour rather
+    // than a bug — so `%lsp-forget` on its own must leave the door open.
+    // `remhash` here is what a crash amounts to: the session is gone and
+    // nothing was recorded about why.
+    lisp.eval("(clrhash *lsp-stopped*)".into());
+    after_change(&lisp);
+    wait(&shared, &lisp, "the repair", |m| m.starts_with("lsp: python-mode"));
+    says(&shared, &lisp, "(if (lsp-session-for-buffer) \"repaired\" \"dead\")", "repaired");
+    lisp.eval("(lsp-stop)".into());
+    wait(&shared, &lisp, "the second stop", |m| m.starts_with("lsp: stopped"));
+
+    // --- the project's own interpreter ---------------------------------------
+    //
+    // A server off `$PATH` is the *editor's* server, and for Python that is
+    // nearly always the wrong one: a globally-installed `pylsp` resolves imports
+    // against the interpreter it was installed under, so every dependency in a
+    // `uv` project reads as missing.
+    let venv = std::path::Path::new(FILE).parent().unwrap().join("venvproj");
+    let _ = std::fs::remove_dir_all(&venv);
+    std::fs::create_dir_all(venv.join(".venv/bin")).unwrap();
+    std::fs::write(venv.join(".venv/bin/python"), "#!/bin/sh\n").unwrap();
+    let root = format!("{}/", venv.display());
+
+    // Found by looking in the *project*, not at `$VIRTUAL_ENV`: the editor was
+    // started from a login shell, and that variable names whichever project you
+    // last activated — the wrong answer in every window but one.
+    says(&shared, &lisp, &format!("(if (%lsp-venv {root:?}) \"found\" \"none\")"), "found");
+    // A project with no virtualenv answers NIL, which is what leaves a
+    // system-Python checkout behaving exactly as it did.
+    says(&shared, &lisp, "(%lsp-venv \"/tmp/\")", "NIL");
+
+    // With no server inside the venv the bare name is kept, and the settings
+    // below are what point the global one at the right interpreter.
+    says(&shared, &lisp, &format!("(%lsp-program-for \"pylsp\" {root:?})"), "pylsp");
+    // ...and with one, it wins: a server inside the venv is already looking at
+    // the right site-packages and needs no configuration at either end.
+    std::fs::write(venv.join(".venv/bin/pylsp"), "#!/bin/sh\n").unwrap();
+    says(
+        &shared,
+        &lisp,
+        &format!("(%lsp-program-for \"pylsp\" {root:?})"),
+        &format!("{}/.venv/bin/pylsp", venv.display()),
+    );
+
+    // The settings a global server is handed. `jedi.environment` is the field
+    // that joins a `pylsp` on `$PATH` to a `.venv` in the project, and is what
+    // makes `g d` on an import land in the project's own copy of it.
+    says(
+        &shared,
+        &lisp,
+        &format!(
+            "(jget (funcall (gethash \"python-mode\" *lsp-settings*) {root:?})
+                   \"pylsp\" \"plugins\" \"jedi\" \"environment\")"
+        ),
+        &format!("{}/.venv/", venv.display()),
+    );
+    // No virtualenv, no settings — rather than a settings object naming one that
+    // is not there.
+    says(
+        &shared,
+        &lisp,
+        "(if (funcall (gethash \"python-mode\" *lsp-settings*) \"/tmp/\") \"some\" \"none\")",
+        "none",
+    );
+    let _ = std::fs::remove_dir_all(&venv);
 
     // A mode with no server registered says so rather than doing nothing.
     lisp.eval(r#"(remhash "python-mode" *lsp-servers*)"#.into());
     lisp.eval("(lsp)".into());
     wait(&shared, &lisp, "the report", |m| m == "lsp: no server registered for python-mode");
+
+    // Last, because it leaves the editor in `*lsp*` rather than in the Python
+    // file — a listing is a buffer you switch to, the same as `xref-show`'s and
+    // `lsp-list-diagnostics`'. The empty case is the one path with no session to
+    // read anything out of, and it used to be the whole command.
+    lisp.eval("(lsp-status)".into());
+    says(&shared, &lisp, "(buffer-name)", "*lsp*");
 
     zemacs_rpc::stop_all();
     let _ = std::fs::remove_file(FILE);

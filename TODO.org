@@ -87,13 +87,17 @@ didSave/didClose, definition, diagnostics. A third server is one
 =(lsp-register-server 'rust-mode "rust-analyzer")= in your config — untested
 here only because the two shipped are the two it was proved against.
 Sync is full-text; see the ceiling in =docs/boundary.org=.
-*** TODO xref — find references, and a *xref* results buffer
-Go-to-definition is done (=lsp-goto-definition=, bound to =g d=). References
-need somewhere to put a list. =project-find-dir= no longer shares that hole —
-it turned out to be a completion prompt like every other picker here — so this
-is on its own: a *xref* buffer wants a generated buffer kind, its own keymap
-and a line-to-location table, which is the magit/dired shape rather than the
-minibuffer one.
+*** DONE xref — find references, and a *xref* results buffer
+This entry predicted a generated buffer kind in Rust with its own keymap and a
+line-to-location table — the magit/dired shape. It needed none of that, and the
+reason is worth keeping: the rows are =PATH:LINE:TEXT=, which is what ripgrep
+prints and what =find-file-at= already parses, so **the text *is* the table**.
+The read-only flag and the mode were each one call that already existed, and
+=runtime/modes/xref.lisp= is the whole feature.
+
+What that buys is what =crates/lisp/tests/xref.rs= mostly asserts: because the
+listing is ordinary text, *deleting a row excludes a hit*. Nothing had to be
+taught that — it falls out of the listing not being a special kind of buffer.
 *** DONE flymake — diagnostics in the gutter
 The data was already there — =(lsp-diagnostics)= answering =((LINE COLUMN
 SEVERITY MESSAGE SOURCE) ...)=, and =*lsp-diagnostics-functions*= firing when it
@@ -811,6 +815,23 @@ highlighter next door is doing an incremental parse of the same text. It runs on
 the Lisp thread and nothing waits on it, so the ceiling is a big file and a
 held-down =z a=; the upgrade is reaching that =Session='s tree, which today lives
 on the worker thread with no way to ask it a second question.
+** DONE org-agenda — =org-todo-list= and =org-agenda-tags=
+=runtime/modes/org-agenda.lisp=, over the same "a listing is ordinary text"
+argument =xref= makes: the rows are locations, so =RET= is =find-file-at= and
+nothing needed a buffer kind. ponytail: the files are read from *disk*, so an
+unsaved change in a pane you have open is not in the agenda until you save it.
+
+** DONE org-table — align, navigate, and edit rows and columns
+=runtime/modes/org-table.lisp=. =TAB=/=S-TAB=/=RET= move by field and row and
+realign on the way, and there are six M-x verbs for inserting, deleting and
+moving rows and columns.
+
+Two ponytails, both about the width calculation: it counts *characters* and not
+cells, so a CJK cell is measured half a column narrow; and a cell is called
+numeric by a character set rather than a parse, which calls =1.20=, =-3= and
+=12%= numbers and is the rule org itself uses. The six row and column verbs have
+no keys — they are M-x only until something asks.
+
 ** TODO org-roam (+ org-roam-ui)
 ** DONE org-modern bullets
 =runtime/modes/org-modern.lisp=, a minor mode on =display= overlays. Heading
@@ -1016,11 +1037,27 @@ Still open: a remote dired listing is read-only — =rename=, =copy=, =delete=,
 happens to be spelled like a host. =tramp= has =rename=, =delete= and =mkdir=
 already, so that is three more turns of the same crank. No remote completion in
 the file prompt, and no symlink targets in a remote listing.
-** TODO The rest of the Magit surface
-Library has =plan_last=/=plan_onto= (rebase todo composition), branch
-create/checkout/delete, cherry-pick, revert, reset variants, hunk discard.
-Only a subset is bound: the rest wants a todo-editing buffer and confirmation
-flows first.
+** DONE The rest of the Magit surface
+Was: "the library has =plan_last=/=plan_onto=, branch create/checkout/delete,
+cherry-pick, revert, reset variants, hunk discard; only a subset is bound, and
+the rest wants a todo-editing buffer and confirmation flows first."
+
+The confirmation flow was the real prerequisite and it already existed — see
+=docs/boundary.org='s "A destructive verb's guard cannot move to Lisp", the
+funnel that made one check cover three doors. The todo-editing buffer turned
+out not to be needed for any of these: =reword=, =squash= and =drop-commit=
+each compose a todo list and run it with no editor spawned, which is what
+=crates/git/src/rebase.rs= was written for.
+
+So the surface is bound: branch create/checkout/delete (and =-force=), merge,
+rebase and =rebase-onto=, cherry-pick, revert, the three resets, the four
+stash verbs, push/=push-force=/=push-upstream=, pull, reword, drop-commit,
+=discard-lines=, =discard-untracked=, =resolve-theirs= and =abort=.
+
+=runtime/modes/magit.lisp= is the asking half. ponytail: every prompt there is
+a bare =read-string= rather than a completing one seeded with the branch list —
+seeding a prompt with candidates core owns is the gap =docs/boundary.org=
+already records under =project-switch=, and this is a second caller for it.
 ** DONE Project: =project-find-dir=, and a picker that reaches the filesystem
 The complaint was "there is no select project where I can look at the entire
 filesystem", and it was right: =project-switch= could only offer roots you had
@@ -1043,9 +1080,22 @@ was testing an empty last component and hidden *directories* were always shown.
 =project-find-dir= (=SPC p D=) is the cached file list folded up to its
 directories — one pass over something already walked.
 
-Still open: project-wide replace.
+Still open: project-wide replace — *closed*, see below.
 
-** TODO Project: project-wide replace
+** DONE Project: project-wide replace
+=xref-replace= (=r= in the =*xref*= listing), and it is the same argument the
+entry above makes: the listing is text, so the files to rewrite are the paths
+named in it and *deleting a row before pressing =r= excludes that file*. Two
+=read-string=s — the second asked inside the first's callback, because a prompt
+is a continuation and there is no other way to have two (=docs/threading.org=).
+
+Each file is read, rewritten and written back *once* whatever number of hits it
+has: a buffer per file and an edit per hit would be N undo steps in N buffers
+and a great deal of round-tripping through the editor for text nobody is
+looking at.
+
+Both this and =lsp-rename= now go through =%write-file-safely= — see "The two
+multi-file writers had no net" below, which was the real hole here.
 
 * PERFORMANCE
 ** DONE Incremental tree-sitter parsing
@@ -1063,8 +1113,8 @@ Measured on =crates/core/src/lib.rs=, one character inserted mid-file, release:
 |      2.9 MB |  270 ms |  117 ms |
 
 The *parse* is where it all is — 155 ms → 0.9 ms at 2.9 MB, about 170×. The
-residual 117 ms is the highlight *query*, still run over the whole tree, and is
-ponytail-noted at the call site with =tree.changed_ranges()= as the upgrade.
+residual 117 ms was the highlight *query*, still run over the whole tree.
+*That is now closed too* — see the entry below.
 
 *This dropped =tree-sitter-highlight=*, and not by preference: that crate builds
 its =Tree= inside its own iterator and offers no way to hand it one, so the only
@@ -1072,6 +1122,56 @@ optimisation that matters here is unreachable through its API. With no injection
 and no locals query — which this crate always configured — its algorithm reduces
 to three rules, now in =spans()=. All 34 syntax tests passed unchanged, which is
 the evidence the reimplementation is faithful. One fewer dependency.
+** DONE Incremental highlight *query*, and the two ways changed_ranges lies
+The other half of the entry above. =Session::highlight= now re-runs the query
+only over the part of the tree that moved and splices the result into the
+previous spans; =Parsed= keeps its span list in *bytes*, which is the unit the
+next call's changed ranges arrive in.
+
+Release, one character inserted mid-file, =crates/core/src/lib.rs= repeated:
+
+| buffer | full | before | after |
+|--------+---------+---------+---------|
+| 280 KB | 21 ms | 9.4 ms | 3.7 ms |
+| 1.1 MB | 84 ms | 37.1 ms | 6.4 ms |
+| 4.5 MB | 344 ms | 150.7 ms | 16.8 ms |
+
+~9× at the top end; one keystroke re-queries about 67 KB of a 4.5 MB file.
+
+*The soundness work was the job*, because =changed_ranges= bounds where the
+*tree* differs and not where the *colour* does. Two holes, both real:
+
+- A match is a pure function of the subtree it is rooted at, but
+  =changed_ranges= reports only the non-identical parts of a changed subtree.
+  Typing a statement above a Python docstring leaves the string byte-identical
+  and unreported while =(module . (expression_statement (string)))= stops
+  matching it. The changed set is widened to whole top-level items plus one
+  either side; removing either the widening or the slack fails the test.
+- *The walk lies under error recovery.* It skips any pair of subtrees agreeing
+  on symbol, size, parse state and error cost — and two *different* error
+  subtrees can agree on all four. A fuzz found a deletion in broken Python that
+  re-lexed a =from= a thousand bytes away from identifier to keyword with
+  nothing in the changed set to say so. An item that did not parse cleanly is
+  now trusted only where it is being re-queried anyway. Typing inside the item
+  you have just broken — which is where the error is while anyone is typing —
+  stays on the fast path.
+
+Evidence beyond the suite: 40 320 random edits over 7 languages, *zero*
+disagreements against a full query of the same tree. Eight edits disagreed with
+a *fresh* parse, and all eight already disagreed before this change —
+tree-sitter's error recovery is path-dependent, so an edited tree can
+legitimately differ from a from-scratch one. That is why the committed fuzz
+compares against the session's own tree.
+
+Two ceilings, both noted in code: a file whose top level is *one* item (a JSON
+document, a file that is one =mod=) re-queries everything and saves only the
+parse; and an error left elsewhere in the file costs a full query, which is
+exactly what every keystroke used to cost and never worse.
+
+At 4.5 MB the residual is parse 2.9 ms / requery 6.6 ms / span copy and char
+conversion 8.5 ms — the O(file) bookkeeping now dominates, and its upgrade
+(hand the caller the changed run rather than the whole list) is a change to
+core's and the renderer's side of the boundary rather than to =crates/syntax=.
 ** TODO Present off-thread, or give up vsync
 With N *frames* the loop runs at 1/N of the refresh rate — each renderer is its
 own =present_vsync()= canvas and =present= parks the thread, so the waits are
@@ -1424,11 +1524,18 @@ is finished.
          ~line_cells~ counts a fragment's source text and ~j~ onto a line with an
          inline ~$x_1$~ lands off by the difference. That is the column half, and
          it is the one that really does want a cell width parked on the ~Editor~.
-   - [ ] **`(line-numbers-p)` is half a reader** — it answers the editor-wide
-         default, but the gutter is now per buffer, so a mode asking "am I
-         showing numbers?" gets the wrong answer on the no-gutter list. Decide
-         whether it becomes per-buffer (breaking configs that read it as the
-         global default) or gains a sibling.
+   - [X] **`(line-numbers-p)` is half a reader** — it answered the editor-wide
+         default, but the gutter is per buffer, so a mode asking "am I showing
+         numbers?" got the wrong answer on the no-gutter list. Decided: it
+         answers the *buffer's effective value*, the same pair the renderer
+         draws from, which is Emacs' own semantics — =display-line-numbers= is
+         buffer-local with a global default and reading it gives you the
+         buffer's answer. **No sibling reader was added**: nothing in the tree
+         reads the editor-wide value on its own, so one would have been an API
+         invented for nobody. =relative-line-numbers-p= is left alone and now
+         says why in a comment — =relative_line_numbers= lives only on
+         =Settings=, so there is no split there to fix and the next reader
+         should not "fix" it to match its neighbour.
    - [X] **Double-encoded text was live in ~org-modern.lisp~ and ~math.lisp~.**
          ~(buffer-string)~ hands back one character per UTF-8 byte and
          ~dup_utf8~ re-encodes it, so an em dash or an accented link description
@@ -1453,19 +1560,129 @@ is finished.
          model moved to characters — there is no raw side left for either pair to
          desynchronise from, and ~%math-code-write~'s ~:external-format :utf-8~
          went from double-encoding a body to spelling it correctly.
-   - [ ] ~prune_images~ is not called after an edit that kills an overlay, so an
-         image whose text was deleted lingers until the next explicit overlay
-         delete. Bounded in practice, not unbounded. Needs a policy on where the
-         sweep belongs — every edit is too often.
-   - [ ] An overlay on an *empty* line never renders (~overlays_for_line~ needs
-         ~o.start < end~). Consistent across all three loops, so nothing
-         disagrees — but Emacs draws it.
-   - [ ] ~point-moved-hook~ misses a buffer switch to the same offset: one
-         ~last_point~ for the whole editor.
-   - [ ] ~eval.rs::init_lisp_drives_editor_commands~ was reported flaking once
+   - [X] ~prune_images~ was not called after an edit that killed an overlay, so
+         an image whose text was deleted lingered until the next explicit
+         overlay delete. **The policy this asked for**, and the entry was right
+         that every edit is too often: ~Overlays::adjust~ and ~clamp~ now
+         *report* whether they dropped anything — they already knew, it was the
+         ~retain~ they both ended with — and ~Editor::apply~ sweeps only when
+         the answer is yes. One site covers ~edit()~, undo/redo and paste,
+         because taking a bool is free and remembering which arms edit is the
+         mistake that caused this. ~revert_buffer~ checks separately, since the
+         buffer it splices is very often not the live one.
+
+         A sibling found while fixing it: ~Image(id, Some(new))~ over an overlay
+         that already had one orphaned the first, and that arm was not in the
+         sweep list. The predicate now asks whether the edit *displaces* an id
+         rather than which variant it is — the *first* typeset displaces
+         nothing, and pruning there sweeps every bitmap rasterised but not yet
+         named. A page is built by adding its figures and *then* setting the
+         scene, so that window is real and the loss is silent.
+   - [X] An overlay on an *empty* line never rendered (the filter wanted
+         ~o.start < end~, and a blank line has ~start == end~). Consistent
+         across all three loops, so nothing disagreed out loud — they were
+         quietly unanimous that a blank line has nothing on it.
+
+         Now one predicate, ~zemacs_core::display::on_line~, which *both* crates
+         import rather than each holding a copy: three loops holding one rule
+         separately is what let this survive, and two crates holding it
+         separately would be the same failure with a bigger radius. The core
+         half had to move too — ~display_subs~ re-filtered by the old rule and
+         ~substitute~ walks ~cells~, of which an empty line has none — because
+         ~line_cells~ and the draw loop share both functions precisely so the
+         column the cursor is in and the column drawn are the same column.
+   - [X] ~point-moved-hook~ missed a buffer switch to the same offset: one
+         ~last_point~ for the whole editor. It is ~(BufferId, usize)~ now. The
+         test pins the ordering against ~buffer-switch-hook~ as well — switch
+         first, so a mode's settings are re-resolved before anything re-renders
+         against them — and one switch still queues exactly one of each.
+   - [X] ~eval.rs::init_lisp_drives_editor_commands~ was reported flaking once
          under full-suite parallel load ("the scratch file should be seeded with
-         a header; got \"\""). Did **not** reproduce in three consecutive full
-         runs; noted in case it returns.
+         a header; got \"\""), and did not reproduce in three consecutive runs.
+
+         Found, and it was never about that test: every fixture in the suite was
+         a *fixed* name under ~temp_dir()~ — ~zemacs_test_init.lisp~,
+         ~zemacs_test_scratch.lisp~, ~zemacs_org_structure/~ — so two ~cargo
+         test~ runs at once, or two suites in one run, wrote and deleted each
+         other's files. A truncated read is exactly the shape that produces. The
+         names carry ~process::id()~ now, in all 30 of them. ~eval.rs~ then
+         needed one more line, because it had a *second* copy of the name in an
+         assertion; it compares against the path it actually built.
+
+** The two multi-file writers had no net                             :done:
+
+   =xref-replace= and =lsp-rename= are the only two commands here that rewrite a
+   whole project at once, and they were the only two write paths in the editor
+   that wrote user source with =:if-exists :supersede= — no backup, no atomic
+   rename, no undo. Every other writer (=write_file= in =crates/app=, tramp's
+   =write_script=) is temp-then-rename, and =crates/app= takes numbered backups
+   into =~/.zemacs.d/backup/=. The =ponytail:= note above =lsp-rename= had said
+   so for a while and named the fix.
+
+   Both go through =%write-file-safely= now: =truename=, then a numbered backup
+   using =backup_into='s exact naming, then a temp file beside the target and a
+   rename over it. **A failed backup refuses the write** — protection that
+   silently degrades is not protection — and both writers answer 0 for a refused
+   file, which is honest and meant neither caller needed a new branch.
+
+   Two ceilings, both marked. Permission bits are lost: ECL has =ext:chmod= but
+   no =stat=, and shelling out to =ls -l= is a subprocess per file where these
+   callers are counted in files-per-project. And there is no =fsync=, which ECL
+   does not expose — so a power cut can still lose the write whole, never half,
+   which is the property actually bought.
+
+** A remote dired listing is no longer read-only                     :done:
+
+   =docs/boundary.org= called this "wiring rather than design", and it was:
+   =rename=, =delete= and =mkdir= were already in =crates/tramp=. Two were
+   genuinely missing and are a few lines each through the same mechanism —
+   =copy= (=cp -R -P=, with the exists-guard =rename_script= already had) and
+   =create_file= (=set -C= and =: > f=, since noclobber's =O_EXCL= is the only
+   honest remote spelling of "never truncates").
+
+   The verbs fork on *the path* rather than on the listing, because a rename out
+   of a remote listing can name a local destination and has to be told so. The
+   confirmation funnel is untouched: =D= and =x= both arrive at =remove_all=, so
+   one check per path still covers both doors.
+
+   Two bugs found on the way. =Path::join= on =/ssh:host:= — the login's *home* —
+   produced the remote *root*. And the =R=/=C= prompt was offering this machine's
+   files as candidates for a remote destination, which is the bug =+= and
+   =C-c n= already had.
+
+   The operations go through the worker thread, not the UI thread. That was
+   worth insisting on: =tramp::TIMEOUT= is 60 seconds and its own note says it is
+   "short enough that a wedged host is a message and not a hung editor", which
+   stops being true the moment the round trip is on the draw loop. The drain is
+   *once per frame in =housekeep=* rather than per command arm — =want_list= was
+   drained only after =EditorCommand::Dired=, and every one of these verbs
+   arrives on the far side of a confirmation, so the per-arm version needs four
+   call sites and the fifth door silently breaks it again.
+
+   "deleted 3, failed 1" survived the move, and it identifies its replies **by
+   path rather than arrival order**: all of dired's verbs share one reply route,
+   so a rename in flight beside a delete batch must not be counted as one of it.
+
+   Still open: N marked files are N round trips. Batching them wants a new
+   =tramp::Op=.
+
+** A =:!= child no longer outlives the editor                        :done:
+
+   =:!sleep 300= survived quit — nothing hung up on the child. The =Child= is
+   kept now and killed (and *waited*, because a zombie is still a pid).
+
+   The part worth writing down is why the obvious fix does not work: =main=
+   leaves through =libc::_exit(0)=, deliberately, and that **runs no
+   destructors**, so a =Drop= impl is inert on a real quit. It is
+   =Term::hangup()=, called by name on the exit path beside
+   =zemacs_rpc::stop_all=. The comment there used to say the language servers
+   were "the one thing that genuinely outlives this process" and that a PTY's
+   child gets its =SIGHUP= from the kernel — true, but a bang is not a PTY child.
+   That comment now names both owners and warns that a =Drop= will not run.
+
+   ponytail: =SIGKILL= reaches the shell and not a grandchild it backgrounded, so
+   =:!sleep 300 & wait= still orphans. The upgrade is a process group on the
+   spawn.
 
 ** MathSync — what is left before it can run
 

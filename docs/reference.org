@@ -106,6 +106,13 @@ and =(buffer-lines)= is =("a" "b")=. Anything iterating over lines wants the sec
     (if hit (goto-char hit) (message "no more TODOs"))))
 #+end_src
 
+The editor's own =/= is a different thing and takes a *regex* — vim's dialect, see
+=vim_regex=. **Every hit on screen is painted** in the theme's =match= face: while
+the prompt is open they follow what you are typing, so you can see how much a
+pattern catches before committing to it, and after RET they follow the last
+pattern the way vim's =hlsearch= does. =:noh= puts them away. =*= searches for the
+word under point and lights that up too.
+
 * Writing text
 
 | Form                              |   | Effect                                          |
@@ -1122,6 +1129,64 @@ project-file.
 a line is jumped to. So this is "put one of the editor's pickers up", and the
 next section is the other thing.
 
+*** Seeding one
+
+A picker Lisp opened is still Lisp's to steer, through three verbs. All of them
+act on whatever prompt is open, so they go immediately after the call that
+opened it.
+
+#+begin_src lisp
+(open-prompt "file")
+(%do "prompt-label" "Open directory: " 0 0)
+(%do "prompt-text" (namestring (user-homedir-pathname)) 0 0)
+#+end_src
+
+=prompt-text= replaces what has been typed and re-ranks against it; =prompt-label=
+retitles the prompt. That pair is the whole of =project-open= in
+=runtime/plugins/project.lisp=, and the reason it seeds an *expanded* home rather
+than a literal =~/= is that the app completes a file prompt with absolute paths,
+which a leading tilde matches none of.
+
+=(%do "prompt-source" "SOURCE ARGUMENT" 0 0)= is the third, and is for a list too
+long to hold: it names a list the *editor* owns and the editor pours it into the
+open prompt, so nothing crosses into the image. The sources are =project-files=
+and =project-dirs=, both taking a root. =project-find-file= is four lines over
+it, and a repository with fifty thousand files costs the same as one with ten.
+
+The rule of thumb, which =project.lisp= shows both halves of: **a list you only
+show goes by name; a list you have to reason about comes across.** The projects
+you have visited are a reader — =(project-recent)= — precisely so that
+=project-switch= can see the list is empty and offer to browse instead.
+
+The buffer picker starts on the buffer you would switch *to*, not the one you
+are in: the live buffer is rotated to the end of the list, so =switch-buffer= RET
+goes somewhere and =C-p= comes back.
+
+** How a picker narrows
+
+Every picker — including =completing-read= — runs the same matcher, and it is
+worth knowing what it rewards.
+
+- *A space splits the query.* Each part has to match on its own, in any order:
+  =buffer switch= finds =switch-to-buffer=. Only where the text is a query and
+  nothing else, so =:=, =/=, ripgrep and =read-string= keep their spaces.
+- *Position beats coverage.* The characters you typed are placed wherever they
+  score best, not wherever they first fit — a word start beats the middle of a
+  word, a run of adjacent characters beats a scattered one, and =fooBar= counts
+  as two words. =sb= finds =switch-buffer= ahead of =superbly-fine=.
+- *Case is smart.* An all-lowercase query matches either case; a capital in the
+  query means that capital.
+- *What you ran before comes first.* Accepting a prompt files the answer under
+  its kind, and later prompts of that kind rank it up — decayed by how long ago,
+  so =M-x= opens on the handful of commands you actually use. It is the same
+  history =M-p= walks, and it lasts the session.
+- *The name outranks the annotation.* An =M-x= row is a command name and then its
+  docstring and key. Both are searched, but every match on a name is offered
+  ahead of every match on prose.
+
+Matched characters are drawn with the theme's =match= face behind them, so you can
+see why a row is on the list.
+
 ** Asking your own question
 
 =read-string= and =completing-read= are what most interactive commands are built
@@ -1208,11 +1273,13 @@ Every setting now has both halves. Writers are primitives, readers are readers.
 | =(set-foreground r g b)=                | =(foreground)= → =(R G B)=      | Also sets the =default= face.       |
 | =(set-syntax-color face r g b)=         | =(syntax-color face)=         | =NIL= for an unknown face.          |
 | =(set-face-style face bold italic)=     | —                           | Weight and slant for the same face. No reader: nothing has needed one. |
+| =(reset-faces)=                         | —                           | Forget every face, colour and style alike. =load-theme= sends it before it loads; nothing else should. |
 | —                                     | =(face-list)=                 | The whole closed vocabulary.      |
-| =(set-line-numbers on)=                 | =(line-numbers-p)=            | Whether the gutter is drawn.      |
+| =(set-line-numbers on)=                 | =(line-numbers-p)=            | Whether the gutter is drawn. The writer sets the editor-wide default; the *reader answers the buffer you are in* — its =set-no-gutter-modes= override, falling back to that default — because that is what the renderer draws from. Emacs' =display-line-numbers=, buffer-local over a global default. |
 | =(set-relative-line-numbers on)=        | =(relative-line-numbers-p)=   | Count from the cursor, in *visual* rows — Emacs' =display-line-numbers-type 'visual=. Orthogonal to whether the gutter is drawn at all. |
 | =(set-tab-width n)=                     | =(tab-width)=                 | Clamped 1–16.                     |
-| =(set-text-width n)=                    | =(text-width)=                | Columns to hold the text column to, centred in the pane — =olivetti-mode=. =0= is off and means the pane's full width. Claimed by =org-mode= at 80. |
+| =(set-indent-openers list)=             | —                           | Line endings that mean the next line is *inside* something, so `Enter' indents a step further: ='(":")= for Python, ='("{" "(" "[")= for the C family, =NIL= for only copying the previous indent. |
+| =(set-text-width n)=                    | =(text-width)=                | Columns to hold the text column to, centred in the pane — =olivetti-mode=. =0= is off and means the pane's full width. Claimed by =org-mode= at 80. *Stamped on the buffer it is called for* as well as on the editor, so a split keeps its measure when another pane takes the keyboard; the reader answers the editor's. |
 | =(set-line-overflow mode)=              | =(line-overflow)=             | ="truncate"= or ="wrap"=.            |
 | =(set-scroll-past-end on)=              | =(scroll-past-end-p)=         | Whether the view may keep going after the last line, into empty rows — vim's =~= filler, VSCode's =scrollBeyondLastLine=. *On.* Nothing is inserted: the buffer is untouched, point cannot go there, the gutter numbers none of it and a click in it is =point-max=. The last line stops on the *top* row. Generated buffers (dired, magit, a terminal, the dashboard) keep the full-pane clamp whatever this says. |
 | =(set-completion-style style)=          | =(completion-style)=          | ="minibuffer"=, ="bottom"=, ="center"=. |
@@ -1220,6 +1287,59 @@ Every setting now has both halves. Writers are primitives, readers are readers.
 | =(set-modeline-pad n)=                  | =(modeline-pad)=              | Pixels. Clamped 0–64.             |
 
 Anything =NIL= is false and only =NIL= is false, as in Lisp.
+
+** What the modeline says
+
+The strip's *shape* is yours. =default-modeline= in =runtime/library.lisp= builds
+the shipped one, and the editor keeps a two-segment fallback under that for a
+session with no image at all. Your init runs afterwards, so adding a segment is
+one line and replacing the strip is =(clear-modeline)= and your own.
+
+#+begin_src lisp
+(clear-modeline)
+(modeline-segment :left  " %m " :face :mode :bold t :filled t)
+(modeline-segment :left  "  %b" :bold t)
+(modeline-segment :left  " %+"  :face "warning")
+(modeline-segment :right "%M  " :face "type")
+(modeline-segment :right "%l:%c" :bold t)
+#+end_src
+
+=SIDE= is =:left= or =:right= — the right group is placed from the edge inwards,
+so the position stays put as the file name changes length. =:face= is a name from
+=face-list=, NIL for the strip's own colour, or =:mode= for *the colour of the
+state you are in*, which is the one face that cannot be named ahead of time.
+=:bold= stacks with whatever weight the theme gave that face. =:filled= paints
+the face as a block and knocks the text out to the strip's colour, which is what
+makes the mode indicator a shape you can read at the edge of vision rather than a
+word you have to look at.
+
+The codes:
+
+| Code | Expands to                                              |
+|------+---------------------------------------------------------|
+| =%m=   | The modal state — =NORMAL=, =INSERT=. Focused pane only.    |
+| =%b=   | The buffer's name.                                      |
+| =%f=   | Its path, or the name again when it has none.           |
+| =%+=   | =●= when the buffer has unsaved changes.                  |
+| =%r=   | =◈= when it is read-only *and* unmodified.                |
+| =%s=   | The last message. Focused pane only.                    |
+| =%k=   | The half-typed key sequence. Focused pane only.         |
+| =%P=   | Unix permissions, when there is a file behind it.       |
+| =%M=   | The major mode, as a word: =Rust=.                        |
+| =%n=   | The minor modes, =+each= in turn.                         |
+| =%l=   | The line number, and =%c= the column, both 1-based.       |
+| =%p=   | Where you are: =Top=, =Bot=, =All=, or a percentage.        |
+| =%%=   | A literal =%=.                                            |
+
+*A segment whose codes all come back empty is dropped whole*, which is the whole
+of the conditional logic and why none of this needs an =if= around it: ="  %P"=
+carries its own two spaces and leaves with them on a buffer that has no file. An
+unknown code stays on screen as itself, so inventing =%z= shows you that you did.
+
+These are templates the editor expands per pane per frame, not a function it
+calls — see [[file:boundary.org][boundary.org]]. It is why a modeline cannot be slow here the way a
+=mode-line-format= can be slow in Emacs, and it is also the limit: a field nobody
+thought of is a new code in the editor rather than a =defun=.
 
 The two face writers are almost always wanted together, so =library.lisp= defines
 =(set-face name rgb &key bold italic)= over them — a =defun=, not a third primitive.
@@ -1231,6 +1351,30 @@ markup, dired and magit:
 : keyword function type string number comment constant variable operator
 : punctuation default modeline modeline-inactive modeline-text
 : heading-1 heading-2 heading-3 bold italic link code markup
+
+Those twenty-two are about *text*, and a theme is expected to name all of them —
+=crates/lisp/tests/themes.rs= fails the build for a shipped theme that does not.
+Twelve more are about the *editor*, and are optional:
+
+: region cursor current-line line-number line-number-current divider
+: error warning match popup popup-border accent
+
+Optional means a face left unset falls back to the ratio the renderer mixed
+before it existed — =mix(background, foreground, 0.28)= for =region=, =0.85= for
+=cursor=, and so on — so a theme that names none of them draws exactly what it
+drew when there were only twenty-two. Which is why the eleven ports that shipped
+before these existed did not have to be rewritten to gain a themeable cursor.
+
+=accent= is the one worth naming even in a minimal theme: it is the colour the
+editor's own chrome uses — the bar down a selected completion row, an LSP kind
+chip, the dashboard's rule, the block at the right end of the modeline — and it
+falls back to =function=, which is a guess that is right in most themes and was
+never anything a theme got to say out loud.
+
+The cost of optional is a face set by one theme surviving into the next, which is
+the bug the exhaustiveness test prevents for the twenty-two and cannot prevent
+for these. =load-theme= closes it at the other end instead, by calling
+=(reset-faces)= before it loads the file.
 
 An unknown face name reports in the status line rather than erroring.
 
@@ -1261,6 +1405,26 @@ All three land a frame later. =(find-file "x")= immediately followed by
 =find-file-at=, and the reason a mode hook is the right place to react to an
 open. See [[file:threading.org][threading.org]].
 
+Two things about =save-file= that are Emacs' rules rather than vim's:
+
+- *An unmodified buffer is not written.* Saving in place when there is nothing
+  to save reports =no changes need to be saved= and touches nothing — a save that
+  always writes moves the mtime of every file you look at, which =make=, a file
+  watcher and =git status= all read as a change. Giving it a =path= is a *save-as*
+  and always writes, because whether the buffer was touched says nothing about
+  whether a file that does not exist yet needs creating.
+- *Saving =*scratch*= to a path forks it.* The file gets an ordinary buffer of its
+  own — a path, a language from the extension, none of a scratchpad's
+  properties — and =*scratch*= stays a scratchpad, with its text and its undo
+  history, exactly where it was in the buffer list. It is the one save-as that
+  does not consume the buffer it saves, because it is the one buffer whose name
+  is a place you come back to rather than a placeholder. =*untitled*= is named in
+  place, as Emacs' =write-file= does.
+
+  Refused, before anything is written, if another buffer is already visiting
+  that file: the fork would have nowhere to land and the open buffer would go
+  stale against a disk that moved under it.
+
 * Git, dired and the terminal
 
 Core has no git, no filesystem and no processes in it. These hand a verb to the
@@ -1268,7 +1432,7 @@ app layer, which does the work and feeds the result back as buffer text.
 
 | Form                   |    | Verbs                                                        |
 |------------------------+----+--------------------------------------------------------------|
-| =(magit verb)=           | HA | ="status"= ="stage"= ="unstage"= ="stage-all"= ="unstage-all"= ="commit"= ="commit-finish"= ="push"= ="pull"= ="refresh"= |
+| =(magit verb)=           | HA | ="status"= ="refresh"= ="toggle"= ="visit"= ="log"= · ="stage"= ="unstage"= ="stage-all"= ="unstage-all"= ="discard"= · ="commit"= ="commit-amend"= ="commit-finish"= ="amend"= ="reword"= ="squash"= ="drop-commit"= · ="stash"= ="stash-pop"= ="stash-apply"= ="stash-drop"= · ="fetch"= ="pull"= ="push"= ="push-upstream"= ="push-force"= · ="checkout"= ="checkout-new"= ="branch-create"= ="branch-delete"= ="branch-delete-force"= · ="merge"= ="cherry-pick"= ="revert"= ="rebase"= ="continue"= ="abort"= ="rebase-continue"= ="rebase-skip"= ="rebase-abort"= · ="reset-soft"= ="reset-mixed"= ="reset-hard"= · ="resolve-ours"= ="resolve-theirs"= |
 | =(dired verb-or-directory)= | HA | ="open"= ="up"= ="enter"= ="mark"= ="unmark"= ="toggle-marks"= ="flag-delete"= ="execute"= ="rename"= ="copy"= ="mkdir"= ="create-file"= ="toggle-hidden"= ="refresh"= — or a *directory* to list, ="~/"= expanded |
 | =(terminal verb)=        | HA | ="open"= ="new"= ="close"= ="restart"= ="next"= ="prev"= ="normal"= ="insert"= ="run:NAME:COMMAND"= ="rerun:NAME:COMMAND"= |
 | =(term-send-key key)=    | HA | One keystroke, spelled as =(key-bindings)= spells one.        |
@@ -1281,6 +1445,13 @@ app layer, which does the work and feeds the result back as buffer text.
 
 The same verbs are reachable as command strings (=magit-status=, =dired-enter=,
 =terminal-close=), which is what the shipped bindings use.
+
+A git verb may carry *one argument* after a space — =(magit "checkout main")=,
+=(magit "stash a message with spaces")= — which is how a question whose answer
+is data stays in the image: =runtime/modes/magit.lisp= is a dozen =read-string=
+calls and nothing else. Everything that acts on the commit, file or stash *under
+the cursor* takes no argument and needs no prompt. A verb that can lose work
+still stops to ask first, and that guard is Rust's — see [[file:boundary.org][boundary.org]].
 
 ** Terminal sessions come in more than one
 
@@ -1309,6 +1480,25 @@ is opened, rather than a PTY appearing and dying.
 (terminal "run:notes:hx ~/notes.md")          ; anything, not only agents
 (call-command "terminal-run:notes:hx ~/notes.md")   ; the same, as a binding
 #+end_src
+
+** Showing a picture to whatever is running
+
+⌘V into a session pastes the clipboard — and if the clipboard holds an *image*,
+it writes it to =~/.zemacs.d/images/= and types the **path** instead. Dragging a
+file from Finder onto a terminal pane does the same, rather than opening it in
+an editor pane.
+
+That is one gesture and not two: a coding agent reads a picture from a path in
+its prompt, so ⌘V into one means "here is what I am looking at" whether you
+copied a screenshot or copied a sentence. The path arrives quoted if it needs to
+be, with a trailing space, so what you have to say about it comes next.
+
+The file is named by its content, so pasting the same screenshot twice is one
+file. Nothing evicts them yet.
+
+SDL cannot read another application's clipboard image, so this goes through the
+platform: =osascript= on macOS, =wl-paste= or =xclip= elsewhere. A machine with
+none of those pastes text and says there is no image.
 
 * AI mode — coding agents as buffers
 
@@ -1561,16 +1751,79 @@ breaks.
 | Form                              |   | Effect                                                    |
 |-----------------------------------+---+-----------------------------------------------------------|
 | =(lsp)=                             | H | Start a server for the live buffer, or say why not.       |
-| =(lsp-stop)= =(lsp-restart)=          | H | =didClose=, =shutdown=, =exit=, then hang up.                   |
-| =(lsp-status)=                      | H | What is running, and where.                               |
-| =(lsp-goto-definition)=             | H | Jump to the definition under the cursor. Bound to =g d=.    |
+| =(lsp-stop)= =(lsp-restart)=          | H | =didClose=, =shutdown=, =exit=, then hang up. A stop *sticks*: its diagnostics go with it and editing does not bring it back. =M-x lsp= or =lsp-restart= is the way back. A server that *dies* is a different thing and still repairs itself on the next keystroke. |
+| =(lsp-status)=                      | H | Every running server in a =*lsp*= buffer: which binary it actually is, the project's virtualenv and whether the server runs from it or was merely told about it, what it reported as its own name and version, the sync mode it negotiated, and what is registered but not running. =SPC l s=. |
+| =(lsp-goto-definition)=             | H | Jump to the definition under the cursor. =g d=.             |
+| =(lsp-find-references)=             | H | Every use of it, in a listing you can walk. =g r=.          |
+| =(lsp-goto-declaration)=            | H | Where it was *announced* — a header, an =extern=. =g D=.      |
+| =(lsp-goto-implementation)=         | H | What satisfies a trait or an interface. =g i=.              |
+| =(lsp-goto-type-definition)=        | H | Where the *type* of the expression is written. =g y=.       |
+| =(lsp-hover)=                       | H | Signature in the echo area, documentation in a buffer. =K=. |
+| =(lsp-rename)=                      | H | Rename the symbol everywhere it is used. =SPC l n=.         |
+| =(lsp-document-symbols)=            | H | Pick a symbol in this file. =SPC l o=.                      |
+| =(lsp-workspace-symbols)=           | H | Pick one anywhere in the project. =SPC l w=.                |
 | =(lsp-diagnostics &optional path)=  | H | =((LINE COLUMN SEVERITY MESSAGE SOURCE) ...)=. =LINE= is 1-based, =COLUMN= 0-based, =SEVERITY= 1 error … 4 hint. |
 | =(lsp-diagnostics-at-point)=        | H | Echo the diagnostics on this line. =SPC l e=.               |
 | =(lsp-list-diagnostics)=            | H | All of them in a buffer, as =path:line:message=. =SPC l E=.  |
 | =(lsp-register-server mode program &rest args)= | H | Which server serves which major mode.         |
+| =*lsp-local-bin*=                   |   | Directories under a project root searched for the project's *own* copy of a server before =$PATH= — =.venv/bin=, =node_modules/.bin=. |
+| =*lsp-settings*=                    |   | MODE → a function of the root answering settings, keyed by the section a server asks for. Sent as =didChangeConfiguration= and used to answer =workspace/configuration=. |
 | =(lsp-project-root path)=           | H | Where a server is started: up to the first =.git=, =Cargo.toml=, =pyproject.toml= … |
 | =(lsp-path-uri path)= =(lsp-uri-path uri)= | H | =file:= URIs, percent-encoded. =NIL= for a URI this editor cannot open. |
 | =*lsp-diagnostics-functions*=       |   | Called with a path when its diagnostics change. **Where flymake attaches.** |
+
+** Python, and your virtualenv
+
+A server started off =$PATH= is the *editor's* server, and for Python that is
+usually the wrong one — a globally installed =pylsp= resolves imports against the
+interpreter it was installed under, so every dependency in a =uv= or =poetry=
+project reads as missing. Two things happen about it, and which one you get
+decides how much works:
+
+- **A server inside the project wins.** =.venv/bin/pylsp= is used in preference
+  to the one on =$PATH=, and then *everything* is right — completion, navigation
+  and the mypy and ruff plugins — because the server is running under the
+  project's own interpreter. In a =uv= project that is one line:
+
+  : uv add --dev python-lsp-server
+
+  The same rule finds =node_modules/.bin/typescript-language-server=. See
+  =*lsp-local-bin*=.
+
+- **Otherwise the global one is told where the venv is**, through
+  =pylsp.plugins.jedi.environment=. That fixes *jedi* — completion, hover, =g d=,
+  =g r= land in the project's own copy of a package — and does **not** fix the
+  mypy or ruff plugins, which resolve their own interpreter and will still report
+  a venv-only import as missing. If you see that, install the server into the
+  venv as above.
+
+The venv is looked for in the project (=.venv/=, =venv/=) and never from
+=$VIRTUAL_ENV=: the editor was started from a login shell, so that variable names
+whichever project you last activated, which is the wrong answer in every window
+but one.
+
+=lsp-rename= writes to the *files*, not to buffers, which is what every
+multi-file write here does: a workspace edit usually names files nothing has
+open, and the ones that are open go stale and are picked up by the auto-revert
+sweep within its own interval. There is no undo across it — the same ceiling
+=xref-replace= has, for the same reason.
+
+** The results buffer
+
+=lsp-find-references= and =project-grep= both answer into =*xref*=, which is an
+*ordinary buffer* of =PATH:LINE:TEXT= rows — ripgrep's format, and what
+=find-file-at= parses. =RET= opens the place on the line, =q= puts the listing away,
+and =r= replaces a string across every file named in it.
+
+That the rows are ordinary text is the feature: **deleting a row excludes a
+hit**, so narrowing a project-wide replace is =dd=. It is =wgrep='s gesture arrived
+at from the other end, and it needed nothing built — the listing has no table
+beside it to keep in step, because the text is the table.
+
+#+begin_src lisp
+;; Anything with a list of places can use it.
+(xref-show "3 things" '("/tmp/a.rs:12:let x = 1;" "/tmp/b.rs:4:let x = 2;"))
+#+end_src
 
 ** =after-change-hook=
 
@@ -1655,12 +1908,23 @@ integers. =NIL= for =arg= means absent. An unknown verb reports =no such command
 | ="set-read-only"=                            | —     | on?        | —   |
 | ="read-from-minibuffer"=                     | label | continuation id | completing? |
 | ="prompt-item"=                              | one candidate | —  | —   |
+| ="prompt-items"=                             | candidates, one per line | — | — |
+| ="prompt-text"= ="prompt-label"=               | what to seed the open prompt with | — | — |
+| ="prompt-source"=                            | ="SOURCE ARGUMENT"= | —  | —   |
+| ="modeline-clear"=                           | —     | —          | —   |
+| ="modeline-segment"=                         | template | side\vert bold\vert filled | face |
 | ="term-key"=                                 | key token | —      | —   |
 | ="call"=                                     | command name | —   | —   |
 
 ="call"= is the one verb that is not a single command: it resolves a name the way
 a key binding does and issues whatever *batch* that produces, which is why it is
 handled beside =paste='s checkpoint rather than in =command_for=.
+
+The last two are cramped on purpose — the envelope carries a string and two
+integers, and the alternative was a C primitive taking five arguments. Nobody
+should write =modeline-segment= by hand: =(modeline-segment SIDE TEMPLATE :face
+… :bold … :filled …)= in =library.lisp= is the door, and the section on the
+modeline above is what to read.
 
 Adding a verb is one arm of the =match= in =zemacs_lisp::command_for= plus a
 one-line =DEFUN= in =shim.c= — nothing in C. Adding a reader is one arm of the

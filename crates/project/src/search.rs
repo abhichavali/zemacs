@@ -7,9 +7,9 @@
 //! Nothing here goes near a shell — the pattern is a single `arg` after `--`,
 //! so a pattern of `; rm -rf ~` or `-i` is a pattern.
 
-use std::io::ErrorKind;
+use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
@@ -45,38 +45,34 @@ pub fn search(root: &Path, pattern: &str) -> Result<Vec<String>> {
         Err(e) if e.kind() == ErrorKind::NotFound => run(FALLBACK, root, pattern),
         other => other,
     };
-    let out = match out {
+    let (hits, failure) = match out {
         Ok(out) => out,
         Err(e) if e.kind() == ErrorKind::NotFound => bail!("ripgrep (rg) is not installed"),
         Err(e) => return Err(e).context("running rg"),
     };
-
-    // ripgrep exits 0 with matches, 1 with none — an empty list, not a failure —
-    // and 2 for a real problem, of which an uncompilable regex is the one the
-    // user causes by typing. Its own message is the best one available.
-    if !matches!(out.status.code(), Some(0) | Some(1)) {
-        let msg = String::from_utf8_lossy(&out.stderr);
-        bail!("{}", msg.trim().lines().next().unwrap_or("rg failed"));
+    if let Some(msg) = failure {
+        bail!("{msg}");
     }
-
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .take(SEARCH_LIMIT)
-        .map(str::to_string)
-        .collect())
+    Ok(hits)
 }
 
+/// At most [`SEARCH_LIMIT`] hits, and — when ripgrep failed outright rather than
+/// merely finding nothing — the one line of its own complaint worth showing.
+///
 /// No path argument: ripgrep then searches the working directory and prints
 /// paths relative to it, which is exactly the required output. Passing `.`
 /// instead would prefix every hit with `./`.
 ///
-/// ponytail: `output()` buffers everything ripgrep prints before a single line
-/// is taken, so a pattern matching a million lines costs the memory even though
-/// only [`SEARCH_LIMIT`] survive. `--max-count` bounds the damage per file. The
-/// upgrade path is reading stdout line by line and killing the child at the
-/// limit, which also gets the results on screen sooner.
-fn run(program: &str, root: &Path, pattern: &str) -> std::io::Result<Output> {
-    Command::new(program)
+/// Lines are taken as they arrive and the child is killed the moment the limit
+/// is reached, rather than waiting for ripgrep to finish and then throwing most
+/// of what it wrote away. That is not a memory nicety: the caller is
+/// synchronous, holds the editor lock and re-runs this on every keystroke of
+/// the prompt, so the whole editor is frozen for as long as ripgrep runs. On a
+/// tree nothing ignores — 683 MB of vendored sources — a pattern of `e` was
+/// 1.17 s and 152 MB buffered to show two thousand lines; stopping at the limit
+/// is 8 ms. `--max-count` bounds the hits per file, this bounds the run.
+fn run(program: &str, root: &Path, pattern: &str) -> std::io::Result<(Vec<String>, Option<String>)> {
+    let mut child = Command::new(program)
         .current_dir(root)
         .args([
             "--line-number",
@@ -89,5 +85,57 @@ fn run(program: &str, root: &Path, pattern: &str) -> std::io::Result<Output> {
         ])
         .arg("--")
         .arg(pattern)
-        .output()
+        // Not inherited, which `spawn` would do and `output` never did: given no
+        // path to search, ripgrep searches *stdin* whenever stdin is readable —
+        // a pipe or a file. The editor's own stdin is whatever launched it, so
+        // inheriting it means searching that instead of the project, and waiting
+        // for a pipe nobody will ever write to, forever, holding the lock.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // Kept rather than dropped because a pattern that will not compile is a
+        // message only ripgrep can write, and read only once stdout is done. A
+        // full stderr pipe cannot deadlock the child against us: `--no-messages`
+        // silences the per-file complaints, which leaves the startup errors, and
+        // ripgrep writes one of those and exits before it has searched a line.
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    // Read bytes rather than `Lines`: ripgrep prints a matching line as it found
+    // it, and a file that is text enough to search can still hold a byte no
+    // `String` will take. Lossy is what the whole path did before.
+    let mut out = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    let mut buf = Vec::new();
+    let mut hits = Vec::new();
+    while hits.len() < SEARCH_LIMIT {
+        buf.clear();
+        if out.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let line = buf.strip_suffix(b"\n").unwrap_or(&buf);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        hits.push(String::from_utf8_lossy(line).into_owned());
+    }
+
+    // Hitting the limit is the normal outcome of a short pattern, so neither the
+    // signal we just sent nor the broken pipe it leaves ripgrep holding may
+    // reach the caller as a failure. `wait` regardless of how the child ended:
+    // killing one and walking away leaves a zombie until the editor exits.
+    let limited = hits.len() == SEARCH_LIMIT;
+    if limited {
+        let _ = child.kill();
+    }
+    let mut err = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_end(&mut err);
+    }
+    let status = child.wait()?;
+
+    // ripgrep exits 0 with matches, 1 with none — an empty list, not a failure —
+    // and 2 for a real problem, of which an uncompilable regex is the one the
+    // user causes by typing. Its own message is the best one available.
+    let failure = (!limited && !matches!(status.code(), Some(0) | Some(1))).then(|| {
+        let msg = String::from_utf8_lossy(&err);
+        msg.trim().lines().next().unwrap_or("rg failed").to_string()
+    });
+    Ok((hits, failure))
 }

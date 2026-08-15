@@ -310,12 +310,34 @@ that silently used the last line would edit the wrong place rather than none."
     (when (<= line (line-count))
       (+ (line-start line) (%lsp-char-column (line-string line) units)))))
 
-(defun %lsp-position-in (text at)
-  "The LSP `Position' of the character offset AT in TEXT, a whole document."
-  (let ((bol (let ((nl (position #\Newline text :end at :from-end t)))
-               (if nl (1+ nl) 0))))
-    (jobj "line" (count #\Newline text :end at)
-          "character" (%lsp-utf16-length text :start bol :end at))))
+(defun %lsp-position-in (text at &optional (line 0) (bol 0))
+  "The LSP `Position' of the character offset AT in TEXT, a whole document.
+
+**One walk of TEXT and not two.** This used to `count' the newlines before AT and
+then find the line's start with `position ... :from-end t', which reads as a
+count and a look backwards and is not one: ECL's `:from-end' on a string scans
+*forward* from the beginning and remembers the last hit, so the pair walked
+everything before AT twice. Measured at 287 KB, the two calls a change costs were
+6.8 ms of its 12.6. Stepping `position' line by line answers both questions from
+the one walk — the last newline it finds is where the line starts, and how many
+it found is the line — and there is no `char' loop in it, which at this size is
+the slowest thing available (15 ms) and not the fastest.
+
+LINE and BOL are a previous answer handed back, and the second and third values
+are what to hand back: the line, and the offset that line starts at. A caller
+placing two positions in the same document has already walked as far as the
+first, and `%lsp-content-change' is exactly that caller — its second position is
+usually one character past its first. Threading turns that second walk into a
+step. Both default to the top, which is the plain walk from 0.
+
+Starting at BOL rather than at the offset it came from is deliberate and free:
+there is no newline between a line's start and any offset on it, so the count is
+the same and the answer is a line start either way."
+  (loop for nl = (position #\Newline text :start bol :end at)
+        while nl do (setf bol (1+ nl) line (1+ line)))
+  (values (jobj "line" line
+                "character" (%lsp-utf16-length text :start bol :end at))
+          line bol))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Sessions
@@ -653,26 +675,53 @@ the ones the server has.
 Common prefix and common suffix, which is what an edit in a text editor looks
 like from the outside — one contiguous run replaced. Not the *minimal* edit:
 retyping a word that happens to share its middle sends the whole word. It does
-not have to be minimal, only true, and `mismatch' from each end is two compiled
-scans where a real diff would be interpreted Lisp on every keystroke.
+not have to be minimal, only true, and a scan from each end is two compiled walks
+where a real diff would be interpreted Lisp on every keystroke.
+
+Forwards that walk is `string/=' and not `mismatch', which is the same question
+asked of the specialised string function rather than the generic sequence one.
+The answer is the same integer by definition: the index of the first difference,
+or NIL when there is none, and a string that is a *prefix* of the other answers
+its own length either way. At 287 KB it costs 0.45 ms against `mismatch''s 2.82.
+
+Backwards there is no such pair — no `string' function takes `:from-end' — so
+`mismatch' stays there, and the `string=' above it is how most keystrokes never
+reach it. TAIL is capped at CAP whatever the search answers, so if the last CAP
+characters already match then CAP *is* the answer and there is nothing to search
+for. A character typed or deleted matches there by construction, because a pure
+insertion or deletion at HEAD leaves everything after it aligned, and the check
+that says so stops at the first difference when it is wrong. At 287 KB a
+character typed costs 2.7 ms and one *replaced* — which fails the check on its
+first comparison and pays for the search — costs 5.5.
+
+ponytail: that search is the last O(n) walk here, at ~20 ns a character against
+`string/=''s 3, which is the price of a generic sequence function. Ceiling: the
+5.5 ms above, on a replacement at 287 KB. Upgrade path: a `mismatch' that knows
+it has a string, next to `%json-quote' in `crates/lisp/src/shim.c' — the other
+thing here that is in C for exactly this reason.
 
 Both ends used to be snapped to a character boundary by `%lsp-char-start',
 because both documents were UTF-8 bytes and a prefix comparison stopped *inside*
 the `é' whose accent you had just changed — a range naming half a codepoint is
 one a server is entitled to do anything at all with. Both are characters now, so
-a `mismatch' can only stop between two of them, and the helper is gone."
-  (let ((head (mismatch old new)))
+a scan can only stop between two of them, and the helper is gone."
+  (let ((head (string/= old new)))
     (when head
       (let* ((lo (length old))
              (ln (length new))
              ;; From the other end, capped so the suffix can never reach back
              ;; over the prefix — `aa' becoming `aaa' matches at both ends.
-             (tail (min (- lo (or (mismatch old new :from-end t) 0))
-                        (- (min lo ln) head)))
+             (cap (- (min lo ln) head))
+             (tail (if (string= old new :start1 (- lo cap) :start2 (- ln cap))
+                       cap
+                       (min (- lo (or (mismatch old new :from-end t) 0)) cap)))
              (old-end (- lo tail)))
-        (jobj "range" (jobj "start" (%lsp-position-in old head)
-                            "end" (%lsp-position-in old old-end))
-              "text" (subseq new head (- ln (- lo old-end))))))))
+        ;; OLD-END is never before HEAD — the cap above is what guarantees it —
+        ;; so the second position always walks forwards from the first.
+        (multiple-value-bind (start line bol) (%lsp-position-in old head)
+          (jobj "range" (jobj "start" start
+                              "end" (%lsp-position-in old old-end line bol))
+                "text" (subseq new head (- ln (- lo old-end)))))))))
 
 ;;; Nothing in this file encodes anything, and saying so is the point of this
 ;;; note, because for a while the opposite was the rule. Buffer text was one Lisp

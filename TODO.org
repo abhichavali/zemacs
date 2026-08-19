@@ -1721,3 +1721,247 @@ is finished.
    you came from*: to the Contents in the curriculum, to the curriculum in the
    program. That is better than two keys for one idea, and it is worth leaving
    alone.
+   
+   
+* Usage TODOs
+   - [X] You should be able to click the icons on the modeline, and maybe get some additional info
+   - [X] MathSync is not properly bound
+   - [X] Voice mode doesn't work in claude code terminal
+   - [X] If I put a Latex snippet in a heading, it should match font size of heading. 
+   - [X] The mouse doesn't work super well in org buffers
+   - [X] Latex previews should match the font size of wherever we put it. The non-inline (inline meaning $ $) latex should be bigger font than the inline ones.
+   - [X] In org mode, C-b should spawn ** bolding, C-i should spawn italics
+   - [X] Org latex previews kind of inconsistently. The behavior I want is as follows, whenever the cursor is not over the preview, it should be rendered. When the cursor is over the preview, it should unrender to text. Aside from that, it should always be previewd. I found that that functionality is not always the case
+   - [X] Switching to another frame turns off visual-line mode
+   - [X] I don't like the ... that happens at the end of ever line with a latex preview
+   - [X] Drag an image into the editor and have it drop in and render
+   - [X] Paste an image in and have it render
+   - [X] Modus: the org heading colours don't quite fit
+
+** The strip answers the mouse                                       :done:
+
+   Clicking a modeline segment says what it is. The renderer hit-tests the
+   strip and hands Lisp the **template** it was drawn from plus the text it
+   expanded to; `%modeline-click' in =library.lisp= dispatches on the `%' code.
+   The template is the identity and it has to be — `●' and `◈' are two glyphs
+   the config chose, and `Rust' one frame is `Org' the next, so `" %+"' is the
+   only stable name the strip has. Same division of labour as the scene's hit
+   test and the terminal's: the gesture is arithmetic, the meaning is policy.
+
+   The dot saves, the message opens =*Messages*=, the name gives the full path,
+   the position spells out what `12:4' is 12 of, and `%N' — a mode's own note —
+   goes to `*modeline-note-functions*', because whoever put a note there is the
+   only one who knows what it says. MathSync registers the first handler.
+
+   It also fixed a bug nobody had reported: the strip is *inside* the pane
+   rectangle, so a click on it fell through to `click_target', which measures
+   rows from the top of the document and answers end-of-buffer for anything
+   below the last one. Clicking the modeline teleported the cursor to the end
+   of the file.
+
+** MathSync finished only where you started it                       :done:
+
+   The key was never the problem — `SPC n m' resolves to `mathsync-transcribe'
+   from every buffer, which is what `define-leader' is for and is deliberate,
+   since the folder is watched whatever you are looking at.
+
+   `mathsync-poll' was gated *whole* on `(minor-mode-p 'mathsync)', which is on
+   in org buffers only. So a transcription started in the curriculum and waited
+   for in the `.py' tangled out of it — which is exactly where you go while it
+   runs — was never noticed finishing: the child exited, `*mathsync-job*' stayed
+   set for the rest of the session, and every later `SPC n m' answered "still
+   reading" about a process long gone. The two halves are gated differently now.
+   Finishing a job is a process-handle read and only when there is a job;
+   scanning the folder is a `directory' call and keeps the mode test, because
+   the note it feeds is only drawn where the mode is on.
+
+   And the binding was missing after all, which I got wrong the first time by
+   testing the wrong file. `SPC n m' was in =runtime/init.lisp=, which is only
+   the *shipped* config: `resolve_init_path' prefers `~/.zemacs.d/init.lisp' the
+   moment it exists, and a config written before this feature has no `SPC n'
+   group in it at all. So the mode loaded, the folder was watched and the note
+   appeared on the strip with no way to press the key it names. Every test I ran
+   loaded the shipped copy by absolute path and passed.
+
+   Fixed in both places. The binding is in `~/.zemacs.d/init.lisp' now, and
+   =modes/mathsync.lisp= binds it itself when nothing else has — guarded on
+   `fboundp' because a mode must load whether or not its init has defined
+   `define-leader' yet, and on `leader-key' because a config that put it
+   somewhere else has already spoken. `default-modeline' in =library.lisp= is
+   there for exactly this reason.
+
+   A transcribed image is now **deleted** rather than moved to `done/'. The
+   argument for moving was that the model gets things wrong and the photograph
+   is the only copy of what it was reading; it loses to what the folder is for.
+   `*mathsync-keep*' is the way back.
+
+** The microphone belongs to the bundle                              :done:
+
+   =scripts/bundle.sh= declares `NSMicrophoneUsageDescription' and
+   `NSSpeechRecognitionUsageDescription'. A child spawned in `:term' inherits
+   zemacs's TCC identity, and macOS denies a recording attempt *outright* when
+   the bundle has no usage string — no prompt, no dialog, which is why it looks
+   like the tool being broken rather than a missing plist key.
+
+   Not verified here, and it cannot be: TCC is a system database and a test
+   process has no window. Re-bundle, and if a denial was already cached under
+   the old plist, `tccutil reset Microphone org.zemacs.zemacs' forgets it.
+
+** An equation is set at the size of the text around it              :done:
+
+   `latex-preview' takes a scale — a multiple of the body em, carried as the
+   hundredths this boundary already carries `overlay-scale' and `%image-file'
+   in — and it reaches dvipng as a **dpi**, so a heading's equation is typeset
+   large rather than being a small one scaled up.
+
+   Two factors and they multiply. Where it is: `%org-latex-scale' counts the
+   leading stars of the line and sizes the fragment by org-modern's own
+   `*org-modern-heading-scale*', so a config that resizes its headings resizes
+   the mathematics in them. `**bold**' at the start of a line is not a level-2
+   heading — stars make one only with a space after them — and without that
+   test every equation in a paragraph opening with emphasis came out oversized.
+   What it is: `latex-fragments' has always answered `display' and every caller
+   ignored it; `\[…\]' now gets `*org-latex-display-scale*', 1.25, because it
+   has a line of its own and is what the paragraph is about.
+
+   Not done: =org-frozen.lisp= builds its own page and still previews at body
+   size, so an equation in a frozen heading is smaller than the same equation
+   in the live buffer. Its `%org-frozen-latex-piece' would have to carry a size
+   down through the layout.
+
+** A preview came back on leaving the *line*, not the fragment       :done:
+
+   Which is the whole of "previews kind of inconsistently". `$a$ and $b$' is two
+   equations on one line: stepping off the first onto the word between them left
+   the line unchanged, so nothing re-typeset it and it stayed spelled out until
+   you pressed `j'.
+
+   `org-latex-reveal-at-point' remembers the range it opened rather than the
+   line it was on — `overlays-in' already answers (ID BEG END), so it costs no
+   second query — and the re-render fires the moment point is outside it. The
+   line flag stays for *edits* and clears the range one: typing moves the
+   fragment's end, and a stale end reads as having walked out, which would run
+   LaTeX in the middle of a word.
+
+** Wrapping is a fact about the document                             :done:
+
+   `Buffer::line_overflow', stamped by `SetLineOverflow' exactly as
+   `Buffer::text_width' is, and read through one new `zemacs_core::wraps'.
+
+   The setting was the editor's and there is one of it, so the *unfocused* frame
+   went on drawing a buffer under the focused buffer's rules. Clicking into a
+   code frame un-wrapped the prose in the frame beside it — a window nobody had
+   touched reflowed — and the same thing happened between two panes of a split.
+
+   It was three bugs, not one, because three loops asked the question:
+   `visible_lines' counted the rows, the draw loop drew them, and `offset_at'
+   answered where a click landed. So a click in an org pane while a `.rs' was
+   focused also landed on the wrong line. `Editor::visual_lines' reads it too,
+   so `j' and `k' count screen rows in the right buffer as well.
+
+** The wheel crosses rows, `scroll' counts lines                     :done:
+
+   The other half of "the mouse doesn't work super well in org buffers", and org
+   is where it bites because org is the mode that wraps: a paragraph is one
+   buffer line and eight rows on screen, so a notch that moved three lines in a
+   code file threw three paragraphs past you in prose. A 1.5× heading and a
+   display equation do the same thing for the same reason.
+
+   `Renderer::scroll_step' converts the notch at the one place it enters, so
+   `Editor::scroll' stays a line everywhere and the *gesture* is in rows. A
+   buffer with no wrapping and nothing typeset takes the identity fast path, so
+   the wheel feels exactly as it did in code.
+
+   ponytail: a line taller than one notch is stepped over or into, never
+   through. The upgrade is `(line, row)' in `Editor::scroll', which is a change
+   to every clamp in core.
+
+** A picture you drag or paste is a figure                            :done:
+
+   Both gestures end at `%org-insert-image', which writes an org link and draws
+   it, so however a figure arrives it means the same thing. What lands in the
+   buffer is text you could have typed — the file stays where it is, and the
+   document opened anywhere else still says `[[file:...]]'. Nothing here invents
+   a binary attachment.
+
+   The link is relative when the file is inside the document's own folder, which
+   is what survives that folder being moved or checked in, and `~/'-abbreviated
+   otherwise. It goes on its own line because that is org's rule for what a
+   figure is and this runtime's rule for what it will draw, and the whole
+   insertion is one `insert-at' — so `u' takes the picture and its line away
+   together.
+
+   *Dropping* already had an arm and it did the wrong thing: `Event::DropFile'
+   fell through to `open_file', so dragging a PNG onto a document opened the PNG
+   as a text buffer. It now asks `%file-dropped', but only when the live buffer
+   is org — which is the one part of the question core can answer for itself.
+   Which files are pictures stays `*org-image-file-types*', in Lisp, where it
+   already was; anything that is not one is still a file you meant to open.
+
+   *Pasting* is `EditorCommand::ClipboardImage', a request in `ListFonts'' shape
+   and for its reason: core does no IO and has no clipboard, and the layer that
+   owns a window is the only one that can reach a pasteboard. The app writes the
+   picture to `~/.zemacs.d/images/' — named by content, so pasting the same
+   screenshot twice is one file — and answers by calling `%clipboard-image'.
+   `M-v' (which is ⌘V here) and `SPC m v'. The reply checks the mode again,
+   because the buffer can change across a round trip through another thread.
+
+   And JPEG, which the gesture forced. `crates/figure' was PNG and SVG on the
+   argument that "a photograph is not a figure in a textbook" — true while a
+   figure arrived by being typed as a link, and false the moment you can drag
+   one in, because what you drag is a photograph. The ceiling note predicted the
+   fix exactly: one manifest line for `zune-jpeg', which `resvg' already builds,
+   and one arm. The two raster decoders are chosen by *magic number* rather than
+   by extension, so a `.png' that something re-saved as a JPEG still reads.
+
+   Still missing: `.webp', which is a real decoder crate rather than a free one.
+
+** Modus headings wore the title's colour                            :done:
+
+   `heading-1' took Modus' `fg-heading-0' — which is what a `#+title' is set in,
+   not a heading — on the argument, written in the file, that zemacs had one
+   heading size so hue was the only thing left to rank three levels with.
+
+   That argument was never true here. `*org-modern-heading-scale*' has set level
+   1 at 1.5x and level 2 at 1.25x since the commit *before* the one that added
+   these themes. And it cost twice over, because `fg-heading-0' is also exactly
+   this theme's `type' — so a heading in a document with code in it read as a
+   type name, which is the "doesn't quite fit" you can see and cannot name.
+
+   Level 1 is `fg-main' now, as Modus spells it, in all three files. Bold at
+   1.5x says top-level far more plainly than a hue can, which is why Modus
+   spells it that way. Levels 2 and 3 were already right and are untouched.
+
+** The `…' was a fold marker, and there was nothing folded              :done:
+
+   `%org-latex-draw' set `:fold' on *every* preview overlay, on the argument —
+   written in the comment beside it — that a one-line fragment has no line after
+   its first and so folding it is a no-op. That is true and it was not the whole
+   story: a fold is what the renderer draws its `…' for, so every line holding
+   an inline `$x^2$' grew an ellipsis on the end claiming there was text behind
+   it. There was none. The flag was being used to claim rows the fragment did
+   not have.
+
+   Two halves, because both were wrong. Lisp only folds a fragment whose source
+   actually contains a newline — a `\begin{align}', which is the case the flag
+   exists for. And `fold_starts_in' — whose only caller is the marker, and whose
+   whole question is "does this line get the indicator" — now says no for a fold
+   carrying an `image': the rows it hid are the *source* of the picture drawn in
+   their place, and the picture already says so. `fold_hiding' is untouched, so
+   `j' still steps over them.
+
+** `C-b' and `C-i' while typing                                      :done:
+
+   `org-emphasis-bold' wraps the selection or opens an empty `**' with point
+   between the stars — the empty half is what makes it a key you press *while*
+   typing, since the tedious character is always the closing one. One
+   `insert-at', so it is one undo step and no keystroke can land between the
+   halves.
+
+   Bound in the **insert** state and not in org's keymap, which is the one
+   decision here: a mode binding applies in every state, and in Normal `C-b' is
+   vim's page-up and `C-i' its jump-forward. Both are worth more than a second
+   spelling of `SPC m b', which still exists and still says "no selection". A
+   state binding is global, so the guard is in the command — and it costs
+   nothing elsewhere, because an unbound Ctrl chord in Insert already did
+   exactly nothing.

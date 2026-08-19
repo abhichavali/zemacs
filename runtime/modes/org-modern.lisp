@@ -250,13 +250,14 @@ that names no scheme is itself."
   (let ((s (%org-link-scheme target)))
     (if s (cdr s) target)))
 
-(defparameter *org-image-file-types* '("png" "svg" "svgz")
+(defparameter *org-image-file-types* '("png" "svg" "svgz" "jpg" "jpeg")
   "Extensions `org-inline-images' will draw, lower-cased.
 
 Exactly what `zemacs-figure' decodes and no more, because a link this list
 claims and the decoder then refuses is a message in the status line rather than
-a link. SVG for a diagram, PNG for a plot; a photograph is not a figure. See the
-ceiling at the head of `crates/figure/src/lib.rs'.")
+a link. SVG for a diagram, PNG for a plot, JPEG for the photograph you dragged
+in. See the ceiling at the head of `crates/figure/src/lib.rs' for what is still
+missing — `.webp' is the one you will meet.")
 
 (defun %org-image-target (target)
   "TARGET's path when it names a file that could be drawn as a figure, else NIL.
@@ -701,8 +702,18 @@ do not read as being inside a block already.
 
 An unterminated block runs to the end of the buffer, which is the same answer
 `%org-modern-scan' gives it — one rule, applied by both, and it beats guessing
-where the author meant to close it."
-  (let ((lines (buffer-lines)) (n 0) (open nil) (out nil))
+where the author meant to close it.
+
+`%org-lines' and not `buffer-lines', and that is the whole of what pressing RET
+in a long org file used to cost. `buffer-lines' is a `line-string' *per line* —
+one `%query' round trip each — and this runs whenever `%org-modern-in-block-p'
+misses, which is on every edit that changes how many lines there are. So RET in
+a three-thousand-line curriculum was three thousand round trips before the next
+character could be typed. `%org-lines' is one `buffer-string' and a walk, which
+is the rule the section it lives in states outright; the forward reference is
+because that section is below this one and moving it would be a bigger diff than
+the fix."
+  (let ((lines (mapcar #'first (%org-lines))) (n 0) (open nil) (out nil))
     (dolist (line lines)
       (incf n)
       (cond ((%org-directive-p line "#+begin_") (setf open (1+ n)))
@@ -1012,6 +1023,37 @@ heading was where forgetting it showed."
           when (and (eq kind :link) (<= beg col) (< col end))
             return (%org-link-parts (subseq line beg end)))))
 
+(defun %org-plain-link-at-point ()
+  "The bracket-less `https://x' point is inside, as (TARGET . TARGET), or NIL.
+
+Org calls this a *plain* link and it is the one people actually type: a URL
+pasted into notes arrives without brackets round it, and `RET' answering `no
+link at point' on one is the editor being strict about punctuation nobody wanted
+to add. Nothing is drawn for it — there is no markup to hide — so this is
+`org-open-at-point''s business alone.
+
+The extent is the whitespace-delimited word point is in, with the brackets and
+quotes prose wraps a URL in taken off either end: `see (https://x/a).' is a link
+inside a parenthesis inside a sentence. A trailing `)' survives when the word
+opened one of its own, which is the whole of what keeps a Wikipedia link ending
+`_(topology))' from losing its last two characters — org solves the same problem
+by counting parentheses, and this is the one-character version of that.
+
+What makes it a link at all is `*org-link-open-functions*' having an entry for
+its scheme, so the policy table is the whole test and `2:30' or `Fix: the thing'
+in prose stay prose. EQUAL and not STRING= on the lookup because a word with no
+scheme answers NIL and NIL is not a string."
+  (let* ((line (line-string))
+         (n (length line))
+         (col (min (- (point) (line-start)) n))
+         (space (position-if #'%org-blank-p line :end col :from-end t))
+         (raw (string-left-trim
+               "(\"'" (subseq line (if space (1+ space) 0)
+                              (or (position-if #'%org-blank-p line :start col) n))))
+         (word (string-right-trim (if (find #\( raw) ".,;:!?\"'" ".,;:!?)\"'") raw)))
+    (when (assoc (car (%org-link-scheme word)) *org-link-open-functions* :test #'equal)
+      (cons word word))))
+
 (defun %org-expand-file (name)
   "NAME as a path, resolved the way a link in a document means it.
 
@@ -1019,8 +1061,20 @@ Relative to the *file's own directory* and not to the process's, which is what
 makes `[[file:fig-1.svg]]' mean the figure next to the .org file rather than one
 next to wherever the editor was launched from. `~/' is expanded here because CL
 does not do it, and a buffer with no file behind it leaves NAME alone — there is
-nothing to be relative to."
-  (let ((base (buffer-file-name)))
+nothing to be relative to.
+
+Org's `::' search option comes off first. `file:notes.org::*Heading' names the
+file `notes.org' and a *place* in it, and every caller here wants the file. Left
+on, the option made the probe ask after a path nobody has: `[[file:a.org::42]]'
+reported `no such file', and `[[file:a.org::*Heading]]' — org's own spelling for
+the cross-file case — did not manage even that, since the `*' makes a wild
+pathname ECL will not look at. Nothing here can jump to the heading afterwards,
+for the reason the link-storing section gives, so the option is dropped rather
+than half-honoured. A file genuinely named with a `::' in it is unreachable this
+way, and unreachable from org too."
+  (let* ((option (search "::" name))
+         (name (if option (subseq name 0 option) name))
+         (base (buffer-file-name)))
     (cond ((and (> (length name) 1) (string= "~/" name :end2 2))
            (namestring (merge-pathnames (subseq name 2) (user-homedir-pathname))))
           ((null base) name)
@@ -1075,9 +1129,15 @@ Org's `[[*Heading]]', and the fallback for a bare target that matches one."
 `find-file' reaches the *application* rather than the editor core, so the new
 buffer arrives a frame later and nothing here can act on it. That is also why
 the file is probed first: an open that will fail should say so now, in a message
-naming the path, rather than a frame later in whatever the app decides to say."
+naming the path, rather than a frame later in whatever the app decides to say.
+
+IGNORE-ERRORS because `probe-file' does not answer NIL for every path that is
+not there: a name carrying a `*' or a `?' is a *wild* pathname to CL, and ECL
+signals a FILE-ERROR rather than looking. `[[file:screenshot 2026-*.png]]' is a
+link somebody will write, and a backtrace is not the answer to it — the message
+below is."
   (let ((path (%org-expand-file (%org-link-rest target))))
-    (cond ((probe-file path) (find-file path))
+    (cond ((ignore-errors (probe-file path)) (find-file path))
           (t (message (format nil "no such file: ~a" path))))))
 
 (defun org-link-open-url (target)
@@ -1110,7 +1170,12 @@ Contents section can be written without ids at all."
        (let ((at (%org-heading-position (subseq target 1))))
          (if at (goto-char at) (message (format nil "no heading: ~a" (subseq target 1))))))
       ((char= (char target 0) #\#) (org-link-open-id (subseq target 1)))
-      ((probe-file (%org-expand-file target)) (find-file (%org-expand-file target)))
+      ;; IGNORE-ERRORS for `org-link-open-file''s reason, and it matters more
+      ;; here: a fuzzy link is *prose*, so `[[Who? What]]' reaches this probe as
+      ;; a wild pathname and used to signal instead of falling through to the
+      ;; heading search on the next line, which is where it belongs.
+      ((ignore-errors (probe-file (%org-expand-file target)))
+       (find-file (%org-expand-file target)))
       (t (let ((at (or (%org-heading-position target) (search-forward target 0))))
            (if at (goto-char at) (message (format nil "not found: ~a" target))))))))
 
@@ -1119,8 +1184,12 @@ Contents section can be written without ids at all."
 
 `RET' in an org buffer, which is what the table above makes worth having: a
 Contents section of `[[id:unit-1][1. Vectors and Spaces]]' becomes a document you
-navigate with one key rather than a list you read and then go hunting through."
-  (let ((link (%org-link-at-point)))
+navigate with one key rather than a list you read and then go hunting through.
+
+A bracketed link first and a bare one second, which is the order org itself
+reads them in: inside `[[https://x][d]]' the description is not a URL, and
+asking the plain reader first would follow whatever word point happened to be on."
+  (let ((link (or (%org-link-at-point) (%org-plain-link-at-point))))
     (if (null link)
         (message "no link at point")
         (let* ((target (car link))
@@ -1130,6 +1199,127 @@ navigate with one key rather than a list you read and then go hunting through."
           (if (and open (fboundp open))
               (funcall open target)
               (%org-link-open-plain target))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Storing a link, and pasting one
+;;;
+;;; The other direction from `org-open-at-point': that one follows a link you
+;;; wrote, and these two write it for you. Between them they are the gesture the
+;;; whole link machinery above exists for — point at a thing, go somewhere else,
+;;; paste a link to it.
+;;;
+;;; What gets stored is deliberately narrow, and it is narrow because it is what
+;;; this editor can actually *follow*. `*Heading' resolves through
+;;; `%org-heading-position' and `file:' through `org-link-open-file'. A
+;;; `file:other.org::*Heading' would be org's own spelling for the cross-file
+;;; case and is not offered, because nothing here opens it: `find-file' reaches
+;;; the application and the buffer arrives a frame later, so there is no moment
+;;; at which this code could jump to the heading in it. Storing a link that
+;;; cannot be followed would be worse than not storing one.
+
+(defvar *org-stored-link* nil
+  "The (TARGET . DESCRIPTION) `org-store-link' last put away, or NIL.
+
+One, not a ring. A ring is the right shape the day anyone wants the link from
+three jumps ago, and until then it is a list with one element in it and a second
+command to walk it.")
+
+(defun %org-heading-here (&optional (lines (%org-lines)))
+  "(TEXT BEGIN END) of the nearest headline at or above point, or NIL.
+
+`%org-headline-above' in `org-fold.lisp' answers the same question by line
+number, and this file loads before that one — but the real reason for a second
+reader is that every caller here wants the headline's *text*, which the
+line-number answer would then have to go back and fetch."
+  (let ((at (point)) (found nil))
+    (dolist (l lines found)
+      (destructuring-bind (text begin end) l
+        (declare (ignore end))
+        (when (> begin at) (return found))
+        (when (%org-line-level text) (setf found l))))))
+
+(defun %org-heading-title (text)
+  "A headline's text with its stars off — what `[[*...]]' has to match.
+
+Exactly `%org-heading-position''s own comparison, keyword and all: a link to
+`* TODO Buy milk' is `[[*TODO Buy milk]]', because that is the string the reader
+on the other side will be holding."
+  (let ((level (%org-line-level text)))
+    (and level (string-trim '(#\Space #\Tab #\Return) (subseq text level)))))
+
+(defun org-store-link ()
+  "Remember a link to where point is, for `org-insert-link' to paste.
+
+On or under a headline that is `*Heading' — org's in-file link, and the one that
+survives being pasted anywhere in this same file. In a file with no headline
+above point it is `file:' and the file's own path, which survives being pasted
+anywhere at all."
+  (let* ((head (%org-heading-here))
+         (title (and head (%org-heading-title (first head))))
+         (path (buffer-file-name)))
+    (cond
+      ((and title (plusp (length title)))
+       (setf *org-stored-link* (cons (format nil "*~a" title) title))
+       (message (format nil "stored: [[*~a]]" title)))
+      (path
+       (setf *org-stored-link* (cons (format nil "file:~a" path)
+                                     (file-namestring path)))
+       (message (format nil "stored: [[file:~a]]" path)))
+      (t (message "nothing to link to here"))))
+  nil)
+
+(defun %org-put-link (target description region)
+  "Insert `[[TARGET][DESCRIPTION]]', over REGION when there is one.
+
+A link with no description is written `[[target]]' rather than `[[target][]]',
+which is org's own spelling for it and the one `%org-link-at-point' reads back."
+  (let ((text (if description
+                  (format nil "[[~a][~a]]" target description)
+                  (format nil "[[~a]]" target))))
+    (if region
+        (replace-region (car region) (cdr region) text)
+        (insert text))
+    (message (format nil "linked: ~a" target))))
+
+(defun %org-insert-link-described (target selection region)
+  "Second half of `org-insert-link': the description, unless the selection is it."
+  (if selection
+      (%org-put-link target selection region)
+      (read-string (format nil "Description (RET for none): ")
+        (lambda (answer)
+          (when answer
+            (let ((d (string-trim " " answer)))
+              (%org-put-link target (and (plusp (length d)) d) nil)))))))
+
+(defun org-insert-link ()
+  "Insert a link, asking for its target and what to call it.
+
+Empty answers with the stored link, so `org-store-link' then `org-insert-link'
+is two gestures and no typing at all.
+
+With a selection up, the selected text becomes the description and the link
+replaces it — which is how a phrase you have already written turns into a link.
+The region is read *before* the prompt opens and carried through as offsets,
+because opening a prompt is what takes the selection down."
+  (let* ((region (region))
+         (selection (and region (region-text))))
+    (read-string (if *org-stored-link*
+                     (format nil "Link (RET for ~a): " (car *org-stored-link*))
+                     "Link: ")
+      (lambda (answer)
+        (when answer
+          (let* ((typed (string-trim " " answer))
+                 (target (if (plusp (length typed))
+                             typed
+                             (car *org-stored-link*))))
+            (if (null target)
+                (message "no link stored")
+                (%org-insert-link-described
+                 target
+                 ;; A typed target takes the selection as its description too:
+                 ;; the region is what you pointed at, whichever link goes on it.
+                 selection region)))))))
+  nil)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Figures
@@ -1219,6 +1409,121 @@ buffer full of plots is decoded."
           (overlay-put ov :org-image path)
           (overlay-put ov 'image id)))
       t)))
+
+;;; ---------------------------------------------------------------------------
+;;; Getting a picture *into* the document
+;;;
+;;; Two gestures and one destination. Dragging a file onto the window is the
+;;; obvious one; pasting a screenshot is the one you reach for more, because the
+;;; picture you want is usually one you just took and never saved.
+;;;
+;;; Both end at `%org-insert-image', which writes a link and draws it, so
+;;; whatever a figure comes to mean it means the same thing however it arrived.
+;;; And the link is *org*: what lands in the buffer is text you could have typed,
+;;; the file stays where it is, and a document opened anywhere else still says
+;;; `[[file:...]]'. Nothing here invents a binary attachment.
+
+(defun %org-image-link-path (path)
+  "PATH as it should be written in a link from this buffer.
+
+Relative when the file is inside the document's own directory, which is the case
+that matters: `[[file:figures/plot.png]]' survives the folder being moved, sent
+or checked in, and an absolute path does not. Absolute otherwise, with `~/' put
+back — a screenshot pasted out of `~/.zemacs.d/images/' is nowhere near your
+notes and a relative link to it would be a row of `../'.
+
+String surgery and not `enough-namestring', which answers a *pathname* rather
+than a string and prints the two cases inconsistently on ECL. The question here
+is what to type into the buffer, so the answer is text all the way through."
+  (let* ((path (namestring path))
+         (base (buffer-file-name))
+         (dir (and base
+                   (namestring (make-pathname :name nil :type nil
+                                              :defaults (pathname base)))))
+         (home (namestring (user-homedir-pathname))))
+    (cond
+      ;; Inside the document's own directory: the tail is the link.
+      ((and dir (> (length path) (length dir))
+            (string= dir path :end2 (length dir)))
+       (subseq path (length dir)))
+      ;; Under `~': shorter to read, and `%org-expand-file' puts it back.
+      ((and (> (length path) (length home))
+            (string= home path :end2 (length home)))
+       (concatenate 'string "~/" (subseq path (length home))))
+      (t path))))
+
+(defun %org-insert-image (path)
+  "Put a link to PATH on its own line at point, and draw it.
+
+On its *own* line, because that is org's rule for what a figure is and this
+file's rule for what it will draw — a link with prose around it is a reference
+and stays words. So a line with anything on it gets a newline first, and one
+that is already blank is used as it stands rather than leaving a gap above every
+picture you paste.
+
+One `insert-at' for the whole thing, which is one undo step: press it by
+mistake and `u' takes the picture and its line away together. Two calls would
+leave a stray newline behind after the undo, and a keystroke could land between
+them — see `replace-region' in `library.lisp'."
+  (let* ((link (format nil "[[file:~a]]" (%org-image-link-path path)))
+         (blank (every #'%org-blank-p (line-string)))
+         (at (if blank (line-start) (line-end)))
+         (text (if blank link (concatenate 'string (string #\Newline) link))))
+    (insert-at at text)
+    (goto-char (+ at (length text)))
+    ;; Drawn now rather than on the next entry into org-mode: the whole point of
+    ;; the gesture is that the picture appears where you dropped it.
+    (org-inline-images-new)
+    (message (format nil "inserted ~a" (file-namestring path)))))
+
+(defun %file-dropped (path)
+  "A file was dragged onto an org buffer.
+
+A picture becomes a figure in the document; anything else is a file you meant to
+open, which is what dragging one onto any other buffer already does. The editor
+asks this only for org buffers — everywhere else it opens the file without
+consulting anybody — so the fallback here is that same behaviour rather than a
+refusal.
+
+`%org-image-target' is the test, so what counts as a picture is
+`*org-image-file-types*' and there is one list rather than two."
+  (if (%org-image-target path)
+      (%org-insert-image path)
+      (find-file path))
+  nil)
+
+(defun %clipboard-image (path)
+  "The clipboard's picture has been written to PATH, or PATH is NIL.
+
+The reply half of `EditorCommand::ClipboardImage'. NIL is reported and not
+silent: `org-paste-image' is a key you pressed *because* you had just copied a
+picture, so being told the clipboard has something else in it is the answer to
+why nothing happened."
+  (cond
+    ((null path) (message "no image in the clipboard"))
+    ((not (derived-mode-p 'org-mode))
+     ;; The buffer can change between the request and the reply — it is a round
+     ;; trip through another thread. Saying where the file went is better than
+     ;; either dropping it or writing a link into a `.rs'.
+     (message (format nil "image saved to ~a" path)))
+    (t (%org-insert-image path)))
+  nil)
+
+(defun org-paste-image ()
+  "Paste the clipboard's picture into the document as a figure.
+
+The picture is written to `~/.zemacs.d/images/', named by its *content*, so
+pasting the same screenshot twice is one file rather than two — and it goes
+there rather than beside your notes because a screenshot is scratch, and a
+folder that grows `Screenshot 3.png' every time you paste is a folder with a
+`.gitignore' problem.
+
+Asks and returns; `%clipboard-image' is what runs when the answer comes back.
+It cannot be a value: the clipboard belongs to the window system, which is two
+threads away, and waiting for it here would be the Lisp thread blocking the
+editor."
+  (%do "clipboard-image" "" 0 0)
+  nil)
 
 (defun org-inline-images-clear ()
   "Take the figures off, showing their links again."
@@ -1383,6 +1688,14 @@ Turning it off removes exactly the overlays it made."
 (define-key "org-mode" "SPC m a" "org-modern-appear")
 (define-key "org-mode" "SPC m f" "org-inline-images")
 (define-key "org-mode" "SPC m F" "org-inline-images-clear")
+;;; Paste a picture. `M-v' is ⌘V here, which is the paste chord on this
+;;; platform and is what the hand reaches for — and it is already
+;;; `terminal-paste-image' in a terminal, so one gesture means "put the picture
+;;; I just copied where I am looking" in both places it can mean anything.
+;;; `SPC m v' is the leader spelling, in org's own group beside the other two
+;;; figure keys.
+(define-key "org-mode" "M-v" "org-paste-image")
+(define-key "org-mode" "SPC m v" "org-paste-image")
 
 ;;; `RET' follows a link, which is the binding an Emacs config has bound in org
 ;;; normal state for as long as there has been one.

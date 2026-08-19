@@ -302,6 +302,14 @@
 (define-leader "SPC h m" "messages-buffer")   ; what Emacs puts on `C-h e'
 (define-leader "SPC b s" "lisp-scratch")
 (define-leader "SPC q q" "quit")
+;;; `SPC n n' is `*todo-file*' — the one buffer you can always get to, for the
+;;; thing you noticed while doing something else. `C-c n' is the chord.
+(define-leader "SPC n n" "open-todo")
+;;; ...and `SPC n m' is the other kind of note: a photograph of a blackboard in
+;;; `*mathsync-dir*', transcribed to org LaTeX and left in the register for `p'.
+;;; In the `SPC n' capture group rather than org's `SPC m', both because that
+;;; group is full and because the folder is watched whatever buffer you are in.
+(define-leader "SPC n m" "mathsync-transcribe")
 (define-key-everywhere "C-M-j" "switch-buffer")
 
 ;;; `M-o' jumps between windows, ace-window style: with two it just switches,
@@ -551,6 +559,7 @@
 (define-key-everywhere "C-c c" "project-find-file")
 (define-key-everywhere "C-c a" "ai")
 (define-key-everywhere "C-c i" "edit-config")
+(define-key-everywhere "C-c n" "open-todo")      ; the notes file, from anywhere
 (define-key-everywhere "C-c s" "switch-buffer")
 (define-key-everywhere "C-c b" "messages-buffer")
 (define-key-everywhere "C-c y" "yank-buffer-file-name")
@@ -602,38 +611,6 @@
 (define-key-everywhere "M--" "zoom-out")
 (define-key-everywhere "M-0" "zoom-reset")
 
-;;; Org markup, only in org buffers and only with something selected.
-(define-key "org-mode" "SPC m b" "org-bold")
-(define-key "org-mode" "SPC m i" "org-italic")
-(define-key "org-mode" "SPC m c" "org-code")
-
-;;; LaTeX previews. `C-c r' is what Emacs muscle memory wants, and it works
-;;; because `normal_key' lets a mode-local *prefix* outrank a global exact
-;;; binding — `C-c' still evaluates everywhere else, including in org buffers on
-;;; its own. `SPC m l' is the leader spelling, and `M-x org-latex-preview' works
-;;; from anywhere: all of these are ordinary zero-argument functions.
-;;;
-;;; The commands are in `modes/org-latex.lisp'; a binding names a string and is
-;;; resolved when the key is pressed, so these may be made before it loads.
-(define-key "org-mode" "C-c r" "org-latex-preview")
-(define-key "org-mode" "C-c R" "org-latex-preview-clear")
-(define-key "org-mode" "SPC m l" "org-latex-preview")
-(define-key "org-mode" "SPC m L" "org-latex-preview-clear")
-
-;;; The agenda — every unfinished item across `*org-agenda-files*', or across
-;;; the buffer you are in when that is unset. It answers into the `*xref*'
-;;; listing, so `RET' on a row opens the headline and `q' puts the list away.
-;;;
-;;; `g' for aGenda and not `a', which `org-modern-appear' has: every letter that
-;;; says "agenda" is taken in org buffers, and a binding that quietly replaced
-;;; another mode's is worse than one you have to learn.
-(define-key "org-mode" "SPC m g" "org-todo-list")
-(define-key "org-mode" "SPC m G" "org-agenda-tags")
-
-;;; Tables need no key of their own. `TAB' aligns on its way between cells, and
-;;; `C-c C-c' on a table aligns it where it stands — org's own gesture, added to
-;;; the front of `org-ctrl-c-ctrl-c'.
-
 ;;; ---------------------------------------------------------------------------
 ;;; The dashboard menu
 ;;;
@@ -670,11 +647,102 @@
 ;;; above this line drops one; `(push "my-mode.lisp" (cdr (last ...)))' — or
 ;;; simply a `load' of your own after it — adds one.
 ;;;
-;;; Loaded here, after the settings and the keymap, because a mode may read
-;;; either: `lsp.lisp' installs `after-change-hook' and there is no reason for
-;;; that to fire while the config is still being read.
+;;; Loaded here, after the settings and the global keymap, because a mode may
+;;; read either: `lsp.lisp' installs `after-change-hook' and there is no reason
+;;; for that to fire while the config is still being read. The keys a config
+;;; claims in a *mode* are below the load instead, and the block down there says
+;;; why.
 
 (load-runtime-modules)
+
+;;; ---------------------------------------------------------------------------
+;;; Org, in the buffers it belongs to
+;;;
+;;; Below `(load-runtime-modules)' rather than above it, and that is the whole
+;;; reason this block sits down here: a mode keymap is a table whose last writer
+;;; wins, so a key a config claims before the org modules load is one they
+;;; silently take back. That has already happened once — the `SPC m e' paragraph
+;;; below is the post-mortem — and it is a trap set for every key a config binds
+;;; in a mode the runtime also has an opinion about. Read the runtime first, and
+;;; a config's binding is the last word.
+
+;;; Org markup, only in org buffers and only with something selected.
+(define-key "org-mode" "SPC m b" "org-bold")
+(define-key "org-mode" "SPC m i" "org-italic")
+(define-key "org-mode" "SPC m c" "org-code")
+;;; ...and the same three while you are typing, where the word-processor chords
+;;; are what the hand reaches for. In the *insert* state and not in org's own
+;;; keymap, because a mode keymap is consulted from `normal_key' and never from
+;;; `insert_key': org's map is the wrong place twice over — it would take `C-b'
+;;; from vim's page-up and `C-i' from its jump-forward in Normal, and it would
+;;; still not be there while you type, which is the one state these are for.
+;;; `org-emphasis-bold' is the one that checks it is in an org buffer, so the
+;;; global binding is inert everywhere else — which is what an unbound Ctrl
+;;; chord in Insert already does.
+(define-key "insert" "C-b" "org-emphasis-bold")
+(define-key "insert" "C-i" "org-emphasis-italic")
+
+;;; LaTeX previews. `C-c r' is what Emacs muscle memory wants, and it works
+;;; because `normal_key' lets a mode-local *prefix* outrank a global exact
+;;; binding — `C-c' still evaluates everywhere else, including in org buffers on
+;;; its own. `SPC m e' is the leader spelling — `e' for equation — and
+;;; `M-x org-latex-preview' works from anywhere: all of these are ordinary
+;;; zero-argument functions.
+;;;
+;;; `e' and not `l', which is what this was and which never once ran: `SPC m l'
+;;; is `org-do-demote' in `modes/org-structure.lisp', and this block used to sit
+;;; *above* the module load, so the demote binding overwrote it every start-up
+;;; and the leader spelling for typesetting was simply dead. `C-c r' was
+;;; carrying the whole feature. The move below the load is what retires that
+;;; whole class of accident; `e' stays because taking `l' back would cost the
+;;; `h'/`l' promote/demote pair, which is the vim-shaped half of the two.
+;;;
+;;; The commands are in `modes/org-latex.lisp'; a binding names a string and is
+;;; resolved when the key is pressed, so these may be made before it loads.
+(define-key "org-mode" "C-c r" "org-latex-preview")
+(define-key "org-mode" "C-c R" "org-latex-preview-clear")
+(define-key "org-mode" "SPC m e" "org-latex-preview")
+(define-key "org-mode" "SPC m E" "org-latex-preview-clear")
+
+;;; Links and dates — the two gestures a document you actually maintain wants.
+;;;
+;;; `y' and `p' for the link pair, which is the strongest mnemonic available in
+;;; an editor with vim's grammar underneath: `SPC m y' yanks a link to where you
+;;; are, `SPC m p' puts one where you are. With a selection up, `SPC m p' turns
+;;; the selected phrase into the link's description.
+;;;
+;;; `C-c l' and `C-c C-l' beside them are Emacs' own spellings, and they work in
+;;; org buffers for the reason `C-c r' does: a mode-local prefix outranks the
+;;; global exact binding, so `C-c' still evaluates everywhere else.
+(define-key "org-mode" "SPC m y" "org-store-link")
+(define-key "org-mode" "SPC m p" "org-insert-link")
+(define-key "org-mode" "C-c l" "org-store-link")
+(define-key "org-mode" "C-c C-l" "org-insert-link")
+
+;;; `s' for schedule and `d' for deadline. Both answer on the headline point is
+;;; under, so they work from anywhere in a task's body rather than only on its
+;;; first line. The prompt takes `2026-09-01', `+3d', or nothing at all for
+;;; today.
+;;;
+;;; Both letters are also `math-curriculum' bindings, which is a minor mode and
+;;; therefore wins inside a curriculum buffer — the same trade `SPC m e' makes
+;;; above, and acceptable for the same reason: a curriculum is read, not planned.
+(define-key "org-mode" "SPC m s" "org-schedule")
+(define-key "org-mode" "SPC m d" "org-deadline")
+
+;;; The agenda — every unfinished item across `*org-agenda-files*', or across
+;;; the buffer you are in when that is unset. It answers into the `*xref*'
+;;; listing, so `RET' on a row opens the headline and `q' puts the list away.
+;;;
+;;; `g' for aGenda and not `a', which `org-modern-appear' has: every letter that
+;;; says "agenda" is taken in org buffers, and a binding that quietly replaced
+;;; another mode's is worse than one you have to learn.
+(define-key "org-mode" "SPC m g" "org-todo-list")
+(define-key "org-mode" "SPC m G" "org-agenda-tags")
+
+;;; Tables need no key of their own. `TAB' aligns on its way between cells, and
+;;; `C-c C-c' on a table aligns it where it stands — org's own gesture, added to
+;;; the front of `org-ctrl-c-ctrl-c'.
 
 ;;; `g d' is the vim spelling and wins over the built-in grammar, which is what
 ;;; a binding in this file always does. The `SPC l' family is the leader

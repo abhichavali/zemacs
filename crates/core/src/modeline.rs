@@ -177,22 +177,43 @@ pub struct Segment {
 /// The modeline for one pane: the segments that hug the left edge, and the ones
 /// that hug the right.
 pub fn segments(editor: &Editor, buf: &Buffer, active: bool) -> (Vec<Segment>, Vec<Segment>) {
+    let (left, right) = drawn(editor, buf, active);
+    let drop = |v: Vec<(&str, Segment)>| v.into_iter().map(|(_, s)| s).collect();
+    (drop(left), drop(right))
+}
+
+/// [`segments`], each one still paired with the template it came from.
+///
+/// The template is what a *click* on the strip has to answer with: the text is
+/// whatever the pane happened to be showing — `Rust`, `12:4`, a bullet — and
+/// nothing downstream could tell one `●` from another, while `" %+"` says which
+/// segment was hit whatever it expanded to that frame. A borrow rather than a
+/// copy, so the draw loop pays nothing for a question only the mouse asks.
+#[allow(clippy::type_complexity)]
+pub fn drawn<'a>(
+    editor: &'a Editor,
+    buf: &Buffer,
+    active: bool,
+) -> (Vec<(&'a str, Segment)>, Vec<(&'a str, Segment)>) {
     let fields = Fields::of(editor, buf, active);
-    let expand = |specs: &[Spec]| -> Vec<Segment> {
+    let expand = |specs: &'a [Spec]| -> Vec<(&'a str, Segment)> {
         specs
             .iter()
             .filter_map(|s| {
                 let text = fields.expand(&s.template)?;
-                Some(Segment {
-                    text,
-                    bold: s.bold,
-                    face: match s.face {
-                        Face::Default => None,
-                        Face::Named(k) => Some(k),
-                        Face::Mode => Some(mode_face(editor.mode)),
+                Some((
+                    s.template.as_str(),
+                    Segment {
+                        text,
+                        bold: s.bold,
+                        face: match s.face {
+                            Face::Default => None,
+                            Face::Named(k) => Some(k),
+                            Face::Mode => Some(mode_face(editor.mode)),
+                        },
+                        filled: s.filled,
                     },
-                    filled: s.filled,
-                })
+                ))
             })
             .collect()
     };
@@ -240,6 +261,10 @@ impl<'a> Fields<'a> {
         Some(match c {
             'm' => live(self.editor.mode.label().to_string()),
             's' => live(self.editor.status.clone()),
+            // A mode's standing note. `live` like the message beside it: it
+            // describes work the *focused* window's editor is doing, and one
+            // note repeated down every pane is the same sentence N times.
+            'N' => live(self.editor.modeline_note.clone()),
             'k' => live(self.editor.pending_hint().to_string()),
             'b' => self.buf.name(),
             'f' => match &self.buf.path {

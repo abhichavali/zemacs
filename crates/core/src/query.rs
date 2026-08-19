@@ -53,6 +53,18 @@ pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
         "point-max" => n.to_string(),
         "line-number" => (line + 1).to_string(), // 1-based, as in Emacs
         "column" => col.to_string(),             // 0-based, as in Emacs
+
+        // The cells one character draws in — the single fact about layout the
+        // image cannot work out for itself, since `(length "\u{6f22}")` is 1 and the
+        // renderer gives it 2. A *character* rather than a string because a
+        // query carries two integers and no text (see the module header); the
+        // caller memoises, and a table or a modeline is drawn out of a few
+        // dozen distinct characters. `org-table.lisp' is the caller that needed
+        // it: column widths counted in characters pad a table of Japanese to a
+        // ragged edge.
+        "char-cells" => char::from_u32(a as u32)
+            .map_or(0, crate::display::char_cells)
+            .to_string(),
         "line-count" => buf.len_lines().to_string(),
         "line-start" => buf.line_start(at(a)).to_string(),
         "line-end" => buf.line_end(at(a)).to_string(),

@@ -897,12 +897,48 @@ fn frozen_org_builds_a_page_of_nodes_that_the_cell_grid_could_not_have_drawn() {
             .map(|_| ())
     });
 
+    // ...and it follows quietly. `org-frozen-after-change` passes QUIET, and the
+    // echo area is the whole reason: clicking a status pill runs
+    // `%math-page-toggle`, which writes, says `programming · done` and fires
+    // this hook a frame later — so the answer to the click was overwritten with
+    // arithmetic about the page every single time.
+    lisp.eval(r##"(progn (message "#quiet-in") (org-frozen-refresh t)
+                         (message "#quiet-out"))"##
+        .into());
+    wait_message(&shared, "a quiet refresh", |m| m == "#quiet-out");
+    {
+        let ed = shared.lock().unwrap();
+        let i = ed.messages.iter().position(|m| m == "#quiet-in").unwrap();
+        let j = ed.messages.iter().position(|m| m == "#quiet-out").unwrap();
+        assert!(
+            !ed.messages[i..=j].iter().any(|m| m.contains("node")),
+            "a refresh nobody asked for reported on itself: {:?}",
+            &ed.messages[i..=j]
+        );
+    }
+    // `SPC m m` is somebody asking, and still gets an answer — which is what
+    // stops the line above from being "delete the message".
+    lisp.eval(r##"(progn (message "#loud-in") (org-frozen-refresh)
+                         (message "#loud-out"))"##
+        .into());
+    wait_message(&shared, "a refresh that was asked for", |m| m == "#loud-out");
+    {
+        let ed = shared.lock().unwrap();
+        let i = ed.messages.iter().position(|m| m == "#loud-in").unwrap();
+        let j = ed.messages.iter().position(|m| m == "#loud-out").unwrap();
+        assert!(
+            ed.messages[i..=j].iter().any(|m| m.contains("node")),
+            "`SPC m m` said nothing: {:?}",
+            &ed.messages[i..=j]
+        );
+    }
+
     // --- leaving takes the page down and gives the document back ----------------
     //
     // Nothing was ever rewritten to draw the page, so leaving is a `(scene-set)`
-    // with no argument. The read-only claim goes with it — both of them, the
-    // one the mode made and the one the scene made, in the order that leaves the
-    // buffer editable rather than frozen forever.
+    // with no argument, and the read-only claim comes down with it — there is
+    // exactly one, made by the scene, which is what makes the flag it gives back
+    // the flag the buffer had before the page went up.
     lisp.eval("(org-frozen-toggle)".into());
     lisp.eval("(org-mode-hook)".into());
     says(&shared, &lisp, "(buffer-read-only-p)", "NIL");
@@ -926,6 +962,84 @@ fn frozen_org_builds_a_page_of_nodes_that_the_cell_grid_could_not_have_drawn() {
             ed.buffer.text.to_string().contains("A basis is a"),
             "and the rest of the document is still there"
         );
+    }
+
+    // --- the round trip, in the three shapes that used to lose something --------
+    //
+    // Getting *out* is the whole of what "editing" means in a mode where nothing
+    // is typed, and each of these left something behind.
+
+    // A buffer that was **already read-only for another reason**. The mode used
+    // to claim read-only itself, one line before the scene claimed it too — so
+    // the flag `set_scene` recorded was the mode's own, the exit hook had to
+    // force the buffer editable to get out at all, and a document opened for
+    // reading came back writable from a round trip that changes nothing else.
+    says(&shared, &lisp, "(progn (set-buffer-read-only t) (buffer-read-only-p))", "CLAIMED");
+    lisp.eval("(progn (org-frozen-mode) (org-frozen-mode-hook))".into());
+    wait(&shared, "a page over a buffer that was already frozen", |ed| {
+        ed.buffer.scene.as_ref().map(|_| ())
+    });
+    // ...and a **second document frozen after this one** does not orphan it.
+    // `*org-frozen-buffers*` held a single name, so the second to be entered
+    // owned the exit hook: `SPC m z` here left the page up and the buffer
+    // read-only with the modeline saying `org-mode`, and it took two more
+    // presses to get the document back.
+    lisp.eval(r#"(push "/tmp/zemacs_test_frozen_other.org" *org-frozen-buffers*)"#.into());
+    lisp.eval("(progn (org-frozen-toggle) (org-mode-hook))".into());
+    says(&shared, &lisp, "(buffer-read-only-p)", "CLAIMED");
+    {
+        let ed = shared.lock().unwrap();
+        assert!(ed.buffer.scene.is_none(), "the page came down anyway");
+        assert_eq!(
+            ed.buffer.read_only(),
+            ReadOnly::Claimed,
+            "and the claim that was on the buffer before `SPC m z` is still on it"
+        );
+    }
+    // The other document is still frozen, which is what says leaving took *this*
+    // one off the list rather than clearing it.
+    says(&shared, &lisp, "(length *org-frozen-buffers*)", "1");
+    lisp.eval("(progn (setf *org-frozen-buffers* nil) (set-buffer-read-only nil))".into());
+    says(&shared, &lisp, "(buffer-read-only-p)", "NIL");
+
+    // A buffer that is **not org at all** is refused rather than frozen.
+    // `org-frozen-toggle` is a zero-argument DEFUN in the package
+    // `refresh-commands` publishes from, so `M-x` reaches it from a Rust file or
+    // a dired listing — and freezing one ran org-mode's whole body over it and
+    // then handed it back in `org-mode`, because nothing here remembers what a
+    // buffer was in before.
+    says(
+        &shared,
+        &lisp,
+        "(progn (text-mode) (org-frozen-toggle) (major-mode))",
+        "text-mode",
+    );
+    says(&shared, &lisp, "(if *org-frozen-buffers* t nil)", "NIL");
+    lisp.eval("(org-mode)".into());
+
+    // --- the three keys a page rebinds after deriving ---------------------------
+    //
+    // `org-table.lisp` puts one dispatcher on each of TAB, S-TAB and RET, and
+    // each has a table half and a fall-through half. Only the fall-through half
+    // means anything on a page: the table half is `%org-table-edit`, which
+    // `replace-region`s the table back and then `goto-char`s to a position
+    // computed for the text it just wrote — and on a frozen page the write is
+    // refused by the one guard in `Editor::apply` while the move is not, so
+    // point ends up describing a rewrite that never happened.
+    //
+    // Read straight out of the editor's mode keymap, which is the table
+    // `normal_key` looks a key up in, so this is the dispatch and not a
+    // restatement of the Lisp.
+    {
+        let ed = shared.lock().unwrap();
+        let bound = |keys: &str| {
+            ed.mode_keymap
+                .get(&("org-frozen-mode".to_string(), keys.to_string()))
+                .cloned()
+        };
+        assert_eq!(bound("<tab>").as_deref(), Some("org-cycle"));
+        assert_eq!(bound("<backtab>").as_deref(), Some("org-global-cycle"));
+        assert_eq!(bound("<ret>").as_deref(), Some("org-open-at-point"));
     }
 
     // --- the document this was built for ---------------------------------------
@@ -1060,6 +1174,21 @@ fn frozen_org_builds_a_page_of_nodes_that_the_cell_grid_could_not_have_drawn() {
     says(&shared, &lisp, r#"(if (%org-frozen-drawer-p ":LOGBOOK:") t nil)"#, "T");
     says(&shared, &lisp, r#"(if (%org-frozen-drawer-p ":END:") t nil)"#, "NIL");
     says(&shared, &lisp, r#"(if (%org-frozen-drawer-p ":ID: unit-1") t nil)"#, "NIL");
+    // ...and a drawer nobody closed ends at the next headline, which is org's own
+    // rule. Without it one missing `:END:` — or a `:smile:` alone on a line,
+    // which is `:WORD:` and so opens one — takes the whole rest of the document
+    // off the page, headings included, and what comes back is blank with nothing
+    // to say why.
+    says(
+        &shared,
+        &lisp,
+        r#"(let ((r (car (%org-frozen-scan
+                           (coerce (%org-lines
+                                     (format nil ":PROPERTIES:~%:ID: x~%* Alpha~%prose"))
+                                   'vector)))))
+             (format nil "~a ~a ~a" (aref r 1) (aref r 2) (aref r 3)))"#,
+        "HIDDEN HEADING NIL",
+    );
     // Five dashes is org's own threshold, which is what keeps `---` in prose
     // from becoming a rule.
     says(&shared, &lisp, r#"(if (%org-frozen-rule-p "-----") t nil)"#, "T");

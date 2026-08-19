@@ -85,7 +85,9 @@ fn the_agenda_lists_what_is_unfinished_and_reads_orgs_own_rules() {
          * A plain heading with no keyword\n\
          **bold at the start of a line**\n\
          * Home :home:\n\
-         ** TODO Fix the sink\n",
+         ** TODO Fix the sink\n\
+         ** TODO [#A] Call the plumber\n\
+         ** TODO Écrire le résumé :maison:\n",
     )
     .unwrap();
 
@@ -137,6 +139,44 @@ fn the_agenda_lists_what_is_unfinished_and_reads_orgs_own_rules() {
     // middle of a sentence is not either.
     says(&shared, &lisp, 10, "(%org-agenda-tags \"Ship it:\")", "NIL");
     says(&shared, &lisp, 11, "(%org-agenda-tags \"See: below\")", "NIL");
+    // Org's separator is `[ \t]`, and a file that came from Windows puts a
+    // `#\Return` after the run — both used to read as "no tags at all", which
+    // is the whole of a tagged file going quiet.
+    says(&shared, &lisp, 12,
+        "(%org-agenda-tags (format nil \"Write it~c:urgent:\" (code-char 9)))", "(urgent)");
+    says(&shared, &lisp, 13,
+        "(%org-agenda-tags (format nil \"Write it :urgent:~c\" (code-char 13)))", "(urgent)");
+
+    // --- inheritance ----------------------------------------------------------
+    //
+    // Org's rule, and the one the tag filter is useless without: a tag on
+    // `* Work` is on every task under it. The row that matters is the *task* —
+    // the heading that spells the word is the one row nobody wants.
+    let work = "(lambda (k tags h) (declare (ignore k h)) \
+                 (member \"work\" tags :test #'string-equal))";
+    says(&shared, &lisp, 14,
+        &format!("(second (%org-agenda-scan \"f\" \
+                  (format nil \"* Work :work:~%** TODO Write it~%\") {work}))"),
+        "f:2:** Write it");
+    // ...and it closes at the right place: a *sibling* of the tagged heading is
+    // out from under it, and so is everything below that sibling.
+    says(&shared, &lisp, 15,
+        &format!("(length (%org-agenda-scan \"f\" \
+                  (format nil \"* Work :work:~%* Home~%** TODO Fix the sink~%\") {work}))"),
+        "1");
+    // `#+FILETAGS:` is the same rule at level 0 — nothing can close it.
+    says(&shared, &lisp, 16,
+        &format!("(first (%org-agenda-scan \"f\" \
+                  (format nil \"#+FILETAGS: :work:~%* TODO Write it~%\") {work}))"),
+        "f:2:* Write it");
+
+    // --- priority -------------------------------------------------------------
+    //
+    // Read from after the `PATH:LINE:` prefix, so a directory with a `[#` in its
+    // name is not a priority; no cookie sorts as `B`, which is org's default and
+    // what puts `[#C]` *below* the undecided majority rather than above it.
+    says(&shared, &lisp, 17, "(%org-agenda-priority \"/tmp/[#z]/n.org:2:* [#A] Do it\")", "A");
+    says(&shared, &lisp, 18, "(%org-agenda-priority \"/tmp/n.org:2:* Do it\")", "B");
 
     // --- and the list itself -------------------------------------------------
 
@@ -145,6 +185,21 @@ fn the_agenda_lists_what_is_unfinished_and_reads_orgs_own_rules() {
     // filesystem in core — and a headless test has nobody to drain that queue.
     // Which is also the path worth testing: an agenda file you have not opened
     // is read from disk, and that is how all but one of them ever are.
+    // First, the two ways a config is wrong. One bare string rather than a list
+    // is what everybody writes and used to be a type error inside `loop`; `~/`
+    // is what the variable's own docstring writes and used to be read as a
+    // directory called `~`. Both arrive here as "cannot read /home/.../...",
+    // and the leading slash is the half that proves the expansion.
+    let missing = format!("zemacs-agenda-nope-{}.org", std::process::id());
+    lisp.eval(format!("(setf *org-agenda-files* \"~/{missing}\")"));
+    lisp.eval("(org-todo-list)".into());
+    wait(&shared, "the unreadable file to be named", |ed| {
+        ed.messages
+            .iter()
+            .any(|m| m.starts_with("org: cannot read /") && m.ends_with(&missing))
+            .then_some(())
+    });
+
     lisp.eval(format!(
         "(setf *org-agenda-files* (list {:?}))",
         file.display().to_string()
@@ -155,7 +210,7 @@ fn the_agenda_lists_what_is_unfinished_and_reads_orgs_own_rules() {
     });
 
     let rows: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(rows.len(), 3, "{rows:#?}");
+    assert_eq!(rows.len(), 5, "{rows:#?}");
     // Unfinished only: `DONE Ship it` is out, and so is every headline with no
     // keyword — a heading is not a task.
     assert!(rows.iter().all(|r| !r.contains("Ship it")), "{rows:#?}");
@@ -167,7 +222,18 @@ fn the_agenda_lists_what_is_unfinished_and_reads_orgs_own_rules() {
     // is what `RET` in the listing parses.
     let first = rows[0];
     assert!(first.starts_with(&file.display().to_string()), "{first}");
-    assert!(first.contains(":2:"), "the line number rides along: {first}");
+    // `[#A]` was written last and is listed first. Everything else keeps the
+    // order it was written in, which is what makes the sort *stable* rather
+    // than merely sorted — so the second row is still the file's first task.
+    assert!(first.ends_with("** [#A] Call the plumber"), "{first}");
+    assert!(rows[1].contains(":2:"), "the line number rides along: {}", rows[1]);
+    // Characters, not bytes, on both sides of the read: `file-length` counts the
+    // file in bytes and `read-sequence` fills the string in characters, which is
+    // why the reader trims to what it actually read. An accented heading is
+    // where the two used to be confused, and it would show up as a truncated
+    // row and a line number counted off the wrong text.
+    let accented = format!("{}:10:** Écrire le résumé :maison:", file.display());
+    assert!(rows.contains(&accented.as_str()), "{rows:#?}");
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_file(&init);

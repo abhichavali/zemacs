@@ -529,6 +529,61 @@ fn modes_are_built_in_lisp() {
         m == "T"
     });
 
+    // --- one contested key, one winner, in a derived mode too ----------------
+    //
+    // `org-fold.lisp` and `org-table.lisp` both claim TAB in `org-mode`, and the
+    // declaration that loads last is the live one: `org-table-tab`, the
+    // dispatcher that hands the key on to `org-cycle` when point is not in a
+    // table. A mode *derived* from org has to agree about that, and it did not
+    // — `%inherit-mode-keys` replayed an ancestor's declarations off a list
+    // `define-mode-key` PUSHes onto, so the oldest claim was written last and
+    // `org-frozen-mode` ran the binding `org-mode` had already dropped.
+    //
+    // Read straight out of the editor's mode keymap, which is the same table
+    // `normal_key` looks a key up in, so this is the dispatch itself rather than
+    // a restatement of the Lisp.
+    {
+        let ed = shared.lock().unwrap();
+        let bound = |mode: &str, keys: &str| {
+            ed.mode_keymap
+                .get(&(mode.to_string(), keys.to_string()))
+                .cloned()
+        };
+        assert_eq!(
+            bound("org-mode", "<tab>").as_deref(),
+            Some("org-table-tab"),
+            "the last declaration of TAB is the one org-mode runs"
+        );
+        assert_eq!(
+            bound("org-mode", "<backtab>").as_deref(),
+            Some("org-table-backtab"),
+            "...and of S-TAB"
+        );
+        // ...and a child may still differ where it says so — which is the whole
+        // point of the split between `define-mode-key` and `define-key`, and
+        // `org-frozen.lisp` says so on all three of org-table's dispatchers.
+        // Each has a table half that `replace-region`s and then moves point to
+        // where it wrote; on a frozen page the write is refused and the move is
+        // not, so point ends up describing a rewrite that never happened.
+        assert_eq!(
+            bound("org-frozen-mode", "<tab>").as_deref(),
+            Some("org-cycle")
+        );
+        assert_eq!(
+            bound("org-frozen-mode", "<backtab>").as_deref(),
+            Some("org-global-cycle")
+        );
+        assert_eq!(
+            bound("org-mode", "<ret>").as_deref(),
+            Some("org-table-return")
+        );
+        assert_eq!(
+            bound("org-frozen-mode", "<ret>").as_deref(),
+            Some("org-open-at-point"),
+            "a printed page follows a link; it does not edit a table cell"
+        );
+    }
+
     lisp.eval("(org-mode)".into());
     wait(&shared, "org-mode after a reload", |ed| {
         (ed.settings.line_overflow == LineOverflow::Wrap && ed.settings.relative_line_numbers)
@@ -619,4 +674,42 @@ fn modes_are_built_in_lisp() {
             && ed.settings.text_width == 80)
             .then_some(())
     });
+
+    // --- ...and a buffer that is *not* on screen keeps its own wrapping ------
+    //
+    // The half above is about the editor's settings following the focus, and it
+    // is only half the story: a second frame — or the other pane of a split —
+    // goes on drawing the buffer you left, and `line_overflow` is one setting
+    // for the whole editor. So clicking into a code frame reflowed the prose in
+    // the frame beside it, which is what "switching to another frame turns off
+    // visual-line mode" looks like from the outside.
+    //
+    // `Buffer::line_overflow` is the stamp that fixes it, and this asserts the
+    // stamp rather than a pixel: the renderer reads it through
+    // `zemacs_core::wraps`, which is the one statement anywhere of what a buffer
+    // wraps at.
+    shared.lock().unwrap().load(
+        "fn other() {}\n",
+        Some(PathBuf::from("/tmp/zemacs_test_modes_c.rs")),
+        Some("rust".into()),
+    );
+    wait(&shared, "the code buffer to take the editor's settings", |ed| {
+        (ed.buffer.major_mode == "rust-mode"
+            && ed.settings.line_overflow == LineOverflow::Truncate)
+            .then_some(())
+    });
+    {
+        let ed = shared.lock().unwrap();
+        let parked = ed.buffers().find(|b| b.id == org).expect("the org buffer is still open");
+        assert_eq!(
+            parked.line_overflow,
+            Some(LineOverflow::Wrap),
+            "the org buffer a second pane is still showing must stay wrapped",
+        );
+        assert_eq!(ed.buffer.line_overflow, Some(LineOverflow::Truncate));
+        // `wraps` is what the renderer and `j` both ask, and it must disagree
+        // about the two buffers even though there is one `Settings` behind them.
+        assert!(zemacs_core::wraps(parked, &ed.settings));
+        assert!(!zemacs_core::wraps(&ed.buffer, &ed.settings));
+    }
 }

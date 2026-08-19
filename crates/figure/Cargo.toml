@@ -11,6 +11,12 @@ anyhow.workspace = true
 # no new crate at all.
 png = "0.18"
 
+# ...and JPEG costs none either: `resvg` below already builds `zune-jpeg` for
+# rasters embedded in an SVG, so naming it here adds a line to this file and
+# nothing to the build. It earned the line when figures stopped being only
+# plots and diagrams — you drag a photograph in, and a photograph is a JPEG.
+zune-jpeg = "0.5"
+
 # Pure Rust, and the whole reason `[[file:fig.svg]]` can work without a system
 # dependency: librsvg would mean cairo, pango and glib in the build, and
 # rasterising with a browser would mean a browser. `resvg` re-exports both

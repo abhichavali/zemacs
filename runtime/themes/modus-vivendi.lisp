@@ -28,11 +28,17 @@
 ;;;;   this face on dired's size column and magit's counts, where undifferen-
 ;;;;   tiated foreground is the exact complaint a theme is here to answer, so it
 ;;;;   borrows Modus' `identifier' colour.
-;;;; * `heading-1' — Modus' `fg-heading-1' is `fg-main' and leans on bold weight
-;;;;   to carry the level. zemacs has the weight now, so the headings below take
-;;;;   it; they keep Modus' three *coloured* levels — 0, 2 and 3 — rather than
-;;;;   `fg-main', because zemacs has one heading size and hue is the only thing
-;;;;   left to rank three levels with once they are all bold.
+;;;; * `bold' and `italic' — see below. `heading-N' used to be a deviation too:
+;;;;   the three took Modus' *coloured* levels 0, 2 and 3, on the argument that
+;;;;   zemacs had one heading size and hue was the only thing left to rank three
+;;;;   levels with. That argument was never true here — `*org-modern-heading-scale*'
+;;;;   has set level 1 at 1.5x and level 2 at 1.25x since before this file was
+;;;;   written — and it cost the theme twice over. Level 1 wore `fg-heading-0',
+;;;;   which is the colour of a `#+title' and not of a heading, and it is also
+;;;;   exactly this theme's `type', so a heading in a document with code in it
+;;;;   read as a type name. The levels are Modus' own 1, 2 and 3 now: `fg-main'
+;;;;   bold at 1.5x says top-level far more plainly than a hue can, which is
+;;;;   why Modus spells it that way.
 ;;;; * `bold' and `italic' — these used to be colours standing in for weight and
 ;;;;   slant, the renderer having neither. It has both, so they carry both, and
 ;;;;   they keep the colours Modus gives the nearest thing it does colour,
@@ -111,7 +117,7 @@
   (set-face "variable"          cyan)                   ; #00d3d0  Modus `variable'
   (set-face "operator"          fg-main)                ; #ffffff  Modus `operator'
   (set-face "punctuation"       fg-main)                ; #ffffff  Modus `punctuation'
-  (set-face "heading-1"         cyan-cooler   :bold t)  ; #6ae4b9  Modus `fg-heading-0'
+  (set-face "heading-1"         fg-main       :bold t)  ; #ffffff  Modus `fg-heading-1'
   (set-face "heading-2"         yellow-faint  :bold t)  ; #d2b580  Modus `fg-heading-2'
   (set-face "heading-3"         blue-faint    :bold t)  ; #82b0ec  Modus `fg-heading-3'
   (set-face "bold"              magenta-warmer :bold t) ; #f78fe7  Modus `fg-prose-verbatim'

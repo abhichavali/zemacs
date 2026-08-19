@@ -762,6 +762,8 @@ pub enum EditorCommand {
     SetMode(Mode),
     ShowDashboard,
     Message(String),
+    /// Set the `%N` modeline note. Empty takes it down.
+    SetModelineNote(String),
     Quit,
 
     // --- settings, all reachable from Lisp ---
@@ -774,6 +776,16 @@ pub enum EditorCommand {
     /// library, so this is a *request* rather than a query, in the shape
     /// [`EditorCommand::Term`] and [`EditorCommand::Project`] already have.
     ListFonts,
+    /// Write whatever picture is on the clipboard to a file, and tell the image
+    /// where it went by calling `(%clipboard-image "PATH")` — or with NIL when
+    /// there is none.
+    ///
+    /// A *request*, in `ListFonts`' shape and for its reason: core does no IO
+    /// and has no clipboard, and the layer that owns a window is the only one
+    /// that can reach the pasteboard. Answered asynchronously, so the command
+    /// that asked has already returned by the time the path arrives — which is
+    /// why the answer is a call into Lisp rather than a value.
+    ClipboardImage,
     SetBackground([f32; 3]),
     SetForeground([f32; 3]),
     SetSyntaxColor(String, [f32; 3]),
@@ -1377,6 +1389,7 @@ impl EditorCommand {
                 // for. See [`EditorCommand::PromptSource`].
                 | EditorCommand::PromptSource(_)
                 | EditorCommand::ListFonts
+                | EditorCommand::ClipboardImage
                 | EditorCommand::Term(_)
                 | EditorCommand::TermKey(_)
                 | EditorCommand::CallLisp(_)
@@ -1655,6 +1668,18 @@ impl Changes {
     }
 }
 
+/// Does this buffer wrap its long lines?
+///
+/// The buffer's own answer when it has one, the editor's otherwise. A free
+/// function for `zemacs_render::gutter_on`'s reason, one setting along: three callers ask it — `Editor::visual_lines` so `j` counts screen
+/// rows, and the renderer's row count and draw loop — and the last time a rule
+/// like this lived in more than one place the two disagreed about every org
+/// buffer. It is in core rather than beside `gutter_on` because core is one of
+/// the three.
+pub fn wraps(buf: &Buffer, set: &Settings) -> bool {
+    buf.line_overflow.unwrap_or(set.line_overflow) == LineOverflow::Wrap
+}
+
 /// A text document plus a cursor expressed as a character index into the rope.
 pub struct Buffer {
     /// Stable handle. Windows refer to buffers by this, never by index.
@@ -1724,6 +1749,24 @@ pub struct Buffer {
     /// about this buffer, and the editor-wide setting stays what it always was —
     /// the baseline a buffer nobody has claimed anything about is drawn at.
     pub text_width: Option<usize>,
+    /// Whether *this buffer* wraps its long lines, or `None` to follow the
+    /// editor-wide [`Settings::line_overflow`].
+    ///
+    /// [`Buffer::text_width`]' argument, one setting along, and reported the
+    /// same way: two frames, one on prose with `visual-line` on and one on a
+    /// `.rs`, and clicking into the second un-wrapped the *first* — a window
+    /// nobody had touched reflowed because the setting behind it was the
+    /// editor's and there is one of it. The same thing happens in a split, and
+    /// it is the same bug: `wrap` is a fact about the document, and a pane draws
+    /// a document.
+    ///
+    /// Stamped by [`EditorCommand::SetLineOverflow`], exactly as `text_width`
+    /// is: `runtime/modes/modes.lisp` re-resolves every claimed setting on each
+    /// buffer switch and pushes it *for the buffer that is now on screen*, so
+    /// the value arriving here is always about this buffer. The editor-wide
+    /// setting stays what it always was — the baseline for a buffer no mode has
+    /// claimed anything about.
+    pub line_overflow: Option<LineOverflow>,
     /// Minor modes, on top of the major one. Order is the order enabled.
     pub minor_modes: Vec<String>,
     /// Scroll position, parked here while another buffer is on screen.
@@ -1817,6 +1860,7 @@ impl Buffer {
             // what makes a buffer nobody has an opinion about look like every
             // other one.
             line_numbers: None,
+            line_overflow: None,
             text_width: None,
             major_mode: FUNDAMENTAL.into(),
             minor_modes: Vec::new(),
@@ -2589,6 +2633,20 @@ pub struct Editor {
     pub pending_confirm: Option<Box<EditorCommand>>,
     /// Last message, shown in the status line.
     pub status: String,
+    /// A line a *mode* keeps on the modeline, drawn by `%N`.
+    ///
+    /// The difference from [`Editor::status`] is how long it is true for.
+    /// `status` is the last thing that *happened* and is replaced by the next
+    /// thing; this is a standing fact about a mode that is running — how many
+    /// files a watcher has seen, that a transcription is in flight — and it stays
+    /// until the mode itself takes it down. A mode reporting that through
+    /// `message` would either be talking over every other message in the editor
+    /// or be silent by the time you looked.
+    ///
+    /// Empty is the ordinary state, and a `%N` segment vanishes when it is empty
+    /// — see [`Fields::expand`], which drops a segment whose every code came back
+    /// blank. So a mode that has nothing to say costs no space on the strip.
+    pub modeline_note: String,
     /// Every message, oldest first, capped at [`MESSAGE_LIMIT`]. The status line
     /// only ever shows the last one, so this is the only record that a message
     /// which was immediately replaced was ever produced at all.
@@ -2772,6 +2830,7 @@ impl Editor {
             no_gutter_modes: Vec::new(),
             prompt: None,
             status: String::from("zemacs — Common Lisp inside."),
+            modeline_note: String::new(),
             messages: Vec::new(),
             should_quit: false,
             revision: 0,
@@ -3384,6 +3443,7 @@ impl Editor {
                 self.mode = Mode::Dashboard;
                 self.dashboard.selected = 0;
             }
+            EditorCommand::SetModelineNote(note) => self.modeline_note = note,
             EditorCommand::Message(m) => {
                 // The status line shows one message; the log keeps the rest.
                 // Without it a burst — a config load, a command that reports
@@ -3465,7 +3525,10 @@ impl Editor {
             EditorCommand::SetRelativeLineNumbers(on) => self.settings.relative_line_numbers = on,
             EditorCommand::SetScrollPastEnd(on) => self.settings.scroll_past_end = on,
             EditorCommand::SetLineOverflow(name) => match LineOverflow::from_name(&name) {
-                Some(o) => self.settings.line_overflow = o,
+                Some(o) => {
+                    self.settings.line_overflow = o;
+                    self.buffer.line_overflow = Some(o);
+                }
                 None => self.status = format!("unknown line overflow: {name}"),
             },
             EditorCommand::ClearCommands => self.commands.clear(),
@@ -3772,6 +3835,10 @@ impl Editor {
             // an error over a picker that is working.
             EditorCommand::PromptSource(_) => {}
             EditorCommand::ListFonts => self.status = "no font backend".into(),
+            // Headless, there is no pasteboard to read. Same shape as the line
+            // above: core answers the request by saying it cannot, rather than
+            // leaving the caller waiting for a reply that never comes.
+            EditorCommand::ClipboardImage => self.status = "no clipboard here".into(),
             // Only reachable with no app under core — a keystroke aimed at a
             // shell that is not there is nothing, not an error worth reporting
             // on every key.
@@ -4397,7 +4464,7 @@ impl Editor {
     /// and this whole path is the identity; `wrap_cols == 0` means nothing has
     /// drawn yet, which is every headless test.
     pub(crate) fn visual_lines(&self) -> bool {
-        self.settings.line_overflow == LineOverflow::Wrap && self.wrap_cols > 0
+        wraps(&self.buffer, &self.settings) && self.wrap_cols > 0
     }
 
     /// The cells of buffer line `line`, exactly as the renderer lays it out —

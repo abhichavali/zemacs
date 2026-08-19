@@ -564,12 +564,20 @@ meant it to stop produces a document that is wrong somewhere you cannot see."
                    name (car open)
                    lang (cdr open)
                    first-line (1+ i))))
-          (in-drawer
+          ;; A headline closes a drawer nobody closed, which is org's own rule
+          ;; and is the other half of the `:END:' guard on
+          ;; `%org-frozen-drawer-p'. That guard stops a drawer from opening a
+          ;; second one; this stops a drawer whose `:END:' was never typed — or
+          ;; a `:smile:' alone on a line, which is `:WORD:' and so opens one —
+          ;; from taking the whole rest of the document off the page, headings
+          ;; included. What comes back is a blank page with nothing to say why,
+          ;; and it is one missing line in a file to get there.
+          ((and in-drawer (not (%org-line-level line)))
            (setf (aref roles i) :hidden)
            (when (string-equal ":END:" trimmed) (setf in-drawer nil)))
           ;; Before the drawer test, because a headline is never a drawer and
           ;; `* :notes:' would otherwise open one.
-          ((%org-line-level line) (setf (aref roles i) :heading))
+          ((%org-line-level line) (setf (aref roles i) :heading in-drawer nil))
           ((%org-frozen-drawer-p trimmed) (setf (aref roles i) :hidden
                                                 in-drawer t))
           ((%org-frozen-keyword line "TITLE") (setf (aref roles i) :title))
@@ -1805,8 +1813,8 @@ reading under which `None' on a fill is usable."
                 (%org-frozen-nodes v groups))
          (rect :width 'fill)))
 
-(defun org-frozen-refresh ()
-  "Redraw the page.
+(defun org-frozen-refresh (&optional quiet)
+  "Redraw the page. QUIET redraws it without saying so.
 
 One scan, one grouping pass, one `highlight' per source block, and one
 `scene-set' — which swaps the whole page in and keeps the reader's place, so a
@@ -1828,14 +1836,24 @@ left to take off. That is one whole function this mode used to need
         (scene-set (%org-frozen-page v groups))
         ;; Ends on the message so the form answers NIL: `eval-string' echoes the
         ;; value of the last form and would otherwise wipe out what this said.
-        (message (format nil "~d node~:p, ~d block~:p, ~d equation~:p"
-                         (length groups) (length (cdr scan))
-                         (+ (length display)
-                            (loop for i from 0 below (length inline)
-                                  sum (length (aref inline i))))))))))
+        ;;
+        ;; QUIET is what `org-frozen-after-change' passes, and the echo area is
+        ;; the whole of the reason. A node count is what somebody who pressed
+        ;; `SPC m m' asked for; it is *not* what somebody who clicked a status
+        ;; pill asked for, and that path — `%math-page-toggle' writing, saying
+        ;; \"programming · done\", and this hook firing a frame later — reported
+        ;; the click and then immediately overwrote it with arithmetic about the
+        ;; page. UNLESS rather than a second function, so the form still answers
+        ;; NIL either way.
+        (unless quiet
+          (message (format nil "~d node~:p, ~d block~:p, ~d equation~:p"
+                           (length groups) (length (cdr scan))
+                           (+ (length display)
+                              (loop for i from 0 below (length inline)
+                                    sum (length (aref inline i)))))))))))
 
-(defvar *org-frozen-buffer* nil
-  "The file (or buffer name) currently frozen, or NIL.
+(defvar *org-frozen-buffers* nil
+  "The files (or buffer names) currently frozen.
 
 DEFVAR rather than DEFPARAMETER, and it exists for one reason: `*major-mode*' in
 `modes.lisp' is a single global, so `X-exit-hook' fires whenever the image
@@ -1844,11 +1862,17 @@ while this document is still frozen in this one. The exit hook has to be able to
 tell \"the user left frozen mode\" from \"the user opened something else\", and
 the buffer's identity is the only thing that answers it.
 
-The ceiling underneath is `modes.lisp''s own and is written up there: a mode is
-a single global, so nothing here can be per-buffer in the way it should be.
-Freeze two documents at once and the second one to be entered owns this.
+A *list*, and it was one name for a while, with a ceiling beside it saying that
+freezing two documents at once meant the second one owned this. That ceiling was
+not `modes.lisp''s to carry: a scene and a read-only claim are both per *buffer*
+in core, and `derived-mode-p' asks the live buffer, so the only thing that was
+ever single was this variable. With one name in it, freezing a second document
+orphaned the first — `SPC m z' in it left the page up and the buffer read-only
+while the modeline said `org-mode', and you had to press the key twice more to
+get your document back. Membership answers the same question for any number of
+them.
 
-Half of that ceiling has since lifted — there *is* a buffer switch hook now,
+The other half of that note stands: there *is* a buffer switch hook now,
 `*buffer-switch-functions*', added so that settings claimed by a mode follow the
 buffer on screen. This variable could be retired in favour of it. It has not
 been, because the exit hook's question is not \"which buffer is live\" but \"did
@@ -1857,25 +1881,40 @@ switch hook is a rewrite of this file's state machine rather than a deletion.")
 
 (defun org-frozen-mode-exit-hook ()
   "Leaving the mode puts the document back: the page comes down and the buffer
-becomes editable again.
+is whatever it was before the page went up.
 
 `(scene-set)' with no argument is how a page is taken down, and it gives the
 buffer back the text that was under it the whole time — nothing was ever
-rewritten to draw the page, which is the assertion worth having.
+rewritten to draw the page, which is the assertion worth having. It gives back
+the *read-only flag* too, and that is now the whole of the restoration: see the
+mode body for why claiming it a second time here was what made the round trip
+lossy.
 
-Guarded on the buffer, for the reason `*org-frozen-buffer*' gives. Taking the
-read-only flag off the wrong buffer would be the dangerous half — a dired
-listing quietly becoming writable is exactly the kind of bug that shows up as
-data loss much later."
+Guarded on the buffer, for the reason `*org-frozen-buffers*' gives. Taking the
+page off the wrong one is the dangerous half — the mode fires this whenever the
+image *enters* any other mode, including opening a `.rs' file in the next
+window, and a page that came down because you glanced away is a document you
+have to press `SPC m z' twice to get back."
   (let ((me (or (buffer-file-name) (buffer-name))))
-    (when (equal me *org-frozen-buffer*)
+    (when (member me *org-frozen-buffers* :test #'equal)
       (scene-set)
-      (set-buffer-read-only nil)
-      (setf *org-frozen-buffer* nil))))
+      (setf *org-frozen-buffers* (remove me *org-frozen-buffers* :test #'equal)))))
 
 (defun org-frozen-toggle ()
-  "Switch between reading this org file and editing it."
-  (if (derived-mode-p 'org-frozen-mode) (org-mode) (org-frozen-mode)))
+  "Switch between reading this org file and editing it.
+
+Frozen tested first, because `org-frozen-mode' derives from `org-mode' and so
+answers to both.
+
+A buffer that is neither is *refused* rather than frozen. This is a zero-argument
+DEFUN in the package `refresh-commands' publishes from, so `M-x org-frozen-toggle'
+reaches it from a Rust file, a dired listing or the dashboard — and freezing one
+ran org-mode's whole body over it and then, on the way back, handed it to
+`org-mode', because nothing here remembers what a buffer was in before. One
+`cond' arm is cheaper than remembering."
+  (cond ((derived-mode-p 'org-frozen-mode) (org-mode))
+        ((derived-mode-p 'org-mode) (org-frozen-mode))
+        (t (message "org-frozen: not an org buffer"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The mode
@@ -1893,13 +1932,21 @@ data loss much later."
 ;;; away.
 
 (define-derived-mode org-frozen-mode org-mode
-  ;; Read-only twice over, and both are real. The claim below is core's single
-  ;; guard in `Editor::apply' — `i', `x', `p', `u', a paste and an `insert' from
-  ;; Lisp are all refused by it, and `i' says so instead of parking you in a mode
-  ;; where every keystroke bounces. Installing a scene claims it *again*, from
-  ;; the other direction, because a scene is not an editing surface; the two
-  ;; nest, and `set_scene' remembers what it found so taking the page down gives
-  ;; back what was there.
+  ;; **Read-only once**, and installing the scene is what claims it. It is core's
+  ;; single guard in `Editor::apply' — `i', `x', `p', `u', a paste and an
+  ;; `insert' from Lisp are all refused by it, and `i' says so instead of parking
+  ;; you in a mode where every keystroke bounces.
+  ;;
+  ;; There used to be a `(set-buffer-read-only t)' here as well, one line above
+  ;; `org-frozen-refresh', on the argument that a mode's claim and a scene's
+  ;; claim nest. They do not nest, they collide: `set_scene' records the flag it
+  ;; *found* so that taking the page down gives back what was there, and what it
+  ;; found was the claim this line had just made. So the flag it gave back was
+  ;; always "frozen", the exit hook had to force the buffer editable to
+  ;; compensate, and a document that was read-only before `SPC m z' — a file
+  ;; opened for reading, a buffer another mode had claimed — came back writable
+  ;; from a round trip that was supposed to change nothing. One claim, made by
+  ;; the one thing that already saves and restores it per buffer.
   ;;
   ;; This is where a paragraph used to argue that everything which is *not* an
   ;; edit still works — every motion, `/', `n', the folds, `M-x' — and that this
@@ -1921,8 +1968,9 @@ data loss much later."
   ;;
   ;; `SPC m z' is the honest answer meanwhile: it is one key back to a buffer
   ;; where all four work.
-  (set-buffer-read-only t)
-  (setf *org-frozen-buffer* (or (buffer-file-name) (buffer-name)))
+  ;; PUSHNEW, so re-entering the mode in a buffer already frozen does not stack
+  ;; a second entry the exit hook would then have to take off twice.
+  (pushnew (or (buffer-file-name) (buffer-name)) *org-frozen-buffers* :test #'equal)
   ;; org-modern is already on — org-mode's body saw to it — but a fragment may
   ;; be *revealed* under the cursor from before the mode changed. Nothing draws
   ;; it while the page is up; this is so that `SPC m z' hands back a manuscript
@@ -1970,13 +2018,13 @@ data loss much later."
 ;;; argument for redrawing here is *more* true than it was: nothing types into
 ;;; this one, and every change it will ever see is a program writing a paragraph.
 ;;;
-;;; Two guards, cheapest first. `*org-frozen-buffer*' is a Lisp variable and free;
+;;; Two guards, cheapest first. `*org-frozen-buffers*' is a Lisp variable and free;
 ;;; `derived-mode-p' is a round trip through `%query' and is only reached once
 ;;; some buffer somewhere has actually been frozen. A config that never enters
 ;;; this mode pays one NIL test per keystroke.
 (defun org-frozen-after-change ()
-  (when (and *org-frozen-buffer* (derived-mode-p 'org-frozen-mode))
-    (org-frozen-refresh))
+  (when (and *org-frozen-buffers* (derived-mode-p 'org-frozen-mode))
+    (org-frozen-refresh t))
   nil)
 
 (add-hook '*after-change-functions* 'org-frozen-after-change)
@@ -1994,14 +2042,29 @@ data loss much later."
 ;;; finds. None of that exists here: there are no machinery folds because there
 ;;; is no hiding, and folding a line a scene is not drawing hides nothing.
 ;;;
-;;; TAB is left inherited from `org-fold.lisp' rather than rebound, and pressing
-;;; it in a frozen page folds text nobody is looking at and reports that it did.
+;;; TAB is *bound* rather than inherited, and it was inherited until
+;;; `%inherit-mode-keys' started replaying an ancestor's declarations in the
+;;; order they were made. What `org-mode' actually has on TAB is
+;;; `org-table.lisp''s dispatcher, and its table half is `%org-table-edit' —
+;;; which `replace-region's the table back and then `goto-char's to a position
+;;; computed for the text it just wrote. On a page the write is refused by the
+;;; one guard in `Editor::apply' and the move is not, so point lands in the
+;;; manuscript at an offset that describes a rewrite that never happened. Only
+;;; the fall-through half of that dispatcher means anything here, so say which
+;;; half — for S-TAB too, which is the same dispatcher and the same write. The
+;;; file had already made exactly this call for `RET' below and simply had not
+;;; noticed it had two siblings.
+;;;
+;;; Pressing it still folds text nobody is looking at and reports that it did.
 ;;; ponytail: harmless and useless. Folding *in a scene* cannot be an overlay —
 ;;; there is no line to hide — so it has to be Lisp state, a set of collapsed
 ;;; heading ids the builder consults, with a click on a heading toggling it. That
 ;;; is strictly simpler than what the old command did, and the place it would
 ;;; attach already exists: `%org-frozen-heading-node' takes a `:tag' from
 ;;; `*org-frozen-node-functions*'.
+
+(define-key "org-frozen-mode" "<tab>" "org-cycle")
+(define-key "org-frozen-mode" "<backtab>" "org-global-cycle")
 
 ;;; `RET' follows the link under *point*, which a scene does not have. It is
 ;;; still bound because point is still somewhere and `SPC m z' is one key away —

@@ -171,6 +171,53 @@ fn meta_return_continues_a_list_and_leaves_prose_alone() {
     assert_eq!(checkbox("the [x] column"), "NIL");
     assert_eq!(checkbox("* [X] heading"), "NIL");
 
+    // --- an item with nothing in it yet -------------------------------------
+    //
+    // The way *out* of a list. `M-RET` on one of these drops the bullet instead
+    // of laying another empty one under it, so the key that started the list can
+    // also finish it — and the reader has to say no to everything that merely
+    // looks empty, or a press would eat a line somebody was still writing.
+    let empty = |line: &str| {
+        probe(
+            &lisp,
+            &shared,
+            "emptyitem",
+            &format!("(and (%org-empty-item-p {line:?}) t)"),
+        )
+    };
+    assert_eq!(empty("- "), "T");
+    assert_eq!(empty("  + "), "T");
+    assert_eq!(empty("3. "), "T");
+    // A box is part of the bullet, not content — an unwritten task is unwritten.
+    assert_eq!(empty("- [ ] "), "T");
+    assert_eq!(empty("  - [X]  "), "T");
+    // ...and anything after it is.
+    assert_eq!(empty("- milk"), "NIL");
+    assert_eq!(empty("- [ ] milk"), "NIL");
+    // An empty *heading* is still a heading: `M-RET` on one gives another.
+    assert_eq!(empty("* "), "NIL");
+    assert_eq!(empty(""), "NIL");
+    assert_eq!(empty("   "), "NIL");
+
+    // --- M-S-RET's prefix ---------------------------------------------------
+    //
+    // In a list it is another item carrying a box, not a headline: `M-S-RET` in
+    // the middle of a checklist used to abandon the list and start a section.
+    let task = |line: &str| {
+        probe(
+            &lisp,
+            &shared,
+            "taskprefix",
+            &format!("(%org-todo-heading-prefix {line:?})"),
+        )
+    };
+    assert_eq!(task("- milk"), "- [ ] ");
+    assert_eq!(task("- [X] milk"), "- [ ] ");
+    assert_eq!(task("   3. milk"), "   4. [ ] ");
+    // Off a list it is a heading with the keyword `%org-heading-with` writes.
+    assert_eq!(task("* Alpha"), "* TODO ");
+    assert_eq!(task("*** [X] ship"), "*** TODO [ ] ");
+
     // --- a heading's box, and where it may sit ------------------------------
     //
     // At the front of the heading's text, after a TODO keyword if there is one,
@@ -307,10 +354,10 @@ fn meta_return_continues_a_list_and_leaves_prose_alone() {
     assert_eq!(
         org_keys,
         "<backtab>=org-table-backtab <ret>=org-table-return <tab>=org-table-tab \
-         C-c C-c=org-ctrl-c-ctrl-c C-c C-t=org-todo \
-         C-c R=org-latex-preview-clear C-c r=org-latex-preview \
+         C-c C-c=org-ctrl-c-ctrl-c C-c C-l=org-insert-link C-c C-t=org-todo \
+         C-c R=org-latex-preview-clear C-c l=org-store-link C-c r=org-latex-preview \
          M-<left>=org-do-promote M-<ret>=org-meta-return M-<right>=org-do-demote \
          M-S-<left>=org-promote-subtree M-S-<ret>=org-insert-todo-heading \
-         M-S-<right>=org-demote-subtree",
+         M-S-<right>=org-demote-subtree M-v=org-paste-image",
     );
 }

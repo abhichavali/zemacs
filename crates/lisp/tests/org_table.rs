@@ -141,6 +141,17 @@ const ALIGNED: &str = "\
 tail
 ";
 
+/// One cell of Japanese and one of ASCII, in a column each. `\u{6771}\u{4eac}` is two
+/// characters and *four* columns, so a layout that counts characters pads this
+/// table to a ragged edge and a layout that counts columns does not — which is
+/// the whole difference, and it is invisible in a table of English.
+const WIDE: &str = "| \u{6771}\u{4eac} | b |\n| xy | c |\ntail\n";
+
+/// A row nobody has laid out yet, with the trailing blanks a hand leaves behind.
+/// Point can sit on one of those in Normal state — it is an ordinary character —
+/// and it is *past* the row's closing bar.
+const PADDED: &str = "| a | b |  \n| c | d |\ntail\n";
+
 #[test]
 fn a_table_lays_itself_out_and_tab_walks_it() {
     let init =
@@ -321,6 +332,24 @@ fn a_table_lays_itself_out_and_tab_walks_it() {
     wait_message(&shared, "the last row stays");
     says(&shared, &lisp, "(string= (line-string 2) \"| Price |\")", "T");
 
+    // --- point past the closing bar ------------------------------------------
+    //
+    // Counting the bars before point counts one too many out here, which named a
+    // cell the row has not got: every column verb then indexed off the end of
+    // every row — a `subseq` error, not a wrong answer — so the cell is clamped
+    // to the last column and the verb acts on the cell point is nearest.
+
+    load(&shared, PADDED, 3);
+    lisp.eval("(goto-char (+ (line-start 1) 10))".into()); // the second trailing blank
+    lisp.eval("(org-table-move-column-left)".into());
+    says(&shared, &lisp, "(string= (line-string 1) \"| b | a |\")", "T");
+
+    load(&shared, PADDED, 4);
+    lisp.eval("(goto-char (+ (line-start 1) 10))".into());
+    lisp.eval("(org-table-delete-column)".into());
+    says(&shared, &lisp, "(string= (line-string 1) \"| a |\")", "T");
+    says(&shared, &lisp, "(string= (line-string 3) \"tail\")", "T");
+
     // --- falling through ----------------------------------------------------
     //
     // The half that could quietly eat org's bindings. Each key is claimed for
@@ -328,7 +357,7 @@ fn a_table_lays_itself_out_and_tab_walks_it() {
     // because there is no way to decline a keystroke once a binding has taken
     // it.
 
-    load(&shared, NOTES, 2);
+    load(&shared, NOTES, 5);
     lisp.eval("(goto-char (line-start 6))".into()); // `tail`
     lisp.eval("(org-table-align)".into());
     wait_message(&shared, "not in a table");
@@ -339,6 +368,37 @@ fn a_table_lays_itself_out_and_tab_walks_it() {
 
     lisp.eval("(org-table-tab)".into());
     wait_message(&shared, "folded"); // `org-cycle`
+
+    // --- columns, not characters --------------------------------------------
+    //
+    // The bars have to line up where the eye is. `東京` is two characters and
+    // four columns, so padding it to a width of four by `length` leaves it two
+    // columns wider than the `xy` beneath it and the table draws crooked — the
+    // failure everything else in this file is blind to, because English has one
+    // column per character and the two measures agree.
+    //
+    // The layout is therefore in columns and the *offset* stays in characters,
+    // which is the pair that has to be kept apart: `東京` is padded by nothing
+    // and `xy` by two spaces, so the second column starts at a different
+    // character offset on each of the two rows while starting in the same place
+    // on screen.
+
+    load(&shared, WIDE, 6);
+    lisp.eval("(goto-char (+ (line-start 2) 2))".into()); // the `x` of `xy`, cell 0
+    lisp.eval("(org-table-align)".into());
+    says(&shared, &lisp, "(string= (line-string 1) \"| \u{6771}\u{4eac} | b |\")", "T");
+    says(&shared, &lisp, "(string= (line-string 2) \"| xy   | c |\")", "T");
+    // Point is still in the cell it was in, found through a row whose padding is
+    // not its neighbour's.
+    says(&shared, &lisp, "(line-number)", "2");
+    column(&shared, &lisp, "2");
+
+    // TAB then lands in cell 1 of the *wide* row, whose second column begins two
+    // characters earlier than the row below it does.
+    lisp.eval("(goto-char (+ (line-start 1) 2))".into());
+    lisp.eval("(org-table-tab)".into());
+    says(&shared, &lisp, "(line-number)", "1");
+    column(&shared, &lisp, "7");
 
     let _ = std::fs::remove_file(&init);
 }

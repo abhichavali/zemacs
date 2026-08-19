@@ -151,6 +151,42 @@ const PROSE_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
 ];
 
+/// Faces to look in for a character the *chosen* font has no glyph for, in
+/// order. Every one of them is consulted before a character is given up on, so
+/// this is a **chain** and not a candidate list: the two above ask *which face*
+/// and stop at the first file that exists, this one asks *what else is there to
+/// try* and every file that exists is another character that draws.
+///
+/// The bug it exists for is Claude Code in the built-in terminal. That interface
+/// is drawn out of Miscellaneous Technical and Dingbats — `⏺` on a tool call,
+/// `⎿` under its result, `☐`/`☒` for a todo, `✻ ✽ ✢ ✳` for the spinner — and no
+/// monospace coding font has any of them. Not Menlo, not SF Mono, and **not a
+/// Nerd Font either**: a Nerd Font patch adds the Private Use Area and leaves
+/// those two blocks exactly as it found them, so choosing one buys the powerline
+/// arrows and leaves `⏺` a tofu. That is the whole of "no matter which font I
+/// choose", and why no reordering of [`FONT_CANDIDATES`] could ever have fixed
+/// it. Every other terminal draws these because the *platform* falls back for
+/// it; SDL_ttf hands us one font and no opinion, so the fallback is here.
+///
+/// The order is coverage, not looks, and the three Apple faces divide the work
+/// rather than overlapping: Apple Symbols is the Miscellaneous Technical and
+/// arrows workhorse (`⎿ ☐ ☒ ⧉ ↵ ∗`), ZapfDingbats owns the block the spinner
+/// frames come out of (`✻ ✽ ✢ ✳ ✓ ✕`), and STIXTwoMath is the only thing on a
+/// stock macOS with `⏺` and `⏵`. The last two are what a desktop Linux install
+/// normally has, and are broad rather than divided.
+///
+/// Deliberately no colour emoji font. `Apple Color Emoji` is a bitmap strike
+/// that [`Renderer::draw_glyph_in`] cannot tint, so it would put a black
+/// rectangle where the tofu was — a worse picture, not a better one, and not
+/// what any of these icons are.
+const SYMBOL_CANDIDATES: &[&str] = &[
+    "/System/Library/Fonts/Apple Symbols.ttf",
+    "/System/Library/Fonts/ZapfDingbats.ttf",
+    "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+];
+
 pub struct Renderer {
     canvas: WindowCanvas,
 
@@ -179,6 +215,14 @@ pub struct Renderer {
     /// prose cut back onto the mono face in [`Renderer::cut_key`], so a page on
     /// such a box is set in the coding font and draws.
     prose_path: Option<PathBuf>,
+    /// The [`SYMBOL_CANDIDATES`] this box actually has, in order — the chain a
+    /// character none of the chosen faces has a glyph for is looked up in. Empty
+    /// on a box with none of them, which is exactly the behaviour this whole
+    /// mechanism replaced: a tofu, drawn once and never explained.
+    ///
+    /// Searched once, in [`Renderer::new`], on [`Renderer::prose_path`]'s
+    /// reasoning and for the same saving.
+    symbol_paths: Vec<PathBuf>,
     /// Point size the font is currently open at — already multiplied by the
     /// display scale, so it is *not* `settings.font_size`.
     point_size: u16,
@@ -225,6 +269,29 @@ pub struct Renderer {
     /// open only because a scene is on screen, which is the condition every
     /// other entry in this map shares.
     faces: HashMap<FaceKey, Option<Face>>,
+    /// The [`SYMBOL_CANDIDATES`] chain, opened on demand: `(index into
+    /// [`Renderer::symbol_paths`], point size)` to the face.
+    ///
+    /// **Not a [`FaceKey`]**, and that is the point rather than an omission.
+    /// `faces` is bounded by a key space that is closed by construction, and
+    /// `a_substitution_reuses_a_face_key_the_cache_bound_already_counted` is the
+    /// standing guard on it: a fallback that minted a key of its own — a third
+    /// family bit — would push the live set past a [`MAX_FACES`] sized for that
+    /// space, and [`cached_face`] would answer by emptying the whole cache and
+    /// re-rasterising the screen every few frames, forever. A chain that lives
+    /// in its own map cannot do that to a bound it is not counted in.
+    ///
+    /// Weight and slant are not in the key either: these are symbol faces, where
+    /// FreeType's synthetic bold is a smear and its italic a shear applied to a
+    /// shape that has no weight axis to move along. A bold `⏺` is a fatter dot
+    /// and nothing else, so all four cuts share one face and one set of textures.
+    ///
+    /// Bounded on [`Renderer::faces`]'s terms, one map over: the size component
+    /// is a [`SCALE_STEPS`] multiple of the body size and the index component is
+    /// a const list, so between two [`Renderer::sync`] clears at most
+    /// `SYMBOL_CANDIDATES.len() * SCALE_STEPS.len()` faces are open, each capped
+    /// at [`MAX_FACE_GLYPHS`] textures.
+    symbols: HashMap<(usize, u16), Option<Face>>,
     /// One texture per overlay image, keyed the way core keys the pixels — by
     /// what produced them. So a second `org-latex-preview` over the same buffer
     /// re-uses these rather than re-uploading a screenful of equations, which is
@@ -394,6 +461,7 @@ impl Renderer {
 
         let font_path = find_font()?;
         let prose_path = find_prose_font()?;
+        let symbol_paths = find_symbol_fonts();
         // Matches `Settings::default().font_size`; `sync` fixes it up on frame one.
         let point_size = scale_point_size(18.0, dpi_scale(&canvas));
         let body = open_face(&font_path, FaceKey::body(point_size, false))?;
@@ -408,11 +476,13 @@ impl Renderer {
             body,
             bold,
             faces: HashMap::new(),
+            symbols: HashMap::new(),
             images: HashMap::new(),
             corners: HashMap::new(),
             scenes: None,
             font_path,
             prose_path,
+            symbol_paths,
             point_size,
             drawn: FNV_SEED,
             shown: None, // nothing on screen yet, so frame one always presents
@@ -470,6 +540,13 @@ impl Renderer {
         // from the old one, so both the fonts and their glyphs are wrong. A
         // family change invalidates them for the plainer reason.
         self.faces.clear();
+        // The symbol chain goes with them, and only for the first of those two
+        // reasons: the *files* are unaffected by which font the editor is set
+        // in, but every face in here is open at a point size derived from the
+        // old body size, and a glyph rasterised at it is the wrong number of
+        // pixels. This is also what keeps the map's bound honest — see the
+        // field, whose "between two clears" is this line.
+        self.symbols.clear();
         let (cell_w, line_h) = metrics(&self.body.font);
         self.cell_w = cell_w;
         self.line_h = line_h;
@@ -960,6 +1037,115 @@ impl Renderer {
         Some((p.window, at))
     }
 
+    /// Buffer lines worth `rows` display rows, up (`rows < 0`) or down from the
+    /// pane's current scroll. `None` when the pointer is over no pane.
+    ///
+    /// The wheel's whole problem, and it is an org one: `Editor::scroll` counts
+    /// *buffer* lines and a wrapped paragraph is one of those and eight rows on
+    /// screen. So a notch that meant three rows in a code file threw three
+    /// paragraphs past you in prose — the one mode that wraps by default — and
+    /// the same is true of a scaled heading and of a display equation, which
+    /// each own more rows than they have lines.
+    ///
+    /// Never zero: a notch that moved nothing would make the wheel dead against
+    /// a single line taller than the step, which is exactly a big equation.
+    ///
+    /// The honest fix is a scroll position that is a row rather than a line, and
+    /// it is a change to every clamp in core. ponytail: this converts at the one
+    /// place a notch enters instead, so `scroll` stays a line everywhere and the
+    /// *gesture* is in rows. The ceiling is a line taller than one notch — the
+    /// wheel steps over it whole rather than through it. Upgrade path is
+    /// `(line, row)` in `Editor::scroll`.
+    pub fn scroll_step(
+        &self,
+        editor: &Editor,
+        frame_index: usize,
+        x: i32,
+        y: i32,
+        rows: i32,
+    ) -> Option<i32> {
+        let area = area_rect(area_of(self.content_area()));
+        let status_h = modeline_h(self.line_h, &editor.settings);
+        let frame = editor.frames.get(frame_index)?;
+        let p = frame.panes(area).into_iter().find(|p| p.rect.contains(x, y))?;
+        let win = frame.window(p.window)?;
+        let buf = editor.buffer_by_id(win.buffer)?;
+        let set = &editor.settings;
+        let wrap = zemacs_core::wraps(buf, set);
+        // Nothing on this line can own more than one row, so a notch is already
+        // its own answer. The same fast path `visible_lines` takes, and for the
+        // same reason: this runs per wheel event.
+        if !wrap && !buf.overlays().iter().any(reshapes_lines) {
+            return Some(rows);
+        }
+        // The pane's own units, as in `click_target`: a zoomed window has taller
+        // rows, so a notch crosses fewer lines in it.
+        let zoom = win.zoom.max(100);
+        let m = Metrics {
+            editor,
+            cell_w: scaled(self.cell_w, zoom),
+            line_h: scaled(self.line_h, zoom),
+            ascent: self.ascent,
+        };
+        let pane = area_of(p.rect);
+        let doc = doc_rect(pane, status_h, measure_px(buf, set, m.cell_w));
+        let text_w = doc.w - gutter_w(buf, set, m.cell_w);
+        let rows_of = |l| line_rows(m, buf, l, text_w, wrap, set.tab_width);
+        Some(scroll_lines_for_rows(rows_of, win.scroll, buf.len_lines(), rows))
+    }
+
+    /// The modeline segment under the pointer: which pane's, the template it was
+    /// drawn from, and the text it expanded to. `None` when the pointer is not
+    /// on a modeline, or is on a bare stretch of one.
+    ///
+    /// The template is the identity and the text is the payload, which is what
+    /// makes this answerable in Lisp at all: `●` and `◈` are two glyphs a config
+    /// chose, and the strip is a list of `%`-code templates a config wrote, so
+    /// the only stable name for "the unsaved-changes segment" is `" %+"` itself.
+    /// Same division of labour as [`Renderer::click_target`] and the scene's hit
+    /// test — the gesture is the renderer's, what it *means* is the image's.
+    ///
+    /// The geometry is [`Renderer::draw_modeline`]'s, spelled a second time, and
+    /// the two must not drift: the strip is laid out in cells from `inset`, the
+    /// right-hand group is placed from the far edge inwards and dropped whole
+    /// when the pane is too narrow to hold it beside the left one. What is
+    /// deliberately *not* repeated is the truncation — a segment cut short still
+    /// belongs to its template, and clipping it here would make the last
+    /// segment on a narrow pane unclickable rather than short.
+    ///
+    /// `None` while a prompt is open: it replaces the whole strip, so there are
+    /// no segments under the pointer to name.
+    pub fn modeline_click(
+        &self,
+        editor: &Editor,
+        frame_index: usize,
+        x: i32,
+        y: i32,
+    ) -> Option<(zemacs_core::frame::WindowId, String, String)> {
+        let area = area_rect(area_of(self.content_area()));
+        let status_h = modeline_h(self.line_h, &editor.settings);
+        let frame = editor.frames.get(frame_index)?;
+        let p = frame.panes(area).into_iter().find(|p| p.rect.contains(x, y))?;
+        let rect = modeline_rect(area_of(p.rect), status_h);
+        if y < rect.y || y >= rect.y + rect.h {
+            return None;
+        }
+        let win = frame.window(p.window)?;
+        let buf = editor.buffer_by_id(win.buffer)?;
+        let active = frame_index == editor.focus_frame && p.window == frame.current;
+        if active && editor.prompt.is_some() {
+            return None;
+        }
+
+        let inset = bevel_width(rect, relief(&editor.settings)) + PAD;
+        let cols = ((rect.w - 2 * inset).max(0) / self.cell_w) as usize;
+        let (left, right) = zemacs_core::modeline::drawn(editor, buf, active);
+        // Which cell of the strip, counting from the first drawable column.
+        let col = ((x - rect.x - inset) / self.cell_w.max(1)).max(0) as usize;
+        let (template, text) = modeline_segment_at(&left, &right, cols, col)?;
+        Some((p.window, template.to_string(), text))
+    }
+
     /// The gutter row under the pointer: which pane's, and which **visual row**
     /// of it. `None` when the pointer is not over a gutter at all.
     ///
@@ -1133,7 +1319,7 @@ impl Renderer {
         // big its type is and how far its prefix pushed it in, so the pane hands
         // down a width and each line divides it — see [`line_box`].
         let text_w = doc.w - gutter;
-        let wrap = set.line_overflow == LineOverflow::Wrap;
+        let wrap = zemacs_core::wraps(buf, set);
 
         // Five shades of the ground and the body colour, and five faces that
         // override them. The ratios are what the renderer mixed before any of
@@ -2844,6 +3030,8 @@ impl Renderer {
             body: plain,
             bold,
             faces,
+            symbols,
+            symbol_paths,
             font_path,
             prose_path,
             textures,
@@ -2869,7 +3057,30 @@ impl Renderer {
                 face
             }
         };
-        let Some(tex) = face.glyph(textures, c) else {
+        // The face the key names may simply not have this character, and asking
+        // is the whole of the terminal-icon fix: SDL_ttf answers a missing glyph
+        // with a tofu box rather than with a refusal, so a face that is never
+        // asked draws one and nobody downstream can tell. See [`symbol_face`],
+        // and [`SYMBOL_CANDIDATES`] for what Claude Code's `⏺` and `⎿` were
+        // landing on before there was a chain to fall through to.
+        //
+        // The ASCII gate is [`substituted`]'s, kept for [`substituted`]'s
+        // reason: this runs for every visible character of every frame, and
+        // `find_glyph` is a C call into FreeType's character map. It is sound
+        // here on a narrower argument than the one written there — the monospace
+        // face is what *every cell of every buffer* is drawn in, so a font
+        // without printable ASCII is not a font this editor can be set in at
+        // all, and the gate hides nothing that was ever going to be legible.
+        let mine = c.is_ascii() || face.font.find_glyph(c).is_some();
+        let tex = if mine {
+            face.glyph(textures, c)
+        } else {
+            symbol_face(symbols, symbol_paths, key.point_size, c)
+                .and_then(|face| face.glyph(textures, c))
+        };
+        // Nothing anywhere has it, or the upload failed. A blank cell, which is
+        // what the whole of this used to be.
+        let Some(tex) = tex else {
             return;
         };
         tex.set_color_mod(color.r, color.g, color.b);
@@ -3660,6 +3871,62 @@ fn find_prose_font() -> anyhow::Result<Option<PathBuf>> {
     Ok(PROSE_CANDIDATES.iter().map(PathBuf::from).find(|p| p.is_file()))
 }
 
+/// Every [`SYMBOL_CANDIDATES`] file this box has, in the order they are named.
+///
+/// `find` in the other two finders and `filter` here, which is that list's
+/// "chain, not candidates" spent. No error and no `Option`: an empty chain is a
+/// box with none of them, and that is the picture there was before any of this
+/// existed rather than a reason to refuse to start.
+fn find_symbol_fonts() -> Vec<PathBuf> {
+    SYMBOL_CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+/// The first face in `paths` with a glyph for `c`, opened at `point_size` if it
+/// was not already, or `None` when the chain has run out.
+///
+/// The chain is walked with [`Font::find_glyph`] and not by rasterising and
+/// looking at the result, because **SDL_ttf does not refuse a character the font
+/// has no glyph for**: it rasterises `.notdef` and hands back a perfectly valid
+/// surface with a tofu box in it. That is what [`glyph_texture`]'s `None`
+/// really means — an upload that failed — and reading it as "no such glyph" is
+/// the mistake that made this bug invisible for as long as it was. `find_glyph`
+/// is the only honest question, and it is the same one [`substituted`] asks one
+/// screenful up.
+///
+/// Two passes over the chain rather than one, because a `&mut` taken inside the
+/// search cannot outlive it: the first opens faces until one has the glyph, the
+/// second goes back for it. The cost is a second hash lookup on a path that has
+/// already opened a font file.
+fn symbol_face<'a>(
+    cache: &'a mut HashMap<(usize, u16), Option<Face>>,
+    paths: &[PathBuf],
+    point_size: u16,
+    c: char,
+) -> Option<&'a mut Face> {
+    // Style zero: see [`Renderer::symbols`] for why a symbol face is opened
+    // upright and unemboldened whatever the run around it asked for.
+    let key = FaceKey { point_size, style: 0 };
+    let found = (0..paths.len()).find(|&i| {
+        cache
+            .entry((i, point_size))
+            .or_insert_with(|| open_face(&paths[i], key).ok())
+            .as_ref()
+            .is_some_and(|face| face.font.find_glyph(c).is_some())
+    })?;
+    let face = cache.get_mut(&(found, point_size))?.as_mut()?;
+    // The same cap the scaled faces are held to, and for the sharper reason: a
+    // fallback face is reached only by characters the chosen font gave up on, so
+    // its repertoire is a handful of icons rather than a document's.
+    if face.glyphs.len() >= MAX_FACE_GLYPHS && !face.glyphs.contains_key(&c) {
+        face.glyphs.clear();
+    }
+    Some(face)
+}
+
 // --- pure layout helpers (unit-tested; no window required) -----------------
 
 fn rgb(c: [f32; 3]) -> Color {
@@ -3927,7 +4194,7 @@ fn offset_at(
     let doc = doc_rect(pane, status_h, measure_px(buf, set, cell_w));
     let gutter = gutter_w(buf, set, cell_w);
     let text_w = doc.w - gutter;
-    let wrap = set.line_overflow == LineOverflow::Wrap;
+    let wrap = zemacs_core::wraps(buf, set);
     let rows = doc_lines(pane, status_h, line_h);
 
     // Clamped rather than rejected: a click in the gutter means column zero of
@@ -3995,6 +4262,83 @@ fn offset_at(
     // Below the last line. Emacs puts point at the end of the buffer, and so
     // does a click in the empty space under a short file.
     buf.len_chars()
+}
+
+/// Buffer lines worth `rows` display rows, up (`rows < 0`) or down from `scroll`.
+///
+/// The arithmetic half of [`Renderer::scroll_step`], split out because it is the
+/// half with the sign in it and the half that needs no window open. `rows_of`
+/// answers how many display rows a buffer line occupies — zero for a folded one,
+/// which is why the count is of *lines* and [`lines_in_rows`] is where that is
+/// written down.
+///
+/// **Never zero**, and both directions. A notch that moved nothing would make
+/// the wheel dead against a single line taller than the step — a display
+/// equation, a 1.5× heading, a paragraph wrapped past three rows — which is the
+/// failure mode this whole conversion exists to avoid.
+fn scroll_lines_for_rows(
+    rows_of: impl Fn(usize) -> usize,
+    scroll: usize,
+    len_lines: usize,
+    rows: i32,
+) -> i32 {
+    let want = rows.unsigned_abs() as usize;
+    let n = match rows < 0 {
+        true => lines_in_rows((0..scroll).rev().map(rows_of), None, want),
+        false => lines_in_rows((scroll..len_lines).map(rows_of), None, want),
+    };
+    let n = n.max(1) as i32;
+    if rows < 0 {
+        -n
+    } else {
+        n
+    }
+}
+
+/// The segment of an expanded modeline covering cell `col`, as (template, text).
+///
+/// The picking half of [`Renderer::modeline_click`], split out because it is the
+/// half with an off-by-one in it and the half that needs no window open. Its
+/// arithmetic is [`Renderer::draw_segments`]' twice over, so the two are read
+/// side by side: the left group runs from column zero with whatever the right
+/// group left it, the right group is placed from the far edge inwards, and both
+/// stop when their budget runs out.
+///
+/// The right group is dropped **whole** when the pane cannot hold it beside the
+/// left one, which is what the draw loop does — half a percentage is worse than
+/// none — so on a narrow pane there is nothing over there to click either.
+#[allow(clippy::type_complexity)]
+fn modeline_segment_at<'a>(
+    left: &[(&'a str, modeline::Segment)],
+    right: &[(&'a str, modeline::Segment)],
+    cols: usize,
+    col: usize,
+) -> Option<(&'a str, String)> {
+    let pick = |group: &[(&'a str, modeline::Segment)], start: usize, budget: usize| {
+        let mut at = start;
+        let mut room = budget;
+        for (template, seg) in group {
+            // `min` and not the raw width, because a segment running off the end
+            // of its budget is *truncated* on screen and only the part actually
+            // drawn is clickable.
+            let w = str_cells(&seg.text).min(room);
+            if w == 0 {
+                continue;
+            }
+            if (at..at + w).contains(&col) {
+                return Some((*template, seg.text.clone()));
+            }
+            at += w;
+            room -= w;
+        }
+        None
+    };
+    let right_cols: usize = right.iter().map(|(_, s)| str_cells(&s.text)).sum();
+    pick(left, 0, cols.saturating_sub(right_cols + 1)).or_else(|| {
+        (right_cols + 1 <= cols)
+            .then(|| pick(right, cols - right_cols, right_cols))
+            .flatten()
+    })
 }
 
 /// Document lines that fit in a pane — the window's `viewport_lines`.
@@ -4740,7 +5084,7 @@ fn visible_lines(
     text_w: i32,
     set: &Settings,
 ) -> usize {
-    let wrap = set.line_overflow == LineOverflow::Wrap;
+    let wrap = zemacs_core::wraps(buf, set);
     // Truncation with nothing folded and nothing typeset is one row per line,
     // and the general path below would agree with it more slowly. A fold, a
     // scale, a prefix and an image each break that identity — the first by
@@ -8401,6 +8745,86 @@ mod tests {
         assert!(text(&ed.buffer, true).contains("DASHBOARD"));
     }
 
+    /// Clicking the strip names the segment under the pointer, not the text.
+    ///
+    /// The three cases that are easy to get wrong and impossible to see: the
+    /// boundary between two adjacent segments, the right-hand group being
+    /// measured from the far edge, and a pane too narrow to hold that group at
+    /// all — where the draw loop drops it whole and so must this.
+    #[test]
+    fn a_click_on_the_modeline_names_the_segment_it_landed_on() {
+        let mut ed = Editor::new();
+        ed.modeline.clear();
+        ed.modeline.push(false, zemacs_core::modeline::Spec::text(" %m "));
+        ed.modeline.push(false, zemacs_core::modeline::Spec::text("  %b"));
+        ed.modeline.push(true, zemacs_core::modeline::Spec::text("%l:%c"));
+        let ed = ed;
+
+        let (left, right) = modeline::drawn(&ed, &ed.buffer, true);
+        // ` DASHBOARD ` is eleven cells, then two spaces and the buffer name.
+        let at = |cols, col| modeline_segment_at(&left, &right, cols, col).map(|(t, _)| t);
+        assert_eq!(at(80, 0), Some(" %m "));
+        assert_eq!(at(80, 10), Some(" %m "));
+        // ...and the very next cell belongs to its neighbour, which is the one
+        // boundary a fencepost error hides in.
+        assert_eq!(at(80, 11), Some("  %b"));
+
+        // The right group is measured from the right edge: `1:1` is three cells,
+        // so on an 80-column strip it owns 77, 78 and 79 and nothing before.
+        assert_eq!(at(80, 79), Some("%l:%c"));
+        assert_eq!(at(80, 77), Some("%l:%c"));
+        assert_eq!(at(80, 76), None);
+
+        // A pane with no room for both groups drops the right one whole, so
+        // there is nothing over there to click. `saturating_sub` also has to
+        // survive it — the left budget goes negative before it is clamped.
+        assert_eq!(at(3, 2), None);
+        assert_eq!(at(0, 0), None);
+    }
+
+    /// A wheel notch is a number of *rows*, and `Editor::scroll` counts lines.
+    ///
+    /// The gesture that is worst in an org buffer and fine everywhere else: a
+    /// paragraph is one buffer line and eight rows on screen, so three notches
+    /// of "three lines" threw three paragraphs past you in the one mode that
+    /// wraps by default.
+    #[test]
+    fn a_wheel_notch_crosses_rows_rather_than_lines() {
+        // Five lines, the middle one a paragraph wrapped over four rows.
+        let heights = [1usize, 1, 4, 1, 1];
+        let rows_of = |l: usize| heights[l];
+
+        // From the top, three rows is the first two lines and part of the third
+        // — `lines_in_rows` counts the line it lands *in*, so three.
+        assert_eq!(scroll_lines_for_rows(rows_of, 0, 5, 3), 3);
+        // ...and from the wrapped line itself, three rows is that line alone.
+        assert_eq!(scroll_lines_for_rows(rows_of, 2, 5, 3), 1);
+        // Backwards, the same: from below it, one notch steps into it and no
+        // further.
+        assert_eq!(scroll_lines_for_rows(rows_of, 3, 5, -3), -1);
+        // ...and from further below, the notch lands *in* the wrapped line
+        // rather than stopping short of it. That is the documented ceiling of
+        // keeping `scroll` a whole line: a tall line is stepped over or into,
+        // never through. Lines 3 and 4 are one row each, so three rows up
+        // reaches into line 2 — three lines.
+        assert_eq!(scroll_lines_for_rows(rows_of, 5, 5, -3), -3);
+
+        // Never zero in either direction, whatever it is asked. A notch that
+        // moved nothing is a dead wheel against a tall line.
+        assert_eq!(scroll_lines_for_rows(rows_of, 2, 5, 1), 1);
+        assert_eq!(scroll_lines_for_rows(rows_of, 3, 5, -1), -1);
+        // ...including at the ends, where there is nothing to count at all. The
+        // step is still honest; `Editor::scroll_lines` is what clamps it.
+        assert_eq!(scroll_lines_for_rows(rows_of, 0, 5, -3), -1);
+        assert_eq!(scroll_lines_for_rows(rows_of, 5, 5, 3), 1);
+
+        // A file with no wrapping and nothing typeset is one row per line, so
+        // the conversion is the identity and the wheel feels exactly as it did.
+        let plain = |_l: usize| 1usize;
+        assert_eq!(scroll_lines_for_rows(plain, 10, 100, 3), 3);
+        assert_eq!(scroll_lines_for_rows(plain, 10, 100, -3), -3);
+    }
+
     #[test]
     fn the_divider_is_its_own_shade() {
         for background in [[0.06, 0.06, 0.09], [0.98, 0.97, 0.94]] {
@@ -9129,6 +9553,78 @@ mod scenes {
                 face.font.find_glyph(c).is_some(),
                 "{} has no glyph for {c:?}, so the ASCII gate in `substituted` hides a tofu",
                 path.display()
+            );
+        }
+    }
+
+    /// The icons Claude Code draws its interface out of, in the built-in
+    /// terminal, in whatever font the editor is set in.
+    ///
+    /// This is the bug named on [`SYMBOL_CANDIDATES`], asserted from both ends.
+    /// The coding face has none of these — that is the first assertion, and it
+    /// is what makes the rest of the test mean anything — so before there was a
+    /// chain to fall through to, [`Renderer::draw_glyph_in`] blitted whatever
+    /// SDL_ttf handed back for a glyph the font does not have, which is a tofu
+    /// box. An empty chain is exactly that state, and it is the second
+    /// assertion: delete [`SYMBOL_CANDIDATES`] and the third one fails.
+    ///
+    /// Every character here is one this editor is asked to draw sixty times a
+    /// second while an agent is running in a pane, and not one of them is in the
+    /// Private Use Area — which is why choosing a Nerd Font never helped. A Nerd
+    /// Font patch adds the PUA and leaves Miscellaneous Technical and Dingbats
+    /// exactly as it found them.
+    #[test]
+    fn the_icons_a_terminal_agent_draws_are_found_outside_the_coding_font() {
+        const ICONS: &[char] = &[
+            '\u{23fa}', // ⏺ the bullet on a tool call
+            '\u{23bf}', // ⎿ the elbow under its result
+            '\u{2610}', // ☐ a todo
+            '\u{2612}', // ☒ a finished one
+            '\u{29c9}', // ⧉
+            '\u{23f5}', // ⏵
+            '\u{273b}', // ✻ the spinner, and the three frames after it
+            '\u{273d}', // ✽
+            '\u{2722}', // ✢
+            '\u{2733}', // ✳
+        ];
+        let paths = find_symbol_fonts();
+        // Not `if paths.is_empty() { return }`, which is how this test would
+        // pass by not running — including on the machine the bug was reported
+        // from, and including with the fix taken back out. Every macOS entry in
+        // [`SYMBOL_CANDIDATES`] ships with the OS, so an empty chain there is a
+        // stale list, which is this same bug arriving by a different door.
+        // Elsewhere the list is a best guess at a desktop install and a box
+        // without those two files has genuinely nothing to be checked against.
+        if cfg!(target_os = "macos") {
+            assert!(!paths.is_empty(), "macOS has all of {SYMBOL_CANDIDATES:?}");
+        } else if paths.is_empty() {
+            return;
+        }
+        let font = find_font().expect("a monospace font, or nothing draws at all");
+        let coding = open_face(&font, FaceKey::body(18, false)).expect("the body face opens");
+        let mut cache = HashMap::new();
+
+        for &c in ICONS {
+            // The premise. If a coding font ever does grow these, this line is
+            // the one that says so — and the fallback below becomes dead weight
+            // rather than the only reason the character is on screen.
+            assert!(
+                coding.font.find_glyph(c).is_none(),
+                "{} has U+{:04X} after all; the fallback below is no longer what draws it",
+                font.display(),
+                c as u32
+            );
+            // With no chain — which is what this renderer had — there is nowhere
+            // else to look, and the cell is a tofu.
+            assert!(
+                symbol_face(&mut cache, &[], 18, c).is_none(),
+                "an empty chain answered for U+{:04X}",
+                c as u32
+            );
+            assert!(
+                symbol_face(&mut cache, &paths, 18, c).is_some(),
+                "nothing in {paths:?} has U+{:04X}, so it still draws as a tofu",
+                c as u32
             );
         }
     }

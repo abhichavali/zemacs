@@ -69,6 +69,27 @@
 ;;; merge rather than to note it. Two copies of a loop this fiddly is one copy
 ;;; that gets fixed and one that does not.
 
+(defmacro with-undo-group (&body body)
+  "Run BODY as *one* undo step, however many times it writes.
+
+Every writing primitive takes an undo checkpoint for itself, which is right for
+the commands that write once and wrong for the several that do not: ticking a
+checkbox rewrites the box and then every statistics cookie above it, and
+demoting a subtree rewrites one headline per line. `u' walked back out of those
+one `replace-region' at a time, through states nobody had ever seen — a list
+with the box ticked and the cookie above it still saying `[0/2]'.
+
+`unwind-protect' rather than a `progn', because an error in the body would
+otherwise leave the image with checkpoints switched off for good, and the next
+thing you typed would be undone together with whatever came before it.
+
+The other shape is `org-table.lisp's, which funnels every one of its commands
+through a single `replace-region' by construction and needs none of this. That
+is the better answer where the edits are all in one place; this is the one for a
+command whose writes are scattered across a buffer scan."
+  `(progn (%undo-group-begin)
+          (unwind-protect (progn ,@body) (%undo-group-end))))
+
 (defun split-string (string char)
   "STRING split on CHAR. Empty fields are kept; the caller drops them."
   (loop with start = 0
@@ -419,7 +440,14 @@ mean `M-x text-mode' in a .rs buffer bounced straight back to `rust-mode'."
 The editor's mode keymap is keyed by the exact mode name, so a key bound for
 `prog-mode' would never be found in a `rust-mode' buffer otherwise."
   (dolist (ancestor (butlast (%mode-chain mode)))
-    (dolist (binding (gethash ancestor *mode-keys*))
+    ;; Oldest declaration first, because the editor's keymap is a table where
+    ;; the last write wins and `define-mode-key' PUSHes — replaying the list as
+    ;; it stands hands the *oldest* claim on a key the last word, which is the
+    ;; opposite of who won in the parent. Two files claiming one key is not
+    ;; hypothetical: `org-fold.lisp' and `org-table.lisp' both bind TAB in
+    ;; `org-mode', org-table's dispatcher is the live one there, and
+    ;; `org-frozen-mode' used to inherit the binding org-mode had dropped.
+    (dolist (binding (reverse (gethash ancestor *mode-keys*)))
       (define-key mode (car binding) (cdr binding)))))
 
 (defun define-mode-key (mode keys command)

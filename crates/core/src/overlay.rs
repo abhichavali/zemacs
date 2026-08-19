@@ -264,10 +264,18 @@ pub fn fold_hiding(overlays: &[Overlay], line_start: usize) -> Option<usize> {
 /// True when a fold *begins* inside `[start, end]` — the line that stays drawn
 /// and gets the indicator. Inclusive at the end, so a fold anchored at the
 /// newline still belongs to the line before it rather than to no line at all.
+///
+/// **A fold carrying an [`Overlay::image`] is not one of them**, and that is the
+/// question this function exists to answer rather than an exception to it: the
+/// marker means "there is more text here than you can see", and a typeset
+/// fragment's hidden rows are the *source* of the picture drawn in their place.
+/// The picture already says so, and better. Without this every line holding a
+/// LaTeX preview grew an `…` on the end of it, inline `$x^2$` included — which
+/// folds nothing at all and merely used the flag to claim its own rows.
 pub fn fold_starts_in(overlays: &[Overlay], start: usize, end: usize) -> bool {
     overlays
         .iter()
-        .any(|o| o.fold && (start..=end).contains(&o.start))
+        .any(|o| o.fold && o.image.is_none() && (start..=end).contains(&o.start))
 }
 
 /// A change to an overlay, as it arrives from Lisp.
@@ -779,6 +787,31 @@ mod tests {
         // be cycled without being remade.
         o.edit(OverlayEdit::Fold(1, false));
         assert_eq!(fold_hiding(o.all(), 4), None);
+    }
+
+    /// A typeset fragment hides its own source and must not also announce it.
+    ///
+    /// `org-latex-preview` folds a `\begin{align}` so the blank rows its source
+    /// became stop existing — otherwise the equation sits at the top of a hole
+    /// as deep as the source was long. Those rows are still hidden, so
+    /// `fold_hiding` has to keep saying so or `j` would step onto a row nobody
+    /// draws; what they are *not* is text you are being kept from, and an `…` on
+    /// the end of the line claims they are.
+    #[test]
+    fn a_fold_carrying_an_image_gets_no_marker() {
+        let mut o = overlay(2, 11);
+        o.edit(OverlayEdit::Fold(1, true));
+        o.edit(OverlayEdit::Image(1, Some(7)));
+        let all = o.all();
+        // Still a fold in every way that moves the cursor or counts a row...
+        assert_eq!(fold_hiding(all, 4), Some(2));
+        // ...and not one for the purpose of drawing the indicator.
+        assert!(!fold_starts_in(all, 0, 3));
+
+        // Taking the image off puts the marker back, so this is a property of
+        // the overlay rather than of how it was made.
+        o.edit(OverlayEdit::Image(1, None));
+        assert!(fold_starts_in(o.all(), 0, 3));
     }
 
     /// A fold is a marker pair like every other overlay, so it *moves* — and a

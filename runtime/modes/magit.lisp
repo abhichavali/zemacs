@@ -103,10 +103,24 @@ Nothing happens for an empty answer or a cancelled prompt, which is the same
 ;;; each of them out of this table with nothing else asked for: pressing `b'
 ;;; lists what continues it, which is what a transient *is* here.
 
-;;; `RET' visits the file under the cursor. `k' throws its changes away, and is
+;;; `RET' visits the file under the cursor. `x' throws its changes away, and is
 ;;; the one key here that always stops to ask.
+;;;
+;;; `x' and not magit's own `k', and this is the one entry in the table that was
+;;; a bug rather than a preference. `"magit"' layers over Normal *so that the
+;;; motions keep working* — and `k' is `up'. Bound here it stopped being a motion
+;;; in the one buffer whose entire interface is "point at a line": moving up the
+;;; staging area opened a discard prompt instead of moving, and the `j' after it
+;;; went into that prompt rather than the buffer, which is why the symptom read
+;;; as "sometimes j and k do nothing" rather than as "k discards". It was
+;;; destructive by default besides — the accident it invites is the one key here
+;;; that can lose work.
+;;;
+;;; `evil-collection-magit' moves discard to `x' for this reason and it is the
+;;; spelling to match: vim's `x' is delete-character, which a generated buffer
+;;; has no use for, so nothing is displaced by taking it.
 (define-key "magit" "<ret>" "magit-visit")
-(define-key "magit" "k" "magit-discard")
+(define-key "magit" "x" "magit-discard")
 
 ;;; --- and the same two keys again, where a selection can reach them ---------
 ;;;
@@ -122,11 +136,15 @@ Nothing happens for an empty answer or a cancelled prompt, which is the same
 ;;; keeping — vim's visual `s' is substitute, and you do not edit a generated
 ;;; status buffer — while every motion does.
 ;;;
-;;; `k' is deliberately absent, and this is the important line. In Visual `k' is
-;;; *up*: it is how the selection gets made in the first place, so binding it
-;;; here would make building a selection impossible — and it would do it by
-;;; discarding your work, since `k' is the destructive one. Region-discard is
+;;; Discard is deliberately absent, and this is the important line. It is the one
+;;; key here that can lose work, and a minor-mode binding is consulted in *every*
+;;; editing mode — so putting it in this table would arm it while you are still
+;;; building the selection you meant to act on. Region-discard is
 ;;; `M-x magit-discard', which is the right amount of friction for it.
+;;;
+;;; This paragraph used to be about `k' specifically, back when `k' was discard:
+;;; binding it here would have made a selection impossible to build, since `k' is
+;;; how you build one. That hazard is gone from the state map above as well now.
 (define-key "magit-mode" "s" "magit-stage")
 (define-key "magit-mode" "u" "magit-unstage")
 

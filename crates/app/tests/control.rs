@@ -240,10 +240,18 @@ fn org_structure_edits_an_outline() {
     req(&mut z, "keys", r#","keys":"M-S-<right>""#);
     text_becomes!("** Release [0/4]\n*** [ ] docs\n*** TODO [ ] api\n*** [ ] tests\n*** [ ] ship\n");
     let after = req(&mut z, "state", "");
+    // The same *character*, which is one column further along: a star goes in at
+    // the front of the line, so everything after it moves, and that is what
+    // Emacs does too — `org-demote` inserts and every position past the insert
+    // shifts with it. This used to assert the same *column*, which is the same
+    // thing only until you are typing: point kept column 1 and landed back on
+    // the second star instead of the space it was on, so `M-<right>' in the
+    // middle of a heading put the next letter inside the last word.
+    assert_eq!(after["line"], before["line"], "the demote changed the line");
     assert_eq!(
-        (after["line"].clone(), after["col"].clone()),
-        (before["line"].clone(), before["col"].clone()),
-        "the subtree demote dragged the cursor",
+        after["col"].as_i64().unwrap(),
+        before["col"].as_i64().unwrap() + 1,
+        "the character under point did not survive the demote",
     );
 
     // ...and back, by the same delta for every heading — a descendant that

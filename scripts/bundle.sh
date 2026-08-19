@@ -86,6 +86,23 @@ $icon_plist
   <key>LSMinimumSystemVersion</key>    <string>11.0</string>
   <key>NSHighResolutionCapable</key>   <true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key> <true/>
+  <!-- The microphone belongs to the *bundle*, not to the process that opens it.
+       A child spawned by the terminal inherits zemacs's TCC identity, so a CLI
+       that records audio - Claude Code's voice mode is the one that found this
+       - is refused by the system without ever prompting, and the refusal looks
+       like the tool being broken rather than like a missing key. macOS denies
+       outright when the usage string is absent; with it, the first attempt
+       prompts once and is remembered.
+
+       A denial is cached per bundle id, so a build made before this key was
+       here has to be forgotten by hand:
+           tccutil reset Microphone org.zemacs.zemacs
+       Speech recognition is the second half of dictation on macOS and is a
+       separate grant, so both are declared. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>A program you run in zemacs's terminal - a voice assistant, a dictation tool - is asking to record audio.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>A program you run in zemacs's terminal is asking to transcribe what you say.</string>
   <!-- Without this zemacs never appears in Finder's "Open With" menu, so it
        cannot be chosen as the default for anything. public.data is the root of
        every file type, which is what puts zemacs in the list for an extension

@@ -660,8 +660,14 @@ and a write refused by `Editor::apply' is a write that says nothing."
 ;;; What the keyboard actually wears out: step to the next problem, step back,
 ;;; say whether this one is done, and get back to the Contents. Everything else
 ;;; a curriculum needs is org's already — `RET' on a Contents link is
-;;; `org-open-at-point', folding a unit is `z a', and `SPC m l' typesets the
+;;; `org-open-at-point', folding a unit is `z a', and `C-c r' typesets the
 ;;; equations.
+;;;
+;;; `C-c r' and not the leader spelling, which in *this* buffer is not the
+;;; typesetter: `SPC m e' is `math-code-edit' here, and a minor mode outranks the
+;;; major one it sits on. The chord is bound in `org-mode' and nothing shadows
+;;; it, so it is the one that means the same thing in a curriculum as in any
+;;; other org file.
 
 (defun %math-describe (problem)
   "A one-line description of PROBLEM for the status line."

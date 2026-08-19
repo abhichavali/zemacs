@@ -57,6 +57,11 @@ extern void rs_do(const char *verb, const char *arg, long a, long b);
 extern void rs_free_string(char *p);
 extern void rs_goto_char(long n);
 extern void rs_delete_region(long a, long b);
+/* One undo step for a command that writes more than once. Every writer above
+ * checkpoints for itself, which is one `u' per `replace-region' — four to walk
+ * back a demoted subtree. Between these two, the checkpoint is taken once. */
+extern void rs_undo_group_begin(void);
+extern void rs_undo_group_end(void);
 extern void rs_replace_region(long a, long b, const char *text);
 extern long rs_make_marker(long pos, int advance);
 extern void rs_set_marker(long id, long pos);
@@ -65,7 +70,7 @@ extern void rs_set_evil_state(const char *name);
 extern void rs_open_prompt(const char *kind);
 /* --- overlays and inline images (see the block near the bottom of this file) */
 extern long rs_make_overlay(long start, long end);
-extern long rs_latex_preview(const char *source);
+extern long rs_latex_preview(const char *source, long scale);
 extern long rs_image_file(const char *path, long ems);
 /* Returns Rust-owned memory, like rs_query: rs_free_string, never free(3). */
 extern char *rs_highlight(const char *lang, const char *text);
@@ -561,6 +566,16 @@ static cl_object f_goto_char(cl_object n) {
   return ECL_NIL;
 }
 
+static cl_object f_undo_group_begin(void) {
+  rs_undo_group_begin();
+  return ECL_NIL;
+}
+
+static cl_object f_undo_group_end(void) {
+  rs_undo_group_end();
+  return ECL_NIL;
+}
+
 static cl_object f_delete_region(cl_object a, cl_object b) {
   rs_delete_region((long)ecl_to_fixnum(a), (long)ecl_to_fixnum(b));
   return ECL_NIL;
@@ -610,12 +625,17 @@ static cl_object f_make_overlay(cl_object start, cl_object end) {
 /* Render one LaTeX fragment; the answer is the id an `image' overlay property
  * takes, or NIL with the reason already in the status line.
  *
+ * SCALE is the type size to set it at, as a percentage of the body em — the
+ * hundredths `%image-file' and `overlay-scale' already carry, and for the same
+ * reason: this boundary is integers and strings. NIL is 100.
+ *
  * This is the slow one — a cold render shells out to latex and dvipng — and it
  * is deliberately synchronous: the Lisp thread waits, the editor does not. That
  * is the whole point of the image having a thread of its own. */
-static cl_object f_latex_preview(cl_object source) {
+static cl_object f_latex_preview(cl_object source, cl_object scale) {
   char *s = dup_utf8_or_empty(source);
-  long id = rs_latex_preview(s);
+  long pct = (scale == ECL_NIL) ? 100 : (long)ecl_to_fixnum(scale);
+  long id = rs_latex_preview(s, pct);
   free(s);
   return id ? ecl_make_fixnum(id) : ECL_NIL;
 }
@@ -883,6 +903,17 @@ static const char *QUERIES_FORM =
     " (defun zemacs::matching-bracket (&optional pos)"
     "   (zemacs::%query \"matching-bracket\" (or pos (zemacs::point)) 0))"
     " (pushnew \"matching-bracket\" zemacs::*readers* :test #'string=)"
+    /* The cells a character draws in. Layout is the renderer's arithmetic and
+     * the image has to agree with it whenever it lays anything out itself: a
+     * CJK character is one character and two columns, so `org-table.lisp'
+     * padding a column by `length' pads a table of Japanese to a ragged edge.
+     * Takes a character rather than a string because a query carries integers
+     * only; callers memoise, and a table is drawn out of a few dozen distinct
+     * characters. `pushnew' for `matching-bracket's reason — it belongs in
+     * `*readers*' so M-x does not offer it, and the loop above only makes
+     * zero-argument ones. */
+    " (defun zemacs::char-cells (c) (zemacs::%query \"char-cells\" (char-code c) 0))"
+    " (pushnew \"char-cells\" zemacs::*readers* :test #'string=)"
     /* The last N messages, or all of them. This is `*Messages*'. */
     " (defun zemacs::messages (&optional n) (zemacs::%query \"messages\" (or n 0) 0))"
     /* A query takes integers, and a face is named by a string everywhere else in
@@ -1472,6 +1503,17 @@ static const char *OVERLAY_FORM =
     " (pushnew \"latex-fragments\" zemacs::*readers* :test #'string=)"
     " (pushnew \"fold-ranges\" zemacs::*readers* :test #'string=)"
     " (pushnew \"project-recent\" zemacs::*readers* :test #'string=)"
+    /* `latex-preview' keeps its one-argument shape — every caller that just
+     * wants an equation at body size still writes `(latex-preview src)' — and
+     * gains the size as an option. SCALE is a multiple of the body em and may
+     * be fractional, so the primitive underneath takes hundredths.
+     *
+     * The wrapper is here rather than in `library.lisp' because `org-frozen.lisp'
+     * and `gui.lisp' both call it, and a primitive whose arity changed under a
+     * config that had not reloaded is the one failure this boundary must not
+     * have. */
+    " (defun zemacs::latex-preview (source &optional scale)"
+    "   (zemacs::%latex-preview source (if scale (round (* 100 scale)) 100)))"
     /* The other producer of an `image' id: a *file*, rather than a LaTeX run.
      * WIDTH is in ems and may be fractional, which is why the primitive
      * underneath takes hundredths — the same percentage `overlay-scale' sends
@@ -1724,6 +1766,10 @@ void zemacs_boot(void) {
   defprim("%DO", (cl_objectfn_fixed)f_do, 4);
   defprim("GOTO-CHAR", (cl_objectfn_fixed)f_goto_char, 1);
   defprim("DELETE-REGION", (cl_objectfn_fixed)f_delete_region, 2);
+  /* `%' because nobody calls these by hand: `with-undo-group' in library.lisp
+   * is the pair, and it is a macro so that an error in the body still closes. */
+  defprim("%UNDO-GROUP-BEGIN", (cl_objectfn_fixed)f_undo_group_begin, 0);
+  defprim("%UNDO-GROUP-END", (cl_objectfn_fixed)f_undo_group_end, 0);
   defprim("REPLACE-REGION", (cl_objectfn_fixed)f_replace_region, 3);
   defprim("%MAKE-MARKER", (cl_objectfn_fixed)f_make_marker, 2);
   defprim("SET-MARKER", (cl_objectfn_fixed)f_set_marker, 2);
@@ -1740,7 +1786,7 @@ void zemacs_boot(void) {
   /* --- end of the JSON-RPC defprims --- */
   /* --- overlays: the only ones that have to answer with a value --- */
   defprim("MAKE-OVERLAY", (cl_objectfn_fixed)f_make_overlay, 2);
-  defprim("LATEX-PREVIEW", (cl_objectfn_fixed)f_latex_preview, 1);
+  defprim("%LATEX-PREVIEW", (cl_objectfn_fixed)f_latex_preview, 2);
   defprim("%IMAGE-FILE", (cl_objectfn_fixed)f_image_file, 2);
   /* Not an overlay itself — it is what a mode turns *into* overlays, which is
    * why it sits with them rather than with the readers: `%QUERY' takes two

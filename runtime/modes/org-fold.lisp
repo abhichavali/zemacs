@@ -16,11 +16,6 @@
 ;;;; helpers, since a fold *is* an overlay: it moves with the text you typed
 ;;;; above it, dies with the text it covered, and comes off with
 ;;;; `delete-overlay' like anything else.
-;;;;
-;;;; ponytail: folding is two-state, not org's three. `org-cycle' in Emacs walks
-;;;; FOLDED -> CHILDREN -> SUBTREE; here a headline is closed or open, and
-;;;; opening one opens everything under it. CHILDREN is a third case in
-;;;; `fold-dwim' plus a per-headline state table, and nobody has missed it yet.
 
 (in-package :zemacs)
 
@@ -58,17 +53,78 @@ alone."
                (setf last l)))
     (line-end last)))
 
+(defun %org-fold-range (line end)
+  "(BEG . END) for a fold from LINE's start to END, or NIL when it hides nothing.
+
+A fold's first line stays drawn — that is what leaves the headline visible — so a
+range stopping before the start of the line *below* LINE hides no rows at all.
+The one thing it would still do is hang the renderer's `…' on LINE, promising
+text that is not there: a heading just typed at the end of a file, and a heading
+with nothing under it but the blank line before the next one, both wore that
+marker while hiding nothing. Every caller here means \"fold this\" to be
+something the reader can watch happen, so the empty range is filtered once, here.
+
+`(1+ (line-end line))' is the next line's start without asking for it, and it is
+why the last line of the buffer needs no case of its own: nothing is greater than
+one past the end of the buffer."
+  (when (> end (1+ (line-end line)))
+    (cons (line-start line) end)))
+
+(defun %org-block-at-point ()
+  "(BEG . END) for the block or drawer *opened* by the line point is on, or NIL.
+
+org's other two foldable things, and both already have the shape a fold wants: an
+opening line that stays drawn and a run of lines under it that goes. A `#+begin_'
+closes at the first `#+end_'; a drawer — `:NAME:' alone on its line — closes at
+`:END:'. Only the line that *opens* one answers, so this is a question about the
+line under point rather than a scan of what encloses it, and TAB anywhere inside
+a block still cycles the subtree the block is part of.
+
+An unclosed one answers NIL rather than folding to the end of the buffer, which
+is the state a block is in for every keystroke of typing it.
+
+`:END:' passes the drawer shape test and is not an opener, so it is named: without
+that, TAB on the line closing one drawer would hunt for the next `:END:' and fold
+two drawers and everything between them into one.
+
+`%org-directive-p' is `org-modern.lisp''s, which is the module loaded directly
+before this one — it makes that test dozens of times per redisplay, and a second
+spelling of what `#+begin_' means is exactly the drift this file should not
+start."
+  (let* ((n (line-number))
+         (text (string-trim '(#\Space #\Tab) (line-string n)))
+         (blockp (%org-directive-p text "#+begin_"))
+         (drawerp (and (> (length text) 2)
+                       (char= (char text 0) #\:)
+                       (char= (char text (1- (length text))) #\:)
+                       (not (find #\Space text))
+                       (not (string-equal text ":end:")))))
+    (when (or blockp drawerp)
+      (loop for l from (1+ n) to (line-count)
+            for s = (string-trim '(#\Space #\Tab) (line-string l))
+            when (if blockp
+                     (%org-directive-p s "#+end_")
+                     (string-equal s ":end:"))
+              return (cons (line-start n) (line-end l))))))
+
 (defun org-subtree-at-point ()
-  "(BEG . END) for the org subtree under point, or NIL outside one.
-The shape `*fold-subtree-functions*' expects."
-  (let ((line (%org-headline-above)))
-    (when line (cons (line-start line) (%org-subtree-end line)))))
+  "(BEG . END) for the org thing under point, or NIL when there is none.
+
+The block or drawer point is sitting on the opening line of, else the subtree it
+is in — that order, because a `#+begin_src' line is inside a subtree too and the
+smaller thing is the one you pointed at. The shape `*fold-subtree-functions*'
+expects."
+  (or (%org-block-at-point)
+      (let ((line (%org-headline-above)))
+        (when line (%org-fold-range line (%org-subtree-end line))))))
 
 (defun org-subtrees ()
-  "(BEG . END) for every top-level subtree — org's `overview' state."
+  "(BEG . END) for every top-level subtree — org's `overview' state.
+Bare headlines are not among them: see `%org-fold-range'."
   (loop for l from 1 to (line-count)
-        when (eql (%org-level l) 1)
-          collect (cons (line-start l) (%org-subtree-end l))))
+        for r = (and (eql (%org-level l) 1)
+                     (%org-fold-range l (%org-subtree-end l)))
+        when r collect r))
 
 (defun %org-children (line)
   "Lines of LINE's *direct* children — headlines exactly one level deeper.
@@ -87,10 +143,11 @@ CHILDREN state and simply unfolding everything."
 ;;; ---------------------------------------------------------------------------
 ;;; org's own three-state cycle
 ;;;
-;;; The ceiling at the top of this file, now closed. `fold-dwim' is still the
-;;; generic two-state toggle every mode gets — a selection, a defun, a magit
-;;; hunk — and this is the one mode whose folding is a *structure* rather than a
-;;; range, so it is the one mode that earns a third state.
+;;; Emacs' FOLDED -> CHILDREN -> SUBTREE, which this file went without for a
+;;; while. `fold-dwim' is still the generic two-state toggle every mode gets — a
+;;; selection, a defun, a magit hunk — and this is the one mode whose folding is
+;;; a *structure* rather than a range, so it is the one mode that earns a third
+;;; state.
 ;;;
 ;;; What makes CHILDREN expressible without a new primitive: a fold hides the
 ;;; lines *after* the first line of its range. So "headline visible, body
@@ -135,14 +192,15 @@ because an overlay adjusts itself across an edit and may have grown."
   ;; then be a type error on the one shape that reaches it.
   (let ((kids (%org-children line)))
     (when kids
-      ;; The body between the headline and its first child. Skipped when the
-      ;; child follows immediately: a fold spanning a single line hides nothing
-      ;; and would only be one more overlay to read back.
-      (let ((first-kid (first kids)))
-        (when (> first-kid (1+ line))
-          (fold-region beg (line-end (1- first-kid)))))
+      ;; The body between the headline and its first child, then each child's own
+      ;; subtree. Both through `%org-fold-range', which is what drops the two
+      ;; folds that would hide nothing: the child that is a bare headline — every
+      ;; `** TODO' in a list of them — and the body that is one blank line.
+      (let ((body (%org-fold-range line (line-end (1- (first kids))))))
+        (when body (fold-region (car body) (cdr body))))
       (dolist (k kids)
-        (fold-region (line-start k) (%org-subtree-end k))))))
+        (let ((r (%org-fold-range k (%org-subtree-end k))))
+          (when r (fold-region (car r) (cdr r))))))))
 
 (defun org-cycle ()
   "TAB on a headline: SUBTREE -> FOLDED -> CHILDREN -> SUBTREE.
@@ -151,14 +209,24 @@ org's own cycle and org's own order — pressing TAB on something open closes it
 which is the gesture that makes an outline an outline. A headline with no
 children has no middle state and cycles in two.
 
-Off a headline this defers to `fold-dwim', so TAB in the preamble or over a
-selection still does the generic thing rather than reporting that there is no
-subtree here."
-  (let ((line (%org-headline-above)))
-    (if (null line)
+Everything with no cycle to it defers to `fold-dwim', which is the generic
+two-state toggle and already knows what those things are: the preamble, a
+selection, the line opening a block or a drawer, and a headline with nothing
+under it — where there is no fold to make and `fold-dwim' says so rather than
+this walking three states past a buffer that never changes."
+  (let* ((line (%org-headline-above))
+         (r (and line
+                 ;; On a `#+begin_src' or a `:PROPERTIES:' line the thing under
+                 ;; point is that block, not the subtree it sits in. Asked here
+                 ;; as well as inside `org-subtree-at-point' because this branch
+                 ;; never reaches that one: the headline above is found either
+                 ;; way, and finding it is what would swallow the block.
+                 (null (%org-block-at-point))
+                 (%org-fold-range line (%org-subtree-end line)))))
+    (if (null r)
         (fold-dwim)
-        (let* ((beg (line-start line))
-               (end (%org-subtree-end line)))
+        (let ((beg (car r))
+              (end (cdr r)))
           (ecase (%org-cycle-state beg end)
             (:subtree  (fold-region beg end)          (message "folded"))
             (:folded   (%org-show-children line beg end) (message "children"))
@@ -260,7 +328,7 @@ whatever this major mode calls a subtree, else what the parser calls one."
 The selection when there is one — so folding an arbitrary block needs no mode
 support at all — and otherwise the mode's own subtree. Toggling opens
 *everything* inside the range, which is org's SUBTREE state rather than its
-CHILDREN one; see the ceiling at the top of this file."
+CHILDREN one; `org-cycle' is the one that walks all three."
   (let ((r (%fold-range)))
     (cond ((null r) (message "nothing foldable here"))
           ((plusp (unfold-region (car r) (cdr r))) (message "unfolded"))

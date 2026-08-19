@@ -26,8 +26,10 @@
 ;;;;
 ;;;; The mappings that are not Modus' own are the same ones the plain vivendi
 ;;;; file documents, and for the same reasons: `number' borrows `identifier',
-;;;; the three `heading-N' take Modus' coloured levels 0/2/3 *and* the bold
-;;;; weight Modus puts on its headings, and `bold'/`italic' take
+;;;; the three `heading-N' take Modus' own levels 1/2/3 *and* the bold weight
+;;;; Modus puts on its headings — level 1 is `fg-main', which with
+;;;; `*org-modern-heading-scale*' behind it says top-level more plainly than a
+;;;; hue can — and `bold'/`italic' take
 ;;;; `fg-prose-verbatim'/`docstring' on top of the real weight and slant they
 ;;;; now carry.
 ;;;;
@@ -110,7 +112,7 @@
   (set-face "variable"          cyan)                   ; #00d3d0  Modus `variable'
   (set-face "operator"          fg-main)                ; #ffffff  Modus `operator'
   (set-face "punctuation"       fg-main)                ; #ffffff  Modus `punctuation'
-  (set-face "heading-1"         cyan-cooler   :bold t)  ; #6ae4b9  Modus `fg-heading-0'
+  (set-face "heading-1"         fg-main       :bold t)  ; #ffffff  Modus `fg-heading-1'
   (set-face "heading-2"         yellow-faint  :bold t)  ; #d2b580  Modus `fg-heading-2'
   (set-face "heading-3"         blue-faint    :bold t)  ; #82b0ec  Modus `fg-heading-3'
   (set-face "bold"              magenta-warmer :bold t) ; #f78fe7  Modus `fg-prose-verbatim'

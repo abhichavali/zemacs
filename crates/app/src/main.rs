@@ -1140,6 +1140,19 @@ impl App {
                     .join(" ");
                 self.call_lisp("%FONTS-LISTED", &format!("'({pairs})"));
             }
+            // The pasteboard's picture, written down and handed back by path.
+            // Same shape as the fonts above and the same reason: the clipboard
+            // belongs to the window system, and this is the layer that owns a
+            // window. NIL when there is no picture, which is a thing the caller
+            // has to be able to tell from a path — `org-paste-image` says "no
+            // image in the clipboard" rather than inserting a broken link.
+            EditorCommand::ClipboardImage => {
+                let arg = match write_clipboard_image(&self.clipboard) {
+                    Some(path) => zemacs_rpc::lisp::string(&path.to_string_lossy()),
+                    None => "nil".into(),
+                };
+                self.call_lisp("%CLIPBOARD-IMAGE", &arg);
+            }
             // Dropped when no shell is running: a keystroke aimed at something that
             // is not there is nothing, not an error worth reporting on every key.
             EditorCommand::TermKey(key) => {
@@ -1259,8 +1272,33 @@ impl App {
                 let path = PathBuf::from(filename);
                 let typed = editor.mode == zemacs_core::Mode::Terminal
                     && self.term.paste_path(editor, &path);
+                // Onto an org buffer it means a third thing: a picture dropped
+                // into a document is a *figure in that document*, and opening
+                // the PNG in a pane — which is what this used to do, as text —
+                // is the one outcome nobody meant by the gesture.
+                //
+                // Which files are figures is `*org-image-file-types*`, and that
+                // list stays in Lisp: it is policy, it is a config's to change,
+                // and it already exists there. So the only question answered on
+                // this side is the one core can answer for itself — is the live
+                // buffer an org buffer — and `%file-dropped` decides the rest,
+                // falling back to `find-file` for anything that is not a
+                // picture. Same division of labour as every other gesture here.
+                //
+                // ponytail: SDL3 carries the drop's x/y and the Rust binding
+                // drops them, so this cannot tell *which pane* was dropped on
+                // and uses the focused one. Ceiling: a split with an org buffer
+                // in the pane you did not aim at. Upgrade path is the binding
+                // growing the field, or reading `SDL_DropEvent` directly.
                 if !typed {
-                    open_file(editor, &path, &self.init_path, &mut self.remote);
+                    if editor.buffer.major_mode == "org-mode" {
+                        self.call_lisp(
+                            "%FILE-DROPPED",
+                            &zemacs_rpc::lisp::string(&path.to_string_lossy()),
+                        );
+                    } else {
+                        open_file(editor, &path, &self.init_path, &mut self.remote);
+                    }
                 }
             }
             Event::Window {
@@ -1395,6 +1433,32 @@ impl App {
                 let pressed = self.mouse.press(&editor.frames[i], i, area, x, y);
                 if let Some(window) = pressed {
                     self.dispatch(editor, EditorCommand::FocusWindow(window));
+                    // The strip along the bottom of the pane, before anything
+                    // treats the click as a position in the text. It is inside
+                    // the pane rectangle, so without this the pointer fell
+                    // through to `click_target`, which measures rows from the
+                    // top of the document and answers end-of-buffer for
+                    // anything below the last one: clicking the modeline
+                    // teleported the cursor to the end of the file.
+                    //
+                    // What a segment *means* is Lisp's, as it is for a scene
+                    // and for a terminal, and behind the same `fboundp` guard:
+                    // a config that never loaded `runtime/library.lisp` gets
+                    // silence rather than an undefined function per click. The
+                    // template names which segment; the text is what it said
+                    // this frame.
+                    let on_the_strip = self.renderers[i].modeline_click(editor, i, x, y);
+                    if let Some((_, template, text)) = on_the_strip {
+                        self.call_lisp(
+                            "%MODELINE-CLICK",
+                            &format!(
+                                "{} {}",
+                                zemacs_rpc::lisp::string(&template),
+                                zemacs_rpc::lisp::string(&text)
+                            ),
+                        );
+                        return ControlFlow::Continue(());
+                    }
                     // A pane showing a scene has no character to land
                     // on: there is no point in a scene and no offset a
                     // click could name, so the gesture is a hit test and
@@ -1684,7 +1748,17 @@ impl App {
                         // is what an unconditional invalidate got wrong in
                         // the second case.
                     } else {
-                        self.dispatch(editor, EditorCommand::ScrollLines(-y * SCROLL_LINES));
+                        // In *rows*, converted to buffer lines by the pane that
+                        // is about to draw them. A wrapped paragraph is one line
+                        // and eight rows, so a notch in prose used to throw
+                        // three paragraphs past you where the same notch in a
+                        // code file moved three lines — see
+                        // `Renderer::scroll_step`.
+                        let rows = -y * SCROLL_LINES;
+                        let lines = self.renderers[i]
+                            .scroll_step(editor, i, px, py, rows)
+                            .unwrap_or(rows);
+                        self.dispatch(editor, EditorCommand::ScrollLines(lines));
                     }
                 }
             }

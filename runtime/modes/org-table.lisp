@@ -134,22 +134,40 @@ length, short rows padded with empty cells."
 ;;; ---------------------------------------------------------------------------
 ;;; How wide, and which way up
 
+(defparameter *org-table-char-cells* (make-hash-table)
+  "How many columns a character is drawn in, remembered.
+
+A table is re-laid-out on every `TAB', so measuring it character by character
+would be a shim round-trip per glyph per keystroke. It is a few dozen distinct
+characters, asked about once each. Never invalidated: how wide a character draws
+is a fact about Unicode, not about this buffer.")
+
+(defun %org-table-cell-width (cell)
+  "The columns CELL is drawn in, which stops being `length' the moment a cell
+holds Japanese or an emoji — those are one character and two columns each, and a
+combining mark is one character and none.
+
+`char-cells' is the renderer's own measure (`char_cells' in
+`crates/core/src/display.rs', the same function `line_cells' sums), so a column
+laid out to this width is a column that lands where it was drawn. NIL is a cell a
+row shorter than the table has not got, and is no columns wide."
+  (loop for c across (or cell "")
+        sum (or (gethash c *org-table-char-cells*)
+                (setf (gethash c *org-table-char-cells*) (char-cells c)))))
+
 (defun %org-table-widths (rows)
-  "The width each column should be laid out to, in *characters*.
+  "The width each column should be laid out to, in *columns of the screen*.
 
-ponytail: characters and not cells. A CJK character occupies two columns on
-screen and one here, so a table of Japanese text is padded to a ragged edge.
-`char_cells' in `crates/render' is the only thing in the editor that can measure
-a cell, and there is no way to ask it a question from the image — see the
-`line_cells' entry in `boundary.org', which is the same ceiling from the other
-side. The upgrade path is the one that entry already names: park a cell width on
-the `Editor' beside `wrap_cols'.
+Not in characters: the bars have to line up where the eye is, and a table of
+Japanese padded by `length' is padded to a ragged edge. Everything downstream
+that turns a width back into a buffer offset therefore has to add the *pad* to a
+character count rather than using the width itself — see `%org-table-goal'.
 
-One character minimum, so an entirely empty column still has a cell to put point
+One column minimum, so an entirely empty column still has a cell to put point
 in."
   (loop for k from 0 below (%org-table-columns rows)
         collect (reduce #'max
-                        (mapcar (lambda (r) (if (eq r :rule) 0 (length (nth k r))))
+                        (mapcar (lambda (r) (if (eq r :rule) 0 (%org-table-cell-width (nth k r))))
                                 rows)
                         :initial-value 1)))
 
@@ -202,7 +220,7 @@ which is the answer that keeps a blank new row from flipping the layout."
 
 (defun %org-table-pad (cell width right)
   "CELL padded to WIDTH, on the left when RIGHT."
-  (let ((pad (make-string (max 0 (- width (length cell))) :initial-element #\Space)))
+  (let ((pad (make-string (max 0 (- width (%org-table-cell-width cell))) :initial-element #\Space)))
     (if right
         (concatenate 'string pad cell)
         (concatenate 'string cell pad))))
@@ -243,16 +261,22 @@ what org writes and what makes a rule readable as a rule in the source."
 ;;; ---------------------------------------------------------------------------
 ;;; Where point is, and where it goes
 
-(defun %org-table-point (bounds lines)
+(defun %org-table-point (bounds lines columns)
   "(ROW . CELL) for where point is in the table, both zero-based.
 
 The cell is the number of `|' strictly before point, less the one that opens the
 row — so point anywhere in a cell, including on the bar that opens it, names
-that cell."
+that cell.
+
+Clamped to COLUMNS, because point can be *past* the row's closing bar: on the
+trailing blanks of a row nobody has aligned yet, or at end of line in insert
+state. That counts one bar too many and names a cell the row has not got, which
+`org-table-delete-column' and the two move verbs then index off the end of every
+row — a `subseq' error rather than a wrong answer."
   (let* ((row (- (line-number) (car bounds)))
          (line (nth row lines))
          (off (min (length line) (- (point) (line-start)))))
-    (cons row (max 0 (1- (count #\| line :end off))))))
+    (cons row (max 0 (min (1- columns) (1- (count #\| line :end off)))))))
 
 (defun %org-table-goal (bounds rows widths rights indent target)
   "The offset point should be at for TARGET, once the table has been written.
@@ -269,8 +293,15 @@ field, which is where you want to be typing in a column of figures."
         (let* ((k (max 0 (min (cdr target) (1- (length widths)))))
                (cell (nth k cells))
                (col (+ (length indent) 2
-                       (loop for j from 0 below k sum (+ (nth j widths) 3))
-                       (if (nth k rights) (- (nth k widths) (length cell)) 0))))
+                       ;; A width is columns and an offset is characters, and a
+                       ;; cell holding a wide character has fewer of the second
+                       ;; than the first. So each cell before this one costs
+                       ;; what `%org-table-pad' actually wrote — its characters
+                       ;; plus its padding — rather than its width.
+                       (loop for j from 0 below k
+                             for c = (nth j cells)
+                             sum (+ (length c) (- (nth j widths) (%org-table-cell-width c)) 3))
+                       (if (nth k rights) (- (nth k widths) (%org-table-cell-width cell)) 0))))
           (+ (line-start line) col)))))
 
 ;;; ---------------------------------------------------------------------------
@@ -293,10 +324,11 @@ and it is pressed once per cell."
     (if (null bounds)
         (message "not in a table")
         (let* ((lines (%org-table-lines bounds))
-               (rows (%org-table-parse lines)))
-          (if (zerop (%org-table-columns rows))
+               (rows (%org-table-parse lines))
+               (n (%org-table-columns rows)))
+          (if (zerop n)
               (message "no columns")
-              (let* ((answer (funcall fn rows (%org-table-point bounds lines)))
+              (let* ((answer (funcall fn rows (%org-table-point bounds lines n)))
                      (rows (car answer))
                      (indent (%org-table-indent lines))
                      (widths (%org-table-widths rows))

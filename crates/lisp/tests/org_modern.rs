@@ -385,4 +385,73 @@ fn org_markup_is_drawn_as_glyphs_and_revealed_under_the_cursor() {
     says(&shared, &lisp, r#"(%org-emphasis-at "2 * 3" 2)"#, "NIL");
     says(&shared, &lisp, r#"(%org-emphasis-at "a *b* c" 2)"#, "4");
     says(&shared, &lisp, r#"(%org-emphasis-at "http://x/a/b/" 5)"#, "NIL");
+
+    // --- what a block scan costs ---------------------------------------------
+    //
+    // `%org-modern-block-lines` reads the buffer *once* rather than once per
+    // line. `buffer-lines` is a `line-string` — a `%query` round trip — apiece,
+    // and this reruns whenever `%org-modern-in-block-p` misses its cache, which
+    // is every edit that changes how many lines there are. Pressing RET in a
+    // three-thousand-line file therefore paid three thousand round trips before
+    // the next character could be typed.
+    //
+    // What it *answers* has to be unchanged, and that is what is pinned here:
+    // the block's body, delimiters excluded, because those are the lines
+    // `org-modern-refresh-line` escalates a full redraw on and it can only
+    // notice them if they do not already read as inside a block.
+    load(&shared, "a\n#+begin_src sh\n- x\n- y\n#+end_src\nb\n", 2);
+    says(&shared, &lisp, "(%org-modern-block-lines)", "((3 . 4))");
+    says(&shared, &lisp, "(if (%org-modern-in-block-p 3) t nil)", "T");
+    says(&shared, &lisp, "(if (%org-modern-in-block-p 2) t nil)", "NIL");
+    says(&shared, &lisp, "(if (%org-modern-in-block-p 6) t nil)", "NIL");
+
+    // --- links that used to open nothing, or signal --------------------------
+    //
+    // A fresh buffer, because everything below is about the file the links are
+    // resolved *relative to*.
+    load(&shared, "See https://plain.example/a. and more.\n", 3);
+
+    // Org's `::` search option names a place in a file, not part of its name.
+    // Left on, `[[file:./a.org::*Heading]]` — org's own spelling for the
+    // cross-file case — probed for a path nobody has; and because the `*` in it
+    // makes a *wild* pathname, ECL signalled a FILE-ERROR rather than answering
+    // NIL, so following one was an error and not even a "no such file".
+    says(&shared, &lisp, r#"(%org-expand-file "./a.org::*H")"#, "/tmp/a.org");
+    // The wild-pathname half on its own: a name with a glob in it is a message.
+    lisp.eval(r#"(org-link-open-file "file:no*such.png")"#.into());
+    wait_message(&shared, "a wild path to be refused rather than signalled", |m| {
+        m == "no such file: /tmp/no*such.png"
+    });
+
+    // A bare URL is org's *plain* link and the one people actually type — a URL
+    // pasted into notes has no brackets round it, and `RET` on one said "no link
+    // at point". The trailing full stop is punctuation, not part of the URL.
+    says(
+        &shared,
+        &lisp,
+        r#"(progn (goto-char (search-forward "plain.example" 0))
+                  (car (%org-plain-link-at-point)))"#,
+        "https://plain.example/a",
+    );
+    // ...and the word after it is prose. `*org-link-open-functions*` having an
+    // entry for the scheme is the whole test, which is what keeps `2:30` and
+    // `Fix: the thing` from being followed.
+    says(
+        &shared,
+        &lisp,
+        r#"(progn (goto-char (search-forward "more" 0)) (%org-plain-link-at-point))"#,
+        "NIL",
+    );
+    // End to end, and without launching a browser: with no opener configured
+    // `org-link-open-url` says so and names the target, which is exactly the
+    // proof that `org-open-at-point` reached the plain reader and handed it on.
+    lisp.eval(
+        r#"(let ((*org-link-opener* nil))
+             (goto-char (search-forward "plain.example" 0))
+             (org-open-at-point))"#
+            .into(),
+    );
+    wait_message(&shared, "a bare URL to be followed", |m| {
+        m == "no opener for https://plain.example/a"
+    });
 }

@@ -204,6 +204,129 @@ fn an_org_subtree_folds_from_lisp_and_stops_occupying_rows() {
         (folds(ed) == 0).then_some(())
     });
 
+    // --- a heading with nothing under it is not foldable ---------------------
+    //
+    // Because a fold's *first* line stays drawn: a range that stops before the
+    // next line's start hides no rows at all. It is still an overlay, though, and
+    // the renderer marks every line a fold begins on — so both of these used to
+    // answer TAB by hanging a `…` on your heading, promising text that was not
+    // there and taking three presses to walk a cycle nothing moved in.
+    //
+    //   0 "* one"  1 ""  2 "* two"
+    //
+    // `* one` owns only the blank separator line, and `* two` is the heading you
+    // have just typed at the end of the file.
+    {
+        let mut ed = shared.lock().unwrap();
+        ed.buffer = Buffer::from_str("* one\n\n* two");
+        ed.buffer.major_mode = "org-mode".into();
+        ed.buffer.cursor = 0;
+        ed.status.clear();
+    }
+    lisp.eval("(zemacs::org-cycle)".into());
+    let status = wait(&shared, "org-cycle to decline a blank body", |ed| {
+        (!ed.status.is_empty()).then(|| ed.status.clone())
+    });
+    assert!(status.contains("nothing foldable"), "got {status:?}");
+    assert_eq!(folds(&shared.lock().unwrap()), 0, "no overlay, so no marker");
+    {
+        let mut ed = shared.lock().unwrap();
+        ed.buffer.cursor = ed.buffer.line_start(2);
+        ed.status.clear();
+    }
+    lisp.eval("(zemacs::org-cycle)".into());
+    let status = wait(&shared, "org-cycle to decline the last heading", |ed| {
+        (!ed.status.is_empty()).then(|| ed.status.clone())
+    });
+    assert!(status.contains("nothing foldable"), "got {status:?}");
+    assert_eq!(folds(&shared.lock().unwrap()), 0);
+
+    // --- CHILDREN of bare headlines is one fold, not three -------------------
+    //
+    // The same rule one level down, and the state it is most visible in: a list
+    // of `** TODO` lines with nothing under them has nothing to hide, so the
+    // middle state is the body fold alone. Asserting the *count* here rather
+    // than only `hidden`, because the bug this catches hides nothing by
+    // definition — it is two extra overlays, each drawing a `…` on a child that
+    // has no body.
+    //
+    //   0 "* one"  1 "body"  2 "** a"  3 "** b"
+    {
+        let mut ed = shared.lock().unwrap();
+        ed.buffer = Buffer::from_str("* one\nbody\n** a\n** b\n");
+        ed.buffer.major_mode = "org-mode".into();
+        ed.buffer.cursor = 0;
+        ed.status.clear();
+    }
+    lisp.eval("(zemacs::org-cycle)".into());
+    wait(&shared, "the whole subtree to fold", |ed| {
+        (hidden(ed) == vec![1, 2, 3]).then_some(())
+    });
+    lisp.eval("(zemacs::org-cycle)".into());
+    wait(&shared, "the children to come back", |ed| {
+        (hidden(ed) == vec![1] && folds(ed) == 1).then_some(())
+    });
+    // ...and the cycle still closes, which is the half a state test can lose:
+    // with no child folds left to read, CHILDREN is told from FOLDED by the body
+    // fold's extent alone.
+    lisp.eval("(zemacs::org-cycle)".into());
+    wait(&shared, "the subtree to open from CHILDREN", |ed| {
+        (folds(ed) == 0).then_some(())
+    });
+
+    // --- blocks and drawers, org's other two foldable things ------------------
+    //
+    // Both have the shape a fold already wants — an opening line that stays drawn
+    // and a run under it that goes — and neither is a subtree, so TAB on one used
+    // to fold the whole heading it sits in and there was no way to collapse a
+    // 200-line `#+begin_src` at all.
+    //
+    //   0 "* one"           1 ":PROPERTIES:"  2 ":ID: 42"    3 ":END:"
+    //   4 "#+begin_src lisp" 5 "(+ 1 2)"      6 "#+end_src"  7 "* two"
+    {
+        let mut ed = shared.lock().unwrap();
+        ed.buffer = Buffer::from_str(
+            "* one\n:PROPERTIES:\n:ID: 42\n:END:\n#+begin_src lisp\n(+ 1 2)\n#+end_src\n* two\n",
+        );
+        ed.buffer.major_mode = "org-mode".into();
+        ed.buffer.cursor = ed.buffer.line_start(1); // on `:PROPERTIES:`
+        ed.status.clear();
+    }
+    lisp.eval("(zemacs::org-cycle)".into());
+    wait(&shared, "the drawer to fold", |ed| {
+        (hidden(ed) == vec![2, 3]).then_some(())
+    });
+    // Two-state, like every other range: there is no CHILDREN inside a drawer.
+    lisp.eval("(zemacs::org-cycle)".into());
+    wait(&shared, "the drawer to open", |ed| (folds(ed) == 0).then_some(()));
+
+    {
+        let mut ed = shared.lock().unwrap();
+        ed.buffer.cursor = ed.buffer.line_start(4); // on `#+begin_src lisp`
+        ed.status.clear();
+    }
+    lisp.eval("(zemacs::org-cycle)".into());
+    wait(&shared, "the source block to fold", |ed| {
+        (hidden(ed) == vec![5, 6]).then_some(())
+    });
+    lisp.eval("(zemacs::fold-open-all)".into());
+    wait(&shared, "the block to open again", |ed| (folds(ed) == 0).then_some(()));
+
+    // ...and the heading above them still cycles as a heading. The block reader
+    // asks about the line under point only, so finding a `#+begin_src` five lines
+    // down must not take TAB away from `* one`.
+    {
+        let mut ed = shared.lock().unwrap();
+        ed.buffer.cursor = 0;
+        ed.status.clear();
+    }
+    lisp.eval("(zemacs::org-cycle)".into());
+    wait(&shared, "the subtree over a block to fold whole", |ed| {
+        (hidden(ed) == vec![1, 2, 3, 4, 5, 6]).then_some(())
+    });
+    lisp.eval("(zemacs::fold-open-all)".into());
+    wait(&shared, "that subtree to open", |ed| (folds(ed) == 0).then_some(()));
+
     // --- code, with nobody having taught this mode anything ------------------
     //
     // The default the whole tree-sitter half exists for: `rust-mode` has no entry

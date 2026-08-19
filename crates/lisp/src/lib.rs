@@ -65,6 +65,7 @@ pub mod scene;
 
 use std::ffi::{c_char, c_double, c_int, c_long, CStr, CString};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 
@@ -90,6 +91,28 @@ struct Host {
 /// Installed once, by [`spawn`], and read from whichever thread a primitive
 /// happens to be called on — the boot thread, or one ECL made itself.
 static HOST: OnceLock<Host> = OnceLock::new();
+
+/// How deep the running Lisp command is inside undo groups — nonzero while it
+/// is collecting several edits into one undo step.
+///
+/// Every primitive that writes takes a checkpoint for itself, which is right
+/// for a command that edits once and wrong for the several that do not: ticking
+/// a checkbox rewrites the box and then every statistics cookie above it, and
+/// demoting a subtree rewrites a headline per line — so `u` walked back out of
+/// them one `replace-region` at a time. The group takes the one checkpoint at
+/// its start and the writers inside it take none.
+///
+/// A depth and not a flag, because the groups nest in practice: `M-RET' under a
+/// checkbox opens a line and then recounts every cookie above it, and the
+/// recount is itself a group because it is also reached on its own. A flag would
+/// have the inner one switch checkpoints back *on* while the outer was still
+/// open.
+static UNDO_GROUP: AtomicUsize = AtomicUsize::new(0);
+
+/// True when the checkpoint has already been taken for this group of edits.
+fn grouped() -> bool {
+    UNDO_GROUP.load(Ordering::Relaxed) > 0
+}
 
 /// Run `f` with the editor locked.
 ///
@@ -365,8 +388,11 @@ pub extern "C" fn rs_show_dashboard() {
 pub extern "C" fn rs_insert(text: *const c_char) {
     // Checkpoint first: text a Lisp command inserts is one user-level edit, so
     // a single `u` must take it back out. Without this, undo would jump past it
-    // to whenever the user last typed.
-    emit(EditorCommand::Checkpoint);
+    // to whenever the user last typed. Unless a group already took it — see
+    // [`UNDO_GROUP`].
+    if !grouped() {
+        emit(EditorCommand::Checkpoint);
+    }
     emit(EditorCommand::InsertText(unsafe { str_or_empty(text) }));
 }
 
@@ -510,10 +536,37 @@ pub extern "C" fn rs_goto_char(n: c_long) {
     emit(EditorCommand::MoveTo(n.max(0) as usize));
 }
 
+/// Open an undo group: take the one checkpoint the edits inside it will share.
+///
+/// Taken *here* rather than lazily at the first write, so that a group whose
+/// body turns out to edit nothing still costs nothing — `Editor::checkpoint`
+/// already refuses to push a snapshot identical to the last one.
+#[no_mangle]
+pub extern "C" fn rs_undo_group_begin() {
+    if !grouped() {
+        emit(EditorCommand::Checkpoint);
+    }
+    UNDO_GROUP.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Close it. Called from an `unwind-protect`, so an error inside the body
+/// cannot leave the image with checkpoints switched off.
+#[no_mangle]
+pub extern "C" fn rs_undo_group_end() {
+    // `saturating_sub`: an `end` without a `begin` — a config calling the
+    // primitive by hand rather than through the macro — must not wrap the depth
+    // around and switch checkpoints off for the rest of the session.
+    let _ = UNDO_GROUP.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+        Some(d.saturating_sub(1))
+    });
+}
+
 #[no_mangle]
 pub extern "C" fn rs_delete_region(a: c_long, b: c_long) {
     let (start, end) = ordered(a, b);
-    emit(EditorCommand::Checkpoint);
+    if !grouped() {
+        emit(EditorCommand::Checkpoint);
+    }
     emit(EditorCommand::DeleteRange(start, end));
 }
 
@@ -525,7 +578,9 @@ pub extern "C" fn rs_replace_region(a: c_long, b: c_long, text: *const c_char) {
     let text = unsafe { str_or_empty(text) };
     let (start, end) = ordered(a, b);
     with_editor(|ed| {
-        ed.apply(EditorCommand::Checkpoint);
+        if !grouped() {
+            ed.apply(EditorCommand::Checkpoint);
+        }
         ed.apply(EditorCommand::DeleteRange(start, end));
         // The cursor is set straight rather than through `MoveTo`, because
         // every `apply` ends in the Normal-mode clamp — point may not sit past
@@ -591,7 +646,7 @@ pub extern "C" fn rs_make_overlay(start: c_long, end: c_long) -> c_long {
 /// ordinary integer. A collision would show the wrong equation and needs about
 /// 2^24 distinct fragments in one session to become likely.
 #[no_mangle]
-pub extern "C" fn rs_latex_preview(source: *const c_char) -> c_long {
+pub extern "C" fn rs_latex_preview(source: *const c_char, scale: c_long) -> c_long {
     use std::hash::{Hash, Hasher};
 
     let source = unsafe { str_or_empty(source) };
@@ -605,7 +660,19 @@ pub extern "C" fn rs_latex_preview(source: *const c_char) -> c_long {
     }) else {
         return 0;
     };
-    let dpi = zemacs_latex::dpi_for_em(px);
+    // `scale` is a percentage of that em, the unit the whole overlay bridge
+    // carries a fraction in — `overlay-scale` and `%image-file` both send
+    // hundredths for the same reason, that this boundary is integers and
+    // strings. 0 (and anything absurd) means "body size".
+    //
+    // Resolved here rather than in Lisp for `%image-file`'s reason as well: the
+    // em in *device* pixels is something only the renderer knows, so a fragment
+    // sized from `(font-size)` in the image would come out half height on a
+    // Retina display. What Lisp gets to say is the ratio — this equation is a
+    // heading's, this one is a display fragment — which is policy, and policy is
+    // Lisp's.
+    let scale = if (10..=400).contains(&scale) { scale } else { 100 };
+    let dpi = zemacs_latex::dpi_for_em(px * scale as f32 / 100.0);
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     (&source, dpi, color).hash(&mut hasher);
@@ -979,6 +1046,9 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
         // available: the envelope carries a string and has no NIL.
         "font-path" => EditorCommand::SetFontPath((!arg.is_empty()).then_some(arg)),
         "list-fonts" => EditorCommand::ListFonts,
+        // The clipboard's picture, written down. See `EditorCommand::ClipboardImage`
+        // — the answer comes back as a call to `%clipboard-image`, not as a value.
+        "clipboard-image" => EditorCommand::ClipboardImage,
 
         // --- the modeline ----------------------------------------------------
         //
@@ -996,6 +1066,10 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
         // [`Settings::indent_openers`].
         "indent-openers" => EditorCommand::SetIndentOpeners(arg),
 
+        // A mode's standing note, drawn by `%N'. Empty takes it down, which is
+        // how a watcher says "nothing to report" without the caller having to
+        // know whether a segment exists.
+        "modeline-note" => EditorCommand::SetModelineNote(arg),
         "modeline-clear" => EditorCommand::Modeline(None),
         "modeline-segment" => EditorCommand::Modeline(Some((
             a & 1 != 0,
@@ -1100,7 +1174,9 @@ pub extern "C" fn rs_do(verb: *const c_char, arg: *const c_char, a: c_long, b: c
         // Same reason `insert` checkpoints: a paste a Lisp command makes is one
         // user-level edit, and one `u` has to take all of it back out.
         Some(cmd @ EditorCommand::Paste { .. }) => {
-            emit(EditorCommand::Checkpoint);
+            if !grouped() {
+                emit(EditorCommand::Checkpoint);
+            }
             emit(cmd);
         }
         Some(cmd) => emit(cmd),

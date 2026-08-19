@@ -185,11 +185,14 @@ fn a_branch_name_is_asked_for_in_lisp_and_arrives_as_one_git_verb() {
     // entry in the panel as well as a key that does nothing. `c' is the one
     // that has to be a *prefix*: core resolves an exact binding before it asks
     // whether a sequence is a prefix, so a bare `c' would make `c a' dead.
+    // Discard is on `x', not on magit's own `k'. `k' is *up*, and the whole
+    // reason the magit keymap layers over Normal is that the motions keep
+    // working — so this assertion is the guard on the motion, not on the verb.
     says(
         &shared,
         &lisp,
         r#"(second (first (where-is "magit-discard")))"#,
-        "k",
+        "x",
     );
     says(
         &shared,

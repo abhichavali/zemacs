@@ -670,6 +670,37 @@ rest of the primitives unqualified."
       (find-file (namestring *config-file*))
       (message "no config file to edit")))
 
+;;; The notes file, which is `edit-config' pointed at prose instead of Lisp: one
+;;; path, reachable from every buffer and every mode, for the thing you noticed
+;;; while you were busy doing something else. `init.lisp' binds it everywhere,
+;;; because a notes file you can only reach from some buffers is one you stop
+;;; trusting and therefore stop using.
+
+(defparameter *todo-file* "~/Code/zemacs/TODO.org"
+  "The file `open-todo' opens. `~/' is expanded, and the file is created if it is
+not there.
+
+One fixed path and deliberately not the current project's TODO.org: the whole
+value of this key is that it goes to the *same* file wherever you press it, so a
+complaint thought of while editing something else lands with the others rather
+than in whatever directory you happened to be in. Set it in your init to keep
+your notes somewhere else.")
+
+(defun open-todo ()
+  "Open `*todo-file*', creating it if this is the first note.
+
+Created and not merely opened, because `find-file' on a path with nothing behind
+it is an error in the status line rather than an empty buffer — and the single
+moment anyone reaches for this is the moment they least want to be told to go
+and make a file first. `:if-exists nil' so an existing file is opened and never
+truncated: this command must be safe to hold down."
+  (let ((path (%expand-home *todo-file*)))
+    (with-open-file (s path :direction :output
+                            :if-does-not-exist :create
+                            :if-exists nil)
+      (declare (ignore s)))
+    (find-file path)))
+
 (defun lisp-version ()
   "Prove there is a real Common Lisp in here."
   (message (format nil "~a ~a — ~d symbol~:p in ZEMACS"
@@ -996,6 +1027,30 @@ the bar, so the ink has to swap to the ground it is now sitting on."
        (%face-number face))
   nil)
 
+(defvar *modeline-note-functions* nil
+  "Functions called with the note's text when the `%N' segment is clicked.
+
+The one segment whose meaning this file cannot know: the note belongs to
+whichever mode put it there, so that mode is what has anything to say about it.
+Each is called with what the strip is showing and answers a string to say
+instead, or NIL to pass. The first answer wins; if nobody answers, the note
+itself is repeated — which is worth doing on its own, since the strip truncates
+and a narrow pane shows half of it.
+
+DEFVAR and not DEFPARAMETER: reloading a config must not throw away the
+handlers the modes already registered.")
+
+(defun modeline-note (text)
+  "Put TEXT on the modeline wherever the strip has a `%N', or take it down when
+TEXT is NIL or empty.
+
+For a *mode* with a standing fact to report — a watcher's backlog, a job in
+flight — as opposed to `message', which is for the thing that just happened and
+is gone by the time anyone looks. A `%N' segment disappears entirely while the
+note is empty, so a mode that is quiet costs nothing on the strip."
+  (%do "modeline-note" (or text "") 0 0)
+  nil)
+
 (defun default-modeline ()
   "Build the strip the editor ships with.
 
@@ -1030,6 +1085,11 @@ editor keeps for a headless session. Your init runs after this and may
   (modeline-segment :left "  %k" :face "constant" :bold t)
 
   ;; Right: what this buffer is, and where in it you are.
+  ;; A mode's standing note, before the buffer's own facts: it is the only thing
+  ;; on the right that is *transient*, and a segment that comes and goes is less
+  ;; disturbing at the edge of the group than in the middle of it. Empty almost
+  ;; always, and an empty `%N' drops the whole segment.
+  (modeline-segment :right "%N  " :face "accent")
   (modeline-segment :right "%P  " :face "comment")
   (modeline-segment :right "%M  " :face "type")
   (modeline-segment :right "%n" :face "comment")
@@ -1043,6 +1103,76 @@ editor keeps for a headless session. Your init runs after this and may
   nil)
 
 (default-modeline)
+
+;;; ---------------------------------------------------------------------------
+;;; ...and clicking one
+;;;
+;;; The renderer answers which *segment* the pointer landed on, as the template
+;;; it was drawn from plus the text it expanded to, and calls this. Same
+;;; division of labour as a scene's hit test and a terminal's: the gesture is
+;;; the renderer's arithmetic, what it means is policy, and policy is here.
+;;;
+;;; The template and not the text is the identity, and it has to be: `●' and
+;;; `◈' are two glyphs *this file* chose a page ago, and a segment expanding to
+;;; `Rust' one frame and `Org' the next is the same segment. `" %+"' is what
+;;; the config wrote down, so it is the only stable name the strip has.
+;;;
+;;; Every arm either says something or does the one obvious thing. Nothing here
+;;; is destructive except `%+', which saves — and saving is exactly what the dot
+;;; is telling you about.
+
+(defun %modeline-code (template)
+  "The first `%' code in TEMPLATE, as a character, or NIL for a literal.
+
+`%%' is a literal per cent and is stepped over rather than answered, which is
+the only subtlety: a segment spelled `100%%' has no code in it at all, and
+reporting `%' as its code would make it click as whatever `%' comes to mean
+next."
+  (let ((n (length template)) (i 0))
+    (loop while (< i (1- n))
+          do (if (char= (char template i) #\%)
+                 (let ((c (char template (1+ i))))
+                   (if (char= c #\%) (incf i 2) (return c)))
+                 (incf i)))))
+
+(defun %modeline-click (template text)
+  "Somebody clicked the modeline segment drawn from TEMPLATE, which said TEXT.
+
+TEXT is passed rather than re-read because a click lands on the pane under the
+pointer and that is not necessarily the focused one — the readers here all
+answer about the *live* buffer, so anything the segment itself already knows is
+better taken from what was drawn."
+  (case (%modeline-code template)
+    ;; The dot. It is there to tell you the buffer is not on disk; clicking it
+    ;; is the shortest possible way to act on that.
+    (#\+ (if (buffer-modified-p)
+             (save-file)
+             (message "nothing to save")))
+    ;; ...and its neighbour, which is the opposite claim.
+    (#\r (message "read-only — nothing typed into this buffer will land"))
+    ;; The buffer's name is shortened to fit; its path is not.
+    ((#\b #\f) (message (or (buffer-file-name) (buffer-name))))
+    ;; The last message, clicked, is a request to see the ones before it.
+    (#\s (messages-buffer))
+    ;; The mode pill, and the two mode segments beside the position.
+    (#\m (message (format nil "~:(~a~) state — Esc for normal, `i' to insert"
+                          (evil-state))))
+    ((#\M #\n)
+     (let ((minor (minor-modes)))
+       (message (format nil "~a~@[ + ~{~a~^ ~}~]" (major-mode) minor))))
+    ;; Where you are, spelled out: the strip has room for `12:4' and not for
+    ;; what it is 12 of.
+    ((#\l #\c #\p)
+     (message (format nil "line ~d of ~d, column ~d" (line-number) (line-count)
+                      (1+ (column)))))
+    (#\P (message (format nil "permissions ~a" text)))
+    ;; A mode's standing note. Whoever put it there owns what it says, so the
+    ;; hook is the answer rather than a table here — see `modeline-note'.
+    (#\N (dolist (f *modeline-note-functions* (message text))
+            (let ((said (ignore-errors (funcall f text))))
+              (when said (return (message said))))))
+    (t nil))
+  nil)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Keys
@@ -1388,16 +1518,123 @@ there is no such link does the row itself get read for one."
 ;;; interrupted; two can.
 
 (defun surround-region (left right)
-  "Wrap the selection in LEFT and RIGHT."
+  "Wrap the selection in LEFT and RIGHT.
+
+The generic one, and the shape `docs/reference.org' and the tutorial teach
+`replace-region' with. Org's own emphasis keys do not go through it: emphasis
+has to be trimmed to one line and taken back off again, which is
+`%org-emphasize' below."
   (let ((r (region)))
     (if r
         (replace-region (car r) (cdr r)
                         (concatenate 'string left (region-text) right))
         (message "no selection"))))
 
-(defun org-bold () (surround-region "*" "*"))
-(defun org-italic () (surround-region "/" "/"))
-(defun org-code () (surround-region "~" "~"))
+(defun %org-emphasis-span (&optional word)
+  "What emphasis should go around: (BEG . END), or NIL when there is nothing.
+
+The selection when there is one — shrunk to what org will actually *render*,
+which the raw selection frequently is not. Emphasis may not cross a line break
+and does not render with whitespace against a marker, so Visual-Line, whose
+region reaches the newline, used to put the closing marker on the *next line*,
+and a Visual selection that caught the trailing space gave `* word *'. Both show
+as literal asterisks. Shrinking rather than refusing: you pressed bold on a
+line, and the line's text is what you meant by it.
+
+With nothing selected and WORD, the run of non-whitespace point is in. `SPC m b'
+is pressed in Normal, where by construction there is never a selection, so
+without this the leader spelling could only ever answer `no selection'.
+
+NIL when nothing is left of it, which is what selecting only whitespace is."
+  (let ((r (region)))
+    (when (or r word)
+      (let* ((beg (if r (car r) (line-start)))
+             (raw (if r (buffer-substring beg (cdr r)) (line-string)))
+             ;; Only the first line of what was selected is a candidate at all.
+             (text (subseq raw 0 (or (position #\Newline raw) (length raw))))
+             (n (length text))
+             ;; Point's offset into TEXT. `(- (point) (line-start))' rather than
+             ;; `(column)', which is a screen column and counts a tab as several.
+             (at (if r 0 (min (- (point) beg) n))))
+        (flet ((blank (c) (member c '(#\Space #\Tab))))
+          (let ((lo (if r
+                        (or (position-if-not #'blank text) n)
+                        (1+ (or (position-if #'blank text :end at :from-end t) -1))))
+                (hi (if r
+                        (1+ (or (position-if-not #'blank text :from-end t) -1))
+                        (or (position-if #'blank text :start at) n))))
+            (when (< lo hi)
+              (cons (+ beg lo) (+ beg hi)))))))))
+
+(defun %org-emphasize (mark &optional pair)
+  "Put MARK around what is selected — or take it back off again.
+
+Pressing bold on text that is already bold means *unbold it*: the alternative is
+`**word**', which org renders as neither. The markers can be inside the span —
+you selected `*word*' — or just outside it, which is what selecting or standing
+in the `word' between them gives, and both count.
+
+PAIR is what the typing chords pass, and it does two things. It opens an empty
+pair when there is nothing to wrap, which is what makes `C-b' a key you press
+*while typing* rather than after selecting: org's emphasis is a pair of
+characters and the tedious part is always the closing one, which you type after
+the word and then have to walk back over. `insert-at' puts both down in one edit
+— one undo step, and no window for a keystroke to land between the two halves —
+and point is then moved the one character inwards. It also reaches for no word:
+mid-word, mid-sentence, the run you are standing in is not the one you meant.
+
+PAIR is the org guard as well, and NIL outside org silently: `C-b' and `C-i' are
+bound in the *insert* state rather than in org's keymap, because in Normal they
+are already vim's page-up and jump-forward and org is not worth either. A state
+binding is global, so this is what keeps them from putting a stray asterisk in a
+`.rs' file. It costs nothing anywhere else — an unbound Ctrl chord in Insert
+already does exactly nothing. `SPC m b' is in org's own keymap and needs no
+guard, which is what lets `M-x org-bold' mean the same thing in a markdown
+buffer."
+  (unless (and pair (not (derived-mode-p 'org-mode)))
+    (let ((visual (and (region) t))
+          (span (%org-emphasis-span (not pair))))
+      (cond
+        (span
+         (let* ((beg (car span))
+                (end (cdr span))
+                (text (buffer-substring beg end))
+                (m (length mark)))
+           (cond ((and (>= (length text) (* 2 m))
+                       (string= mark text :end2 m)
+                       (string= mark text :start2 (- (length text) m)))
+                  (replace-region beg end (subseq text m (- (length text) m))))
+                 ((and (string= mark (buffer-substring (- beg m) beg))
+                       (string= mark (buffer-substring end (+ end m))))
+                  (replace-region (- beg m) (+ end m) text))
+                 (t
+                  (replace-region beg end
+                                  (concatenate 'string mark text mark))))
+           ;; The selection it came from now covers text that has moved, and a
+           ;; `d' pressed next would delete the wrong run. An operator leaves
+           ;; Visual in vim, and this is one.
+           (when visual (set-evil-state "normal"))))
+        (pair
+         (let ((at (point)))
+           (insert-at at (concatenate 'string mark mark))
+           (goto-char (+ at (length mark)))))
+        (t (message "nothing to emphasise")))))
+  nil)
+
+;;; The three the leader spelling reaches, in whatever buffer you are in. With
+;;; nothing selected they take the word point is in, which is the only thing
+;;; `SPC m b' can mean: it is pressed in Normal, and Normal has no selection.
+(defun org-bold () (%org-emphasize "*"))
+(defun org-italic () (%org-emphasize "/"))
+(defun org-code () (%org-emphasize "~"))
+
+;;; ...and the three `C-b'/`C-i'/`C-~'-shaped ones, which are org's alone and
+;;; open an empty pair instead of reaching for a word. Separate functions rather
+;;; than a flag on the three above, because a key binding names a zero-argument
+;;; function and both spellings have to be bindable.
+(defun org-emphasis-bold () (%org-emphasize "*" t))
+(defun org-emphasis-italic () (%org-emphasize "/" t))
+(defun org-emphasis-code () (%org-emphasize "~" t))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The rest of the runtime
@@ -1518,6 +1755,9 @@ there is no such link does the row itself get read for one."
     ;; ...and the agenda after the table, because it is a scanner over
     ;; `xref-show' and reads `*org-todo-keywords*' out of `org-modern.lisp'.
     "modes/org-agenda.lisp" "modes/org-frozen.lisp"
+    ;; After `org-modern.lisp', which is where `*org-mode-functions*' is
+    ;; declared and therefore where the hook this adds itself to has to exist.
+    "modes/mathsync.lisp"
     "modes/math.lisp" "modes/ai.lisp" "modes/tutor.lisp"
     "modes/math-code.lisp" "modes/math-written.lisp")
   "The shipped runtime, in load order. `modes/modes.lisp' is not here: it comes

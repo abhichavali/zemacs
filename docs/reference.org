@@ -1432,7 +1432,7 @@ app layer, which does the work and feeds the result back as buffer text.
 
 | Form                   |    | Verbs                                                        |
 |------------------------+----+--------------------------------------------------------------|
-| =(magit verb)=           | HA | ="status"= ="refresh"= ="toggle"= ="visit"= ="log"= · ="stage"= ="unstage"= ="stage-all"= ="unstage-all"= ="discard"= · ="commit"= ="commit-amend"= ="commit-finish"= ="amend"= ="reword"= ="squash"= ="drop-commit"= · ="stash"= ="stash-pop"= ="stash-apply"= ="stash-drop"= · ="fetch"= ="pull"= ="push"= ="push-upstream"= ="push-force"= · ="checkout"= ="checkout-new"= ="branch-create"= ="branch-delete"= ="branch-delete-force"= · ="merge"= ="cherry-pick"= ="revert"= ="rebase"= ="continue"= ="abort"= ="rebase-continue"= ="rebase-skip"= ="rebase-abort"= · ="reset-soft"= ="reset-mixed"= ="reset-hard"= · ="resolve-ours"= ="resolve-theirs"= |
+| =(magit verb)=           | HA | ="status"= ="refresh"= ="toggle"= ="visit"= ="log"= · ="stage"= ="unstage"= ="stage-all"= ="unstage-all"= ="discard"= · ="commit"= ="commit-amend"= ="commit-finish"= ="commit-fixup"= ="commit-instant-fixup"= ="amend"= ="reword"= ="squash"= ="drop-commit"= · ="stash"= ="stash-pop"= ="stash-apply"= ="stash-drop"= · ="fetch"= ="fetch-all"= ="pull"= ="push"= ="push-upstream"= ="push-force"= · ="checkout"= ="checkout-new"= ="branch-create"= ="branch-rename"= ="branch-delete"= ="branch-delete-force"= ="tag"= ="tag-delete"= · ="merge"= ="cherry-pick"= ="revert"= ="rebase"= ="rebase-upstream"= ="rebase-interactive"= ="rebase-finish"= ="rebase-cancel"= ="rebase-modify"= ="rebase-autosquash"= ="continue"= ="abort"= ="rebase-continue"= ="rebase-skip"= ="rebase-abort"= · ="reset-soft"= ="reset-mixed"= ="reset-hard"= · ="resolve-ours"= ="resolve-theirs"= |
 | =(dired verb-or-directory)= | HA | ="open"= ="up"= ="enter"= ="mark"= ="unmark"= ="toggle-marks"= ="flag-delete"= ="execute"= ="rename"= ="copy"= ="mkdir"= ="create-file"= ="toggle-hidden"= ="refresh"= — or a *directory* to list, ="~/"= expanded |
 | =(terminal verb)=        | HA | ="open"= ="new"= ="close"= ="restart"= ="next"= ="prev"= ="normal"= ="insert"= ="run:NAME:COMMAND"= ="rerun:NAME:COMMAND"= |
 | =(term-send-key key)=    | HA | One keystroke, spelled as =(key-bindings)= spells one.        |
@@ -1449,9 +1449,22 @@ The same verbs are reachable as command strings (=magit-status=, =dired-enter=,
 A git verb may carry *one argument* after a space — =(magit "checkout main")=,
 =(magit "stash a message with spaces")= — which is how a question whose answer
 is data stays in the image: =runtime/modes/magit.lisp= is a dozen =read-string=
-calls and nothing else. Everything that acts on the commit, file or stash *under
-the cursor* takes no argument and needs no prompt. A verb that can lose work
-still stops to ask first, and that guard is Rust's — see [[file:boundary.org][boundary.org]].
+and =completing-read= calls and nothing else. A revision completes over
+=(git-refs)= — every branch, remote branch and tag of the repository behind the
+live buffer — and a branch over =(git-branches)=; both are readers. Everything
+that acts on the commit, file or stash *under the cursor* takes no argument and
+needs no prompt. A verb that can lose work still stops to ask first, and that
+guard is Rust's — see [[file:boundary.org][boundary.org]].
+
+="rebase-interactive"= opens the todo list =git rebase -i= would have handed an
+editor, as a buffer in =git-rebase-mode= (also =magit.lisp=): =p r e s f d= set
+the step under point and move down, =x= and =b= insert an =exec= or a =break=,
+=M-k=/=M-j= move a step, =C-c C-c= is ="rebase-finish"= — which parses the buffer
+and hands git the list whole — and =C-c C-k= is ="rebase-cancel"=.
+
+Pressing =?= or =h= in the status buffer shows every key it answers to, drawn by
+which-key out of the same table the prefixes are. The labels are Magit's own
+transient wording, declared beside each binding with =which-key-describe=.
 
 ** Terminal sessions come in more than one
 

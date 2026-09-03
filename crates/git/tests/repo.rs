@@ -1007,6 +1007,104 @@ fn an_edit_step_stops_the_rebase_without_conflicting() {
     assert_eq!(zemacs_git::status(repo.path()).unwrap().rebase, None);
 }
 
+/// `c f` then `r f`: a `fixup!` commit, and the autosquash that folds it into
+/// the commit it names. git writes the todo list itself, so the assertion is
+/// on what is left — two commits, the fixup gone, its change in the right one.
+#[test]
+fn a_fixup_commit_is_folded_in_by_autosquash() {
+    if no_git() {
+        return;
+    }
+    let repo = three("fixup");
+    let second = short(repo.path(), "HEAD~1");
+
+    write(repo.path(), "second.txt", "second, corrected\n");
+    git(repo.path(), &["add", "second.txt"]);
+    zemacs_git::commit_fixup(repo.path(), &second).unwrap();
+    assert_eq!(log_count(repo.path()), 4);
+    assert_eq!(message(repo.path(), "HEAD"), "fixup! second");
+
+    // ...with an unrelated edit still in the tree, which git would otherwise
+    // refuse to rebase over; `--autostash` carries it across.
+    write(repo.path(), "loose.txt", "not yet\n");
+    assert!(matches!(
+        zemacs_git::rebase_autosquash(repo.path(), "HEAD~3").unwrap(),
+        RebaseOutcome::Done(_)
+    ));
+    assert_eq!(log_count(repo.path()), 3);
+    assert_eq!(message(repo.path(), "HEAD~1"), "second");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("second.txt")).unwrap(),
+        "second, corrected\n"
+    );
+    assert!(repo.path().join("loose.txt").exists(), "the stash came back");
+
+    // Nothing staged is nothing to fix up with.
+    assert!(zemacs_git::commit_fixup(repo.path(), "HEAD").is_err());
+}
+
+/// `r i` starts from a commit and reaches HEAD, oldest first — the list an
+/// editor is opened on — and refuses a commit that is not on the branch.
+#[test]
+fn an_interactive_plan_runs_from_a_commit_to_head() {
+    if no_git() {
+        return;
+    }
+    let repo = three("plan-from");
+    let plan = zemacs_git::plan_from(repo.path(), &short(repo.path(), "HEAD~1")).unwrap();
+    assert_eq!(plan.base.as_deref(), Some(git(repo.path(), &["rev-parse", "HEAD~2"]).trim()));
+    let subjects: Vec<&str> = plan.todo.iter().map(|t| t.subject.as_str()).collect();
+    assert_eq!(subjects, ["second", "third"]);
+    assert!(plan.todo.iter().all(|t| t.action == Action::Pick));
+
+    // From the root: no base, and git spells that `--root`.
+    let root = zemacs_git::plan_from(repo.path(), &short(repo.path(), "HEAD~2")).unwrap();
+    assert_eq!(root.base, None);
+    assert_eq!(root.todo.len(), 3);
+
+    zemacs_git::branch_create(repo.path(), "aside", Some("HEAD~2")).unwrap();
+    git(repo.path(), &["checkout", "-q", "aside"]);
+    write(repo.path(), "aside.txt", "a\n");
+    commit_all(repo.path(), "aside");
+    let err = zemacs_git::plan_from(repo.path(), &short(repo.path(), "main"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not on the current branch"), "{err}");
+}
+
+/// What a revision prompt completes over: heads, then remotes, then tags, and
+/// never `origin/HEAD`, which is a branch already in the list under its name.
+#[test]
+fn refs_lists_branches_remotes_and_tags_in_that_order() {
+    if no_git() {
+        return;
+    }
+    let repo = init("refs");
+    write(repo.path(), "a.txt", "a\n");
+    commit_all(repo.path(), "first");
+    zemacs_git::branch_create(repo.path(), "feature", None).unwrap();
+    zemacs_git::tag(repo.path(), "v1", "HEAD").unwrap();
+
+    let remote = Temp::new("refs-remote");
+    git(remote.path(), &["init", "-q", "--bare", "."]);
+    git(repo.path(), &["remote", "add", "origin", remote.path().to_str().unwrap()]);
+    git(repo.path(), &["push", "-q", "origin", "main"]);
+    git(repo.path(), &["remote", "set-head", "origin", "main"]);
+
+    let refs = zemacs_git::refs(repo.path()).unwrap();
+    assert_eq!(refs, ["feature", "main", "origin/main", "v1"], "{refs:?}");
+
+    zemacs_git::tag_delete(repo.path(), "v1").unwrap();
+    assert!(!zemacs_git::refs(repo.path()).unwrap().contains(&"v1".to_string()));
+
+    zemacs_git::branch_rename(repo.path(), "trunk").unwrap();
+    assert_eq!(
+        zemacs_git::status(repo.path()).unwrap().branch.as_deref(),
+        Some("trunk")
+    );
+    assert!(zemacs_git::fetch_all(repo.path()).is_ok());
+}
+
 #[test]
 fn squashing_a_commit_into_its_parent_leaves_one_commit_and_both_messages() {
     if no_git() {

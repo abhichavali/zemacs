@@ -62,9 +62,9 @@ pub use hunk::{
     FileDiff, Hunk,
 };
 pub use rebase::{
-    amend, drop_commit, parse_todo, plan_last, plan_onto, rebase_abort, rebase_continue,
-    rebase_skip, rebase_start, rebase_state, reword, squash, write_todo, Action, Plan, Rebase,
-    RebaseOutcome, TodoItem,
+    amend, drop_commit, parse_todo, plan_from, plan_last, plan_onto, rebase_abort,
+    rebase_autosquash, rebase_continue, rebase_skip, rebase_start, rebase_state, reword, squash,
+    write_todo, Action, Plan, Rebase, RebaseOutcome, TodoItem,
 };
 pub use render::{render, Face, Line, Section, Span};
 
@@ -501,6 +501,14 @@ pub fn commit(repo: &Path, message: &str) -> Result<String> {
     Ok(first_line(&out).unwrap_or_else(|| "committed".into()))
 }
 
+/// Commit the index as a `fixup!` of `revision` — Magit's `c f`. No message is
+/// asked for: git writes `fixup! <that commit's subject>`, which is exactly what
+/// [`rebase_autosquash`] looks for when it folds the commit back in.
+pub fn commit_fixup(repo: &Path, revision: &str) -> Result<String> {
+    let out = run(repo, ["commit".to_string(), format!("--fixup={}", rev(revision)?)])?;
+    Ok(first_line(&out).unwrap_or_else(|| "committed".into()))
+}
+
 /// Push to the configured upstream. Fails loudly when there is none — that is
 /// something the user has to see, not something to paper over. [`push_upstream`]
 /// is the one that configures it.
@@ -603,6 +611,12 @@ pub fn pull(repo: &Path) -> Result<String> {
 /// Update the remote-tracking branches without touching anything local.
 pub fn fetch(repo: &Path) -> Result<String> {
     let out = run(repo, ["fetch"])?;
+    Ok(last_line(&out).unwrap_or_else(|| "fetched".into()))
+}
+
+/// The same, from every remote — Magit's `f a`.
+pub fn fetch_all(repo: &Path) -> Result<String> {
+    let out = run(repo, ["fetch", "--all"])?;
     Ok(last_line(&out).unwrap_or_else(|| "fetched".into()))
 }
 
@@ -761,6 +775,53 @@ pub fn branches(repo: &Path) -> Result<Vec<Branch>> {
             })
         })
         .collect())
+}
+
+/// Every name a revision prompt should offer: local branches, then
+/// remote-tracking branches, then tags, each group in git's own order.
+/// `origin/HEAD` is left out — it names a branch that is already in the list.
+pub fn refs(repo: &Path) -> Result<Vec<String>> {
+    let out = git(
+        repo,
+        [
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/",
+            "refs/remotes/",
+            "refs/tags/",
+        ],
+    )?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|r| {
+            r.strip_prefix("refs/heads/")
+                .or_else(|| r.strip_prefix("refs/remotes/"))
+                .or_else(|| r.strip_prefix("refs/tags/"))
+        })
+        .filter(|name| !name.ends_with("/HEAD"))
+        .map(str::to_string)
+        .collect())
+}
+
+/// Give the current branch a new name. Its upstream and reflog come along.
+pub fn branch_rename(repo: &Path, name: &str) -> Result<()> {
+    run(repo, ["branch".to_string(), "-m".into(), rev(name)?.to_string()])?;
+    Ok(())
+}
+
+/// A lightweight tag on `revision`.
+pub fn tag(repo: &Path, name: &str, revision: &str) -> Result<()> {
+    run(
+        repo,
+        ["tag".to_string(), rev(name)?.to_string(), rev(revision)?.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Delete a tag. The commit it named is untouched.
+pub fn tag_delete(repo: &Path, name: &str) -> Result<String> {
+    let out = run(repo, ["tag".to_string(), "-d".into(), rev(name)?.to_string()])?;
+    Ok(last_line(&out).unwrap_or_else(|| "deleted".into()))
 }
 
 /// Make a branch at `start` (or at HEAD) without moving onto it.
@@ -1047,12 +1108,16 @@ pub(crate) fn last_line(out: &Output) -> Option<String> {
     lines(out).last()
 }
 
+/// Every line of both streams, in order. A carriage return breaks a line too:
+/// `git rebase` writes its progress as `Rebasing (2/3)\rRebasing (3/3)\r` and
+/// the result after it on the *same* line, and the status bar would otherwise
+/// be handed all three with the returns still in.
 fn lines(out: &Output) -> impl Iterator<Item = String> + '_ {
     let both = [&out.stdout, &out.stderr];
     both.into_iter()
         .flat_map(|b| {
             String::from_utf8_lossy(b)
-                .lines()
+                .split(['\n', '\r'])
                 .map(|l| l.trim().to_string())
                 .collect::<Vec<_>>()
         })
@@ -1233,6 +1298,19 @@ fn header(rec: &[u8], status: &mut Status) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `git rebase` writes its progress with carriage returns and the result
+    /// after them on the same line; the status bar wants the result alone.
+    #[test]
+    fn a_carriage_return_ends_a_line_of_output() {
+        let out = Output {
+            status: std::process::ExitStatus::default(),
+            stdout: Vec::new(),
+            stderr: b"Rebasing (2/3)\rRebasing (3/3)\rSuccessfully rebased.\n".to_vec(),
+        };
+        assert_eq!(last_line(&out).as_deref(), Some("Successfully rebased."));
+        assert_eq!(first_line(&out).as_deref(), Some("Rebasing (2/3)"));
+    }
 
     /// Parsing is pure, so the awkward records are worth pinning down here
     /// without a repository; the integration tests drive the real thing.

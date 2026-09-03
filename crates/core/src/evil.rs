@@ -4521,6 +4521,8 @@ impl Editor {
                 // C-c away from everywhere else.
                 if self.buffer.kind == crate::BufferKind::CommitMessage {
                     self.run_action("magit-commit-finish")
+                } else if self.buffer.kind == crate::BufferKind::RebaseTodo {
+                    self.run_action("magit-rebase-finish")
                 } else if self.mode.is_visual() {
                     self.run_action("eval-region")
                 } else if self.buffer.last_top_level_form(self.buffer.cursor + 1).is_some() {
@@ -5041,6 +5043,71 @@ mod tests {
                 .any(|c| matches!(c, EditorCommand::CallLisp(s) if s.contains("my-f5"))),
             "an F-key is a key a config can bind: {out:?}"
         );
+    }
+
+    /// A config that bound `c` whole, then a runtime that binds `c a`: the
+    /// later binding has to win, or `c a` is a sequence nobody can type — the
+    /// lookup resolves an exact match before it asks about prefixes. And the
+    /// other way round, because both are what Emacs does and a family the
+    /// user has just overwritten with a whole key is not theirs any more.
+    #[test]
+    fn a_later_binding_displaces_a_prefix_or_a_family_in_the_same_map() {
+        let bind = |ed: &mut Editor, keys: &str, command: &str| {
+            ed.apply(EditorCommand::BindKey {
+                mode: "magit".into(),
+                keys: keys.into(),
+                command: command.into(),
+            })
+        };
+        let mut ed = fresh("x\n");
+        ed.mode = Mode::Magit;
+        bind(&mut ed, "c", "magit-commit");
+        bind(&mut ed, "c a", "magit-commit-amend");
+        bind(&mut ed, "c c", "magit-commit");
+        // `c` alone now waits for the rest, instead of committing on the spot.
+        let out = ed.handle_key(Key::Char('c'));
+        assert!(
+            out.iter().all(|c| !matches!(c, EditorCommand::Git(_))),
+            "`c` is a prefix now: {out:?}"
+        );
+        let out = ed.handle_key(Key::Char('a'));
+        assert_eq!(out, vec![EditorCommand::Git("commit-amend".into())]);
+        assert!(!ed.keymap.contains_key(&(Mode::Magit, "c".to_string())));
+
+        // The family goes the moment `c` is asked for whole again.
+        bind(&mut ed, "c", "magit-commit");
+        assert!(!ed.keymap.contains_key(&(Mode::Magit, "c a".to_string())));
+        assert!(!ed.keymap.contains_key(&(Mode::Magit, "c c".to_string())));
+        assert_eq!(
+            ed.handle_key(Key::Char('c')),
+            vec![EditorCommand::Git("commit".into())]
+        );
+        // Another map's `c` family is nobody's business here.
+        ed.apply(EditorCommand::BindKey {
+            mode: "normal".into(),
+            keys: "c x".into(),
+            command: "elsewhere".into(),
+        });
+        bind(&mut ed, "c", "magit-commit");
+        assert!(ed.keymap.contains_key(&(Mode::Normal, "c x".to_string())));
+
+        // Insert is the exception in one direction: `C-c` evaluates while you
+        // type, and the `C-c d` that `define-key-everywhere` lands in this map
+        // afterwards must not turn it into a key that waits.
+        let insert = |ed: &mut Editor, keys: &str| {
+            ed.apply(EditorCommand::BindKey {
+                mode: "insert".into(),
+                keys: keys.into(),
+                command: "x".into(),
+            })
+        };
+        insert(&mut ed, "C-c");
+        insert(&mut ed, "C-c d");
+        assert!(ed.keymap.contains_key(&(Mode::Insert, "C-c".to_string())));
+        // ...while a whole key asked for afterwards still takes the family.
+        insert(&mut ed, "C-x C-s");
+        insert(&mut ed, "C-x");
+        assert!(!ed.keymap.contains_key(&(Mode::Insert, "C-x C-s".to_string())));
     }
 
     /// Insert mode agrees with Normal about what they mean, so pressing `i`

@@ -228,6 +228,34 @@ fn ask_here(name: &str) -> Option<String> {
                 .collect();
             Some(format!("({})", rows.join(" ")))
         }
+        // What a git prompt completes over: every ref for a revision (`b b`,
+        // `m m`, `r e`), the local branches alone for a branch (`b k`). The
+        // repository is the one behind the nearest file — asked from the
+        // status buffer, which has no file, that is the buffer `magit-status`
+        // was pressed in, exactly as `Magit::locate` finds it — and no
+        // repository answers `()`: the prompt then completes over nothing and
+        // takes what was typed, which is what it did before this reader.
+        //
+        // git is run outside the lock: the path is copied under it and the
+        // subprocess spawned after, so a slow filesystem costs the Lisp thread
+        // and not the keystroke behind it.
+        "git-refs" | "git-branches" => {
+            let from = with_editor(|ed| ed.nearest_path())?
+                .or_else(|| std::env::current_dir().ok())?;
+            let names: Vec<String> = zemacs_git::repo_root(&from)
+                .and_then(|repo| match name {
+                    "git-refs" => zemacs_git::refs(&repo).ok(),
+                    _ => zemacs_git::branches(&repo)
+                        .ok()
+                        .map(|bs| bs.into_iter().map(|b| b.name).collect()),
+                })
+                .unwrap_or_default();
+            let rows: Vec<String> = names
+                .iter()
+                .map(|n| zemacs_core::query::lisp_string(n))
+                .collect();
+            Some(format!("({})", rows.join(" ")))
+        }
         _ => None,
     }
 }

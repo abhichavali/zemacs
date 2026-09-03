@@ -270,8 +270,9 @@ pub fn plan_onto(repo: &Path, base: &str) -> Result<Plan> {
 }
 
 /// A plan whose todo list starts at `commit`, so `todo[0]` is that commit and
-/// `base` is its parent. The building block under reword/squash/drop.
-fn plan_from(repo: &Path, commit: &str) -> Result<Plan> {
+/// `base` is its parent. The building block under reword/squash/drop, and what
+/// Magit's `r i` opens an editor on: every commit from `commit` up to HEAD.
+pub fn plan_from(repo: &Path, commit: &str) -> Result<Plan> {
     let commit = rev_parse(repo, commit)?;
     let base = rev_parse(repo, &format!("{commit}^")).ok();
     let range = match &base {
@@ -345,6 +346,30 @@ pub fn rebase_start(repo: &Path, plan: &Plan) -> Result<RebaseOutcome> {
     // git has read it by now whether it stopped or finished; leaving it behind
     // would make the next rebase's failure look like a stale success.
     let _ = fs::remove_file(&file);
+    outcome(repo, out)
+}
+
+/// `git rebase -i --autosquash <base>` — Magit's `r f`. git itself writes the
+/// todo list, moving every `fixup!`/`squash!` commit under the one it names, and
+/// this runs it with an editor that changes nothing. So it takes no [`Plan`]:
+/// the whole point is that the list is git's.
+///
+/// `--autostash`, because a fixup is usually made with more edits still in the
+/// tree and git would otherwise refuse to start; Magit's instant fixup stashes
+/// around the rebase the same way.
+pub fn rebase_autosquash(repo: &Path, base: &str) -> Result<RebaseOutcome> {
+    let out = run_with(
+        repo,
+        [
+            "rebase".to_string(),
+            "-i".into(),
+            "--autosquash".into(),
+            "--autostash".into(),
+            rev(base)?.to_string(),
+        ],
+        &[("GIT_SEQUENCE_EDITOR", OsStr::new("true"))],
+        None,
+    );
     outcome(repo, out)
 }
 

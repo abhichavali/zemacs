@@ -2066,18 +2066,35 @@ impl Renderer {
             return;
         };
         let style = editor.settings.completion_style;
-        if !p.completes() || style == CompletionStyle::Minibuffer {
+        // A question with no candidate list — a `read-string`, or the
+        // yes-or-no guard in front of a discard — gets the centered box too
+        // when that is the style, minus the rows. The complaint it answers is
+        // that such a prompt landed on the modeline of whichever pane was
+        // focused, one line high, in the corner. `:` and `/` stay on the strip:
+        // `/` moves the buffer under it as you type, and a scrim over the match
+        // would hide the one thing an incremental search exists to show.
+        let listing = p.completes();
+        let asking = matches!(
+            p.kind,
+            zemacs_core::PromptKind::Lisp { .. } | zemacs_core::PromptKind::Confirm
+        );
+        let framed = style == CompletionStyle::Center;
+        if style == CompletionStyle::Minibuffer || !(listing || (framed && asking)) {
             return;
         }
 
-        // One row for "no matches" so the box never collapses to nothing.
-        let want = p.matches.len().clamp(1, POPUP_ROWS);
-        let framed = style == CompletionStyle::Center;
-        let b = if framed {
+        // One row for "no matches" so the box never collapses to nothing, and
+        // none at all for a prompt that has nothing to list.
+        let want = if listing { p.matches.len().clamp(1, POPUP_ROWS) } else { 0 };
+        let mut b = if framed {
             center_popup(w, h, status_h, self.line_h, self.cell_w, want)
         } else {
             bottom_popup(w, h, status_h, self.line_h, want)
         };
+        if !listing {
+            // No candidate rule under the input line, so no room for one.
+            b.h -= 2 * PADV + 1;
+        }
 
         let (bg, fg) = (editor.settings.background, editor.settings.foreground);
         let accent = accent(editor);
@@ -2121,7 +2138,9 @@ impl Renderer {
 
             y += PADV;
             self.draw_str(&truncate(title_of(&p.label), cols), x0, y, rgb(accent));
-            self.draw_right(&count, b.x + b.w - inset - PAD, y, count_c);
+            if listing {
+                self.draw_right(&count, b.x + b.w - inset - PAD, y, count_c);
+            }
             y += self.line_h + PADV;
             self.fill(b.x + inset, y, b.w - 2 * inset, 1, rule_c);
             y += 1 + PADV;
@@ -2148,6 +2167,9 @@ impl Renderer {
             self.draw_right(&count, b.x + b.w - PAD, y, count_c);
         }
         y += self.line_h;
+        if !listing {
+            return;
+        }
 
         if framed {
             y += PADV;

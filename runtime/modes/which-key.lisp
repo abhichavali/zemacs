@@ -61,9 +61,32 @@ than another prefix."
     (when (and (> (length k) n) (every #'string= p (subseq k 0 n)))
       (values (nth n k) (= (length k) (1+ n))))))
 
+(defparameter *which-key-replacements* nil
+  "(COMMAND . LABEL): what to write beside a key instead of the command's name.
+
+Emacs' which-key shows the command, and for a Lisp command that is the right
+answer — the name is what you would type at `M-x'. A built-in verb is different:
+`magit-commit-instant-fixup' is a spelling nobody chose, and a panel of twenty of
+them is a wall. Magit's own transients write `Fixup' and `Instant fixup', so
+`modes/magit.lisp' says so here, and any config can do the same for its own.
+An alist rather than a hash table: it is read once per prefix key and written
+once per file load, and `assoc' over forty entries is nothing.")
+
+(defun which-key-label (command)
+  "What the panel writes beside COMMAND's key."
+  (or (cdr (assoc command *which-key-replacements* :test #'string=)) command))
+
+(defun which-key-describe (command label)
+  "Show LABEL rather than COMMAND's name in the panel. Replaces an earlier entry
+for COMMAND, so a reload does not stack."
+  (setf *which-key-replacements*
+        (acons command label
+               (remove command *which-key-replacements* :key #'car :test #'string=)))
+  label)
+
 (defun %which-key-group (prefix token)
-  (let ((named (cdr (assoc (concatenate 'string prefix " " token)
-                           *which-key-groups* :test #'string=))))
+  (let* ((key (if (string= prefix "") token (concatenate 'string prefix " " token)))
+         (named (cdr (assoc key *which-key-groups* :test #'string=))))
     (concatenate 'string "+" (or named "..."))))
 
 (defun %which-key-maps ()
@@ -79,23 +102,29 @@ state's own name found no rows there and this function reported nothing at all �
 on the dashboard, which is the buffer the editor starts in."
   (append (reverse (minor-modes)) (list (major-mode)) (evil-keymaps)))
 
-(defun which-key-rows (prefix)
-  "(TOKEN . LABEL) for every key that continues PREFIX in the live buffer, each
-token once, nearest keymap first, sorted by key."
+(defun which-key-rows (prefix &optional maps)
+  "(TOKEN . LABEL) for every key that continues PREFIX, each token once, nearest
+keymap first, sorted by key. The keymaps are the live buffer's unless MAPS names
+them, which is how a mode shows *its own* table rather than everything reachable
+from it — the difference between Magit's `?' and a list that also has every
+Normal-mode key in it."
   (let ((rows nil)
         (bindings (key-bindings)))       ; one reader call, not one per row
-    (dolist (map (%which-key-maps))
+    (dolist (map (or maps (%which-key-maps)))
       (dolist (b bindings)
         (when (string= (first b) map)
           (multiple-value-bind (token wholep) (%key-continuation prefix (second b))
             (when (and token (not (assoc token rows :test #'string=)))
-              (push (cons token (if wholep (third b) (%which-key-group prefix token)))
+              (push (cons token (if wholep
+                                    (which-key-label (third b))
+                                    (%which-key-group prefix token)))
                     rows))))))
     (sort (nreverse rows) #'string< :key #'car)))
 
-(defun which-key (prefix)
+(defun which-key (prefix &optional maps)
   "Show what continues PREFIX: a panel above the status line, and the same
-answer on one line inside it.
+answer on one line inside it. MAPS, when given, names the keymaps to read
+instead of the live buffer's — see `which-key-rows'.
 
 Called by the editor the moment a prefix key is pressed — that is the whole
 feature — and by hand from `M-x' or from `which-key-leader' below.
@@ -123,16 +152,22 @@ rather than per command — every key of a leader sequence but the last. It cost
 one `key-bindings' read and a walk over it, on the Lisp thread, where nothing
 is waiting for it. If that ever shows up, the answer is a cache invalidated by
 wrapping `define-key', not a table filled in by hand."
-  (let* ((rows (which-key-rows prefix))
-         (n (length rows))
+  (which-key-show prefix (which-key-rows prefix maps)))
+
+(defun which-key-show (prefix rows)
+  "Draw ROWS — (TOKEN . LABEL), as `which-key-rows' answers them — as the panel
+for PREFIX, and the same on one line. The half of `which-key' that draws, on its
+own so a caller can choose the rows: `git-dispatch' shows the status buffer's
+table with the bindings every buffer has taken back out of it."
+  (let* ((n (length rows))
          (shown (subseq rows 0 (min n *which-key-limit*)))
          (cells (mapcar (lambda (row) (format nil "~a ~a" (car row) (cdr row))) shown)))
     (which-key-row)                     ; retire the previous prefix's rows
     (when rows
       (dolist (cell cells) (which-key-row cell))
       (message
-       (format nil "~a-  ~{~a~^   ~}~@[   +~a more~]"
-               prefix cells
+       (format nil "~@[~a-  ~]~{~a~^   ~}~@[   +~a more~]"
+               (and (plusp (length prefix)) prefix) cells
                (when (> n *which-key-limit*) (- n *which-key-limit*)))))))
 
 (defun which-key-leader ()

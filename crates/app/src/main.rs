@@ -234,6 +234,9 @@ struct Perf {
     present: Duration,
     worst: Duration,
     presents: u32,
+    /// Frames drawn to a picture the digest said was already on screen: work
+    /// the generation asked for and nobody saw.
+    discards: u32,
     draws: u64,
     /// The number the user actually feels: from SDL stamping a keystroke to the
     /// frame answering it reaching the screen. Everything above is where the
@@ -260,6 +263,7 @@ impl Perf {
             present: Duration::ZERO,
             worst: Duration::ZERO,
             presents: 0,
+            discards: 0,
             draws: 0,
             latency: Duration::ZERO,
             worst_latency: Duration::ZERO,
@@ -281,10 +285,11 @@ impl Perf {
     }
 
     /// One iteration is over. Reports and resets when the interval is up.
-    fn frame(&mut self, started: Instant, presents: u32, draws: u32) {
+    fn frame(&mut self, started: Instant, presents: u32, discards: u32, draws: u32) {
         let Some(every) = self.every else { return };
         self.frames += 1;
         self.presents += presents;
+        self.discards += discards;
         self.draws += u64::from(draws);
         self.worst = self.worst.max(started.elapsed());
         let elapsed = self.since.elapsed();
@@ -294,7 +299,7 @@ impl Perf {
         let n = f64::from(self.frames.max(1));
         let ms = |d: Duration| d.as_secs_f64() * 1000.0 / n;
         eprintln!(
-            "perf: {:.0} fps ({} frames in {:.1}s) | per frame: wait {:.2} input {:.2} draw {:.2} present {:.2} ms, worst {:.1} ms | {:.1} presents, {:.0} draw calls",
+            "perf: {:.0} fps ({} frames in {:.1}s) | per frame: wait {:.2} input {:.2} draw {:.2} present {:.2} ms, worst {:.1} ms | {:.1} presents, {:.1} discarded, {:.0} draw calls",
             n / elapsed.as_secs_f64(),
             self.frames,
             elapsed.as_secs_f64(),
@@ -304,6 +309,7 @@ impl Perf {
             ms(self.present),
             self.worst.as_secs_f64() * 1000.0,
             f64::from(self.presents) / n,
+            f64::from(self.discards) / n,
             self.draws as f64 / n,
         );
         // Only when somebody typed — an idle interval has nothing to say here,
@@ -379,11 +385,20 @@ fn focus_after_close(focus: usize, closed: usize, before: usize) -> usize {
 ///
 /// `OLD-END` is `nil` when the app cannot say what the reader had — a buffer
 /// switch, a document replaced wholesale, or a reader further behind than
-/// core's log reaches. `TEXT` is then the whole buffer, and the meaning is
-/// "replace everything you have", which is exactly the full-text `didChange`
-/// the LSP client sends on every keystroke today. So the incremental case is
-/// the new one and the resynchronising case is the status quo.
+/// core's log reaches. The meaning is "replace everything you have", and
+/// `TEXT` is then `nil` rather than the whole buffer. It used to be the whole
+/// buffer, on the argument above, and it cost every file its own size in Lisp
+/// heap on every load: the string is spliced into a form the image has to
+/// *read* — a Lisp string as long as the file, on the image's heap, which
+/// Boehm grows to fit and never gives back — before the `fboundp` guard finds
+/// there is nobody to hand it to. Measured at 45 MB of image heap for a 3 MB
+/// file, for a hook nothing yet defines.
 ///
+// ponytail: a consumer of the resync case has to read the buffer itself, one
+// turn late — which is the threading gap the paragraph above warns about. When
+// one arrives, stash the snapshot on the app under a serial and hand the form
+// `(%edit-text serial)`, so the text crosses only when asked for and is still
+// the one the record was made from.
 /// One thing a consumer still owes itself, because no delta shape can supply
 /// it: `OLD-END` is an offset into the document *before* the edit, and LSP
 /// wants it as a line and a character. The buffer no longer holds that text, so
@@ -412,15 +427,13 @@ fn after_edit_form(editor: &Editor, told: &mut Option<(BufferId, u64)>) -> Optio
             "nil".to_string(),
         ),
     };
-    let text = editor.buffer.slice_string(change.start, change.new_end);
+    let text = match old_end.as_str() {
+        "nil" => "nil".to_string(),
+        _ => zemacs_rpc::lisp::string(&editor.buffer.slice_string(change.start, change.new_end)),
+    };
     Some(lisp_call(
         "AFTER-EDIT-HOOK",
-        &format!(
-            "{} {old_end} {} {}",
-            change.start,
-            change.new_end,
-            zemacs_rpc::lisp::string(&text),
-        ),
+        &format!("{} {old_end} {} {text}", change.start, change.new_end),
     ))
 }
 
@@ -540,6 +553,14 @@ fn main() -> anyhow::Result<()> {
     }
     start_in_home();
     inherit_login_path();
+    // An editor is not a game. SDL's default is to hold a "no display sleep"
+    // assertion for as long as the video subsystem is up — sensible for
+    // something played with a joystick, and the reason a Mac with zemacs open
+    // never went to sleep on its own (`pmset -g assertions` named it: "zemacs
+    // using SDL_DisableScreenSaver"). Before `init`, because that is when the
+    // assertion is taken; on X11 and Wayland the same hint keeps SDL from
+    // inhibiting the idle timer.
+    sdl3::hint::set("SDL_VIDEO_ALLOW_SCREENSAVER", "1");
     mac_window_hints();
     let sdl = sdl3::init().map_err(|e| anyhow::anyhow!("SDL init: {e}"))?;
     // One renderer per frame, in frame order. See the module docs.
@@ -557,6 +578,53 @@ fn main() -> anyhow::Result<()> {
     let mut pump = sdl
         .event_pump()
         .map_err(|e| anyhow::anyhow!("SDL event pump: {e}"))?;
+
+    // The loop below parks until something happens rather than on a frame
+    // clock, and this is how everything that is not a keyboard says
+    // "something happened". Threads reach the editor through the shared mutex
+    // and raise no window event, so without this the only way to notice one was
+    // to wake on a timer and look — sixty times a second, forever, for the once
+    // in a thousand that anything was there. See `zemacs_core::set_waker`.
+    //
+    // Held in `_events` for the whole run: an `EventSender` does not keep the
+    // subsystem alive, and a shut-down subsystem turns every wakeup into a
+    // silent error — which would be a stale screen with no way to explain it.
+    let _events = sdl
+        .event()
+        .map_err(|e| anyhow::anyhow!("SDL event subsystem: {e}"))?;
+    // Safe in spite of the signature, for the reason `control` gives at its own
+    // call: the only contract on `SDL_RegisterEvents` is that the number comes
+    // back as an event type, which is all it is used as.
+    let wake_type = unsafe { _events.register_event() }
+        .map_err(|e| anyhow::anyhow!("register the wakeup event: {e}"))?;
+    // Whether an unanswered wakeup is already in the queue. Coalescing is not
+    // an optimisation here, it is the thing that makes waking per *primitive*
+    // affordable: a Lisp loop calling `(point)` ten thousand times would
+    // otherwise push ten thousand events into a queue that is finite and whose
+    // overflow drops the keystroke behind them.
+    let woken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let woken = woken.clone();
+        let sender = _events.event_sender();
+        zemacs_core::set_waker(move || {
+            if !woken.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let _ = sender.push_event(Event::User {
+                    timestamp: 0,
+                    window_id: 0,
+                    type_: wake_type,
+                    code: 0,
+                    data1: std::ptr::null_mut(),
+                    data2: std::ptr::null_mut(),
+                });
+            }
+        });
+    }
+    // The PTY thread is the one producer that lives in a crate with no idea an
+    // editor exists, so it gets the same waker by hand. What it buys is the
+    // whole of a terminal's idle cost: the loop used to come round at the
+    // display's rate for as long as any session existed, to see whether the
+    // child had printed. Now the child printing is what wakes it.
+    zemacs_term::set_waker(zemacs_core::wake);
     // Only the perf report reads the clock, but it has to be SDL's own: an
     // event's timestamp is in it, and the interesting part of a keystroke's life
     // is over before this loop ever sees the event.
@@ -630,11 +698,14 @@ fn main() -> anyhow::Result<()> {
         // SDL's queue until the loop came back round from a present it was
         // spending on an unchanged picture anyway.
         //
-        // The timeout is not a frame clock; nothing the user does needs it. It
-        // bounds one thing only: how long a change made by the *Lisp thread* —
-        // which reaches the editor through the shared mutex and raises no SDL
-        // event — can sit undrawn. One display frame is as long as that should
-        // ever be.
+        // The timeout is not a frame clock and no longer pretends to be one.
+        // It used to be one display frame, because a change made by the *Lisp
+        // thread* — which reaches the editor through the shared mutex and
+        // raises no SDL event — could otherwise sit undrawn, and looking sixty
+        // times a second was the only way to find out. The image now says so
+        // itself through `zemacs_core::wake`, so what is left to wake for is
+        // timers, and the park is as long as the nearest one. See
+        // [`App::park_ms`], which is where that arithmetic lives.
         //
         // Before the lock, and that is load-bearing. Parking here holding the
         // editor would put every Lisp primitive behind the user's next
@@ -648,9 +719,7 @@ fn main() -> anyhow::Result<()> {
         let idle = Instant::now();
         let queued = control.as_ref().is_some_and(control::Control::pending);
         let waited = (!presented && !queued)
-            .then(|| {
-                pump.wait_event_timeout_ms(app.renderers.first().map_or(16, Renderer::frame_ms))
-            })
+            .then(|| pump.wait_event_timeout_ms(app.park_ms()))
             .flatten();
         let frame_start = Instant::now();
         perf.idle += frame_start - idle;
@@ -674,6 +743,20 @@ fn main() -> anyhow::Result<()> {
                 break 'main;
             }
         }
+        // Here, and not a line earlier or a line later. This is the whole
+        // correctness of the coalescing in `set_waker` above.
+        //
+        // The flag means "an unanswered wakeup is already in the queue", which
+        // is what lets a producer that finds it set push nothing. Clearing it
+        // *after* the queue has been drained is what makes that sentence true
+        // again: from here on, a thread that touches the editor either pushes
+        // an event — which the park below picks up — or found the flag set by
+        // someone whose event is still queued, which comes to the same thing.
+        // Clearing before the drain leaves a window in which the event that
+        // made the flag true has just been eaten while the flag is still set,
+        // and the change behind the *next* wakeup then sits undrawn until a
+        // timer happens to notice it.
+        woken.store(false, std::sync::atomic::Ordering::Release);
 
         if let Some(i) = batch.closing {
             app.mouse.release(); // whatever was being dragged may be going away
@@ -737,7 +820,11 @@ fn main() -> anyhow::Result<()> {
         // that forgets to touch costs a fraction of a second of staleness — a
         // lag somebody notices and reports — instead of a pane that silently
         // stops updating, which is the failure nobody can describe.
-        let due = app.last_draw.elapsed() >= DRAW_AT_LEAST;
+        // ...and only while somebody is looking. It is a net under a *bug* —
+        // a writer that forgot to `touch` — and the cost of one going unnoticed
+        // behind another window is a window that is right again the moment it
+        // comes forward, because a focus event invalidates the renderer anyway.
+        let due = app.focused && app.last_draw.elapsed() >= DRAW_AT_LEAST;
         let shooting = control.as_ref().is_some_and(control::Control::shooting);
         let drew = editor.generation != app.drawn_generation || due || shooting;
 
@@ -789,7 +876,7 @@ fn main() -> anyhow::Result<()> {
         // Nothing was drawn, so there is nothing new to show. Skipped rather
         // than left to `present`'s own digest test, which would answer the same
         // and flush an empty command list per renderer to do it.
-        let presents = if drew { app.present() } else { 0 };
+        let (presents, discards) = if drew { app.present() } else { (0, 0) };
         presented = presents > 0;
         perf.present += presenting.elapsed();
         // A keystroke that changed nothing on screen — `k` at the top of the
@@ -798,7 +885,7 @@ fn main() -> anyhow::Result<()> {
         if let Some(stamped) = batch.typed.filter(|_| presented) {
             perf.key((now_ns().saturating_sub(stamped) / 1_000_000) as u32);
         }
-        perf.frame(frame_start, presents, draws);
+        perf.frame(frame_start, presents, discards, draws);
     }
     // Language servers are children of this process and outlive it otherwise —
     // one stray `clangd` indexing a repository per session, which is the kind of
@@ -926,6 +1013,17 @@ struct App {
     /// When that was, for the safety net beside it — see [`DRAW_AT_LEAST`].
     last_draw: Instant,
     revert_watch: Revert,
+    /// Whether any of this application's windows has the keyboard.
+    ///
+    /// Two things hang off it, both of which are "nobody is looking at this":
+    /// the `DRAW_AT_LEAST` safety net, which is a net against a bug rather than
+    /// anything a person waits for, and how often files are checked for having
+    /// changed underneath. Neither is worth a wakeup on a laptop in a bag.
+    ///
+    /// True to begin with because the first thing `main` does with a window is
+    /// `focus()` it, and a focus we asked for ourselves raises no event on
+    /// every platform.
+    focused: bool,
     /// Reads, writes and listings on other machines. Inert — no thread, no
     /// socket — until the first `/ssh:` name of the session.
     remote: Remote,
@@ -1013,6 +1111,7 @@ impl App {
             drawn_generation: u64::MAX,
             last_draw: Instant::now(),
             revert_watch: Revert::default(),
+            focused: true,
             remote,
         }
     }
@@ -1199,10 +1298,12 @@ impl App {
             // The far side of a `yes`. Each arm goes to the *same* worker its
             // guarded twin does, with the guard spent — so the question is asked in
             // exactly one place and answered in exactly one place.
+            EditorCommand::RevertBuffer => revert_visited(editor, Save::Guarded),
             EditorCommand::Confirmed(inner) => match *inner {
                 EditorCommand::SaveFile(path) => {
                     save_file(editor, path, Save::Forced, &mut self.remote)
                 }
+                EditorCommand::RevertBuffer => revert_visited(editor, Save::Forced),
                 EditorCommand::Git(verb) => self.magit.run_confirmed(editor, &verb),
                 EditorCommand::Dired(verb) => self.dired.run_confirmed(editor, &verb),
                 // Nothing else parks a command, so this is a confirmation for
@@ -1334,6 +1435,14 @@ impl App {
                     // `NewFrame`; until then two frames showing different
                     // buffers swap contents when you click between them.
                     WindowEvent::FocusGained => {
+                        self.focused = true;
+                        // Straight away rather than on the next tick: while
+                        // nobody was looking the sweep below was running at a
+                        // quarter of its rate, so the first thing to answer on
+                        // coming back is "did any of this change while I was
+                        // away". One stat per open file, once, on an event that
+                        // happens when a human moves a mouse.
+                        self.last_revert = Instant::now() - REVERT_EVERY * 4;
                         if let Some(i) = frame {
                             // Through the command, not a bare assignment:
                             // the live buffer belongs to the focused window,
@@ -1356,6 +1465,12 @@ impl App {
                     // Nothing has to touch `hovered`: it records whether a box
                     // was up, so taking one down is itself the invalidation.
                     WindowEvent::MouseLeave => editor.tooltip = None,
+                    // Nobody is looking. Not "stop drawing" — anything that
+                    // actually changes still draws, because `generation` says
+                    // so and the waker brings the loop round to see it — only
+                    // "stop doing the things whose whole purpose was that
+                    // somebody might be looking". See [`App::focused`].
+                    WindowEvent::FocusLost => self.focused = false,
                     _ => {}
                 }
             }
@@ -1917,6 +2032,59 @@ impl App {
         }
     }
 
+    /// How long the loop may park in `SDL_WaitEventTimeout` before it has to
+    /// come round on its own.
+    ///
+    /// This used to be one display frame, always, and it was the whole idle
+    /// cost of the editor: sixty wakeups a second — a hundred and twenty on a
+    /// 120 Hz panel — each one taking the editor's lock, draining an empty
+    /// queue and finding nothing, for as long as the process lived. Everything
+    /// a *person* does raises an SDL event and always did; what the frame clock
+    /// was standing in for was everything a *thread* does, and threads now say
+    /// so themselves through `zemacs_core::wake`.
+    ///
+    /// So what is left to wake for is timers, and the answer is "when the first
+    /// of them is due". Three of them: the auto-save sweep, the revert sweep,
+    /// and the `DRAW_AT_LEAST` net — which only counts while somebody is
+    /// looking, because that is the only condition it exists under.
+    ///
+    /// The PTY used to be the exception — alacritty's reader thread hands the
+    /// grid over through its own lock, and only `Term::sync` noticed — so while
+    /// a session existed this stayed a display frame, which is to say a shell
+    /// prompt nobody was typing at cost sixty wakeups a second for the rest of
+    /// the session. The child printing now wakes the loop itself, through
+    /// `zemacs_term::set_waker`, and so does a `:!` finishing.
+    ///
+    /// `MAX_PARK` is the floor under the whole scheme, in the same spirit as
+    /// `DRAW_AT_LEAST` above it: a producer added later that forgets to wake
+    /// costs a second of staleness — a lag somebody notices and reports —
+    /// rather than a pane that never updates again, which is the bug nobody can
+    /// describe.
+    fn park_ms(&self) -> u32 {
+        let until = |since: Instant, every: Duration| every.saturating_sub(since.elapsed());
+        let mut next = until(self.last_autosave, AUTOSAVE_EVERY)
+            .min(until(self.last_revert, self.revert_every()));
+        if self.focused {
+            next = next.min(until(self.last_draw, DRAW_AT_LEAST));
+        }
+        (next.as_millis() as u32).clamp(1, MAX_PARK.as_millis() as u32)
+    }
+
+    /// How often to ask the filesystem whether an open file changed underneath.
+    ///
+    /// [`REVERT_EVERY`] while somebody is looking; a quarter of that otherwise.
+    /// Not "off": an agent editing your files while you read the diff in
+    /// another window is exactly what this sweep is for, and a second of delay
+    /// keeps that working while a laptop nobody is typing at stops asking the
+    /// disk four times a second forever. Coming back to the window sweeps
+    /// immediately — see the `FocusGained` arm.
+    fn revert_every(&self) -> Duration {
+        match self.focused {
+            true => REVERT_EVERY,
+            false => REVERT_EVERY * 4,
+        }
+    }
+
     /// The per-frame housekeeping: everything core holds but cannot fill in
     /// itself.
     ///
@@ -2012,7 +2180,7 @@ impl App {
         // Same shape, same argument, one order of magnitude more often: this one
         // is a `stat` rather than a write, and five seconds is how long a file
         // is allowed to be stale on screen.
-        if self.last_revert.elapsed() >= REVERT_EVERY {
+        if self.last_revert.elapsed() >= self.revert_every() {
             self.revert_watch.poll(editor);
             self.last_revert = Instant::now();
         }
@@ -2107,8 +2275,8 @@ impl App {
     /// lock immediately above the call, because presenting parks this thread
     /// until the display's next vertical blank and holding the editor across
     /// that would put every Lisp primitive behind the display.
-    fn present(&mut self) -> u32 {
-        let mut presents = 0;
+    fn present(&mut self) -> (u32, u32) {
+        let (mut presents, mut discards) = (0, 0);
         for renderer in self.renderers.iter_mut() {
             // Only what changed. A present of an identical picture costs a whole
             // vertical blank and shows the user nothing, and it is the frame the
@@ -2127,12 +2295,13 @@ impl App {
                 // frame, for as long as the editor is open. See
                 // [`Renderer::discard`].
                 renderer.discard();
+                discards += 1;
                 continue;
             }
             renderer.present();
             presents += 1;
         }
-        presents
+        (presents, discards)
     }
 }
 
@@ -3234,11 +3403,23 @@ const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
 /// stale pane is a lag somebody notices and reports; a pane that silently stops
 /// updating is the bug nobody can describe.
 ///
-/// Two draws a second while idle, against sixty. The draw is the couple of
-/// milliseconds `App::draw` documents, so this is the difference between an
-/// editor that costs a seventh of a core doing nothing and one that costs about
-/// half a percent.
-const DRAW_AT_LEAST: Duration = Duration::from_millis(500);
+/// Half a second used to be the number here, and it was chosen against a loop
+/// that woke sixty times a second anyway — two draws against sixty was a
+/// rounding error. It is not one any more. With the loop parked until something
+/// happens ([`App::park_ms`]) this net *is* the idle cost of the editor:
+/// measured at HEAD, an idle window spent 1.2 ms drawing and 1.0 ms in a
+/// present that the digest then discarded, per wakeup, for around 1.6% of a
+/// core doing nothing — all of it this.
+///
+/// Two seconds costs a quarter of that and gives up nothing the argument above
+/// asked for: a pane that is two seconds stale is still a lag somebody notices
+/// and reports, which is the entire job. It is also off altogether while the
+/// window is not focused — see the `due` line in the loop.
+const DRAW_AT_LEAST: Duration = Duration::from_secs(2);
+
+/// The longest the loop will park without being woken, and the floor under
+/// [`App::park_ms`]. See its header for what it is a net against.
+const MAX_PARK: Duration = Duration::from_secs(1);
 
 fn autosave_dir() -> Option<PathBuf> {
     Some(config_dir()?.join("auto-save"))
@@ -3645,10 +3826,26 @@ impl Revert {
             // unrecoverable move available here.
             return;
         };
-        match self.seen.insert(path.to_path_buf(), stamp) {
-            Some(seen) if seen == stamp => return, // untouched since last look
-            Some(_) => {}                          // moved — worth a read
-            None => return,                        // first sight
+        // `get_mut` before `insert`, so the case this sweep is almost always in
+        // — a file nobody has touched — costs a hash lookup and no allocation.
+        // Inserting first would clone the path four times a second per open
+        // file for as long as the session lives, to overwrite a stamp with
+        // itself.
+        match self.seen.get_mut(path) {
+            Some(seen) if *seen == stamp => return, // untouched since last look
+            Some(seen) => *seen = stamp,           // moved — worth a read
+            // First sight is worth a read too, and this used to return here.
+            // The buffer was filled by `open_file`, and *this* stat can already
+            // be newer than that: a file rewritten inside the sweep's own
+            // interval — which is where an agent editing the file you just
+            // opened lands — was recorded as the baseline and compared against
+            // nothing, so the buffer sat permanently out of step with a file
+            // this loop would never look at again. It costs one read of a file
+            // that is almost always identical, and the content comparison below
+            // is what makes that read free of consequence.
+            None => {
+                self.seen.insert(path.to_path_buf(), stamp);
+            }
         }
 
         let Some(buffer) = editor.buffer_by_id(id) else {
@@ -3691,6 +3888,58 @@ impl Revert {
         }
         revert(editor, id, path, &text);
     }
+}
+
+/// `M-x revert-buffer` — take what is on disk, on purpose.
+///
+/// The manual half of the sweep below. That half refuses exactly one case, and
+/// refusing it is the right default: a buffer with unsaved changes is never
+/// silently clobbered, so a file rewritten underneath one is announced and left
+/// alone. The announcement is easy to miss and there was no way to say "take it
+/// anyway" — which is the state you are in when an agent edits the file you are
+/// sitting in, and the edit does not appear.
+///
+/// So the guard is a question rather than a refusal. `Save::Guarded` asks it,
+/// `Save::Forced` is the answer coming back — the same two-step, and the same
+/// `Confirmed` wrapper, that `save_file` uses for "changed on disk — save
+/// anyway?", because this is that question from the other side.
+///
+/// An unmodified buffer skips it: there is nothing to lose, and the whole point
+/// is to be quicker than waiting out the sweep.
+fn revert_visited(editor: &mut Editor, guard: Save) {
+    let Some(path) = editor.buffer.path.clone() else {
+        editor.apply(EditorCommand::Message(
+            "no file behind this buffer to revert from".into(),
+        ));
+        return;
+    };
+    if guard == Save::Guarded && editor.buffer.modified {
+        let question = format!(
+            "{} has unsaved changes — reread from disk anyway?",
+            display_path(&path)
+        );
+        editor.confirm(&question, EditorCommand::Confirmed(Box::new(EditorCommand::RevertBuffer)));
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        editor.apply(EditorCommand::Message(format!(
+            "cannot read {}",
+            display_path(&path)
+        )));
+        return;
+    };
+    if text == editor.buffer.text.to_string() {
+        // Said rather than done, because "nothing happened" and "it worked" look
+        // identical on screen and only one of them means the file you were
+        // waiting for has landed.
+        editor.apply(EditorCommand::Message(format!(
+            "{} is already what is on disk",
+            display_path(&path)
+        )));
+        return;
+    }
+    let id = editor.buffer.id;
+    revert(editor, id, &path, &text);
 }
 
 /// Replace buffer `id`'s text with what is on disk, keeping point where it was.
@@ -5623,10 +5872,12 @@ mod tests {
         let mut editor = Editor::new();
         editor.load("abc", None, None);
         let mut told = None;
-        // The first look has no watermark, so it is a resync: the whole buffer,
-        // and `nil` for what the image had, because the app cannot know.
+        // The first look has no watermark, so it is a resync: `nil` for what
+        // the image had, because the app cannot know, and `nil` for the text —
+        // the whole buffer is on the other side of a primitive, not in a form
+        // the reader has to swallow first.
         let form = after_edit_form(&editor, &mut told).expect("a first look always reports");
-        assert!(form.contains("(funcall h 0 nil 3 \"abc\")"), "{form}");
+        assert!(form.contains("(funcall h 0 nil 3 nil)"), "{form}");
 
         editor.apply(EditorCommand::MoveTo(1));
         typing(&mut editor, "XY");
@@ -5658,7 +5909,7 @@ mod tests {
         editor.create_buffer("*second*".into());
         typing(&mut editor, "hi");
         let form = after_edit_form(&editor, &mut told).expect("a new document is news");
-        assert!(form.contains("(funcall h 0 nil 2 \"hi\")"), "{form}");
+        assert!(form.contains("(funcall h 0 nil 2 nil)"), "{form}");
     }
 
     /// The text is escaped for CL's reader, not Rust's. `\n` inside a Common

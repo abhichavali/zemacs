@@ -28,7 +28,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use alacritty_terminal::event::{Event, EventListener, Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
@@ -408,12 +409,47 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
 /// back to the PTY, and the writer does not exist yet when the listener has to
 /// be constructed. [`Terminal::poll`] drains them.
 #[derive(Clone)]
-struct Proxy(Sender<Event>);
+struct Proxy {
+    events: Sender<Event>,
+    /// Shared with the [`Terminal`] — see its `dirty`. Set here, on the PTY
+    /// thread, so the flag is what decides whether the child's output is worth
+    /// a wakeup: a grid nobody has looked at since the last one is not.
+    dirty: Arc<AtomicBool>,
+}
 
 impl EventListener for Proxy {
     fn send_event(&self, event: Event) {
-        let _ = self.0.send(event);
+        // The child printed. Wake the loop only if it has not already been
+        // told: a session parked behind another buffer keeps its flag until
+        // someone switches to it, so a build spewing into a background pane
+        // costs one wakeup and then none, and the visible one costs at most one
+        // per frame. Everything else — a size query the child is blocked on,
+        // the exit — is rare and wakes unconditionally.
+        let wake = match event {
+            Event::Wakeup => !self.dirty.swap(true, Ordering::Relaxed),
+            _ => true,
+        };
+        let _ = self.events.send(event);
+        if wake {
+            if let Some(f) = WAKE.get() {
+                f();
+            }
+        }
     }
+}
+
+/// Who to tell when a child prints, so the main loop can park instead of
+/// polling every session at the display's rate for as long as one exists.
+///
+/// The same shape as `zemacs_core::set_waker`, and installed with it: this
+/// crate knows nothing of the editor, so it cannot call that one itself. `None`
+/// — every test, every headless caller — means the events queue up and the
+/// next `poll` finds them, which is what always happened.
+static WAKE: OnceLock<fn()> = OnceLock::new();
+
+/// Install the waker. The second call is ignored.
+pub fn set_waker(f: fn()) {
+    let _ = WAKE.set(f);
 }
 
 pub struct Terminal {
@@ -424,6 +460,19 @@ pub struct Terminal {
     rows: usize,
     title: String,
     exited: bool,
+    /// Whether the grid may have changed since the last time anyone flattened
+    /// it, so the app can skip the flattening when it cannot have.
+    ///
+    /// Copying the screen out is not cheap — `rows * cols` cells out from under
+    /// alacritty's lock, then a `String` per row — and the app used to do it on
+    /// every frame for as long as a terminal buffer was on screen, which is to
+    /// say sixty times a second at a shell prompt nobody was typing at. The
+    /// grid changes when the child prints, and the child printing is exactly
+    /// what [`alacritty_terminal::event::Event::Wakeup`] means.
+    ///
+    /// True to begin with, so the first screenful goes up without waiting for
+    /// the child to say anything.
+    dirty: Arc<AtomicBool>,
     /// The child's exit code, once it has one. Kept rather than thrown away
     /// because a *harness* that dies on the first frame — a bad flag, an
     /// expired login — is otherwise indistinguishable from a shell you quit on
@@ -552,7 +601,10 @@ impl Terminal {
         let pty = tty::new(&options, window_size(cols, rows), 0)?;
 
         let (tx, events) = channel();
-        let proxy = Proxy(tx);
+        // True to begin with: the first screenful goes up without waiting for
+        // the child to say anything — see `dirty`.
+        let dirty = Arc::new(AtomicBool::new(true));
+        let proxy = Proxy { events: tx, dirty: dirty.clone() };
         let config = Config {
             scrolling_history: SCROLLBACK,
             ..Config::default()
@@ -571,6 +623,7 @@ impl Terminal {
             rows,
             title: "terminal".into(),
             exited: false,
+            dirty,
             status: None,
             command,
         })
@@ -721,11 +774,31 @@ impl Terminal {
                     self.status = Some(code);
                 }
                 Event::Exit => self.exited = true,
+                // "New terminal content available" — the child printed. The
+                // flag was already raised on the way in, by `Proxy`, since
+                // raising it is what decided whether to wake anyone.
+                Event::Wakeup => {}
                 // Bell, clipboard, colour queries and cursor-blink changes are
                 // ignored deliberately — none of them has anywhere to go yet.
                 _ => {}
             }
         }
+    }
+
+    /// Whether the grid changed since the last ask, clearing the flag.
+    ///
+    /// Taken rather than read so the caller cannot forget to clear it, and
+    /// cleared *late* — the app asks after it has decided the buffer is worth
+    /// refreshing at all, so a session parked behind another buffer keeps its
+    /// flag and catches up whole when you switch back to it.
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::Relaxed)
+    }
+
+    /// The grid changed for a reason the child did not announce.
+    fn mark_dirty(&self) {
+        self.dirty
+            .store(true, Ordering::Relaxed);
     }
 
     pub fn title(&self) -> &str {
@@ -773,6 +846,9 @@ impl Terminal {
         }
         self.cols = cols;
         self.rows = rows;
+        // A reflow rewrites the grid without the child having said a word, so
+        // it is the one change `Event::Wakeup` does not cover.
+        self.mark_dirty();
         self.term.lock().resize(Size { cols, rows });
         let _ = self.notifier.0.send(Msg::Resize(window_size(cols, rows)));
     }
@@ -780,6 +856,10 @@ impl Terminal {
     /// Scroll through the scrollback. Positive is toward the top of the
     /// history, matching the editor's own wheel handling.
     pub fn scroll(&self, lines: i32) {
+        // Moving the viewport through the scrollback shows different rows
+        // without the child having printed any — the second of the two changes
+        // `Event::Wakeup` does not cover. See [`Terminal::dirty`].
+        self.mark_dirty();
         self.term.lock().scroll_display(Scroll::Delta(lines));
     }
 

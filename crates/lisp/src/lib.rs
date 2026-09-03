@@ -121,6 +121,18 @@ fn grouped() -> bool {
 /// keystroke to panic too. `None` before [`spawn`] has installed the host.
 fn with_editor<T>(f: impl FnOnce(&mut Editor) -> T) -> Option<T> {
     let host = HOST.get()?;
+    let out = with_editor_locked(host, f);
+    // Outside the lock, and after it: this is the other half of the `touch`
+    // below. `touch` records *that* the editor changed; this tells the loop
+    // parked in `SDL_WaitEventTimeout` to come and look, which is what lets
+    // that park be measured in "until something happens" rather than in frames.
+    // Waking while still holding the guard would only have the main thread wake
+    // up and block on us.
+    zemacs_core::wake();
+    Some(out)
+}
+
+fn with_editor_locked<T>(host: &Host, f: impl FnOnce(&mut Editor) -> T) -> T {
     let mut guard = host.editor.lock().unwrap_or_else(|e| e.into_inner());
     // Every primitive, including the readers. This is the *only* signal the
     // draw loop gets that the image touched the editor — the Lisp thread
@@ -133,7 +145,7 @@ fn with_editor<T>(f: impl FnOnce(&mut Editor) -> T) -> Option<T> {
     // site. See [`Editor::generation`] for why the error is taken in this
     // direction.
     guard.touch();
-    Some(f(&mut guard))
+    f(&mut guard)
 }
 
 /// Pure commands are applied on the spot, so a read that follows one sees it.
@@ -142,6 +154,9 @@ fn emit(cmd: EditorCommand) {
     if cmd.needs_app() {
         if let Some(host) = HOST.get() {
             let _ = host.tx.send(cmd);
+            // The app drains this channel from the main loop, which has to be
+            // awake to do it. Same reason as `with_editor`.
+            zemacs_core::wake();
         }
         return;
     }
@@ -864,6 +879,9 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
         // *and* land on a line: `find-file` reaches the app a frame later, so a
         // `goto-char` after it would move the cursor in the buffer you left.
         "open-at" => EditorCommand::OpenAt(arg),
+        // Take what is on disk. Asks first when the buffer has unsaved changes,
+        // which is the one case the automatic sweep refuses outright.
+        "revert-buffer" => EditorCommand::RevertBuffer,
 
         // --- overlays -------------------------------------------------------
         //

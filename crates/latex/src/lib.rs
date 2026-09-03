@@ -277,7 +277,10 @@ fn run(program: &Path, args: &[&str], cwd: &Path) -> Result<bool> {
                     TIMEOUT.as_secs()
                 );
             }
-            None => std::thread::sleep(Duration::from_millis(5)),
+            // 50 ms rather than 5: this is the wait for a process that takes
+            // the better part of a second, so a tenth of the wakeups costs a
+            // twentieth of a TeX run in added latency and nobody can see it.
+            None => std::thread::sleep(Duration::from_millis(50)),
         }
     }
 }

@@ -269,6 +269,113 @@ fn org_structure_edits_an_outline() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A file rewritten underneath a buffer you had edited, and the way to take it.
+///
+/// Here rather than in a unit test because the whole feature is the app's: the
+/// sweep that notices, the guard that refuses, the prompt that asks and the read
+/// that lands are four different layers, and the bug this closes lives in the
+/// seam between the first two. `global-auto-revert-mode` deliberately never
+/// clobbers a modified buffer — so an agent editing the file you are sitting in
+/// says so once, on a status line, and the edit does not appear. That is correct
+/// and it is not enough; `revert-buffer` is the other half.
+#[test]
+fn revert_buffer_takes_a_file_that_changed_under_an_edited_buffer() {
+    let dir = std::env::temp_dir().join(format!("zemacs_revert-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let path = dir.join("notes.txt");
+    std::fs::write(&path, "one\n").expect("write");
+
+    let mut z = Zemacs::start();
+    z.until("ready", |f| (f["event"] == "ready").then_some(()));
+
+    let mut id = 0;
+    let mut req = |z: &mut Zemacs, op: &str, args: &str| {
+        id += 1;
+        z.send(&format!(r#"{{"id":{id},"op":"{op}"{args}}}"#));
+        z.until("a reply", |f| (f["id"] == id).then(|| f["result"].clone()))
+    };
+
+    req(
+        &mut z,
+        "eval",
+        &format!(r#","form":"(find-file \"{}\")""#, path.display()),
+    );
+    let deadline = Instant::now() + PATIENCE;
+    while req(&mut z, "state", "")["path"] == serde_json::Value::Null {
+        assert!(Instant::now() < deadline, "the file never opened");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Edit it, so the buffer is modified — which is the whole case. An
+    // unmodified buffer is taken by the sweep without anyone asking, and there
+    // would be nothing here to fix.
+    req(&mut z, "keys", r#","keys":"<esc> i x <esc>""#);
+    let deadline = Instant::now() + PATIENCE;
+    while req(&mut z, "state", "")["modified"] != serde_json::json!(true) {
+        assert!(Instant::now() < deadline, "the buffer never went modified");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Now something else rewrites the file: an agent, a formatter, a checkout.
+    std::fs::write(&path, "written by somebody else\n").expect("rewrite");
+
+    // The sweep notices within 250ms and *refuses*, saying so exactly once.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let msgs = req(&mut z, "messages", "")["messages"].to_string();
+        if msgs.contains("not reverted") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sweep never reported the external change: {msgs}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // ...and the buffer still holds what was typed, which is the property that
+    // must not regress: this guard is the reason unsaved work survives an agent.
+    assert_eq!(req(&mut z, "text", "")["text"], serde_json::json!("xone\n"));
+
+    // `M-x revert-buffer` asks before discarding it, because that text has never
+    // been written down anywhere.
+    req(&mut z, "action", r#","name":"revert-buffer""#);
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        // The `screen` op and not `state`: a prompt is drawn on the echo line,
+        // which is `status_line()`'s job, while `state.status` is the raw
+        // status underneath it.
+        let screen = req(&mut z, "screen", "")["screen"].to_string();
+        if screen.contains("reread from disk anyway?") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "revert-buffer never asked: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Anything that is not `yes` is no — so `yes`, spelled out.
+    req(&mut z, "keys", r#","keys":"y e s <ret>""#);
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let got = req(&mut z, "text", "")["text"].clone();
+        if got == serde_json::json!("written by somebody else\n") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the buffer never took the file; it is {got}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    z.send(&format!(r#"{{"id":{},"op":"quit"}}"#, id + 1));
+    z.until("the exit event", |f| (f["event"] == "exit").then_some(()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Hovering a diagnostic's mark, in the real editor with a real pointer.
 ///
 /// Here rather than in `crates/lisp/tests/` for `which_key.rs`'s reason, which

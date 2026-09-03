@@ -1965,3 +1965,92 @@ is finished.
    state binding is global, so the guard is in the command — and it costs
    nothing elsewhere, because an unbound Ctrl chord in Insert already did
    exactly nothing.
+   
+   
+* New stuff                                                          :done:
+- [X] Vim Marks should have a small mark in the buffer noting that a mark was set there
+- [X] \[ \] In org mode files should turn into a checkbox, even if not preceded by a bullet.
+- [X] Sometimes edits made from AI mode don't reflect in the buffer. Fix this. Also add a revert buffer function that allows me to reread from disk.
+- [X] Pasting over something doesn't overwrite it
+
+** A mark you can see                                                :done:
+
+   `ma' hangs an overlay carrying `gutter' on the line, so the letter is in the
+   margin next to it. Carried *by the mark* rather than worked out when the
+   gutter is drawn, which is the whole design: an overlay already moves with the
+   text through `Overlays::adjust', so the letter and the position `` `a ``
+   jumps to cannot drift apart, and deleting the line takes the mark with it
+   because the overlay is *on* that text. It covers the line's own text and
+   falls back to the newline on an empty one — `%lsp-draw-diagnostics'' rule,
+   and load-bearing here for a second reason: `drop_collapsed' retires anything
+   an edit squeezes to nothing, so a zero-width overlay would not survive the
+   next keystroke.
+
+   **Letters only.** The four marks vim writes for itself — `` `[ ``, `` `] ``,
+   `` `. `` and `` `^ `` — come through the same `set_mark_at', and they are
+   rewritten by every change and every exit from Insert. Drawing those would put
+   three pieces of punctuation in the gutter of whatever line you last touched
+   and churn an overlay per keystroke; the test pins it, and without the guard
+   it reads `[(0 "a") (0 "[") (0 "]") (0 ".")]'.
+
+** A checkbox with no bullet in front of it                          :done:
+
+   `[ ] milk' on a line of its own is a checklist somebody typed without
+   reaching for `-' first, and it now draws as a box and ticks like one. Two
+   readers had to agree rather than one: `%org-modern-line' draws it and
+   `%org-checkbox-index' ticks it, and a box that renders but cannot be ticked
+   would have been half a feature.
+
+   The rule is *the first non-blank thing on the line*, which falls out of
+   `%org-checkbox-at' anchoring rather than searching — so `the [x] column' is
+   still prose. Left alone: an ordered item (`1. [ ] thing') still draws no box,
+   because its content starts at the `1' and neither the list branch nor this
+   one claims it; and `M-RET' on a bulletless box makes a heading rather than
+   another box, since `%org-checkbox-prefix' reads a bullet to carry.
+
+** An agent's edit that never arrived, and `revert-buffer'           :done:
+
+   Two halves, and only one of them was a bug.
+
+   The bug: the sweep *ignored the first stat of every file*. The buffer is
+   filled by `open_file' and the first stat could already be newer than that
+   read — which is exactly where an agent writing the file you just opened lands
+   — so the newer stamp was recorded as the baseline, compared against nothing,
+   and the buffer sat permanently out of step with a file the loop would never
+   look at again. First sight now reads and compares like any other; the content
+   check below it makes that free in the common case.
+
+   The half that was not a bug: a *modified* buffer is never silently clobbered.
+   That is deliberate and it is the only thing standing between unsaved work and
+   an agent, so it stays — but the announcement is one line on a status bar and
+   there was no way to say "take it anyway". `M-x revert-buffer' is that way. It
+   asks first when the buffer is modified, through the same `Confirmed' wrapper
+   `save_file' uses for "changed on disk — save anyway?", because this is that
+   question from the other side; an unmodified buffer skips the question, since
+   there is nothing to lose and the point is to be quicker than the sweep.
+
+   Proved in `crates/app/tests/control.rs' end to end, because the four layers
+   involved — the sweep, the guard, the prompt, the read — are the app's and the
+   bug lived in the seam between the first two.
+
+** `p` over a selection replaces it                                  :done:
+
+   It pasted *beside* the selection and left both. `InsertAt' rather than
+   `Paste', and that is the fix rather than a detail: `Paste' puts the text at
+   the cursor, and `clamp_cursor' will not let the cursor sit past the last
+   character of a line — so deleting to the end of one left point short of the
+   hole it had just made and the paste landed inside the text it was meant to
+   replace. `alpha beta' came out `alphaalpha '.
+
+   The register is **kept**, which is where this differs from vim on purpose.
+   `operate(Op::Delete, …)' would yank what it removes into the unnamed
+   register, overwriting the text being pasted before the paste could read it;
+   vim's answer is to swap the two, which is why `p' over three selections in a
+   row pastes something different each time and is the most complained-about
+   corner of its register model. Keeping it is the shorter code and the
+   behaviour people install a plugin to get. What was replaced is therefore not
+   in a register afterwards — `u' has it.
+
+   Block mode is left to the ordinary paste: replacing a rectangle is several
+   disjoint edits and a shape rule of its own, and `op_block' is the only thing
+   that knows that shape.

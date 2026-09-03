@@ -108,14 +108,19 @@ has already guaranteed the space, which is what makes the `position' safe."
       (1+ (position #\Space line :start i)))))
 
 (defun %org-checkbox-index (line)
-  "Index of the `[' of LINE's checkbox, or NIL when the item has none.
+  "Index of the `[' of LINE's checkbox, or NIL when there is none.
 
 `%org-checkbox-at' from `org-modern.lisp' is the parser — one rule for what a
 cookie is, shared with the thing that draws it — and this starts it from where
-the bullet ends. A cookie anywhere else on the line is prose (`the [x] column'),
-which is why this starts from the bullet rather than searching."
-  (let ((at (%org-item-end line)))
-    (when at (car (%org-checkbox-at line at)))))
+the bullet ends.
+
+With no bullet it starts from the front of the line instead, because a box does
+not need one: `[ ] milk' on a line of its own is a checklist somebody typed
+without reaching for `-' first, and org ticks it. What is *not* allowed either
+way is a cookie further along the line — `the [x] column' is prose — and that
+falls out of `%org-checkbox-at' anchoring on the first non-blank character
+rather than searching for a bracket."
+  (car (%org-checkbox-at line (or (%org-item-end line) 0))))
 
 (defun %org-empty-item-p (line)
   "True when LINE is a list item with nothing in it yet.

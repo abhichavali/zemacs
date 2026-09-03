@@ -15,8 +15,8 @@
 //! **user keymap** → built-in grammar.
 
 use crate::{
-    frame, BufferId, Direction, Editor, EditorCommand, Insertion, Key, MarkerId, Mode, Prompt,
-    PromptKind,
+    frame, overlay::OverlayEdit, BufferId, Direction, Editor, EditorCommand, Insertion, Key,
+    MarkerId, Mode, OverlayId, Prompt, PromptKind,
 };
 use regex::Regex;
 use std::cell::{Ref, RefCell};
@@ -218,7 +218,8 @@ pub(crate) struct Vim {
     /// True while `.` is running, so the replay does not record itself as the
     /// new last change and `..` stays a repeat rather than a fixpoint.
     repeating: bool,
-    /// `ma` — one marker per (buffer, letter).
+    /// `ma` — one marker per (buffer, letter), and the gutter mark that shows
+    /// where it is.
     ///
     /// Keyed by buffer because vim's lowercase marks are per file and a marker
     /// only resolves in the buffer it was made in: a mark set elsewhere would
@@ -226,7 +227,13 @@ pub(crate) struct Vim {
     /// when a buffer goes away, so a long session leaks a handful of dead
     /// (id, char) pairs. They read as "mark not set", which is the right
     /// answer anyway; move the map onto `Buffer` if that ever stops being true.
-    marks: HashMap<(BufferId, char), MarkerId>,
+    ///
+    /// The overlay is carried *with* the marker rather than derived when the
+    /// gutter is drawn, and that is the whole of why this is a pair: an overlay
+    /// already moves with the text through `Overlays::adjust`, so the mark and
+    /// the letter beside it cannot drift apart under an edit. Deriving it in the
+    /// renderer would mean a second thing that knows what a mark is.
+    marks: HashMap<(BufferId, char), (MarkerId, OverlayId)>,
     /// Where you were before each jump, oldest first — `C-o`, `C-i` and
     /// `` `` ``. Markers for the marks' reason: an edit above a remembered line
     /// must not send `C-o` a few characters adrift. Buffer-stamped because a
@@ -1555,6 +1562,17 @@ impl Editor {
                 ],
                 None => vec![EditorCommand::Message("no previous insert".into())],
             },
+            // `p` with a selection up *replaces* it, which is what vim does and
+            // is the whole reason for selecting before pasting. Both spellings,
+            // because "before" and "after" mean nothing when the target is a
+            // range rather than a point.
+            //
+            // Block mode is left to the ordinary paste below: replacing a
+            // rectangle is several disjoint edits and a shape rule of its own,
+            // and `op_block` is the only thing here that knows that shape.
+            "p" | "P" if visual && self.mode != Mode::VisualBlock => {
+                self.paste_over_selection(n)
+            }
             "p" => self.paste_cmds(true, n),
             "P" => self.paste_cmds(false, n),
             "u" => vec![EditorCommand::Undo],
@@ -2991,12 +3009,44 @@ impl Editor {
     fn set_mark_at(&mut self, name: char, at: usize) {
         let slot = (self.buffer.id, name);
         // Replacing a mark frees the marker it used, or `ma` in a loop leaves
-        // one dead marker per press in the buffer for `splice` to walk.
-        if let Some(old) = self.vim.marks.remove(&slot) {
+        // one dead marker per press in the buffer for `splice` to walk — and the
+        // letter in the gutter with it, or the old line keeps saying `a`.
+        if let Some((old, ov)) = self.vim.marks.remove(&slot) {
             self.delete_marker(old);
+            self.buffer.overlays.edit(OverlayEdit::Delete(ov));
         }
-        let id = self.make_marker(at.min(self.buffer.len_chars()), Insertion::Stay);
-        self.vim.marks.insert(slot, id);
+        let at = at.min(self.buffer.len_chars());
+        let id = self.make_marker(at, Insertion::Stay);
+        // A letter in the margin, so a mark is something you can see rather than
+        // something you have to remember setting.
+        //
+        // Only for a mark *you* set. The four vim writes for itself — `` `[ ``,
+        // `` `] ``, `` `. `` and `` `^ `` — come through this same function, and
+        // they are rewritten by every change and every exit from Insert: drawing
+        // those would put three pieces of punctuation in the gutter of whatever
+        // line you last touched and churn an overlay per keystroke. They are
+        // punctuation and a mark you can press `m` for is a letter, which is the
+        // whole of the test.
+        //
+        // The *line's own text* is what the overlay covers, which is
+        // `%lsp-draw-diagnostics`' rule and is load-bearing twice over: an
+        // overlay dies with the text it is on, so deleting the line takes the
+        // mark with it, and `Overlays::drop_collapsed` retires anything an edit
+        // squeezes to nothing — so a zero-width overlay would not survive the
+        // next keystroke. An empty line has no text and falls back to the
+        // newline it does have.
+        let ov = if name.is_alphabetic() {
+            let line = self.buffer.line_of(at);
+            let beg = self.buffer.line_start(line);
+            let end = self
+                .buffer
+                .line_end(line)
+                .max((beg + 1).min(self.buffer.len_chars()));
+            self.make_overlay_with(beg, end, |o| o.gutter = Some(name.to_string()))
+        } else {
+            0
+        };
+        self.vim.marks.insert(slot, (id, ov));
     }
 
     /// Where a mark is, letters and the ones vim writes itself alike.
@@ -3020,7 +3070,7 @@ impl Editor {
                 .vim
                 .marks
                 .get(&(self.buffer.id, name))
-                .copied()
+                .map(|(id, _)| *id)
                 .and_then(|id| self.marker_position(id)),
         }
     }
@@ -3115,6 +3165,67 @@ impl Editor {
                 span: Span::Exclusive,
             },
         })
+    }
+
+    /// `p` over a visual selection: the selection goes and the register lands
+    /// where it was.
+    ///
+    /// `InsertAt` and not `Paste`, which is the whole reason this is a function
+    /// rather than two more commands on the end of `op_selection`. `Paste` puts
+    /// the text at the *cursor*, and the cursor is not where the selection was:
+    /// `clamp_cursor` runs at the end of every `apply` and Normal mode may not
+    /// sit past the last character of a line, so deleting to the end of one
+    /// leaves point one short of the hole it just made and the paste lands
+    /// inside the text it was meant to follow — `alpha beta` became
+    /// `alphaalpha `. `InsertAt` is the primitive for an edit whose position is
+    /// computed rather than pointed at, and the position is `start`.
+    ///
+    /// The register is *kept*. `operate(Op::Delete, …)` would yank what it
+    /// removes into the unnamed one — overwriting the text being pasted before
+    /// the paste could read it — and vim's answer is to swap the two, which is
+    /// why `p` over three selections in a row pastes something different each
+    /// time and is the most complained-about corner of its register model.
+    /// Keeping it is both the shorter code and the behaviour people reach for a
+    /// plugin to get.
+    ///
+    /// ponytail: what was replaced is therefore not in a register afterwards.
+    /// `u` has it, which is what the `Checkpoint` guarantees; the day somebody
+    /// wants vim's swap it is a `Yank` in front and a `SetRegister` behind.
+    fn paste_over_selection(&mut self, n: usize) -> Vec<EditorCommand> {
+        let Some((start, end)) = self.selection() else {
+            return vec![];
+        };
+        // Which register, resolved here because `InsertAt` carries its text
+        // rather than reading one. `"_p` is a delete with nothing put back,
+        // which is exactly what the black hole means.
+        let name = self.vim.pending.take();
+        let text = match name.filter(|c| !special_register(*c)) {
+            Some(named) => match self.register_text(named) {
+                Some((text, _)) => text,
+                None => {
+                    return vec![EditorCommand::Message(format!(
+                        "register {named} is empty"
+                    ))]
+                }
+            },
+            None if name == Some('_') => String::new(),
+            // `"+`/`"*` are the unnamed register here — it *is* the system
+            // clipboard — so they need no case of their own.
+            None => self.register.clone(),
+        };
+        let mut cmds = vec![
+            EditorCommand::SetMode(Mode::Normal),
+            EditorCommand::Checkpoint,
+            EditorCommand::DeleteRange(start, end),
+        ];
+        if !text.is_empty() {
+            // A linewise register already ends in its newline, so `n` copies of
+            // it are `n` lines and the same `repeat` serves both shapes. The
+            // selection it replaces was linewise too whenever this matters,
+            // which is what makes `start` a line start.
+            cmds.push(EditorCommand::InsertAt(start, text.repeat(n.max(1))));
+        }
+        cmds
     }
 
     /// `p`, and `"ap` out of a named register.
@@ -3762,11 +3873,19 @@ impl Editor {
         // What has been chosen here before, newest first. It is what `M-p`
         // walks *and* an input to the ranking — see `Prompt::recent` — so it is
         // handed over on the way in rather than looked up per keystroke.
-        prompt.recent = self
-            .history_for(kind)
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        //
+        // Not for the switcher. Its list arrives already most-recently-used —
+        // that is what `others` *is* — and a buffer reached through
+        // `find-file`, `:e` or a pane's focus never passes through this prompt,
+        // so ranking by what the prompt was answered with before put a buffer
+        // picked here last week above the one you left a second ago.
+        if kind != PromptKind::Buffer {
+            prompt.recent = self
+                .history_for(kind)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        }
         // The switcher previews by *showing* the highlighted buffer, so it needs
         // stable handles for the candidates and one for the way back. Captured
         // here, with the list, because this is the only moment the two are known
@@ -5158,6 +5277,32 @@ mod tests {
         let mut ed = fresh("abcdef");
         feed(&mut ed, &keys("vlld"));
         assert_eq!(ed.buffer.text.to_string(), "def");
+        assert_eq!(ed.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn visual_p_pastes_over_the_selection() {
+        // Yank a word, select another, paste: the selection is *replaced*. It
+        // used to be inserted beside the text it was aimed at, which left both.
+        let mut ed = fresh("alpha beta");
+        feed(&mut ed, &keys("yew"));
+        feed(&mut ed, &keys("vep"));
+        assert_eq!(ed.buffer.text.to_string(), "alpha alpha");
+        assert_eq!(ed.mode, Mode::Normal);
+
+        // ...and the register still holds what was yanked, not what was
+        // replaced, so the next paste puts the same text down again. This is
+        // where vim differs, deliberately: see `paste_over_selection`.
+        feed(&mut ed, &keys("0vep"));
+        assert_eq!(ed.buffer.text.to_string(), "alpha alpha");
+    }
+
+    #[test]
+    fn visual_line_p_replaces_whole_lines() {
+        let mut ed = fresh("aaa\nbbb\nccc\n");
+        feed(&mut ed, &keys("yyj"));
+        feed(&mut ed, &keys("Vp"));
+        assert_eq!(ed.buffer.text.to_string(), "aaa\naaa\nccc\n");
         assert_eq!(ed.mode, Mode::Normal);
     }
 
@@ -6564,6 +6709,35 @@ mod tests {
         assert_eq!(ed.buffer.name(), "*second*");
     }
 
+    /// The order is how recently each buffer was *used*, not how recently it
+    /// was picked here: a buffer reached by any other route still moves up.
+    #[test]
+    fn the_switcher_is_ordered_by_use_not_by_its_own_history() {
+        let mut ed = fresh("first");
+        let first = ed.buffer.id;
+        ed.apply(EditorCommand::CreateBuffer("*second*".into()));
+        let second = ed.buffer.id;
+        ed.apply(EditorCommand::CreateBuffer("*third*".into()));
+        let third = ed.buffer.id;
+
+        // Pick `*second*` through the switcher, so it is in its history.
+        ed.run_action("switch-buffer");
+        for cmd in ed.handle_key(Key::Enter) {
+            ed.apply(cmd);
+        }
+        assert_eq!(ed.buffer.id, second);
+
+        // Then visit the others by some route that is not the switcher.
+        ed.switch_buffer_id(first);
+        ed.switch_buffer_id(third);
+
+        ed.run_action("switch-buffer");
+        let p = ed.prompt.as_ref().unwrap();
+        let shown: Vec<BufferId> = p.matches.iter().map(|&i| p.ids[i]).collect();
+        assert_eq!(&shown[..2], &[first, second], "{:?}", p.items);
+        assert_eq!(shown.last(), Some(&third), "the live one goes last");
+    }
+
     #[test]
     fn the_buffer_switcher_shows_what_it_is_pointing_at() {
         let mut ed = fresh("first");
@@ -7248,6 +7422,58 @@ mod tests {
         // an unset mark says so rather than jumping somewhere arbitrary
         feed(&mut ed, &[Key::Char('`'), Key::Char('z')]);
         assert!(ed.status.contains("mark not set"));
+    }
+
+    /// A mark you can see. Setting one puts its letter in the gutter, and the
+    /// overlay that draws it is carried by the mark rather than worked out when
+    /// the gutter is drawn — so it moves with the text and cannot get out of
+    /// step with where `` `a `` actually goes.
+    #[test]
+    fn setting_a_mark_puts_its_letter_in_the_gutter() {
+        let gutter = |ed: &Editor| -> Vec<(usize, String)> {
+            ed.buffer
+                .overlays()
+                .iter()
+                .filter_map(|o| o.gutter.clone().map(|g| (ed.buffer.line_of(o.start), g)))
+                .collect()
+        };
+
+        let mut ed = fresh("alpha
+beta
+gamma");
+        feed(&mut ed, &keys("jjma"));
+        assert_eq!(gutter(&ed), vec![(2, "a".into())], "the line the mark is on");
+
+        // It follows the text: deleting the line above moves the mark up, and
+        // the letter with it, because both are anchored in the document rather
+        // than at a line number.
+        feed(&mut ed, &keys("ggdd"));
+        assert_eq!(gutter(&ed), vec![(1, "a".into())]);
+
+        // Moving the same mark elsewhere moves the letter — it does not leave
+        // one behind on the old line.
+        feed(&mut ed, &keys("ggma"));
+        assert_eq!(gutter(&ed), vec![(0, "a".into())]);
+
+        // ...and a second letter is a second mark, not a replacement.
+        feed(&mut ed, &keys("jmb"));
+        let mut marks = gutter(&ed);
+        marks.sort();
+        assert_eq!(marks, vec![(0, "a".into()), (1, "b".into())]);
+
+        // Deleting the line a mark is on takes its letter with it: the overlay
+        // is *on* that text, so there is no way to be left pointing at a line
+        // that is no longer the one you marked.
+        feed(&mut ed, &keys("dd"));
+        assert_eq!(gutter(&ed), vec![(0, "a".into())]);
+
+        // ...and the marks vim sets for *itself* draw nothing. `x` writes
+        // `` `[ ``, `` `] `` and `` `. `` on the line it edits, and `<esc>` out
+        // of Insert writes `` `^ ``; a gutter full of punctuation that moved
+        // every time you typed would make the feature worse than not having it.
+        feed(&mut ed, &keys("x"));
+        feed(&mut ed, &keys("ix<esc>"));
+        assert_eq!(gutter(&ed), vec![(0, "a".into())], "only marks you set draw");
     }
 
     #[test]

@@ -62,5 +62,13 @@ serde_json = { version = "1", features = ["raw_value"] }
 [profile.dev]
 opt-level = 1          # tree-sitter and font rasterization are painful at opt-level 0
 
+# What `scripts/install.sh` ships. Whole-program optimisation across the
+# fourteen crates: the rope, the renderer and the grammar tables are all
+# behind crate boundaries that a per-crate build cannot see through. The price
+# is paid once, at install time, in build minutes; the editor pays nothing.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [profile.dev.package."*"]
 opt-level = 3          # always optimize dependencies

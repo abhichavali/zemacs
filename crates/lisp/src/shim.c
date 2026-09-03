@@ -1502,11 +1502,19 @@ static const char *OVERLAY_FORM =
      * goes into the prompt without passing through here. See
      * `runtime/plugins/project.lisp'. */
     " (defun zemacs::project-recent () (zemacs::%query \"project-recent\" 0 0))"
+    /* And the two git lists: every ref of the repository behind the live
+     * buffer, and its local branches. Short like `project-recent', and Lisp
+     * lists for the same reason — `completing-read' takes them straight, and
+     * `magit.lisp' is what decides which question gets which list. */
+    " (defun zemacs::git-refs () (zemacs::%query \"git-refs\" 0 0))"
+    " (defun zemacs::git-branches () (zemacs::%query \"git-branches\" 0 0))"
     /* A reader is a noun, not a command: keep it out of the M-x list the same
      * way every other reader is kept out. */
     " (pushnew \"latex-fragments\" zemacs::*readers* :test #'string=)"
     " (pushnew \"fold-ranges\" zemacs::*readers* :test #'string=)"
     " (pushnew \"project-recent\" zemacs::*readers* :test #'string=)"
+    " (pushnew \"git-refs\" zemacs::*readers* :test #'string=)"
+    " (pushnew \"git-branches\" zemacs::*readers* :test #'string=)"
     /* `latex-preview' keeps its one-argument shape — every caller that just
      * wants an equation at body size still writes `(latex-preview src)' — and
      * gains the size as an option. SCALE is a multiple of the body em and may
@@ -1568,7 +1576,7 @@ static const char *OVERLAY_FORM =
     "              \"FOLD-REGION\" \"FOLDS-IN\" \"FOLDED-P\" \"UNFOLD-REGION\""
     "              \"UNFOLD-ALL\""
     "              \"LATEX-PREVIEW\" \"LATEX-FRAGMENTS\" \"HIGHLIGHT\""
-    "              \"FOLD-RANGES\" \"PROJECT-RECENT\""
+    "              \"FOLD-RANGES\" \"PROJECT-RECENT\" \"GIT-REFS\" \"GIT-BRANCHES\""
     "              \"*OVERLAY-PROPERTIES*\"))"
     "   (export (intern n \"ZEMACS\") \"ZEMACS\")))";
 

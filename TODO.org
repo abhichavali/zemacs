@@ -1058,6 +1058,48 @@ stash verbs, push/=push-force=/=push-upstream=, pull, reword, drop-commit,
 a bare =read-string= rather than a completing one seeded with the branch list —
 seeding a prompt with candidates core owns is the gap =docs/boundary.org=
 already records under =project-switch=, and this is a second caller for it.
+** DONE Magit: the keys, the prompts, and an interactive rebase
+The complaint was three things at once — the status buffer's keys were not
+Magit's, a question like =b b= landed on one modeline strip with nothing to
+complete over, and there was no =r i= — and the ponytail note above is the
+second of them, closed the way it said: two readers in =crates/lisp=,
+=(git-refs)= and =(git-branches)=, and every revision prompt in =magit.lisp= is
+now a =completing-read= over them. Nothing has to match, so a hash still checks
+out.
+
+The prompt itself: with =(set-completion-style "center")= a =read-string= and a
+yes-or-no guard now get the same centered box a picker does, minus the rows —
+one branch in =draw_completion=. =:= and =/= stay on the strip, because =/= moves
+the buffer under it and a scrim would hide the match.
+
+The rebase: =rebase-interactive= opens the todo list as a buffer of kind
+=RebaseTodo= in =git-rebase-mode=, whose keys are evil-collection's for that
+file (=p r e s f d x b=, =M-k=/=M-j=, =C-c C-c=, =C-c C-k=). Every key is an
+ordinary edit of ordinary text, so =u= undoes it, and =rebase-finish= parses the
+buffer back with =parse_todo= — which refuses a line it cannot read rather than
+dropping a commit. Alongside it, because they are the keys a hand reaches for:
+=c f=/=c F= (fixup, instant fixup), =r f= (autosquash — git writes that todo
+list itself), =r m=, =r u=, =b m=, =t t=/=t k=, =f a=, and =?=/=h= for the whole
+table.
+
+which-key learned two things for it: a replacement label per command
+(=which-key-describe=), so the panel says "Instant fixup" rather than a verb
+name nobody chose; and an explicit keymap list, so =?= shows the status
+buffer's table with the bindings every buffer has taken back out of it.
+
+Two bugs the live run found. =g r= relocated the repository from the status
+buffer's own (absent) path and so jumped to the working directory's; the
+repository now comes from =Editor::nearest_path=, the buffer you came from. And
+a config that had copied =(define-key "magit" "c" "magit-commit")= from an
+older =init.lisp= had every =c <letter>= dead, because an exact binding is
+resolved before a prefix is asked about — so a later binding now displaces a
+conflicting prefix or family in the same map, which is Emacs' rule.
+
+ponytail: the todo buffer's faces are overlays re-laid after every action key,
+so a line typed by hand in Insert is plain until the next one — an
+after-change hook would fix it and the editor has none. =b m= renames only the
+current branch, =P p=/=F p= are the upstream verbs under a second letter, and
+there is no =c s= / =c S=; each is one arm in =magit.rs= the day it is missed.
 ** DONE Project: =project-find-dir=, and a picker that reaches the filesystem
 The complaint was "there is no select project where I can look at the entire
 filesystem", and it was right: =project-switch= could only offer roots you had

@@ -500,9 +500,10 @@
 (define-key "magit" "r s" "magit-rebase-skip")
 (define-key "magit" "r a" "magit-rebase-abort")   ; throws the rebase away
 
-;;; The rest of the keymap — commit, branch, stash, push, merge, reset, the
-;;; conflict keys and the four commands that ask for a name — is in
-;;; `modes/magit.lisp', which ships with the editor rather than with this file.
+;;; The rest of the keymap — commit, branch, stash, push, merge, reset, tag,
+;;; the conflict keys, the interactive rebase and every command that asks for a
+;;; name — is in `modes/magit.lisp', which ships with the editor rather than
+;;; with this file, along with `?' for the whole table.
 ;;; It is one keymap either way: a binding is a name in a table, and both files
 ;;; write to the same one.
 ;;;

@@ -32,6 +32,12 @@ zemacs-gui.workspace = true
 # `runtime/plugins/project.lisp'. `docs/boundary.org' named this crate edge as
 # the price of closing that split, and this is it.
 zemacs-project.workspace = true
+# Two more readers, both lists of names: the refs and the branches of the
+# repository behind the live buffer, which are what `b b` and `b k` complete
+# over. `runtime/modes/magit.lisp` priced this edge as the upgrade from a bare
+# `read-string`; the list is a few dozen strings, so it crosses the shim as a
+# Lisp list like `project-recent` does.
+zemacs-git.workspace = true
 
 [build-dependencies]
 cc = "1"

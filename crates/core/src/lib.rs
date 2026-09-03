@@ -1564,6 +1564,9 @@ pub enum BufferKind {
     Magit,
     /// A commit message being written. `C-c C-c` finishes it.
     CommitMessage,
+    /// An interactive rebase's todo list being edited. `C-c C-c` hands it to
+    /// git; the plan it belongs to is parked in the app's magit state.
+    RebaseTodo,
     /// A directory listing.
     Dired,
     /// A shell. Its text is a flattening of the terminal grid, rewritten every
@@ -2016,6 +2019,7 @@ impl Buffer {
             (None, BufferKind::Dired) => "*dired*".into(),
             (None, BufferKind::Terminal) => "*terminal*".into(),
             (None, BufferKind::CommitMessage) => "COMMIT_EDITMSG".into(),
+            (None, BufferKind::RebaseTodo) => "git-rebase-todo".into(),
             (None, BufferKind::Text) => "*untitled*".into(),
         }
     }
@@ -3267,6 +3271,22 @@ impl Editor {
     /// there has to still be a name you can hand back to `switch-to-buffer`.
     /// Here nothing reads the string back: accepting goes by
     /// [`Prompt::ids`](crate::Prompt::ids), so the row is free to be legible.
+    /// The path of the live buffer, or of the buffer you came here from — the
+    /// nearest file to whatever is on screen.
+    ///
+    /// For a question about *where you are* asked from a generated buffer: the
+    /// status buffer has no path, and the repository it should show is the one
+    /// holding the file `magit-status` was pressed in, which is the most
+    /// recently left buffer. `others` is most-recently-used, so its first path
+    /// is that answer. `None` when no buffer has a file behind it, and the
+    /// caller falls back to the working directory as it always did.
+    pub fn nearest_path(&self) -> Option<PathBuf> {
+        self.buffer
+            .path
+            .clone()
+            .or_else(|| self.others.iter().find_map(|b| b.path.clone()))
+    }
+
     pub fn buffer_candidates(&self) -> Vec<String> {
         let names = self.buffer_names();
         let width = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
@@ -3703,18 +3723,28 @@ impl Editor {
                 mode,
                 keys,
                 command,
-            } => match Mode::from_name(&mode) {
-                Some(m) => {
-                    self.keymap.insert((m, normalize_keys(&keys)), command);
+            } => {
+                let keys = normalize_keys(&keys);
+                match Mode::from_name(&mode) {
+                    Some(m) => {
+                        // Insert is the one map where a whole key stays whole:
+                        // a sequence hung off it would make the key *wait*
+                        // rather than fire, and `C-c` evaluates while you type
+                        // precisely because `(define-key "insert" "C-c" ...)`
+                        // says so — while `define-key-everywhere "C-c d"`
+                        // lands in this map too, later, meaning nothing here.
+                        displace(&mut self.keymap, &m, &keys, m != Mode::Insert);
+                        self.keymap.insert((m, keys), command);
+                    }
+                    // Not an editing mode, so it names a major or minor mode.
+                    // Unknown names are *not* an error: a binding may be made
+                    // before the mode it belongs to is ever entered.
+                    None => {
+                        displace(&mut self.mode_keymap, &mode, &keys, true);
+                        self.mode_keymap.insert((mode, keys), command);
+                    }
                 }
-                // Not an editing mode, so it names a major or minor mode.
-                // Unknown names are *not* an error: a binding may be made
-                // before the mode it belongs to is ever entered.
-                None => {
-                    self.mode_keymap
-                        .insert((mode, normalize_keys(&keys)), command);
-                }
-            },
+            }
             // No sweep here. Whether this edit let go of an `ImageId` is a
             // question only the overlay itself can answer — see
             // [`overlay::Overlays::edit`], which asks it on the way past and
@@ -4746,6 +4776,30 @@ impl Editor {
             self.status,
         )
     }
+}
+
+/// Emacs' rule for a binding that conflicts with one already in the same map:
+/// the later definition wins, whole. Binding `c` whole where `c c` exists
+/// removes the family, because the whole key is what was asked for. Binding
+/// `c c` where `c` is bound whole removes `c` when `prefix_too` — the lookup
+/// resolves an exact binding before it asks whether the sequence is a prefix,
+/// so `c c` could otherwise never be typed, and a config that copied
+/// `(define-key "magit" "c" "magit-commit")` from an old `init.lisp` had every
+/// `c <letter>` the runtime later bound silently dead. Same map only: across
+/// maps a mode-local prefix outranks a global exact binding, and that rule
+/// lives in the lookup.
+fn displace<K: Eq + std::hash::Hash>(
+    map: &mut HashMap<(K, String), String>,
+    owner: &K,
+    keys: &str,
+    prefix_too: bool,
+) {
+    let under = format!("{keys} ");
+    map.retain(|(m, bound), _| {
+        m != owner
+            || !(bound.starts_with(&under)
+                || (prefix_too && keys.starts_with(&format!("{bound} "))))
+    });
 }
 
 /// Canonical spacing for a key sequence: `"g  d"` and `"gd"` both become `"g d"`.

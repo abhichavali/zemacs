@@ -84,6 +84,10 @@ pub struct Magit {
     /// `RET` on a file. The app opens buffers; this layer asks, exactly as
     /// dired does.
     pub open_file: Option<PathBuf>,
+    /// The interactive rebase whose todo list is open for editing. What
+    /// `rebase-finish` needs and the buffer cannot say: the base. The list
+    /// itself is read back out of the buffer, edits and all.
+    plan: Option<git::Plan>,
 }
 
 impl Magit {
@@ -151,8 +155,14 @@ impl Magit {
     fn try_run(&mut self, editor: &mut Editor, verb: &str) -> anyhow::Result<()> {
         let (verb, arg) = split(verb);
         match verb {
+            // A refresh *from the status buffer* keeps the repository it is
+            // showing; `magit-status` from a file in another repository moves
+            // to that one. Locating again from a buffer with no path is how
+            // `g r` used to land in the working directory's repository.
             "status" | "refresh" => {
-                self.repo = Some(self.locate(editor)?);
+                if self.repo.is_none() || editor.buffer.kind != BufferKind::Magit {
+                    self.repo = Some(self.locate(editor)?);
+                }
                 self.refresh(editor)
             }
             // Fold a section, or open a file's diff under it. The one key
@@ -294,9 +304,13 @@ impl Magit {
                 editor.apply(EditorCommand::Message(summarize(&out, "amend")));
                 Ok(())
             }
-            "fetch" => {
+            "fetch" | "fetch-all" => {
                 let repo = self.repo()?.to_path_buf();
-                let out = git::fetch(&repo)?;
+                let out = if verb == "fetch" {
+                    git::fetch(&repo)?
+                } else {
+                    git::fetch_all(&repo)?
+                };
                 self.refresh(editor)?;
                 editor.apply(EditorCommand::Message(summarize(&out, "fetch")));
                 Ok(())
@@ -378,14 +392,149 @@ impl Magit {
             }
             // Replay this branch onto another one. The todo list is worked out
             // here and handed to git whole, so no sequence editor is spawned —
-            // see `zemacs_git::rebase`.
-            "rebase" => {
+            // see `zemacs_git::rebase`. `r e` names the base; `r u` and `r p`
+            // take the upstream, which is the one this branch is measured
+            // against in the header.
+            "rebase" | "rebase-upstream" => {
                 let repo = self.repo()?.to_path_buf();
-                let base = self.revision(editor, arg)?;
+                let base = if verb == "rebase-upstream" {
+                    self.upstream(&repo)?
+                } else {
+                    self.revision(editor, arg)?
+                };
                 let plan = git::plan_onto(&repo, &base)?;
                 let outcome = git::rebase_start(&repo, &plan)?;
                 self.refresh(editor)?;
                 editor.apply(EditorCommand::Message(report(outcome, "rebase")));
+                Ok(())
+            }
+            // `r i`: the todo list `git rebase -i` would have opened an editor
+            // on, opened in *this* editor. Every commit from the one under the
+            // cursor up to HEAD, as `pick` lines; `rebase-finish` reads the
+            // buffer back and hands the list to git whole. The base is parked
+            // here because the buffer has nowhere to say it.
+            "rebase-interactive" => {
+                let repo = self.repo()?.to_path_buf();
+                let from = self.revision(editor, arg)?;
+                let plan = git::plan_from(&repo, &from)?;
+                editor.show_special(BufferKind::RebaseTodo, &todo_template(&plan));
+                // A major mode of its own, so the single-letter keys — `p`,
+                // `s`, `f`, `d` — mean pick, squash, fixup and drop here and
+                // nothing else; `runtime/modes/magit.lisp` binds them.
+                editor.apply(EditorCommand::SetMajorMode("git-rebase-mode".into()));
+                self.plan = Some(plan);
+                editor.apply(EditorCommand::Message(
+                    "edit the todo list, then C-c C-c to rebase".into(),
+                ));
+                Ok(())
+            }
+            // `C-c C-c` in the todo buffer. The list is whatever the buffer says
+            // now — reordered, re-worded, lines dropped — and `parse_todo`
+            // refuses a line it cannot read rather than skipping it, so a typo
+            // is an error here and never a silently dropped commit.
+            "rebase-finish" => {
+                let repo = self.repo()?.to_path_buf();
+                if editor.buffer.kind != BufferKind::RebaseTodo {
+                    anyhow::bail!("not in a rebase todo buffer");
+                }
+                let base = self
+                    .plan
+                    .as_ref()
+                    .map(|p| p.base.clone())
+                    .ok_or_else(|| anyhow::anyhow!("no rebase is being planned"))?;
+                let todo = git::parse_todo(&editor.buffer.text.to_string())?;
+                let outcome = git::rebase_start(&repo, &git::Plan { base, todo })?;
+                self.plan = None;
+                self.close_todo(editor);
+                self.refresh(editor)?;
+                editor.apply(EditorCommand::Message(report(outcome, "rebase")));
+                Ok(())
+            }
+            // `C-c C-k`: nothing has touched the repository yet, so there is
+            // nothing to undo — the buffer goes and the status comes back.
+            "rebase-cancel" => {
+                self.plan = None;
+                self.close_todo(editor);
+                self.refresh(editor)?;
+                editor.apply(EditorCommand::Message("rebase cancelled".into()));
+                Ok(())
+            }
+            // `r m`: stop at the commit under the cursor to amend it — an
+            // interactive rebase whose only edit is one `edit`, so it needs no
+            // buffer and runs on the spot.
+            "rebase-modify" => {
+                let repo = self.repo()?.to_path_buf();
+                let from = self.revision(editor, arg)?;
+                let mut plan = git::plan_from(&repo, &from)?;
+                plan.todo[0].action = git::Action::Edit;
+                let outcome = git::rebase_start(&repo, &plan)?;
+                self.refresh(editor)?;
+                editor.apply(EditorCommand::Message(report(outcome, "rebase")));
+                Ok(())
+            }
+            // `r f`: fold every `fixup!` commit into the one it names. git
+            // writes this todo list itself, so the base is all that is asked —
+            // the upstream when nothing is named, which is where the fixups
+            // usually are.
+            "rebase-autosquash" => {
+                let repo = self.repo()?.to_path_buf();
+                let base = if arg.is_empty() {
+                    self.upstream(&repo)?
+                } else {
+                    arg.to_string()
+                };
+                let outcome = git::rebase_autosquash(&repo, &base)?;
+                self.refresh(editor)?;
+                editor.apply(EditorCommand::Message(report(outcome, "autosquash")));
+                Ok(())
+            }
+            // `c f` and `c F`: the index as a `fixup!` of the commit under the
+            // cursor. The instant one goes on to autosquash it into place, onto
+            // that commit's parent, so the whole gesture is "this belongs in
+            // that commit" with nothing left to do afterwards.
+            "commit-fixup" | "commit-instant-fixup" => {
+                let repo = self.repo()?.to_path_buf();
+                let target = self.revision(editor, arg)?;
+                if git::status(&repo)?.staged.is_empty() {
+                    anyhow::bail!("nothing staged to fix up with");
+                }
+                let out = git::commit_fixup(&repo, &target)?;
+                let message = if verb == "commit-fixup" {
+                    summarize(&out, verb)
+                } else {
+                    report(git::rebase_autosquash(&repo, &format!("{target}^"))?, "fixup")
+                };
+                self.refresh(editor)?;
+                editor.apply(EditorCommand::Message(message));
+                Ok(())
+            }
+            "branch-rename" => {
+                let repo = self.repo()?.to_path_buf();
+                if arg.is_empty() {
+                    anyhow::bail!("branch-rename needs the new name");
+                }
+                git::branch_rename(&repo, arg)?;
+                self.refresh(editor)?;
+                editor.apply(EditorCommand::Message(format!("renamed to {arg}")));
+                Ok(())
+            }
+            // `t t` tags the commit under the cursor, or HEAD when the cursor
+            // is elsewhere — the second is the common case, tagging a release
+            // you just made.
+            "tag" | "tag-delete" => {
+                let repo = self.repo()?.to_path_buf();
+                if arg.is_empty() {
+                    anyhow::bail!("{verb} needs the tag's name");
+                }
+                let out = if verb == "tag" {
+                    let at = self.revision(editor, "").unwrap_or_else(|_| "HEAD".into());
+                    git::tag(&repo, arg, &at)?;
+                    format!("tagged {at} as {arg}")
+                } else {
+                    git::tag_delete(&repo, arg)?
+                };
+                self.refresh(editor)?;
+                editor.apply(EditorCommand::Message(summarize(&out, verb)));
                 Ok(())
             }
             // History surgery on the commit under the cursor. Each is a rebase
@@ -684,6 +833,24 @@ impl Magit {
         }
     }
 
+    /// The branch's upstream, as a revision — and an error rather than a
+    /// guess when there is none, because every caller is about to rebase onto
+    /// it.
+    fn upstream(&self, repo: &Path) -> anyhow::Result<String> {
+        git::status(repo)?
+            .upstream
+            .ok_or_else(|| anyhow::anyhow!("this branch has no upstream"))
+    }
+
+    /// Kill the todo buffer if it is the live one. The rebase it described has
+    /// run or been abandoned, and a stale list left in the switcher would be
+    /// one `C-c C-c` from running again against a history it no longer fits.
+    fn close_todo(&self, editor: &mut Editor) {
+        if editor.buffer.kind == BufferKind::RebaseTodo {
+            editor.apply(EditorCommand::KillBuffer(0));
+        }
+    }
+
     fn view_mut(&mut self) -> anyhow::Result<&mut git::View> {
         self.view
             .as_mut()
@@ -737,13 +904,17 @@ impl Magit {
             .ok_or_else(|| anyhow::anyhow!("no repository — run magit-status first"))
     }
 
-    /// The repository to show: the one holding the current file, else the one
-    /// holding the working directory.
+    /// The repository to show: the one holding the current file — or, from a
+    /// buffer with no file, the file you came from — else the one holding the
+    /// working directory.
+    ///
+    /// `nearest_path` rather than the live buffer's own path, and the case is
+    /// `g r`: the status buffer has no path, so a refresh located from it went
+    /// to the working directory's repository, which is not necessarily the one
+    /// on screen.
     fn locate(&self, editor: &Editor) -> anyhow::Result<PathBuf> {
         let from = editor
-            .buffer
-            .path
-            .clone()
+            .nearest_path()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         git::repo_root(&from).ok_or_else(|| anyhow::anyhow!("{} is not a git repository", from.display()))
@@ -865,6 +1036,36 @@ fn commit_template(status: &git::Status, writing: &Writing, old: &str) -> String
     s
 }
 
+/// The `git-rebase-todo` file as git would have written it: the steps, then
+/// the legend as comments. `parse_todo` drops the comments, so the buffer
+/// round-trips however it is edited — and the legend is the keys rather than
+/// git's one-letter abbreviations, because here a letter *is* a key.
+fn todo_template(plan: &git::Plan) -> String {
+    let mut s = git::write_todo(&plan.todo);
+    let onto = plan.base.as_deref().unwrap_or("the root");
+    s.push_str(&format!(
+        "\n{COMMENT} Rebase {} commit{} onto {onto}\n{COMMENT}\n",
+        plan.todo.len(),
+        if plan.todo.len() == 1 { "" } else { "s" }
+    ));
+    for line in [
+        "p pick    use commit",
+        "r reword  use commit, but edit the commit message",
+        "e edit    use commit, but stop for amending",
+        "s squash  use commit, but meld into previous commit",
+        "f fixup   like squash, but discard this commit's message",
+        "d drop    remove commit",
+        "x exec    run a command after this step",
+        "b break   stop here",
+        "M-k M-j   move the step up or down",
+        "",
+        "C-c C-c   rebase    C-c C-k   cancel",
+    ] {
+        s.push_str(&format!("{COMMENT} {line}\n"));
+    }
+    s
+}
+
 /// Drop comment lines and surrounding blank lines, as git does.
 fn strip_comments(text: &str) -> String {
     let body: Vec<&str> = text
@@ -952,6 +1153,32 @@ mod tests {
         // A reword takes its tree from HEAD, so saying what is staged would be
         // a lie about what is going to happen.
         assert!(!reword.contains("a.rs"), "{reword}");
+    }
+
+    /// The todo buffer is what git would have opened an editor on, and it has
+    /// to read back as exactly the plan it was written from — every comment
+    /// dropped, every step kept — or `C-c C-c` runs a rebase nobody wrote.
+    #[test]
+    fn the_todo_template_round_trips_through_the_parser() {
+        let plan = git::Plan {
+            base: Some("abc1234".into()),
+            todo: vec![
+                git::TodoItem::pick("1111111", "first"),
+                git::TodoItem::pick("2222222", "second: with punctuation"),
+            ],
+        };
+        let text = todo_template(&plan);
+        assert!(text.starts_with("pick 1111111 first\n"), "{text}");
+        assert!(text.contains("# Rebase 2 commits onto abc1234"), "{text}");
+        // The legend names the *keys*, which is what a letter is in this buffer.
+        assert!(text.contains("C-c C-c"), "{text}");
+        assert_eq!(git::parse_todo(&text).unwrap(), plan.todo);
+        // A root rebase has no base to name, and says so rather than printing
+        // an empty word.
+        let root = git::Plan { base: None, ..plan };
+        assert!(todo_template(&root).contains("2 commits onto the root"));
+        let one = git::Plan { base: None, todo: root.todo[..1].to_vec() };
+        assert!(todo_template(&one).contains("1 commit onto the root"));
     }
 
     /// The one line that lets a question whose answer is *data* stay in Lisp.
@@ -1289,6 +1516,8 @@ mod tests {
         assert!(confirm_question("checkout").is_none());
         assert!(confirm_question("visit").is_none());
         assert!(confirm_question("log").is_none());
+        assert!(confirm_question("rebase-interactive").is_none());
+        assert!(confirm_question("commit-fixup").is_none());
         assert!(confirm_question("rebase-abort").is_some());
     }
 

@@ -41,6 +41,37 @@ pub use overlay::{fold_hiding, fold_starts_in, Image, ImageId, Overlay, OverlayE
 /// `apply`, one frame's drawing — and never across a wait.
 pub type Shared = std::sync::Arc<std::sync::Mutex<Editor>>;
 
+/// How a thread that is not the main one says "there is something to draw".
+///
+/// The main loop parks in `SDL_WaitEventTimeout` and every other thread reaches
+/// the editor through the mutex above, raising no window event. Without this
+/// the loop's only way to notice a change made off the event queue was to wake
+/// on a timer and look — sixty times a second, forever, for the once an hour
+/// something is actually there. This is that timer, replaced by the signal it
+/// was standing in for.
+///
+/// A global rather than a handle threaded through six constructors, for the
+/// same reason [`Editor::generation`] is a counter rather than a callback: the
+/// producers are in four crates that have no business knowing what a window is,
+/// and there is exactly one editor per process by construction. `None` until
+/// the app installs one, which is what keeps every test and every headless
+/// caller working with no waker at all.
+static WAKE: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+/// Install the process's waker. The second call is ignored.
+pub fn set_waker(f: impl Fn() + Send + Sync + 'static) {
+    let _ = WAKE.set(Box::new(f));
+}
+
+/// Ask the main loop to come round. Cheap enough to call per primitive: the
+/// installed waker coalesces, so a Lisp loop calling `(point)` ten thousand
+/// times raises one event, not ten thousand.
+pub fn wake() {
+    if let Some(f) = WAKE.get() {
+        f();
+    }
+}
+
 /// Editing mode — the heart of the modal ("Evil") feel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mode {
@@ -916,6 +947,21 @@ pub enum EditorCommand {
     OpenAt(String),
     SaveFile(Option<PathBuf>),
 
+    /// Re-read the live buffer from the file it is visiting, discarding what is
+    /// in it.
+    ///
+    /// The manual half of auto-revert, and it exists because the automatic half
+    /// deliberately refuses one case: a buffer with unsaved changes is never
+    /// silently clobbered, so a file rewritten underneath it — by a formatter,
+    /// by `git checkout`, by an agent editing the file you are sitting in — is
+    /// announced and *not* taken. This is how you then say "take it anyway",
+    /// and it is guarded by a [`EditorCommand::Confirmed`] in exactly that case
+    /// because the text it discards has never been written down anywhere.
+    ///
+    /// The app's, not core's: the file is the app's to read, and the splice that
+    /// keeps markers and overlays alive is [`Editor::revert_buffer`].
+    RevertBuffer,
+
     /// "The user has already said yes to this" — the answer to a
     /// [`PromptKind::Confirm`], carrying the command it was guarding.
     ///
@@ -1378,6 +1424,7 @@ impl EditorCommand {
             self,
             EditorCommand::OpenFile(_)
                 | EditorCommand::SaveFile(_)
+                | EditorCommand::RevertBuffer
                 // Whatever it wraps was guarded by a layer that only the app
                 // has — the filesystem, or git.
                 | EditorCommand::Confirmed(_)
@@ -3846,6 +3893,9 @@ impl Editor {
             EditorCommand::OpenFile(p) => self.status = format!("cannot open {}", p.display()),
             EditorCommand::OpenAt(hit) => self.status = format!("cannot open {hit}"),
             EditorCommand::SaveFile(_) => self.status = "cannot save: no file backend".into(),
+            EditorCommand::RevertBuffer => {
+                self.status = "cannot revert: no file backend".into()
+            }
             EditorCommand::Confirmed(_) => {
                 self.status = "cannot confirm: no file backend".into()
             }

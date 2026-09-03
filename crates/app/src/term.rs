@@ -350,6 +350,9 @@ impl Term {
             // The receiver is gone only if the editor is, and then there is
             // nobody left to tell.
             let _ = tx.send(text);
+            // ...and the loop has to come round to read it: `reap_bangs` runs
+            // per iteration, and nothing else is going to cause one.
+            zemacs_core::wake();
         });
         self.bangs.push((child, rx));
     }
@@ -832,20 +835,34 @@ impl Term {
         if self.sessions[i].frozen {
             return;
         }
-        let text = self.sessions[i]
-            .inner
-            .screen(fg(editor), bg(editor))
-            .to_text();
-        // Only when it changed: `show_named` bumps the revision, and doing that
-        // every frame would have the syntax thread reparsing a terminal sixty
-        // times a second.
-        if editor.buffer.text != text {
-            let name = self.sessions[i].name.clone();
-            editor.show_named(BufferKind::Terminal, Some(&name), &text);
-            // A child printing is the other thing that happens with nobody at
-            // the keyboard. The draw loop skips a frame whose generation has
-            // not moved, and a shell's output moves nothing else here.
-            editor.touch();
+        // Only when the grid can have changed. Flattening it is `rows * cols`
+        // cells copied out from under alacritty's lock and a `String` per row,
+        // and this used to run on every turn of the loop for as long as a
+        // terminal buffer was on screen — sixty times a second at a shell
+        // prompt nobody was typing at, to produce the same screenful sixty
+        // times and throw away fifty-nine. See `Terminal::dirty`: the flag is
+        // raised by the child printing, by a reflow and by a scroll through the
+        // history, which is every way these rows can differ.
+        //
+        // Asked *after* the freeze check above, so a session parked behind
+        // another buffer keeps its flag rather than having it cleared by a
+        // refresh that did not happen.
+        if self.sessions[i].inner.take_dirty() {
+            let text = self.sessions[i]
+                .inner
+                .screen(fg(editor), bg(editor))
+                .to_text();
+            // Only when it changed: `show_named` bumps the revision, and doing
+            // that every frame would have the syntax thread reparsing a
+            // terminal sixty times a second.
+            if editor.buffer.text != text {
+                let name = self.sessions[i].name.clone();
+                editor.show_named(BufferKind::Terminal, Some(&name), &text);
+                // A child printing is the other thing that happens with nobody
+                // at the keyboard. The draw loop skips a frame whose generation
+                // has not moved, and a shell's output moves nothing else here.
+                editor.touch();
+            }
         }
         // A session running a harness is in `ai-mode`, a plain shell in
         // `terminal-mode` — the axis `(major-mode)` answers on, which is what a

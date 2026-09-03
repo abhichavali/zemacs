@@ -989,6 +989,10 @@ pub fn spawn_worker() -> Worker {
                 if res_tx.send(done).is_err() {
                     break;
                 }
+                // The app drains this channel from its main loop, which has to
+                // be awake to do it. Without this a finished parse waits for
+                // whatever wakes the loop next, and the colour arrives late.
+                zemacs_core::wake();
             }
         })
         .expect("failed to spawn syntax thread");

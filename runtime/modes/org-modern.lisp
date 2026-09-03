@@ -391,7 +391,14 @@ substitution and the highlighter's one-face-per-heading rule still holds."
          (append (list (list indent (1+ indent) :list))
                  (when box (list (list (car box) (cdr box) :checkbox)))
                  (%org-modern-inline line from))))
-      (t (%org-modern-inline line indent)))))
+      ;; ...and a box with no bullet in front of it, which is a checklist
+      ;; written without reaching for `-' first. Anchored on the first non-blank
+      ;; character by `%org-checkbox-at', so `the [x] column' stays prose;
+      ;; `%org-checkbox-index' in `org-structure.lisp' reads it from the same
+      ;; place, which is what makes this one tickable rather than only drawn.
+      (t (let ((box (%org-checkbox-at line indent)))
+           (append (when box (list (list (car box) (cdr box) :checkbox)))
+                   (%org-modern-inline line (if box (cdr box) indent))))))))
 
 (defun %org-modern-scan (text)
   "Every substitution TEXT wants, as (BEG END KIND LITERAL): BEG and END in

@@ -999,6 +999,10 @@ static const char *LIBRARY_FORM =
     "(progn"
     /* --- commands ------------------------------------------------------- */
     " (defun zemacs::undo () (zemacs::%do \"undo\" nil 0 0))"
+    /* Emacs' `revert-buffer'. Zero arguments, so it is in the M-x list, which
+     * is where somebody looks for it the moment a file has changed underneath a
+     * buffer they had edited and the sweep said so and declined. */
+    " (defun zemacs::revert-buffer () (zemacs::%do \"revert-buffer\" nil 0 0))"
     " (defun zemacs::redo () (zemacs::%do \"redo\" nil 0 0))"
     " (defun zemacs::split-window-right () (zemacs::%do \"split-window-right\" nil 0 0))"
     " (defun zemacs::split-window-below () (zemacs::%do \"split-window-below\" nil 0 0))"

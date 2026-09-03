@@ -960,33 +960,6 @@ impl Renderer {
         self.draws
     }
 
-    /// One frame of this window's display, in milliseconds. The loop sleeps this
-    /// long when it has nothing to put on screen, so it wants the real refresh
-    /// rate rather than a guess: on a 120 Hz panel, guessing 60 would double how
-    /// long a change made off the event queue waits to be noticed.
-    ///
-    /// 60 Hz when SDL cannot say. Asked per sleep rather than cached because a
-    /// window can be dragged to a display with a different rate, and the call is
-    /// a field read behind an SDL lock — far cheaper than the sleep it sizes.
-    /// Through the *display*, not the window. SDL3's `Window::display_mode` is
-    /// `SDL_GetWindowFullscreenMode`, which answers `None` for any window that
-    /// is not in exclusive fullscreen — that is every window this editor makes,
-    /// so asking it would pin this to 60 Hz forever and silently double the
-    /// latency of a Lisp-thread change on a 120 Hz panel. The desktop mode of
-    /// the display the window is on is the number that was always meant.
-    pub fn frame_ms(&self) -> u32 {
-        let hz = self
-            .canvas
-            .window()
-            .get_display()
-            .ok()
-            .and_then(|d| d.get_mode().ok())
-            .map(|m| m.refresh_rate)
-            .filter(|hz| *hz > 0.0)
-            .unwrap_or(60.0);
-        ((1000.0 / hz) as u32).max(1)
-    }
-
     // --- pointing ----------------------------------------------------------
 
     /// The window a click at `(x, y)` landed in, and the buffer offset under
@@ -3080,12 +3053,11 @@ impl Renderer {
         };
         // Nothing anywhere has it, or the upload failed. A blank cell, which is
         // what the whole of this used to be.
-        let Some(tex) = tex else {
+        let Some((tex, w, h)) = tex else {
             return;
         };
         tex.set_color_mod(color.r, color.g, color.b);
-        let q = tex.query();
-        let _ = canvas.copy(tex, None, Rect::new(x, y, q.width, q.height));
+        let _ = canvas.copy(&*tex, None, Rect::new(x, y, *w, *h));
         // The key and not only the character, and that is what lets one word
         // shape serve all three faces: a glyph's pixels are a function of the
         // face it came out of, and only the *body* size is implied by the frame
@@ -3159,7 +3131,12 @@ impl Cut {
 /// the font must drop the glyphs in the same move.
 struct Face {
     font: Font<'static>,
-    glyphs: HashMap<char, Option<Texture<'static>>>,
+    /// Each texture with its width and height. The size is needed on every
+    /// blit, and asking SDL for it is four property lookups — each validating
+    /// the handle in a hash table — per glyph per frame, which sampled at
+    /// close to a millisecond of a keystroke's draw on a full screen of text.
+    /// A glyph's size is fixed the moment it is rasterised, so it is kept then.
+    glyphs: HashMap<char, Option<(Texture<'static>, u32, u32)>>,
 }
 
 impl Face {
@@ -3174,7 +3151,7 @@ impl Face {
         &mut self,
         textures: &'static TextureCreator<WindowContext>,
         c: char,
-    ) -> Option<&mut Texture<'static>> {
+    ) -> Option<&mut (Texture<'static>, u32, u32)> {
         self.glyphs
             .entry(c)
             .or_insert_with(|| glyph_texture(textures, &self.font, c))
@@ -3651,7 +3628,7 @@ fn glyph_texture(
     textures: &'static TextureCreator<WindowContext>,
     font: &Font,
     c: char,
-) -> Option<Texture<'static>> {
+) -> Option<(Texture<'static>, u32, u32)> {
     // Render as a one-char *string* rather than via `render_char`: the string
     // path applies the glyph's left bearing for us, so blitting at the cell
     // origin lines up.
@@ -3664,7 +3641,7 @@ fn glyph_texture(
 
     let mut tex = textures.create_texture_from_surface(&surface).ok()?;
     tex.set_blend_mode(BlendMode::Blend);
-    Some(tex)
+    Some((tex, surface.width(), surface.height()))
 }
 
 /// Upload an overlay bitmap. `None` records a failure so it is not retried on
@@ -3826,6 +3803,21 @@ fn scale_point_size(font_size: f32, scale: f32) -> u16 {
 }
 
 fn find_font() -> anyhow::Result<PathBuf> {
+    // Memoised, because `Renderer::sync` asks on every frame it draws and the
+    // answer cannot change: the environment is read once at exec and the
+    // candidate list is a constant, so every ask after the first was a `stat`
+    // per candidate to arrive at the path it already had. Only the success is
+    // remembered — a failure is a session with no font at all, which is not a
+    // state worth caching.
+    static FOUND: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if let Some(p) = FOUND.get() {
+        return Ok(p.clone());
+    }
+    let found = find_font_uncached()?;
+    Ok(FOUND.get_or_init(|| found).clone())
+}
+
+fn find_font_uncached() -> anyhow::Result<PathBuf> {
     if let Some(p) = std::env::var_os("ZEMACS_FONT") {
         let p = PathBuf::from(p);
         anyhow::ensure!(p.is_file(), "$ZEMACS_FONT is not a file: {}", p.display());

@@ -259,6 +259,28 @@ fn an_org_session_survives_its_own_features_meeting() {
         "* Tasks [0/2]\n- [ ] milk\n- [ ] eggs\n"
     );
 
+    // A box with no bullet in front of it is still a box: a checklist typed
+    // without reaching for `-` first. It has to be tickable and not only drawn,
+    // which is why the reader `org-modern` draws from and the reader
+    // `org-toggle-checkbox` ticks from are the same one.
+    load(&shared, "[ ] milk\nthe [x] column is prose\n", 20);
+    lisp.eval("(goto-char (line-start 1))".into());
+    lisp.eval("(org-toggle-checkbox)".into());
+    assert_eq!(
+        text(&shared, &lisp),
+        "[X] milk\nthe [x] column is prose\n",
+        "a bulletless box ticks"
+    );
+    // ...and a cookie further along a line is prose, which is what keeps this
+    // from turning every `[x]` in a document into a checkbox.
+    lisp.eval("(goto-char (line-start 2))".into());
+    assert_eq!(
+        ask(&shared, &lisp, "(%org-checkbox-index (line-string 2))"),
+        "NIL",
+        "a cookie mid-line is not a checkbox"
+    );
+
+    load(&shared, "* Tasks [0/2]\n- [ ] milk\n- [ ] eggs\n", 21);
     let before = text(&shared, &lisp);
     lisp.eval("(goto-char (+ (line-start 2) 6))".into());
     lisp.eval("(org-toggle-checkbox)".into());

@@ -1675,6 +1675,10 @@ buffer."
 ;;;                   `pylsp' and `clangd' — and a third is one line in your
 ;;;                   init: `(lsp-register-server 'rust-mode "rust-analyzer")'.
 ;;;
+;;;   pdf.lisp        PDFs as pages: mutool draws one fitted to the window and
+;;;                   a scene shows it. `j'/`k' scroll and turn the page, `/'
+;;;                   searches, `m' inverts. After `gui.lisp', which it is
+;;;                   written on.
 ;;;   which-key.lisp  what continues the prefix you just pressed, in the status
 ;;;                   line — and the same table read the other way round, as the
 ;;;                   docstring and key `M-x' now shows beside a command.
@@ -1744,7 +1748,7 @@ buffer."
     ;; matters is that both are loaded before a key is pressed.
     "modes/xref.lisp"
     "modes/which-key.lisp" "modes/show-paren.lisp" "modes/avy.lisp"
-    "modes/magit.lisp"
+    "modes/magit.lisp" "modes/pdf.lisp"
     "modes/lisp-mode.lisp" "modes/repl.lisp" "modes/parinfer.lisp"
     "modes/org-latex.lisp" "modes/org-modern.lisp" "modes/org-fold.lisp"
     ;; ...and `org-table.lisp' after both of them, because its three keys are

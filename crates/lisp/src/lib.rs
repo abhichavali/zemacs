@@ -1069,6 +1069,7 @@ fn command_for(verb: &str, arg: String, a: i64, b: i64) -> Option<EditorCommand>
             Ok(scene) => EditorCommand::SetScene(Some(scene)),
             Err(e) => EditorCommand::Message(format!("scene-set: {e}")),
         },
+        "scene-scroll" => EditorCommand::SceneScroll(a.clamp(0, i32::MAX as i64) as i32),
 
         // --- lisp-api: the verbs that closed `boundary.org`'s table ----------
         //

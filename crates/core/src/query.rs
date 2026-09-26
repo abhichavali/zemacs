@@ -204,6 +204,17 @@ pub fn query(ed: &Editor, name: &str, a: i64, b: i64) -> String {
 
         "window-scroll" => ed.scroll.to_string(),
         "window-height" => ed.viewport_lines.to_string(),
+        // The page area of the focused pane in device pixels, `(W H)` — what a
+        // scene is laid out in, so what a figure fitted to the window needs.
+        "window-pixel-size" => format!("({} {})", ed.viewport_px.0, ed.viewport_px.1),
+        // How far the live buffer's scene is scrolled, in pixels, or NIL when it
+        // is showing text.
+        "scene-scroll" => buf.scene.as_ref().map_or("nil".into(), |s| s.scroll.to_string()),
+        // `(W H)` of an id `image-file` or `latex-preview` answered, or NIL.
+        "image-size" => match u64::try_from(a).ok().and_then(|id| ed.image(id)) {
+            Some(i) => format!("({} {})", i.width, i.height),
+            None => "nil".into(),
+        },
         "frame-count" => ed.frames.len().to_string(),
         // Windows of the *focused* frame — the only one a Lisp command can act
         // on, since `select-window` addresses ids within it. `(ID NAME)` each,

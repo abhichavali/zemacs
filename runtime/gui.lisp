@@ -427,6 +427,22 @@ and the page already up is left alone."
   (setf *scene-tags-shown* t)
   (%scene-set page))
 
+(defun scene-scroll (&optional y)
+  "How far the live buffer's page is scrolled, in pixels — NIL when it shows
+text. With Y, scroll it there; past the end is fine, the draw clamps it."
+  (if y
+      (progn (%do "scene-scroll" "" (max 0 (round y)) 0) y)
+      (%query "scene-scroll" 0 0)))
+
+(defun window-pixel-size ()
+  "`(W H)' of the box the focused window lays a page out in, in device pixels —
+the same pixels `image' sizes are in."
+  (%query "window-pixel-size" 0 0))
+
+(defun image-size (id)
+  "`(W H)' of the bitmap ID names, in device pixels, or NIL."
+  (%query "image-size" id 0))
+
 ;;; None of the builders is a command: they take `&rest' and so *look*
 ;;; zero-argument to the introspection `refresh-commands' does, and running one
 ;;; by hand builds a string nobody sees. The same lever `rpc.lisp' uses for
@@ -436,5 +452,5 @@ and the page already up is left alone."
 ;;; the page down, which is exactly what you want from `M-x' when a mode has left
 ;;; one up and you would like the text back.
 (when (boundp '*hidden-commands*)
-  (dolist (n '("block" "text" "run" "rect"))
+  (dolist (n '("block" "text" "run" "rect" "scene-scroll" "window-pixel-size"))
     (pushnew n *hidden-commands* :test #'string=)))

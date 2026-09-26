@@ -721,6 +721,9 @@ impl Renderer {
             if focused && p.window == current {
                 editor.viewport_lines = lines;
                 editor.wrap_cols = cols;
+                // The box `scene_viewport` lays a scene out in, for the same pane.
+                let doc = doc_rect(pane, status_h, 0);
+                editor.viewport_px = (doc.w, doc.h);
             }
         }
 

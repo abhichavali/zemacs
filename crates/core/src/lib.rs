@@ -1041,6 +1041,10 @@ pub enum EditorCommand {
     /// therefore already read-only — could never be handed a new one or have
     /// this one taken away.
     SetScene(Option<zemacs_gui::Scene>),
+    /// Scroll the live buffer's scene to this many pixels from the top. Written
+    /// raw, as a swap writes it: the draw clamps it against the laid-out height
+    /// before the frame is painted, because only the renderer can measure one.
+    SceneScroll(i32),
 
     /// Put a prompt up whose answer goes **back to Lisp**, as
     /// `(%prompt-reply ID ANSWER)` through [`EditorCommand::CallLisp`]. `id`
@@ -2636,6 +2640,11 @@ pub struct Editor {
     /// has to be rasterised at this size or it comes out half-height on a
     /// Retina display.
     pub font_px: f32,
+    /// The focused pane's page area in device pixels, `(width, height)` — the
+    /// box a scene is laid out in. Parked by the renderer beside `font_px`, and
+    /// for the same reason: a PDF page fitted to the window has to be rendered
+    /// at a size only the renderer knows.
+    pub viewport_px: (i32, i32),
     /// Command names published by the Lisp image, for `M-x` completion.
     pub commands: Vec<String>,
     /// What has been answered to prompts before, oldest first, so `M-p` in a
@@ -2868,6 +2877,7 @@ impl Editor {
             next_overlay_id: 1,
             images: HashMap::new(),
             font_px: Settings::default().font_size,
+            viewport_px: (0, 0),
             commands: Vec::new(),
             prompt_history: Vec::new(),
             pending_hooks: Vec::new(),
@@ -3812,6 +3822,11 @@ impl Editor {
                 // figure of no size and has to decide what to do about it.
                 let scene = scene.map(|s| self.with_image_sizes(s));
                 self.buffer.set_scene(scene);
+            }
+            EditorCommand::SceneScroll(y) => {
+                if let Some(scene) = self.buffer.scene.as_mut() {
+                    scene.scroll = y.max(0);
+                }
             }
             EditorCommand::ReadFromMinibuffer {
                 id,

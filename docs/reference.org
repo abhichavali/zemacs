@@ -552,6 +552,36 @@ an overlay carrying the handle, and the renderer grows the line to fit the
 bitmap exactly as it does for a display equation. =SPC m f= redraws, =SPC m F=
 clears, and entering =org-mode= draws what has none yet.
 
+* PDFs
+
+A =.pdf= opens in =pdf-mode= from anywhere a file opens — dired's =RET=,
+=find-file=, recent files, the project finder. =mutool= (=brew install
+mupdf-tools=) draws one page at a time, fitted to the window, into a [[file:gui.org][scene]];
+=runtime/modes/pdf.lisp= is the whole of it.
+
+| Keys                    | Does                                                 |
+|-------------------------+------------------------------------------------------|
+| =j= =k= =C-d= =C-u= =C-f= =C-b= | Scroll; past either end of a page, turn it         |
+| =J= =K=, =<right>= =<left>=     | Next and previous page                             |
+| =g g= =G= =g t=               | First page, last page, a page by number            |
+| =+= =-= ~=~ =H=               | Zoom in and out, fit the width, fit the whole page |
+| =m=                           | Light text on a dark page                          |
+| =/= =n= =N=                   | Go to the next or previous page with some text     |
+| =t=                           | The document's text in a buffer, to copy from      |
+| =g r=                         | Read the file again — after LaTeX rebuilt it       |
+| =q=                           | Close it                                           |
+
+Your place in each document is kept for the session. Zoom tops out at the
+window's width, because a scene does not scroll sideways.
+
+Three readers came with it, and they are general:
+
+| Form                  | Answers                                                          |
+|-----------------------+------------------------------------------------------------------|
+| =(window-pixel-size)= | =(W H)= of the box a scene is laid out in, in device pixels      |
+| =(scene-scroll &optional y)= | How far the page is scrolled, or scrolls it to =Y=; =NIL= on text |
+| =(image-size id)=     | =(W H)= of a bitmap =image-file= or =latex-preview= answered     |
+
 * Following a link
 
 | Form                   |   | Does                                                     |

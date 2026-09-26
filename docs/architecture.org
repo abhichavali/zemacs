@@ -1,0 +1,192 @@
+#+TITLE: Architecture
+#+SUBTITLE: the crates, the threads, and the path of one keystroke
+
+The other documents in this directory describe the Lisp API and why its edges
+are where they are. This one is the map underneath: which crate owns what, which
+thread runs what, and how a keystroke or a Lisp call becomes a change on screen.
+Read it before changing anything in Rust, and before deciding a feature needs
+Rust at all ([[file:boundary.org][boundary.org]] is the rule for that).
+
+* In one paragraph
+
+A single =Editor= value (=crates/core=) holds every buffer, window, frame, prompt
+and setting. It lives in an =Arc<Mutex<Editor>>= (=zemacs_core::Shared=) owned by
+the application's main loop (=crates/app=) and shared with the embedded ECL image
+(=crates/lisp=), which runs on its own thread. Every change to a document is an
+=EditorCommand= applied by =Editor::apply=; the few commands core cannot carry
+out (files, git, dired, terminals, calling Lisp, closing an OS window) are
+performed by =App::dispatch= in =crates/app/src/main.rs=. The renderer
+(=crates/render=) draws the =Editor= once per changed frame. Everything a user
+configures — keys, modes, themes, most features — is Lisp in =runtime/=.
+
+* The crates
+
+Package names are the ones in each =Cargo.toml=; the workspace is the root
+=Cargo.toml=.
+
+| Package          | Entry                        | Owns                                                                  | Depends on (ours)                                   |
+|------------------+------------------------------+-----------------------------------------------------------------------+-----------------------------------------------------|
+| =zemacs-app=     | =crates/app/src/main.rs=     | The =zemacs= binary: SDL3 loop, windows, =App::dispatch=, file IO, auto-save, revert, =--control= (=control.rs=), dired/magit/terminal/project glue (=dired.rs=, =magit.rs=, =term.rs=, =project.rs=) | everything below                                    |
+| =zemacs-core=    | =crates/core/src/lib.rs=     | The pure model: =Buffer= (ropey), =Editor=, =EditorCommand=, =Editor::apply=; =evil.rs= (keys → commands, =run_action=); =query.rs= (readers); frames, markers, overlays, minibuffer, modeline | =zemacs-gui=                                        |
+| =zemacs-render=  | =crates/render/src/lib.rs=   | Drawing a frame: glyph cache, panes, gutter, modeline, overlays, scenes, terminal grids, =save_png= | =zemacs-core=, =zemacs-term=, =zemacs-gui=          |
+| =zemacs-lisp=    | =crates/lisp/src/lib.rs=, =shim.c= | The ECL image: boot, the Lisp thread, every primitive's Rust half, =command_for=, =ask_here=; =scene.rs= reads a printed scene | core, rpc, latex, syntax, figure, gui, project, git, tramp |
+| =zemacs-syntax=  | =crates/syntax/src/lib.rs=   | tree-sitter highlighting on a worker thread; =org.rs= scans org by hand; =*.scm= queries | =zemacs-core=                                       |
+| =zemacs-gui=     | =crates/gui/src/lib.rs=      | Scene tree and pixel layout (=layout.rs=); no dependencies at all      | —                                                   |
+| =zemacs-term=    | =crates/term/src/lib.rs=     | A PTY-backed terminal grid (=alacritty_terminal=)                      | —                                                   |
+| =zemacs-rpc=     | =crates/rpc/src/lib.rs=      | JSON-RPC over a child's stdio: spawn, framing, reader/writer threads  | —                                                   |
+| =zemacs-git=     | =crates/git/src/lib.rs=      | git via the =git= binary: status, hunks, rebase; magit's data         | =zemacs-tramp=                                      |
+| =zemacs-dired=   | =crates/dired/src/lib.rs=    | Directory listing and file operations                                  | —                                                   |
+| =zemacs-project= | =crates/project/src/lib.rs=  | Project roots, file lists, recent projects, ripgrep search            | =zemacs-tramp=                                      |
+| =zemacs-tramp=   | =crates/tramp/src/lib.rs=    | =/ssh:host:/path= names (=path.rs=) and remote IO on a worker thread   | —                                                   |
+| =zemacs-latex=   | =crates/latex/src/lib.rs=    | One LaTeX fragment → RGBA (=latex= → DVI → =dvipng=)                   | —                                                   |
+| =zemacs-figure=  | =crates/figure/src/lib.rs=   | One image file (PNG, JPEG, SVG) → RGBA                                 | —                                                   |
+
+Three consequences of that graph decide where code can go:
+
+- *core cannot call anything downstream of it.* A reader that needs a parse, a
+  git call or the recent-projects list cannot be an arm in =query.rs=; it goes in
+  =ask_here= in =crates/lisp/src/lib.rs=, which is tried first and falls through
+  to =zemacs_core::query::query=.
+- *Nothing below the app can open a file, touch a window or run Lisp.* Those
+  effects are =EditorCommand= variants for which =EditorCommand::needs_app=
+  answers true, and =App::dispatch= performs them.
+- *=zemacs-gui= stays dependency-free* so its layout tests run with no window and
+  no font (text is measured through the =Measure= trait).
+
+* The threads
+
+| Thread (name)                         | Started by                                     | Does                                                                                              |
+|---------------------------------------+------------------------------------------------+---------------------------------------------------------------------------------------------------|
+| main                                  | =main= in =crates/app/src/main.rs=             | SDL events, key translation, =App::dispatch=, draw, present. The only thread with a window.       |
+| =zemacs-lisp=                         | =zemacs_lisp::spawn=                           | Owns the ECL image. Evaluates queued forms *one at a time* from a =String= channel.               |
+| =zemacs-syntax=                       | =zemacs_syntax::spawn_worker=                  | tree-sitter parses; answers spans tagged with the revision they were computed from.              |
+| =zemacs-tramp=                        | =zemacs_tramp::spawn_worker=                   | Remote file operations over ssh, strictly in order.                                               |
+| =zemacs-rpc-in-N= / =-out-N= / =-err-N= | =zemacs_rpc= per child (language servers etc.) | Read, write and drain stderr for one JSON-RPC child.                                              |
+| terminal event loop                   | =zemacs_term= (=alacritty_terminal::EventLoop=) per terminal | Reads the PTY and updates that terminal's grid.                                          |
+| =zemacs-grep=                         | =crates/app/src/main.rs= (=Grep=)              | Runs the project-search =rg= for the newest pattern typed.                                        |
+| =zemacs-watch=                        | =crates/app/src/watch.rs= (macOS)              | kqueue watcher that makes auto-revert immediate.                                                  |
+| auto-save writer                      | =autosave_queue= in =main.rs=                  | Writes auto-save files off the frame.                                                             |
+| =zemacs-control=                      | =crates/app/src/control.rs= (=--control= only) | Reads protocol requests from stdin and wakes the loop.                                            |
+| threads a config starts               | =mp:process-run-function= in Lisp              | Anything slow a config wants off the Lisp thread; see [[file:threading.org][threading.org]].                             |
+
+Only the main thread and Lisp (including threads a config starts) touch the
+=Editor=, always through the mutex. The rules, in full in [[file:threading.org][threading.org]]:
+
+- A Lisp primitive holds the lock for *one primitive* (=with_editor= in
+  =crates/lisp/src/lib.rs=).
+- The main loop holds it for one iteration's input handling and drawing and
+  *releases it before* =present=, which blocks on the display.
+- The other threads hand results back over channels (or flags) that the main
+  loop polls, and wake it when something has arrived: =zemacs_core::wake=
+  (installed with =zemacs_core::set_waker=; =zemacs_term=, =zemacs_rpc= and
+  =zemacs_tramp= have their own =set_waker=) pushes one coalesced SDL user
+  event, so the loop parked in =wait_event_timeout= comes round.
+
+The loop draws only when =Editor::generation= has moved (or a periodic safety
+net fires). =Editor::touch= moves it; =with_editor= touches on every primitive and
+=App::route_event= on every SDL event. Rust code that changes what is on screen
+from anywhere else must touch too, or the change sits undrawn.
+
+* One keystroke, end to end
+
+1. *SDL.* =Event::KeyDown= (or =Event::TextInput= in Insert mode and prompts,
+   where SDL text input is on) reaches =App::route_event=. =key_from_keydown=
+   turns it into a =zemacs_core::Key= and it is queued in =batch.keys=. ⌘ is Meta;
+   Option is not (it composes text).
+2. *Translation.* The main loop calls =editor.handle_key(key)=
+   (=crates/core/src/evil.rs=). This is the modal state machine: it consults an
+   open prompt, pending key sequences, the key bindings Lisp installed with
+   =define-key= — the buffer's minor modes (most recently enabled first), then
+   its major mode (=mode_binding=; consulted from =normal_key=, not
+   =insert_key=), then the state's own keymap — and only then the vim grammar
+   (counts, operators, motions). It may
+   change ephemeral UI state (the prompt, the pending operator, the selection,
+   the mode) but never the document; it answers a =Vec<EditorCommand>=. A
+   binding names a command, resolved by =Editor::run_action=: a built-in verb
+   (listed in =BUILTIN_COMMANDS=) produces commands directly, any other name
+   becomes =EditorCommand::CallLisp("(name)")=.
+3. *Dispatch.* Each command goes to =App::dispatch=. App-only commands are
+   performed there (=CallLisp= → =Lisp::eval=, =OpenFile=, =SaveFile=, =Git=,
+   =Dired=, =Term=, =Project=, =CloseFrame=, …); everything else falls through to
+   =editor.apply(cmd)= in =crates/core/src/lib.rs=, the single document writer,
+   which also refuses a mutating command in a generated (read-only) buffer and
+   says so in the status line.
+4. *The rest of the iteration.* The loop drains commands the Lisp thread sent
+   down the channel (=rx=), then =App::tell_readers= hands the new revision to the
+   syntax thread, turns =Editor::pending_hooks= into Lisp calls (mode hooks,
+   =after-change-hook=, =point-moved-hook=, =buffer-switch-hook=) and turns
+   JSON-RPC messages into Lisp forms; =App::housekeep= does auto-save, revert and
+   the other timers.
+5. *Draw.* If the generation moved, =App::draw= calls =Renderer::render= for each
+   frame (=crates/render/src/lib.rs=; invariant: =renderers[i]= draws
+   =editor.frames[i]=). The renderer also *parks measurements* on the =Editor=
+   (=font_px=, =viewport_px=, pane sizes) that readers such as
+   =window-pixel-size= answer from. The lock is dropped, then =App::present=.
+
+=crates/lisp/tests/prompt.rs= reproduces steps 2–3 without a window (its =feed=
+helper), which is the quickest way to see the path in code.
+
+* How Lisp reaches the editor
+
+** Reading: =%query=
+
+=(point)= is =(%query "point" 0 0)=. =f_query= in =crates/lisp/src/shim.c= calls
+=rs_query= in =crates/lisp/src/lib.rs=, which tries =ask_here= and then
+=zemacs_core::query::query= under the lock. The answer is a *string of Lisp
+source* that the shim =READ=s (=read_utf8=), so one C signature returns numbers,
+strings, lists and =NIL=. Arguments are two integers, no strings. An unknown
+name answers =NIL=. The readers whose answer is buffer text (=buffer-string=,
+=buffer-substring=, =line-string=) go through =%query-string= / =query_string=
+instead, which skips the escaping.
+
+Zero-argument readers get their Lisp name from the =*readers*= list in
+=QUERIES_FORM= (=shim.c=); readers with arguments are a =defun= — in
+=QUERIES_FORM= or in a runtime file (=window-pixel-size=, =scene-scroll= and
+=image-size= are in =runtime/gui.lisp=).
+
+** Writing: =%do=
+
+=(%do verb arg a b)= — a verb, an optional string, two integers. =f_do= calls
+=rs_do=, which maps the verb to an =EditorCommand= in =command_for= and hands it
+to =emit=:
+
+- if =cmd.needs_app()= is false, it is applied *now*, under the lock, so a
+  reader on the next line sees it;
+- otherwise it is sent down the channel and performed by =App::dispatch= on the
+  main loop's next iteration — which is why =(find-file "x")= followed by
+  =(buffer-name)= still names the old buffer ([[file:threading.org][threading.org]], "Commands that
+  land a frame later").
+
+The verb ="call"= is special: it runs =Editor::run_action= and emits the whole
+batch. An unknown verb puts =no such command: VERB= in the status line.
+
+** Dedicated primitives
+
+Anything the two envelopes cannot carry — floats, a handle coming back, two
+strings, a call that must block for a round trip — is a C primitive: an =rs_*=
+function in =lib.rs=, its =extern= and an =f_*= wrapper in =shim.c=, and a
+=defprim= line in =zemacs_boot=. =%make-marker=, =make-overlay=, =highlight= and
+=%remote-probe= are examples. [[file:boundary.org][boundary.org]] explains why this is the last resort.
+
+** The editor calling Lisp
+
+There is one route: =EditorCommand::CallLisp(form)= → =App::dispatch= →
+=Lisp::eval= → the Lisp thread's queue. Mode hooks are the same route with an
+extra hop: core pushes the hook's *name* onto =Editor::pending_hooks= and
+=tell_readers= calls it if it is defined. A prompt's answer comes back as
+=(%prompt-reply ID ANSWER)=; a JSON-RPC message is converted to a form on the
+main thread. Because the image evaluates one form at a time, a slow form delays
+every later hook and binding but never input or drawing.
+
+** Boot and load order
+
+=zemacs_lisp::spawn= starts the thread, which runs =zemacs_boot= (=shim.c=):
+=cl_boot=, then =PACKAGE_FORM=, the =defprim=s, =HELPERS_FORM=, =QUERIES_FORM=,
+=PATHS_FORM= (sets =*runtime-dir*= from =$ZEMACS_RUNTIME=), =LIBRARY_FORM=,
+=OVERLAY_FORM=, =PROMPT_FORM=. Then =zemacs_load_init= calls =load-init= on the
+init file the app resolved (=$ZEMACS_INIT=, else =~/.zemacs.d/init.lisp=, else
+=runtime/init.lisp=). That file loads =runtime/library.lisp= (which loads
+=modes/modes.lisp=, which loads =modes/library.lisp=), sets up keys and
+appearance, and calls =(load-runtime-modules)=, which loads each file in
+=*runtime-modules*= in order inside its own =handler-case=. After that, the
+thread evaluates whatever =Lisp::eval= queues, each form through =eval-string=.

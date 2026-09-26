@@ -10,7 +10,7 @@ the policy: your keybindings, your theme, your dashboard, your commands.
 
 - *Common Lisp inside* — an embedded ECL image runs on its own thread. Your
   =init.lisp= drives the editor the way elisp drives Emacs.
-- *GPU-accelerated* — SDL2 on an =accelerated= canvas (Metal on macOS, Vulkan
+- *GPU-accelerated* — SDL3 on an =accelerated= canvas (Metal on macOS, Vulkan
   or GL elsewhere). Glyphs are rasterized once into a per-character texture
   cache and thereafter blitted and recolored by the GPU. The dashboard footer
   and the startup line both print the backend actually in use, so "accelerated"
@@ -27,54 +27,58 @@ the policy: your keybindings, your theme, your dashboard, your commands.
 
 * Architecture
 
-Three threads, message-passing only (=crossbeam-channel=) — no shared mutable
-state, so nothing in the editor takes a lock:
+Three threads matter, and none of them waits on another for long:
 
-- *Main thread* — SDL2 event loop, renderer, and the single mutable =Editor=.
-  Single-writer, so the text rope needs no lock.
-- *Lisp thread* — owns the ECL image and its GC. Loads =init.lisp= and pushes
-  =EditorCommand=s; it never touches the editor directly. The main thread hands
-  it forms to evaluate when a keybinding fires.
+- *Main thread* — the SDL3 event loop, the renderer, and =App::dispatch=.
+- *Lisp thread* — owns the ECL image and its GC. It evaluates one queued form
+  at a time and reaches the =Editor= through a mutex it holds for *one
+  primitive* at a time, never across a redraw; the main thread releases the same
+  mutex before it presents a frame. See [[file:docs/threading.org][docs/threading.org]].
 - *Syntax thread* — reparses the buffer and returns highlight spans. Its queue
   *coalesces*: a burst of keystrokes causes one parse of the newest text, not
   one parse per key, so a fast typist can't outrun it. Results carry the
   revision they were computed from and are dropped if the buffer has moved on.
 
-Every mutation — from the keyboard or from Lisp — is an =EditorCommand=, and
-every command goes through =Editor::apply=. The only exceptions are the three
-effects the pure core cannot perform (evaluate Lisp, read a file, write a
-file); the app layer handles those in one =dispatch= function.
+Language servers, terminals, remote files and project search each get helper
+threads that hand results back over channels.
 
-#+begin_example
-crates/
-  core/    pure model: ropey buffer, modes, EditorCommand, the Evil grammar
-  render/  SDL2 + SDL2_ttf: glyph cache, cursor/selection rects, dashboard
-  syntax/  tree-sitter highlighting -> char-offset spans
-  lisp/    ECL embedded via a small C shim, on its own thread
-  app/     SDL2 loop; owns Editor, spawns Lisp, wires it together
-runtime/
-  init.lisp default configuration (Common Lisp)
-#+end_example
+Every change to a document — from the keyboard or from Lisp — is an
+=EditorCommand=, and every one goes through =Editor::apply=. The exceptions are
+the effects the pure core cannot perform (calling Lisp, reading and writing
+files, git, dired, terminals, closing an OS window); the app layer performs
+those in =App::dispatch=.
+
+Fourteen crates under =crates/= (=core=, =render=, =syntax=, =lisp=, =app= and
+nine smaller ones) and the Lisp runtime under =runtime/=. The map, the crate
+graph and the path of one keystroke are in [[file:docs/architecture.org][docs/architecture.org]]; how to work
+on the code is in [[file:AGENTS.md][AGENTS.md]].
 
 * Prerequisites
 
 - Rust (stable, 1.89+)
-- =brew install ecl sdl2 sdl2_ttf pkg-config=
+- =brew install ecl sdl3 sdl3_ttf pkgconf=
+- Used by features at run time, not by the build: =git=, =rg= (project search),
+  =mutool= (PDFs), =latex= and =dvipng= (org LaTeX previews).
 
 * Run
 
 #+begin_src sh
 cargo run -p zemacs-app          # or: cargo run --bin zemacs
 cargo run -p zemacs-app -- FILE  # open a file instead of the dashboard
-cargo test                       # model, grammar, highlighting, Lisp bridge
+scripts/install.sh               # release build to ~/.local/bin and ~/Applications
+cargo test -p zemacs-lisp --test pdf_mode   # one test file; see docs/testing.org
 #+end_src
 
-Environment overrides, both useful for trying things without touching your
-config:
+=cargo test --workspace= runs everything and takes minutes; [[file:docs/testing.org][docs/testing.org]]
+says how to run one piece.
 
-| =ZEMACS_INIT= | path to an init file, instead of the usual lookup |
-| =ZEMACS_FONT= | path to a monospace =.ttf= / =.ttc=               |
-| =ZEMACS_PERF= | seconds between frame-timing reports on stderr    |
+Environment overrides, useful for trying things without touching your config:
+
+| =ZEMACS_INIT=       | path to an init file, instead of the usual lookup |
+| =ZEMACS_RUNTIME=    | the =runtime/= directory to read the shipped Lisp from, instead of the checkout the binary was built from |
+| =ZEMACS_FONT=       | path to a monospace =.ttf= / =.ttc=               |
+| =ZEMACS_PROSE_FONT= | path to the proportional font scenes set prose in |
+| =ZEMACS_PERF=       | seconds between frame-timing reports on stderr    |
 
 =ZEMACS_PERF=1= puts a line a second on stderr saying where the frame went —
 time waiting for you, handling input, drawing and presenting, plus draw calls
@@ -134,7 +138,8 @@ modal modes it is off and characters come straight from the keycode. That is
 deliberate: macOS press-and-hold (the accent panel) is a text-input feature, so
 leaving it on would mean holding =j= offers you =ĵ= instead of moving down.
 
-*Meta is Command (⌘)*, the macOS Emacs convention — Option works too.
+*Meta is Command (⌘)*, the macOS Emacs convention. Option is deliberately not
+Meta: it is how you type –, ≠ and ü.
 
 The mouse wheel scrolls the view; the cursor is dragged along only as far as
 keeping it on screen requires, so scrolling is not a motion.
@@ -265,7 +270,5 @@ config never stops the editor from starting.
 
 * Roadmap
 
-Multiple buffers + splits · a minibuffer with completion (vertico/consult-like)
-· incremental reparse on a worker thread · text objects (=ciw=, =di(=) and
-registers · Magit / Dired / Org · a Lisp-side buffer and window API · project
-and session management.
+What is done, what is open and why is kept in [[file:TODO.org][TODO.org]]; the Lisp API is
+documented in [[file:docs/README.org][docs/]].

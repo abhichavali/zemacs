@@ -28,10 +28,22 @@ cannot, and why the line is where it is.
 | [[file:recipes.org][recipes.org]]            | The things people actually write, end to end.                         |
 | [[file:boundary.org][boundary.org]]           | What belongs in Lisp, what belongs in Rust, and every known ceiling.   |
 | [[file:curriculum.org][curriculum.org]]         | The curriculum format: a whole interactive course as one .org file.    |
+| [[file:gui.org][gui.org]]                | Scenes: a pixel-laid-out page a window can show instead of cells.     |
 
 If you only read one thing, read [[file:threading.org][threading.org]]. It is the one place zemacs
 deliberately differs from Emacs, and the difference changes how you write
 commands.
+
+** For changing zemacs itself
+
+Start at [[file:../AGENTS.md][AGENTS.md]] in the repository root: the repo map, the commands, the
+gotchas, and which document a change has to update. Then:
+
+| File                       | What it answers                                                       |
+|----------------------------+-----------------------------------------------------------------------|
+| [[file:architecture.org][architecture.org]]       | The crates and how they depend on each other, the threads, and one keystroke from SDL to the screen. |
+| [[file:testing.org][testing.org]]            | How the suites are laid out, how a Lisp test boots an image, and how a test passes for the wrong reason. |
+| [[file:control-mode.md][control-mode.md]]        | Driving the real editor headless over =zemacs --control=.              |
 
 * The thirty-second version
 

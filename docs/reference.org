@@ -1626,6 +1626,7 @@ buffer that saved it.
 | =(set-register text &optional linewise)=    | H | Put literal text there.               |
 | =(register)=                                | R | =(TEXT . LINEWISE-P)=, or =NIL= when it is empty. |
 | =(paste &optional after)=                   | H | Paste before point, or after it. One undo step. |
+| =(with-undo-group &body body)=              | H | Run BODY as *one* undo step however many times it writes. Nests; closes on error. Groups undo only — a keystroke can still land between its writes. |
 
 =linewise= is vim's distinction: a linewise register pastes as whole lines above
 or below the current one rather than into it.

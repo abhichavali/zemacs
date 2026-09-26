@@ -1,8 +1,8 @@
-//! zemacs-render — the SDL2 window and text renderer.
+//! zemacs-render — the SDL3 window and text renderer.
 //!
 //! The whole frame is drawn with two primitives: filled rectangles
 //! (`Canvas::fill_rect`) and single-glyph textures blitted at monospace cell
-//! positions. That is *why* SDL2 instead of a GPU text stack: the cursor, the
+//! positions. That is *why* SDL instead of a GPU text stack: the cursor, the
 //! visual selection, the current-line highlight and the modeline — bevel and
 //! all — are just rects, and the text is a grid — no shaping, no atlas, no
 //! pipeline.

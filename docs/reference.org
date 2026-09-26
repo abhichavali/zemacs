@@ -1947,33 +1947,70 @@ integers. =NIL= for =arg= means absent. An unknown verb reports =no such command
 | ="paste"=                                    | —     | after?     | —   |
 | ="git"= ="dired"= ="term"=                      | verb  | —          | —   |
 | ="open-at"=                                  | =path:line:text= | —  | —   |
+| ="revert-buffer"=                            | —     | —          | —   |
 | ="create-buffer"=                            | name  | —          | —   |
 | ="kill-buffer"=                              | —     | index      | —   |
 | ="set-language"=                             | language, =NIL= for none | — | — |
 | ="set-read-only"=                            | —     | on?        | —   |
-| ="read-from-minibuffer"=                     | label | continuation id | completing? |
+| ="scroll-past-end"=                          | —     | on?        | —   |
+| ="indent-openers"=                           | line endings that open a block, space-separated | — | — |
+| ="overlay-face"= ="overlay-background"= ="overlay-line-background"= | face name; unknown or =NIL= clears | overlay | — |
+| ="overlay-weight"=                           | ="bold"= or ="normal"=; anything else leaves it to the face | overlay | — |
+| ="overlay-slant"=                            | ="italic"= or ="normal"=; anything else leaves it to the face | overlay | — |
+| ="overlay-display"= ="overlay-line-prefix"= ="overlay-gutter"= ="overlay-help-echo"= | text, =NIL= clears | overlay | — |
+| ="overlay-image"=                            | —     | overlay    | image id, 0 clears |
+| ="overlay-scale"=                            | —     | overlay    | percent of body size, 0 clears |
+| ="overlay-fold"=                             | —     | overlay    | fold? |
+| ="delete-overlay"=                           | —     | overlay    | —   |
+| ="remove-overlays"=                          | —     | beg        | end |
+| ="scene-set"=                                | a printed page, =NIL= takes it down | — | — |
+| ="scene-scroll"=                             | —     | pixels from the top | — |
+| ="read-from-minibuffer"=                     | label | continuation id | 0 plain, 1 completing, 2 completing and previewing |
 | ="prompt-item"=                              | one candidate | —  | —   |
 | ="prompt-items"=                             | candidates, one per line | — | — |
 | ="prompt-text"= ="prompt-label"=               | what to seed the open prompt with | — | — |
 | ="prompt-source"=                            | ="SOURCE ARGUMENT"= | —  | —   |
+| ="completion-show"=                          | —     | anchor position, -1 takes it down | selected row |
+| ="completion-row"= ="completion-doc"=          | one row / one doc line, =NIL= empties | — | — |
+| ="which-key"=                                | one ="KEY LABEL"= row, =NIL= empties | — | — |
+| ="grab-key"=                                 | function to call with the next key, =NIL= stops | — | — |
+| ="modeline-note"=                            | text, =""= takes it down | — | — |
 | ="modeline-clear"=                           | —     | —          | —   |
 | ="modeline-segment"=                         | template | side\vert bold\vert filled | face |
+| ="font-path"=                                | a font file, =""= for the renderer's own search | — | — |
+| ="list-fonts"= ="clipboard-image"=             | —     | —          | —   |
 | ="term-key"=                                 | key token | —      | —   |
 | ="call"=                                     | command name | —   | —   |
+
+Nearly every verb has a named door, and that is the one to call — it validates
+the value, spells the arguments and survives the envelope changing. The ones
+whose names differ: the =overlay-*= verbs are =overlay-put=; =scene-set= and
+=scene-scroll= are the functions of those names in =runtime/gui.lisp=; =which-key=
+is =which-key-row=; =completion-*= are =completion-show=, =completion-row= and
+=completion-doc=; =font-path= is =set-font=; =indent-openers= and =scroll-past-end=
+are =set-indent-openers= and =set-scroll-past-end=; =clipboard-image= is reached
+through =org-paste-image=.
+
+="list-fonts"= and ="clipboard-image"= are *requests*: the app does the IO and
+answers on a later turn by calling =(%fonts-listed …)= or =(%clipboard-image PATH)=
+in the image, so the form that asked has already returned.
 
 ="call"= is the one verb that is not a single command: it resolves a name the way
 a key binding does and issues whatever *batch* that produces, which is why it is
 handled beside =paste='s checkpoint rather than in =command_for=.
 
-The last two are cramped on purpose — the envelope carries a string and two
+=modeline-segment= is cramped on purpose — the envelope carries a string and two
 integers, and the alternative was a C primitive taking five arguments. Nobody
-should write =modeline-segment= by hand: =(modeline-segment SIDE TEMPLATE :face
-… :bold … :filled …)= in =library.lisp= is the door, and the section on the
-modeline above is what to read.
+should write it by hand: =(modeline-segment SIDE TEMPLATE :face … :bold …
+:filled …)= in =library.lisp= is the door, and the section on the modeline above
+is what to read.
 
-Adding a verb is one arm of the =match= in =zemacs_lisp::command_for= plus a
-one-line =DEFUN= in =shim.c= — nothing in C. Adding a reader is one arm of the
-=match= in =zemacs_core::query= plus a name in the list in =QUERIES_FORM=.
+Adding a verb is an =EditorCommand= variant with its arm in =Editor::apply=
+(=crates/core/src/lib.rs=), one arm of the =match= in =zemacs_lisp::command_for=,
+and a one-line =DEFUN= over =%do= — in =shim.c= or in a runtime file — plus a row
+in this table. Nothing in C. Adding a reader is one arm of the =match= in
+=zemacs_core::query= plus a Lisp name: the list in =QUERIES_FORM= for a
+zero-argument reader, or a =DEFUN= over =%query= in a runtime file.
 
 ** The subprocess primitives
 

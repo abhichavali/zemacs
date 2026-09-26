@@ -1675,14 +1675,25 @@ buffer."
 ;;;                   `pylsp' and `clangd' — and a third is one line in your
 ;;;                   init: `(lsp-register-server 'rust-mode "rust-analyzer")'.
 ;;;
-;;;   pdf.lisp        PDFs as pages: mutool draws one fitted to the window and
-;;;                   a scene shows it. `j'/`k' scroll and turn the page, `/'
-;;;                   searches, `m' inverts. After `gui.lisp', which it is
-;;;                   written on.
+;;;   xref.lisp       a list of places in an ordinary buffer: rows are
+;;;                   `PATH:LINE:TEXT', `RET' opens one and `r' replaces across
+;;;                   them. `xref-show' is what `lsp.lisp', the agenda and
+;;;                   project search hand their results to.
 ;;;   which-key.lisp  what continues the prefix you just pressed, in the status
 ;;;                   line — and the same table read the other way round, as the
 ;;;                   docstring and key `M-x' now shows beside a command.
 ;;;   show-paren.lisp the matching delimiter, lit.
+;;;   avy.lisp        `SPC j c': type a character, every one on screen grows a
+;;;                   label, press the label. `display' overlays plus the
+;;;                   `grab-key' verb, which hands it the next keystroke.
+;;;   magit.lisp      the half of magit that is a question — a branch, a
+;;;                   revision, a stash message — as `git-...' commands that
+;;;                   prompt and then call the Rust verb, plus the keymap. The
+;;;                   status buffer and every destructive guard stay in Rust.
+;;;   pdf.lisp        PDFs as pages: mutool draws one fitted to the window and
+;;;                   a scene shows it. `j'/`k' scroll and turn the page, `/'
+;;;                   searches, `m' inverts. After `gui.lisp', which it is
+;;;                   written on.
 ;;;   lisp-mode.lisp  one scanner for the shape of Lisp text, and the motion,
 ;;;                   kill, slurp/barf and indentation commands built on it.
 ;;;   repl.lisp       `C-c C-e' and friends, evaluating in *this* image and
@@ -1706,6 +1717,14 @@ buffer."
 ;;;                   `M-RET' for another heading or item, `M-left'/`M-right' to
 ;;;                   promote and demote, `C-c C-t' for the TODO cycle, `C-c C-c'
 ;;;                   for a checkbox, `S-TAB' for the whole buffer.
+;;;   org-table.lisp  a table laid out on every edit, and TAB / S-TAB / RET
+;;;                   walking its cells. After both files above because its
+;;;                   keys hand off to `org-cycle', `org-global-cycle' and
+;;;                   `org-open-at-point' outside a table.
+;;;   org-agenda.lisp `org-todo-list' (`SPC m g') and `org-agenda-tags'
+;;;                   (`SPC m G'): every unfinished headline, as a scanner over
+;;;                   `xref-show'. Reads `*org-todo-keywords*' from
+;;;                   `org-modern.lisp'.
 ;;;   org-frozen.lisp org as a *printed page*: `org-frozen-mode', which derives
 ;;;                   from `org-mode' and is read-only for real. Drawers,
 ;;;                   `#+keyword:' lines and block delimiters stop occupying
@@ -1716,6 +1735,12 @@ buffer."
 ;;;                   `org-fold.lisp' because it rebinds TAB over that file's
 ;;;                   `org-cycle', and before `math.lisp' because a curriculum is
 ;;;                   what it was built to display.
+;;;   org-export.lisp `SPC m X': this org buffer as LaTeX in `*org-latex*',
+;;;                   one line at a time. Its `ponytail:' says what it skips.
+;;;   mathsync.lisp   photographs dropped in `~/Public/MathSync' become org
+;;;                   LaTeX (`SPC n m'): the directory is the queue, and
+;;;                   `mathsync_transcribe.py' asks a vision model. After
+;;;                   `org-modern.lisp' for its `*org-mode-functions*' hook.
 ;;;   math.lisp       a whole maths curriculum as one org file — units, problems,
 ;;;                   and a place for your answer, all of it ordinary org with
 ;;;                   `#+ZEMACS_*' properties on the headings. The format is

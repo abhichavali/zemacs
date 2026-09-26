@@ -15,6 +15,6 @@ unicode-width.workspace = true
 # entry in `Cargo.lock` and no C toolchain. `image` would have cost both.
 png = "0.18"
 
-# `use-pkgconfig` is what finds Homebrew's SDL2 on Apple Silicon — /opt/homebrew/lib
+# `use-pkgconfig` is what finds Homebrew's SDL3 on Apple Silicon — /opt/homebrew/lib
 # is not on the default linker search path, so without it the test binary fails to link.
 sdl3 = { version = "0.18.4", features = ["ttf", "use-pkg-config"] }

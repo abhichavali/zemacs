@@ -1797,7 +1797,7 @@ void zemacs_boot(void) {
   defprim("%DO", (cl_objectfn_fixed)f_do, 4);
   defprim("GOTO-CHAR", (cl_objectfn_fixed)f_goto_char, 1);
   defprim("DELETE-REGION", (cl_objectfn_fixed)f_delete_region, 2);
-  /* `%' because nobody calls these by hand: `with-undo-group' in library.lisp
+  /* `%' because nobody calls these by hand: `with-undo-group' in modes/modes.lisp
    * is the pair, and it is a macro so that an error in the body still closes. */
   defprim("%UNDO-GROUP-BEGIN", (cl_objectfn_fixed)f_undo_group_begin, 0);
   defprim("%UNDO-GROUP-END", (cl_objectfn_fixed)f_undo_group_end, 0);

@@ -151,3 +151,25 @@
 
 (add-auto-mode ".rst" 'text-mode)
 (add-auto-mode ".adoc" 'text-mode)
+
+;;; ---------------------------------------------------------------------------
+;;; Pictures
+;;;
+;;; The application opens a file that is not text as a read-only buffer holding
+;;; its name; this mode draws the picture over that name, with the overlay org
+;;; uses for `[[file:plot.png]]' — see `%org-image-draw'. Nothing else to it: no
+;;; zoom, no rotate. Add them when they are missed.
+
+(defparameter *image-mode-width* 60
+  "Widest a picture is drawn, in ems — NIL for the size it was authored at.
+Ems for the reason `*org-image-width*' gives.")
+
+(define-derived-mode image-mode nil
+  (let ((id (image-file (buffer-file-name) *image-mode-width*)))
+    (if id
+        (let ((ov (make-overlay (point-min) (point-max))))
+          (when ov (overlay-put ov 'image id)))
+        (message (format nil "~a: cannot draw this picture" (buffer-name))))))
+
+(dolist (ext '(".png" ".jpg" ".jpeg"))
+  (add-auto-mode ext 'image-mode))

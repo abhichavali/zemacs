@@ -44,8 +44,17 @@ fn remember_at(file: &Path, root: &Path) {
     // Canonical, so that the same project reached through `..` or a symlink is
     // one entry rather than three. A root that no longer exists is not history
     // worth writing down.
-    let Ok(root) = root.canonicalize() else {
-        return;
+    //
+    // A tramp name is kept as written: it is already absolute, `Display` is
+    // `parse`'s exact inverse, and `canonicalize` would ask *this* machine
+    // about a directory on another one and drop it — the same check, for the
+    // same reason, as the recent-files list in the app.
+    let root = match remote(root) {
+        true => root.to_path_buf(),
+        false => match root.canonicalize() {
+            Ok(root) => root,
+            Err(_) => return,
+        },
     };
     let mut list = vec![root.clone()];
     list.extend(read_at(file).into_iter().filter(|p| *p != root));
@@ -61,8 +70,15 @@ fn read_at(file: &Path) -> Vec<PathBuf> {
         .lines()
         .filter(|line| !line.is_empty())
         .map(PathBuf::from)
-        .filter(|path| path.is_dir())
+        // A remote root is kept unchecked: asking would be a round trip per
+        // entry at every `SPC p p`, and a host that has gone is reported by the
+        // open that follows, which is when it matters.
+        .filter(|path| remote(path) || path.is_dir())
         .collect()
+}
+
+fn remote(path: &Path) -> bool {
+    zemacs_tramp::parse(&path.to_string_lossy()).is_some()
 }
 
 /// ponytail: `Display` is lossy, so a project whose path is not UTF-8 is
@@ -164,6 +180,20 @@ mod tests {
     fn a_missing_recents_file_reads_as_an_empty_list() {
         let temp = Temp::new("missing");
         assert!(read_at(&temp.0.join("never-written")).is_empty());
+    }
+
+    /// A root on another machine goes in as its tramp name and comes back out
+    /// unchecked, beside the local ones — the local filesystem has no opinion
+    /// about whether `/ssh:box:/srv/app` exists.
+    #[test]
+    fn a_remote_root_is_remembered_by_name() {
+        let temp = Temp::new("remote");
+        let file = temp.0.join("projects");
+        let local = temp.dir("here");
+        let there = PathBuf::from("/ssh:me@box#2222:/srv/app it's");
+        remember_at(&file, &local);
+        remember_at(&file, &there);
+        assert_eq!(read_at(&file), vec![there, local]);
     }
 
     #[test]

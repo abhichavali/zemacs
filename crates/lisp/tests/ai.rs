@@ -6,7 +6,7 @@
 //! this does. It loads `runtime/init.lisp` itself rather than a stub, because
 //! the thing being proved is partly *that* the config loads it.
 //!
-//! **None of the three coding agents is a build dependency.** The pure half
+//! **None of the four coding agents is a build dependency.** The pure half
 //! below runs everywhere. The half that checks a real `--help` skips per binary
 //! when it is not installed, exactly as `lsp_live.rs` does for language
 //! servers — a harness is not something a test suite may require.
@@ -140,7 +140,7 @@ fn ai_mode_is_data_in_lisp() {
         "names",
         "(format nil \"~{~a~^,~}\" (mapcar #'first *ai-harnesses*))",
     );
-    assert_eq!(names, "claude,cursor,opencode");
+    assert_eq!(names, "claude,codex,cursor,opencode");
 
     let programs = probe(
         &lisp,
@@ -149,7 +149,7 @@ fn ai_mode_is_data_in_lisp() {
         "(format nil \"~{~a~^,~}\" (mapcar #'second *ai-harnesses*))",
     );
     assert_eq!(
-        programs, "claude,cursor-agent,opencode",
+        programs, "claude,codex,cursor-agent,opencode",
         "cursor's CLI is `cursor-agent`; `cursor` is the GUI"
     );
 
@@ -183,7 +183,7 @@ fn ai_mode_is_data_in_lisp() {
             "names2",
             "(format nil \"~{~a~^,~}\" (mapcar #'first *ai-harnesses*))"
         ),
-        "claude,cursor,opencode,aider"
+        "claude,codex,cursor,opencode,aider"
     );
     // ...and adding it twice does not double it, so `reload-config` is safe.
     probe(&lisp, &shared, "again", "(ai-add-harness \"aider\" \"aider\")");
@@ -194,7 +194,7 @@ fn ai_mode_is_data_in_lisp() {
             "names3",
             "(format nil \"~{~a~^,~}\" (mapcar #'first *ai-harnesses*))"
         ),
-        "claude,cursor,opencode,aider"
+        "claude,codex,cursor,opencode,aider"
     );
     probe(
         &lisp,
@@ -205,12 +205,15 @@ fn ai_mode_is_data_in_lisp() {
 
     // --- the verb each harness produces -------------------------------------
     //
-    // Read rather than run, so this holds on a machine with none of the three
+    // Read rather than run, so this holds on a machine with none of them
     // installed. These strings are the entire interface between this config and
     // the editor.
     for (name, resume, want) in [
         ("claude", "t", "terminal-run:claude:claude -r"),
         ("claude", "nil", "terminal-run:claude:claude"),
+        // A subcommand, not a flag — the same one line in the list either way.
+        ("codex", "t", "terminal-run:codex:codex resume"),
+        ("codex", "nil", "terminal-run:codex:codex"),
         ("cursor", "t", "terminal-run:cursor:cursor-agent --resume"),
         ("cursor", "nil", "terminal-run:cursor:cursor-agent"),
         ("opencode", "t", "terminal-run:opencode:opencode --continue"),
@@ -398,6 +401,7 @@ fn ai_mode_is_data_in_lisp() {
     let mut checked = 0;
     for (program, flag) in [
         ("claude", "--resume"),
+        ("codex", "resume"),
         ("cursor-agent", "--resume"),
         ("opencode", "--continue"),
     ] {
@@ -419,7 +423,7 @@ fn ai_mode_is_data_in_lisp() {
         );
         checked += 1;
     }
-    eprintln!("checked {checked}/3 harness CLIs");
+    eprintln!("checked {checked}/4 harness CLIs");
 }
 
 /// `which`, again, because a test binary may not depend on `zemacs-term`.

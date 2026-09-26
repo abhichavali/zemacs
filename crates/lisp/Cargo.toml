@@ -38,6 +38,9 @@ zemacs-project.workspace = true
 # `read-string`; the list is a few dozen strings, so it crosses the shim as a
 # Lisp list like `project-recent` does.
 zemacs-git.workspace = true
+# One primitive: `%remote-probe`, the climb `%project-at` makes over ssh when
+# the buffer's file is on another machine — see `rs_remote_probe`.
+zemacs-tramp.workspace = true
 
 [build-dependencies]
 cc = "1"

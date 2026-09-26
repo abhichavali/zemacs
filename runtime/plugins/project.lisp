@@ -25,6 +25,14 @@
 ;;;; `cargo build --release', or `zig build' for a `build.zig', meant editing
 ;;;; Rust and recompiling. It is now a list you can PUSH onto from your init,
 ;;;; which is the whole definition of policy this migration is sorted by.
+;;;;
+;;;; Remote projects. A buffer visiting `/ssh:host:/src/app/main.rs' is in the
+;;;; project at `/ssh:host:/src/app/', and every verb here works on it: the
+;;;; climb is one ssh round trip (`%remote-probe') asking about the same two
+;;;; tables, the pickers are filled from a listing the app fetches off the
+;;;; frame, `project-compile' and `project-shell' start their child on the host
+;;;; through `ssh -t', and `SPC s p' searches there. The one exception is
+;;;; `project-grep', whose listing is edited with local file IO; it says so.
 
 (in-package :zemacs)
 
@@ -94,6 +102,69 @@ by asking a question the root itself answers badly."
           ((and real (null (pathname-name real))) real)
           (t (%directory-of (pathname file))))))
 
+(defun %remote-p (name)
+  "True for a `/ssh:host:/path' name: a file on another machine, which no
+`probe-file' here can answer for and no pathname should be made of."
+  (and (stringp name) (> (length name) 5) (string= "/ssh:" name :end2 5)))
+
+(defparameter *remote-projects* (make-hash-table :test #'equal)
+  "Remote file or directory -> its (ROOT LABEL), or NIL for none. The climb is a
+round trip and the answer does not move under a file, so each name pays once.
+
+ponytail: kept for the session — `project-forget' is the app's and does not
+reach this, so a `.git' made on the host after the file was opened is seen after
+a restart or a `(clrhash *remote-projects*)'.")
+
+(defparameter *project-trouble* nil
+  "Why the last climb found nothing, when the reason was a host that did not
+answer rather than a tree with no marker in it. Said instead of
+`*project-none*', which would be a confident wrong answer about a project that
+is there.")
+
+(defun %project-none ()
+  "What a verb says when there is no project to act on."
+  (or *project-trouble* *project-none*))
+
+(defun %marker-names (&rest tables)
+  "The marker file names of TABLES, one per line, for `%remote-probe'."
+  (format nil "~{~a~%~}" (mapcar #'first (apply #'append tables))))
+
+(defun %remote-row (dir hits table)
+  "The first row of TABLE whose marker the probe found in DIR."
+  (find-if (lambda (row) (member (list dir (first row)) hits :test #'equal)) table))
+
+(defun %remote-project-at (name)
+  "`%project-at' for NAME on another machine: (ROOT LABEL), ROOT a tramp name
+ending in `/', or NIL.
+
+One `%remote-probe' asks the host which of every marker in both tables sits in
+each directory above NAME, and the rule below — deepest repository, a build
+file only without one — is applied here to the answer, from the same tables, so
+a row pushed onto either from an init counts over ssh too. A host that did not
+answer is asked again next time, and `%project-none' says why it did not; an
+answer is remembered."
+  (multiple-value-bind (known seen) (gethash name *remote-projects*)
+    (if seen
+        known
+        (let ((hits (%remote-probe name (%marker-names *project-roots*
+                                                       *project-builders*))))
+          (if (stringp hits)
+              (progn (setf *project-trouble* hits) nil)
+              (setf (gethash name *remote-projects*)
+                    (let ((build nil))
+                      (dolist (dir (remove-duplicates (mapcar #'first hits)
+                                                      :test #'string= :from-end t)
+                                   build)
+                        (let ((root (%remote-row dir hits *project-roots*)))
+                          (when root (return (list dir (second root)))))
+                        (unless build
+                          (let ((row (%remote-row dir hits *project-builders*)))
+                            (when row (setf build (list dir (second row))))))))))))))
+
+(defun %root-name (root)
+  "ROOT as the string a verb or a message wants. A remote root already is one."
+  (if (stringp root) root (namestring root)))
+
 (defun %project-at (&optional start)
   "(ROOT LABEL) for the project holding START, or NIL if there is none.
 
@@ -106,7 +177,14 @@ independent sub-project resolves too high, and the fix for that is a `.project'
 file in it, which `*project-roots*' checks first.
 
 Same rule `crates/project' still applies for `project-find-file', because these
-two must not disagree about which tree you are in."
+two must not disagree about which tree you are in.
+
+A remote START — or a remote buffer, with none — is `%remote-project-at''s, and
+its ROOT is a string rather than a pathname."
+  (setf *project-trouble* nil)
+  (let ((file (or start (buffer-file-name))))
+    (when (%remote-p file)
+      (return-from %project-at (%remote-project-at file))))
   (let ((build nil))
     (dolist (dir (%ancestors (or start (%project-start))))
       (let ((root (%project-marker dir *project-roots*)))
@@ -124,8 +202,11 @@ two must not disagree about which tree you are in."
 Read from the root rather than from the marker that made it one, which is
 usually not the same file: a Cargo workspace is identified by its `.git', and
 `cargo build' is still the answer. Costs one `probe-file' per builder, and only
-when someone asks to compile."
-  (let ((row (%project-marker root *project-builders*)))
+when someone asks to compile — or, for a remote ROOT, one round trip."
+  (let ((row (if (%remote-p root)
+                 (let ((hits (%remote-probe root (%marker-names *project-builders*))))
+                   (and (listp hits) (%remote-row root hits *project-builders*)))
+                 (%project-marker root *project-builders*))))
     (and row (if (eq which :build) (third row) (fourth row)))))
 
 (defparameter *project-none*
@@ -144,41 +225,38 @@ work while cargo is still printing — `q' dismisses it, and pressing the key ag
 re-runs into the same pane instead of stacking a second. `project-make' made the
 same argument first and this is now consistent with it.
 
-Through `sh -c \"cd ROOT && …\"' because the child otherwise starts wherever the
-buffer you were in lives. `cargo' and `make' climb to find their own manifest and
-would not notice; `npm' does not climb, and would build the wrong package in a
-monorepo.
-
-ponytail: ROOT is interpolated into a double-quoted shell word, so a project
-directory containing a `\"' or a `$' would break the line. The upgrade is a
-`%shell-quote' that wraps in single quotes and escapes those; nobody has a
-repository called `my\"repo'."
+At ROOT because the child otherwise starts wherever the buffer you were in
+lives. `cargo' and `make' climb to find their own manifest and would not notice;
+`npm' does not climb, and would build the wrong package in a monorepo. `cd:' is
+the terminal's `default-directory' for the one verb after it, so ROOT is a
+directory handed over and never a word spliced into the shell line — which is
+also what lets a remote ROOT run the build on its host, through `ssh -t'."
   (let ((found (%project-at)))
     (cond
-      ((null found) (message *project-none*))
+      ((null found) (message (%project-none)))
       (t
-       (let* ((root (namestring (first found)))
-              (command (%project-command (first found) which)))
-         (if command
-             (terminal (format nil "output:~a:/bin/sh -c \"cd ~a && ~a\""
-                               name root command))
-             (message (format nil "no ~a command for a ~a project"
-                              name (second found)))))))))
+       (let ((command (%project-command (first found) which)))
+         (cond
+           (command
+            (terminal (format nil "cd:~a" (%root-name (first found))))
+            (terminal (format nil "output:~a:/bin/sh -c ~s" name command)))
+           (t (message (format nil "no ~a command for a ~a project"
+                               name (second found))))))))))
 
 (defun project-root ()
   "Say where this project is, and what identified it. Bound to `SPC p r'."
   (let ((found (%project-at)))
     (message (if found
-                 (format nil "~a (~a)" (namestring (first found)) (second found))
-                 *project-none*)))
+                 (format nil "~a (~a)" (%root-name (first found)) (second found))
+                 (%project-none))))
   nil)
 
 (defun project-dired ()
   "Open the project root in dired. Bound to `SPC p d'."
   (let ((found (%project-at)))
     (if found
-        (dired (namestring (first found)))
-        (message *project-none*)))
+        (dired (%root-name (first found)))
+        (message (%project-none))))
   nil)
 
 (defun project-compile ()
@@ -204,7 +282,11 @@ repository called `my\"repo'."
 
 (defun %project-name (root)
   "ROOT's own directory name, for a prompt label — `zemacs', not the whole path."
-  (or (car (last (pathname-directory root))) (namestring root)))
+  (if (stringp root)
+      (let* ((dir (string-right-trim "/" root))
+             (cut (position #\/ dir :from-end t)))
+        (if cut (subseq dir (1+ cut)) dir))
+      (or (car (last (pathname-directory root))) (namestring root))))
 
 (defun %project-pick (source label callback)
   "Ask LABEL over the app's SOURCE list, and call CALLBACK with the answer.
@@ -228,8 +310,8 @@ you are in, what the prompt says, and that accepting one opens it — swap
 `find-file' for a split and `SPC p f' opens in the other window."
   (let ((found (%project-at)))
     (if (null found)
-        (message *project-none*)
-        (let ((root (namestring (first found))))
+        (message (%project-none))
+        (let ((root (%root-name (first found))))
           (%project-pick (format nil "project-files ~a" root)
                          (format nil "~a: " (%project-name (first found)))
                          #'find-file))))
@@ -243,8 +325,8 @@ one pass over a list that is already cached rather than a second walk. Accepting
 one opens it as a directory, which is dired."
   (let ((found (%project-at)))
     (if (null found)
-        (message *project-none*)
-        (let ((root (namestring (first found))))
+        (message (%project-none))
+        (let ((root (%root-name (first found))))
           (%project-pick (format nil "project-dirs ~a" root)
                          (format nil "~a directory: " (%project-name (first found)))
                          #'find-file))))
@@ -290,8 +372,14 @@ long after the process's own directory has stopped being relevant, and
 `xref-replace' writes to them. Passing the root as ripgrep's *path argument* is
 what makes them absolute — it prints what it was given."
   (let ((found (%project-at)))
-    (if (null found)
-        (message *project-none*)
+    (cond
+      ((null found) (message (%project-none)))
+      ;; The listing's `r' rewrites files with local file IO, which a remote
+      ;; row would send to a path on *this* machine. The picker is the same
+      ;; ripgrep, run on the host.
+      ((stringp (first found))
+       (message "project-grep is local only — SPC s p searches a remote project"))
+      (t
         (let ((root (namestring (first found))))
           (read-string "Search project: "
             (lambda (pattern)
@@ -316,7 +404,7 @@ what makes them absolute — it prints what it was given."
                                        rows)))
                          (xref-show (format nil "~a hit~:p for ~a"
                                             (length rows) pattern)
-                                    rows))))))))))))
+                                    rows)))))))))))))
   nil)
 
 (defun project-open ()
@@ -340,3 +428,48 @@ for the first visit and `project-switch' covers the rest."
   (%do "prompt-label" "Open directory: " 0 0)
   (%do "prompt-text" (namestring (user-homedir-pathname)) 0 0)
   nil)
+
+;;; ---------------------------------------------------------------------------
+;;; Running things at the root
+;;;
+;;; Both go through `cd:', the terminal's one-verb `default-directory', so the
+;;; root is a directory handed to the child and never text in a command line —
+;;; and a remote root is a child on the host, through `ssh -t', for free.
+
+(defun project-shell ()
+  "A shell at the project root. Bound to `SPC p s'.
+
+Pressed again it shows the same shell rather than starting another — the one
+started *at this root*, so two projects keep two shells. On a remote project it
+is a login shell on the host, in the root, over the connection the files
+already came through."
+  (let ((found (%project-at)))
+    (cond
+      ((null found) (message (%project-none)))
+      (t (terminal (format nil "cd:~a" (%root-name (first found))))
+         (terminal "open"))))
+  nil)
+
+(defun project-shell-command ()
+  "Run one shell line at the project root and say what it printed. Bound to
+`SPC p !'.
+
+`:!' with the root as its directory: run and reported in the echo area, no
+buffer left behind — on the host, when the project is remote."
+  (let ((found (%project-at)))
+    (if (null found)
+        (message (%project-none))
+        (let ((root (%root-name (first found))))
+          (read-string (format nil "! in ~a: " (%project-name (first found)))
+                       (lambda (line)
+                         (when (and line (plusp (length line)))
+                           (terminal (format nil "cd:~a" root))
+                           (terminal (format nil "shell:~a" line))))))))
+  nil)
+
+;;; Here rather than in `init.lisp' so that every config has them — the
+;;; shipped keys for the rest of `SPC p' live in the init a user copies, and a
+;;; copy made before these existed would never learn them. Emacs' own letters:
+;;; `project-shell' is `C-x p s' and `project-shell-command' is `C-x p !'.
+(define-leader "SPC p s" "project-shell")
+(define-leader "SPC p !" "project-shell-command")

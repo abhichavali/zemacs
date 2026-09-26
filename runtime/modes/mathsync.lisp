@@ -261,7 +261,11 @@ policy — see `*mathsync-keep*'."
     (cond
       ((and text (plusp (length text)))
        ;; The unnamed register, which is what `p' pastes — see `set-register'.
-       (set-register text)
+       ;; *Linewise*, the way `yy' fills it: a display block is line-shaped, and
+       ;; a charwise paste before a heading gave `\end{align}* Heading' — one
+       ;; line, whose preview then folded the heading away with the equation's
+       ;; other rows.
+       (set-register text t)
        (setf *mathsync-ready* t)
        (%mathsync-archive image)
        (message (format nil "mathsync: ~a transcribed — `p' to paste"

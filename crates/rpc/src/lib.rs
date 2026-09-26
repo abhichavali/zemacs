@@ -108,6 +108,19 @@ struct Rpc {
     rx: Receiver<(Conn, Event)>,
 }
 
+/// Who to tell when a child said something, so the main loop drains [`poll`]
+/// now rather than on its next timer.
+///
+/// The same shape as `zemacs_term::set_waker`, for the same reason: this crate
+/// knows nothing of the editor. `None` — every test — means events queue until
+/// somebody polls, which is what always happened.
+static WAKE: OnceLock<fn()> = OnceLock::new();
+
+/// Install the waker. The second call is ignored.
+pub fn set_waker(f: fn()) {
+    let _ = WAKE.set(f);
+}
+
 fn rpc() -> &'static Rpc {
     static RPC: OnceLock<Rpc> = OnceLock::new();
     RPC.get_or_init(|| {
@@ -186,12 +199,24 @@ pub fn start(program: &str, args: &[String], cwd: Option<&std::path::Path>) -> s
         std::thread::Builder::new()
             .name(format!("zemacs-rpc-in-{id}"))
             .spawn(move || {
+                // Every event wakes the loop, which is what drains the queue: a
+                // reply that only queued waited for whatever timer came round
+                // next, and a completion popup a quarter of a second late is a
+                // completion popup that feels broken. The waker coalesces, so a
+                // server flooding diagnostics costs one wakeup per frame.
+                let send = |event| {
+                    let sent = tx.send((id, event)).is_ok();
+                    if let Some(f) = WAKE.get() {
+                        f();
+                    }
+                    sent
+                };
                 let mut r = BufReader::new(stdout);
                 loop {
                     match frame::read_frame(&mut r) {
                         Frame::Body(body) => match serde_json::from_slice::<Value>(&body) {
                             Ok(v) => {
-                                if tx.send((id, Event::Message(v))).is_err() {
+                                if !send(Event::Message(v)) {
                                     return; // the editor is gone
                                 }
                             }
@@ -200,19 +225,16 @@ pub fn start(program: &str, args: &[String], cwd: Option<&std::path::Path>) -> s
                             Err(e) => {
                                 let head = String::from_utf8_lossy(&body);
                                 let head: String = head.chars().take(120).collect();
-                                let _ = tx.send((
-                                    id,
-                                    Event::Protocol(format!("not JSON ({e}): {head}")),
-                                ));
+                                send(Event::Protocol(format!("not JSON ({e}): {head}")));
                             }
                         },
                         Frame::Broken(why) => {
-                            let _ = tx.send((id, Event::Protocol(why)));
-                            let _ = tx.send((id, Event::Exited(exit_report(&tail))));
+                            send(Event::Protocol(why));
+                            send(Event::Exited(exit_report(&tail)));
                             return;
                         }
                         Frame::Eof => {
-                            let _ = tx.send((id, Event::Exited(exit_report(&tail))));
+                            send(Event::Exited(exit_report(&tail)));
                             return;
                         }
                     }

@@ -354,14 +354,29 @@ impl View {
 ///
 /// `from` may be a file; its directory is used.
 pub fn repo_root(from: &Path) -> Option<PathBuf> {
-    let dir = if from.is_dir() { from } else { from.parent()? };
+    // A remote name goes as it is: asking whether it is a directory would be a
+    // round trip of its own, and the far side's `cd` already falls back to the
+    // parent of a file — see `zemacs_tramp::command_argv`.
+    let remote = zemacs_tramp::parse(&from.to_string_lossy());
+    let dir = if remote.is_some() || from.is_dir() { from } else { from.parent()? };
     let mut out = git(dir, ["rev-parse", "--show-toplevel"]).ok()?;
     // `rev-parse` prints the path raw and unquoted, so trimming the newline is
     // the whole of the parsing.
     while matches!(out.last(), Some(b'\n' | b'\r')) {
         out.pop();
     }
-    (!out.is_empty()).then(|| to_path(&out))
+    if out.is_empty() {
+        return None;
+    }
+    // ...and a remote top-level is a path *there*, so it goes back into a name
+    // on that host: everything downstream joins files onto it and opens them.
+    Some(match remote {
+        Some(there) => {
+            let path = String::from_utf8_lossy(&out).into_owned();
+            PathBuf::from(zemacs_tramp::RemotePath { path, ..there }.to_string())
+        }
+        None => to_path(&out),
+    })
 }
 
 /// Everything in the working tree and index, plus the stash, the recent log and
@@ -962,21 +977,50 @@ where
         .into_iter()
         .map(|a| a.as_ref().to_os_string())
         .collect();
-    let mut command = Command::new("git");
-    command
-        .current_dir(repo)
-        .args(&args)
-        // An editor must never be blocked by a child process waiting on a
-        // terminal it does not have: no credential prompt on push, no editor
-        // spawned for a merge commit message.
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_EDITOR", "true")
-        // Lets a status refresh coexist with a `git` the user is running in a
-        // terminal, instead of fighting over index.lock.
-        .env("GIT_OPTIONAL_LOCKS", "0");
-    for (key, value) in env {
-        command.env(key, value);
-    }
+    // An editor must never be blocked by a child process waiting on a
+    // terminal it does not have: no credential prompt on push, no editor
+    // spawned for a merge commit message. `GIT_OPTIONAL_LOCKS` lets a status
+    // refresh coexist with a `git` the user is running in a terminal, instead
+    // of fighting over index.lock.
+    let base: [(&str, &OsStr); 3] = [
+        ("GIT_TERMINAL_PROMPT", OsStr::new("0")),
+        ("GIT_EDITOR", OsStr::new("true")),
+        ("GIT_OPTIONAL_LOCKS", OsStr::new("0")),
+    ];
+    let mut command = match zemacs_tramp::parse(&repo.to_string_lossy()) {
+        // The one seam every git call goes through, so a repository on another
+        // machine is the same code with a different child: `ssh`, running
+        // exactly this `git` and these arguments in the repository there, each
+        // word quoted by tramp and the environment carried as `env` words
+        // rather than set on the local client. stdin and stdout pass through
+        // ssh unchanged, which is all a patch or a porcelain parse needs.
+        //
+        // ponytail: magit calls this on the frame, so each git is a round trip
+        // the editor waits out — a status is five or six of them, and a host
+        // that is down costs ssh's connect timeout once. Moving magit onto a
+        // worker is the fix, and it is the same fix a slow local repository
+        // would want.
+        Some(there) => {
+            let text = |s: &OsStr| s.to_string_lossy().into_owned();
+            let argv: Vec<String> = std::iter::once("git".to_string())
+                .chain(args.iter().map(|a| text(a)))
+                .collect();
+            let env: Vec<(String, String)> = (base.iter().chain(env))
+                .map(|(k, v)| (k.to_string(), text(v)))
+                .collect();
+            let mut c = Command::new(zemacs_tramp::program());
+            c.args(zemacs_tramp::command_argv(&there, &argv, &env, false));
+            c
+        }
+        None => {
+            let mut c = Command::new("git");
+            c.current_dir(repo).args(&args);
+            for (key, value) in base.iter().chain(env) {
+                c.env(key, value);
+            }
+            c
+        }
+    };
 
     let out = match stdin {
         None => command.output(),
@@ -1139,7 +1183,20 @@ pub(crate) fn to_path(bytes: &[u8]) -> PathBuf {
 
 /// The `.git` directory, which is where every trace of a half-finished
 /// operation lives. Not always `repo/.git`: a worktree's is elsewhere.
+///
+/// Refused for a remote repository. Every caller reads or *writes* files in it
+/// with `std::fs` — the rebase todo is written there — and a path on the host
+/// handed to this machine's filesystem is at best a miss and at worst a write
+/// into a local repository that happens to live at the same path. So over ssh
+/// the status shows no merge or rebase in flight, and the interactive rebase
+/// says it is local only.
+///
+/// ponytail: the upgrade is `tramp::read`/`write` behind these, for the half
+/// dozen marker files and the one todo list.
 pub(crate) fn git_dir(repo: &Path) -> Result<PathBuf> {
+    if zemacs_tramp::parse(&repo.to_string_lossy()).is_some() {
+        bail!("rebasing and in-progress operations are local only — not over ssh");
+    }
     let mut out = git(repo, ["rev-parse", "--absolute-git-dir"])?;
     while matches!(out.last(), Some(b'\n' | b'\r')) {
         out.pop();

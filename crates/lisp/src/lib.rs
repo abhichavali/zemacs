@@ -574,6 +574,53 @@ pub extern "C" fn rs_highlight(lang: *const c_char, text: *const c_char) -> *mut
         .into_raw()
 }
 
+/// `(%remote-probe START NAMES)`: which of NAMES — newline separated — are in
+/// each directory from the remote START up to `/`, as `((DIR NAME) …)` nearest
+/// first, `DIR` a tramp name ending in `/`. A string instead is the host's own
+/// reason it could not answer; `NIL` is a START that is not remote at all.
+///
+/// The reader `%query` could not carry, for `rs_highlight`'s reason — two
+/// strings — and a primitive rather than a Rust climb because the *names* are
+/// policy: they come from `*project-roots*` and `*project-builders*`, so a row
+/// pushed onto either from an init counts over ssh exactly as it does here.
+/// `zemacs_tramp::probe` is the one round trip; deciding is Lisp's.
+///
+/// **Blocks the Lisp thread for that round trip**, the way `run-process` does
+/// for its child: tens of milliseconds on a warm control socket, and bounded by
+/// ssh's connect timeout against a host that is down. The caller remembers the
+/// answer, so it is paid once per file.
+#[no_mangle]
+pub extern "C" fn rs_remote_probe(start: *const c_char, names: *const c_char) -> *mut c_char {
+    let start = unsafe { str_or_empty(start) };
+    let names: Vec<String> = unsafe { str_or_empty(names) }
+        .lines()
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect();
+    let q = zemacs_core::query::lisp_string;
+    let src = match zemacs_tramp::parse(&start) {
+        None => "nil".to_string(),
+        Some(p) => match zemacs_tramp::probe(&p, &names) {
+            Ok(hits) => {
+                let rows: Vec<String> = hits
+                    .iter()
+                    .map(|(dir, name)| {
+                        let dir = dir.to_string();
+                        let slash = if dir.ends_with('/') { "" } else { "/" };
+                        format!("({} {})", q(&format!("{dir}{slash}")), q(name))
+                    })
+                    .collect();
+                format!("({})", rows.join(" "))
+            }
+            // tramp's own words already name the host and the path.
+            Err(e) => q(&e.to_string()),
+        },
+    };
+    CString::new(src)
+        .unwrap_or_else(|_| CString::new("nil").expect("literal has no NUL"))
+        .into_raw()
+}
+
 #[no_mangle]
 pub extern "C" fn rs_goto_char(n: c_long) {
     emit(EditorCommand::MoveTo(n.max(0) as usize));

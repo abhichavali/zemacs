@@ -44,6 +44,8 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
 /// How much scrollback to keep — what a terminal emulator typically ships with.
 const SCROLLBACK: usize = 10_000;
+/// ...and for a child that is a program rather than `$SHELL`. See `spawn_command`.
+const HARNESS_SCROLLBACK: usize = 2_000;
 
 // --- what the renderer draws ---------------------------------------------
 
@@ -605,8 +607,20 @@ impl Terminal {
         // the child to say anything — see `dirty`.
         let dirty = Arc::new(AtomicBool::new(true));
         let proxy = Proxy { events: tx, dirty: dirty.clone() };
+        // A harness gets a fifth of a shell's scrollback. An agent session runs
+        // for hours and prints the whole conversation into history, so its ten
+        // thousand lines of cells fill and stay resident, per session, for as
+        // long as it lives — and the conversation is kept by the agent itself,
+        // which can replay it, where a shell's history exists only here.
+        // ponytail: keyed on "is a command" rather than "is an agent", so an
+        // output pane gets the short history too — a build that prints more
+        // than two thousand lines keeps only its tail, which is where the
+        // error is. A per-spawn size is the upgrade when that bites.
         let config = Config {
-            scrolling_history: SCROLLBACK,
+            scrolling_history: match command {
+                Some(_) => HARNESS_SCROLLBACK,
+                None => SCROLLBACK,
+            },
             ..Config::default()
         };
         let term = Arc::new(FairMutex::new(Term::new(config, &size, proxy.clone())));

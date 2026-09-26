@@ -5,7 +5,9 @@
 //! already knows about `.gitignore`, binary files and encodings.
 //!
 //! Nothing here goes near a shell — the pattern is a single `arg` after `--`,
-//! so a pattern of `; rm -rf ~` or `-i` is a pattern.
+//! so a pattern of `; rm -rf ~` or `-i` is a pattern. A remote root's search
+//! does go through one, the host's, and there the pattern is a single-quoted
+//! word in `zemacs_tramp`'s script, which is the same promise kept there.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::path::Path;
@@ -40,6 +42,14 @@ pub fn search(root: &Path, pattern: &str) -> Result<Vec<String>> {
     if pattern.trim().is_empty() {
         return Ok(Vec::new());
     }
+    // A root on another machine is searched *there*: ripgrep over ssh, the
+    // same `path:line:text` relative to the root coming back, so every caller
+    // — the search prompt, and the hit it opens by joining onto that root — is
+    // unchanged. Blocks for the round trip, which is why the prompt's caller
+    // runs this on a thread of its own.
+    if let Some(there) = zemacs_tramp::parse(&root.to_string_lossy()) {
+        return Ok(zemacs_tramp::search(&there, pattern, SEARCH_LIMIT)?);
+    }
 
     let out = match run("rg", root, pattern) {
         Err(e) if e.kind() == ErrorKind::NotFound => run(FALLBACK, root, pattern),
@@ -65,9 +75,10 @@ pub fn search(root: &Path, pattern: &str) -> Result<Vec<String>> {
 ///
 /// Lines are taken as they arrive and the child is killed the moment the limit
 /// is reached, rather than waiting for ripgrep to finish and then throwing most
-/// of what it wrote away. That is not a memory nicety: the caller is
-/// synchronous, holds the editor lock and re-runs this on every keystroke of
-/// the prompt, so the whole editor is frozen for as long as ripgrep runs. On a
+/// of what it wrote away. That is not a memory nicety: the caller re-runs this
+/// for every keystroke of the prompt, one at a time, so a slow run is the delay
+/// before the list catches up with what you typed. (It used to be worse — the
+/// run was under the editor lock, and froze everything.) On a
 /// tree nothing ignores — 683 MB of vendored sources — a pattern of `e` was
 /// 1.17 s and 152 MB buffered to show two thousand lines; stopping at the limit
 /// is 8 ms. `--max-count` bounds the hits per file, this bounds the run.

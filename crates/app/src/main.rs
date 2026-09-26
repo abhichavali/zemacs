@@ -40,6 +40,7 @@ mod dock;
 mod magit;
 mod project;
 mod term;
+mod watch;
 use dired::Dired;
 use magit::Magit;
 use project::Project;
@@ -625,6 +626,11 @@ fn main() -> anyhow::Result<()> {
     // display's rate for as long as any session existed, to see whether the
     // child had printed. Now the child printing is what wakes it.
     zemacs_term::set_waker(zemacs_core::wake);
+    // ...and the two other producers in crates that know no editor: a language
+    // server's reply and a remote file arriving. Without these they waited for
+    // the revert tick to drain them.
+    zemacs_rpc::set_waker(zemacs_core::wake);
+    tramp::set_waker(zemacs_core::wake);
     // Only the perf report reads the clock, but it has to be SDL's own: an
     // event's timestamp is in it, and the interesting part of a keystroke's life
     // is over before this loop ever sees the event.
@@ -817,8 +823,8 @@ fn main() -> anyhow::Result<()> {
         // ...and so does a frame that has not been drawn for `DRAW_AT_LEAST`,
         // which is the safety net rather than a clock. `generation` is a list of
         // writers rather than a property of the editor, so a writer added later
-        // that forgets to touch costs a fraction of a second of staleness — a
-        // lag somebody notices and reports — instead of a pane that silently
+        // that forgets to touch costs at most that long of staleness — a lag
+        // somebody notices and reports — instead of a pane that silently
         // stops updating, which is the failure nobody can describe.
         // ...and only while somebody is looking. It is a net under a *bug* —
         // a writer that forgot to `touch` — and the cost of one going unnoticed
@@ -1003,9 +1009,11 @@ struct App {
     /// next to. See [`queue_point_moved`].
     last_point: Option<(BufferId, usize)>,
     last_file_query: Option<String>,
-    last_grep: Option<String>,
+    grep: Grep,
     last_autosave: Instant,
     last_revert: Instant,
+    /// When a person last did anything — see [`App::revert_every`].
+    last_input: Instant,
     /// [`Editor::generation`] as it stood when the last frame was drawn. A frame
     /// whose generation matches this one is a frame nothing could have changed
     /// in, and is skipped whole. `MAX` so the first one always draws.
@@ -1105,12 +1113,16 @@ impl App {
             told_syntax: None,
             last_point: None,
             last_file_query: None,
-            last_grep: None,
+            grep: Grep::default(),
             last_autosave: Instant::now(),
             last_revert: Instant::now(),
+            last_input: Instant::now(),
             drawn_generation: u64::MAX,
             last_draw: Instant::now(),
-            revert_watch: Revert::default(),
+            revert_watch: Revert {
+                watch: watch::Watch::new(),
+                ..Revert::default()
+            },
             focused: true,
             remote,
         }
@@ -1219,7 +1231,13 @@ impl App {
             }
             EditorCommand::Term(verb) => self.term.run(editor, &verb),
             EditorCommand::Project(verb) => self.project.run_verb(editor, &verb),
-            EditorCommand::PromptSource(spec) => self.project.fill_prompt(editor, &spec),
+            EditorCommand::PromptSource(spec) => {
+                // A remote project's listing is a round trip, so it goes to the
+                // IO thread and lands in the picker a few frames later.
+                if let Some(fetch) = self.project.fill_prompt(editor, &spec) {
+                    self.remote.fetch(fetch);
+                }
+            }
             // Straight back into the image as `NAME` and `PATH` pairs, because
             // the picker that asked is Lisp and the thing that can answer is a
             // font library. Scanned on demand rather than at startup: it costs a
@@ -1280,7 +1298,12 @@ impl App {
                 open_file(editor, &path, &self.init_path, &mut self.remote)
             }
             EditorCommand::OpenAt(hit) => {
-                let root = self.project.search_root(editor);
+                // The root the prompt's hits were found under, when they came
+                // from the prompt — for a remote project the only way to know
+                // it without asking the host again. An absolute hit (`xref`'s)
+                // ignores the root it is joined onto either way.
+                let root = (self.grep.root.take())
+                    .unwrap_or_else(|| self.project.search_root(editor));
                 open_at(editor, &root, &hit, &self.init_path, &mut self.remote);
             }
             EditorCommand::SaveFile(path) => {
@@ -1346,6 +1369,11 @@ impl App {
         // stopped drawing would keep its old geometry for as long as it took the
         // safety net to notice. See [`Editor::generation`].
         editor.touch();
+        // Everything but a thread's wakeup is somebody at the machine — a key,
+        // the mouse, the window manager. See [`App::revert_every`].
+        if !matches!(event, Event::User { .. }) {
+            self.last_input = Instant::now();
+        }
         match event {
             Event::Quit { .. } => return ControlFlow::Break(()),
             // Event-driven rather than polled: reading the clipboard is a
@@ -1961,7 +1989,7 @@ impl App {
                     seen: editor.buffer.change_count(),
                     buffer: editor.buffer.id,
                     lang: lang.clone(),
-                    text: editor.buffer.text.to_string(),
+                    text: editor.buffer.text.clone(),
                     // What the parser's tree has not been told yet. `None` —
                     // a different buffer, or a reader that fell further behind
                     // than core's log reaches — is "assume nothing", which
@@ -1978,6 +2006,9 @@ impl App {
                         .filter(|(b, _)| *b == editor.buffer.id)
                         .and_then(|(_, seen)| editor.buffer.changes_since(seen))
                         .map(<[_]>::to_vec),
+                    // The live buffer: the next request's edits are relative
+                    // to this one, which is what a kept tree is for.
+                    keep: true,
                 }),
                 // A generated buffer colours itself — dired and magit hand their
                 // own spans straight to the editor — so clearing here would
@@ -2078,10 +2109,21 @@ impl App {
     /// keeps that working while a laptop nobody is typing at stops asking the
     /// disk four times a second forever. Coming back to the window sweeps
     /// immediately — see the `FocusGained` arm.
+    ///
+    /// "Looking" is a focused window *and* input within [`IDLE_AFTER`]: a
+    /// focused editor left on screen overnight is nobody looking too, and was
+    /// the one idle state still ticking four times a second. The first key back
+    /// sweeps at once, because `last_revert` is by then already older than the
+    /// fast period.
+    ///
+    /// With the kqueue watcher running, a change sweeps the moment it happens
+    /// and this timer is only the backstop: it re-arms files opened or replaced
+    /// since, and catches what a watch cannot see (a network volume). A second
+    /// is how long a file just opened can go unwatched.
     fn revert_every(&self) -> Duration {
-        match self.focused {
-            true => REVERT_EVERY,
-            false => REVERT_EVERY * 4,
+        match self.revert_watch.watch.active() {
+            true => REVERT_EVERY * 4,
+            false => revert_period(self.focused, self.last_input.elapsed()),
         }
     }
 
@@ -2102,7 +2144,7 @@ impl App {
         // First, because a reply can replace the whole document — the highlight
         // adoption and the parse request below should see the buffer this frame
         // rather than the next one.
-        self.remote.poll(editor, &mut self.dired);
+        self.remote.poll(editor, &mut self.dired, &mut self.project);
 
         // ...and immediately after it, because dired owns no ssh worker and no
         // buffers: it sets a field and someone else spends it. Here rather than
@@ -2119,7 +2161,7 @@ impl App {
         self.remote.take_from(&mut self.dired);
 
         refresh_file_completions(editor, &mut self.last_file_query);
-        refresh_grep(editor, &self.project, &mut self.last_grep);
+        refresh_grep(editor, &mut self.grep);
 
         adopt_highlights(editor, highlighter);
 
@@ -2180,7 +2222,10 @@ impl App {
         // Same shape, same argument, one order of magnitude more often: this one
         // is a `stat` rather than a write, and five seconds is how long a file
         // is allowed to be stale on screen.
-        if self.last_revert.elapsed() >= self.revert_every() {
+        //
+        // ...or at once, when the watcher says a file changed: an agent's edit
+        // should be on screen within a frame, not within a tick.
+        if self.revert_watch.watch.take_fired() || self.last_revert.elapsed() >= self.revert_every() {
             self.revert_watch.poll(editor);
             self.last_revert = Instant::now();
         }
@@ -2339,10 +2384,14 @@ fn request_pending_parses(editor: &mut Editor, highlighter: &zemacs_syntax::Work
             seen: buffer.change_count(),
             buffer: id,
             lang,
-            text: buffer.text.to_string(),
+            text: buffer.text.clone(),
             // No log to hand over, and none wanted: a revert replaces the whole
             // document, so there is no edit small enough to be worth describing.
             edits: None,
+            // ...and no tree to keep. The next edits sent for this buffer, if
+            // any, start from the text `told_syntax` last told the parser —
+            // not this one — so a tree of this text is one they would lie to.
+            keep: false,
         });
     }
 }
@@ -2394,7 +2443,7 @@ fn open_file(editor: &mut Editor, path: &Path, init_path: &Path, remote: &mut Re
     // ever been, and getting it is one `memcmp` against `/ssh:` — see
     // [`Remote`] for why the remote half cannot happen on this line.
     if let Some(there) = tramp::parse(&path.to_string_lossy()) {
-        remote.open(editor, there);
+        remote.open(editor, there, None);
         return;
     }
     match std::fs::read_to_string(&path) {
@@ -2418,6 +2467,23 @@ fn open_file(editor: &mut Editor, path: &Path, init_path: &Path, remote: &mut Re
             remember_recent(&path);
             project_remember(&path);
         }
+        // Not text. A picture, most likely — and drawing one is Lisp's: the
+        // buffer holds the file's name, read-only, and `image-mode` (picked by
+        // extension in `modes/library.lisp`) hangs the decoded image over it.
+        // A binary that is not a picture opens the same way and shows its name,
+        // which beats the "stream did not contain valid UTF-8" it used to say.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            let shown = display_path(&path);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| shown.clone());
+            editor.load(&name, Some(path.clone()), None);
+            editor.apply(EditorCommand::SetReadOnly(true));
+            editor.buffer.visited = disk_stamp(&path);
+            editor.apply(EditorCommand::Message(format!("opened {shown}")));
+            remember_recent(&path);
+        }
         Err(e) => editor.apply(EditorCommand::Message(format!(
             "{}: {e}",
             display_path(&path)
@@ -2437,17 +2503,26 @@ fn open_at(editor: &mut Editor, root: &Path, hit: &str, init_path: &Path, remote
         return;
     };
     // Relative, because ripgrep ran with the project root as its directory.
-    // Always local — ripgrep searched this machine — but it goes through the
-    // same door, so a `remote` handle travels with it rather than a second
-    // spelling of "open a file" growing here.
-    open_file(editor, &root.join(path), init_path, remote);
-    // ripgrep counts from 1. A hit for a file that changed under us lands on
-    // the last line rather than refusing to open it at all.
-    if let Ok(line) = line.parse::<usize>() {
-        let target = line.saturating_sub(1).min(editor.buffer.len_lines());
-        editor.buffer.move_to_line_col(target, 0);
-        editor.buffer.cursor = editor.buffer.first_non_blank(target);
+    let file = root.join(path);
+    // A remote project's hit is a remote file, which arrives frames from now:
+    // the line travels with the request and is applied when the text lands,
+    // rather than to whatever buffer is live at this instant.
+    if let Some(there) = tramp::parse(&file.to_string_lossy()) {
+        remote.open(editor, there, line.parse().ok());
+        return;
     }
+    open_file(editor, &file, init_path, remote);
+    if let Ok(line) = line.parse::<usize>() {
+        goto_hit_line(editor, line);
+    }
+}
+
+/// ripgrep counts from 1. A hit for a file that changed under us lands on
+/// the last line rather than refusing to open it at all.
+fn goto_hit_line(editor: &mut Editor, line: usize) {
+    let target = line.saturating_sub(1).min(editor.buffer.len_lines());
+    editor.buffer.move_to_line_col(target, 0);
+    editor.buffer.cursor = editor.buffer.first_non_blank(target);
 }
 
 /// Ask ripgrep for matches. Empty for a pattern too short to be worth running —
@@ -2476,30 +2551,114 @@ fn grep(root: &Path, pattern: &str) -> Vec<String> {
     zemacs_project::search(root, pattern).unwrap_or_else(|e| vec![e.to_string()])
 }
 
-/// Re-run ripgrep when the pattern changes.
+/// The project-search prompt's ripgrep, on a thread of its own.
+///
+/// It used to run right here, under the editor lock, once per keystroke of the
+/// prompt — so every character typed into `Search project:` froze the editor
+/// for one whole `rg` run, which is 8 ms on a tidy tree and far more on one
+/// nothing ignores. Now a changed pattern is *asked for* and the frame goes on;
+/// the answer comes back through `hits` and a wakeup, the same round trip a
+/// `:!` takes.
+///
+/// One thread rather than one per keystroke, and it only ever runs the newest
+/// pattern waiting: typing `foobar` while ripgrep chews on `fo` costs two scans,
+/// not five running at once.
+///
+/// ponytail: the scan in flight is not cancelled when the pattern moves on, so
+/// a slow tree still costs one wasted run behind each pause. The upgrade is a
+/// kill switch threaded into `zemacs_project::search`, which already kills the
+/// child at the hit limit.
+struct Grep {
+    /// The pattern last asked for, so a keystroke that only moves the selection
+    /// does not ask again. `None` while no grep prompt is open.
+    last: Option<String>,
+    /// `(where the search starts, pattern)` — a file or directory, not a root:
+    /// the thread finds the root, because for a remote file that is a round
+    /// trip and this end is the frame.
+    ask: std::sync::mpsc::Sender<(PathBuf, String)>,
+    /// `(pattern, root, hits)`, in the order they finished.
+    hits: std::sync::mpsc::Receiver<(String, PathBuf, Vec<String>)>,
+    /// The root the hits on screen are relative to, which is what `OpenAt`
+    /// joins the chosen one onto. Carried back rather than recomputed at
+    /// `Enter`, where a remote root would be a round trip on the frame.
+    root: Option<PathBuf>,
+}
+
+impl Default for Grep {
+    fn default() -> Self {
+        let (ask, asked) = std::sync::mpsc::channel::<(PathBuf, String)>();
+        let (found, hits) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("zemacs-grep".into())
+            .spawn(move || {
+                let mut roots = project::Roots::default();
+                while let Ok(mut job) = asked.recv() {
+                    // Patterns typed past while the last scan ran are searches
+                    // nobody is going to read.
+                    while let Ok(newer) = asked.try_recv() {
+                        job = newer;
+                    }
+                    let (start, pattern) = job;
+                    let root = roots.of(&start);
+                    let found_now = grep(&root, &pattern);
+                    if found.send((pattern, root, found_now)).is_err() {
+                        return; // the app is gone
+                    }
+                    zemacs_core::wake();
+                }
+            })
+            .expect("failed to spawn the grep thread");
+        Self { last: None, ask, hits, root: None }
+    }
+}
+
+/// Hand the prompt whatever ripgrep has finished, and ask again when the
+/// pattern changed.
 ///
 /// Mirrors [`refresh_file_completions`]: core does no IO, so the candidates are
-/// pushed in from here. Keyed on the pattern so a keystroke that only moves the
-/// selection does not re-run the search.
-fn refresh_grep(editor: &mut Editor, project: &Project, last: &mut Option<String>) {
+/// pushed in from here.
+fn refresh_grep(editor: &mut Editor, grep: &mut Grep) {
+    adopt_grep(editor, &grep.hits, &mut grep.root);
     let Some(prompt) = editor.prompt.as_mut() else {
-        *last = None;
+        grep.last = None;
         return;
     };
     if prompt.kind != PromptKind::Grep {
-        *last = None;
+        grep.last = None;
         return;
     }
-    if last.as_deref() == Some(prompt.text.as_str()) {
+    if grep.last.as_deref() == Some(prompt.text.as_str()) {
         return;
     }
-    *last = Some(prompt.text.clone());
-    // Held across the search, since `search_root` needs the editor back.
+    grep.last = Some(prompt.text.clone());
     let pattern = prompt.text.clone();
-    let root = project.search_root(editor);
-    let hits = grep(&root, &pattern);
-    if let Some(prompt) = editor.prompt.as_mut() {
-        prompt.set_items(hits);
+    let start = editor
+        .buffer
+        .path
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let _ = grep.ask.send((start, pattern));
+}
+
+/// Put each finished search on the prompt — but only one for the pattern the
+/// prompt still holds. A result for `fo` landing after you typed `foo` is the
+/// wrong list, and showing it for a frame reads as the search having gone
+/// backwards; the answer for `foo` is already on its way.
+fn adopt_grep(
+    editor: &mut Editor,
+    hits: &std::sync::mpsc::Receiver<(String, PathBuf, Vec<String>)>,
+    shown_root: &mut Option<PathBuf>,
+) {
+    while let Ok((pattern, root, found)) = hits.try_recv() {
+        let Some(prompt) = editor.prompt.as_mut() else {
+            continue;
+        };
+        if prompt.kind == PromptKind::Grep && prompt.text == pattern {
+            prompt.set_items(found);
+            *shown_root = Some(root);
+            editor.touch();
+        }
     }
 }
 
@@ -2517,7 +2676,9 @@ fn save_file(editor: &mut Editor, path: Option<PathBuf>, guard: Save, remote: &m
     // A dired buffer's `path` is the *directory* it lists, and a magit buffer's
     // text is a rendered status. Writing either would overwrite something real
     // with a screenshot of a view.
-    if editor.buffer.kind.is_generated() {
+    // A read-only claim is the same refusal: `image-mode` holds a picture's
+    // *name* in the buffer, and `:w` would replace the picture with it.
+    if editor.buffer.read_only() != zemacs_core::ReadOnly::No {
         let name = editor.buffer.name();
         editor.apply(EditorCommand::Message(format!("{name} is not a file")));
         return;
@@ -2720,10 +2881,13 @@ enum Job {
     /// `stat` says file, directory, or nothing, and each answer queues its own
     /// follow-up. Two round trips to open a file — the second on a connection
     /// the first one opened, which is what `tramp`'s control socket is for.
-    Probe(tramp::RemotePath),
+    ///
+    /// The line is a search hit's: the cursor can only be put on it once the
+    /// text has arrived, which is two replies after the `Enter` that asked.
+    Probe(tramp::RemotePath, Option<usize>),
     /// The read behind a `Probe`, carrying the metadata that `stat` already
     /// learned so the mode bits and the mtime are not asked for twice.
-    Open(tramp::RemotePath, Option<tramp::RemoteEntry>),
+    Open(tramp::RemotePath, Option<tramp::RemoteEntry>, Option<usize>),
     /// A directory, for dired.
     List(tramp::RemotePath),
     /// A write, and the buffer that asked for it.
@@ -2742,6 +2906,11 @@ enum Job {
     /// the file it acted on rather than the operation, because that is all the
     /// answer is for: `Dired` counts it, and a failure has to name something.
     Dired(tramp::RemotePath),
+    /// A remote project's file list, for the picker that asked.
+    Files(project::Fetch),
+    /// The climb above something just opened, for the project switcher's
+    /// history — the remote half of `project_remember`.
+    Remember(tramp::RemotePath),
 }
 
 impl Job {
@@ -2749,11 +2918,13 @@ impl Job {
     /// the context a user needs: it names the host and the file.
     fn path(&self) -> &tramp::RemotePath {
         match self {
-            Job::Probe(p)
-            | Job::Open(p, _)
+            Job::Probe(p, _)
+            | Job::Open(p, ..)
             | Job::List(p)
             | Job::Save { path: p, .. }
-            | Job::Dired(p) => p,
+            | Job::Dired(p)
+            | Job::Files(project::Fetch { root: p, .. })
+            | Job::Remember(p) => p,
         }
     }
 }
@@ -2774,7 +2945,9 @@ fn acted_on(op: &tramp::Op) -> tramp::RemotePath {
         | tramp::Op::CreateFile(p)
         | tramp::Op::Delete { path: p, .. }
         | tramp::Op::Rename { from: p, .. }
-        | tramp::Op::Copy { from: p, .. } => p.clone(),
+        | tramp::Op::Copy { from: p, .. }
+        | tramp::Op::Probe { path: p, .. }
+        | tramp::Op::Files { root: p, .. } => p.clone(),
     }
 }
 
@@ -2788,6 +2961,9 @@ struct Remote {
     /// exactly one reply, tagged with the id it went out with, and nothing is
     /// coalesced or dropped.
     jobs: std::collections::HashMap<u64, Job>,
+    /// Directories whose project has already been asked for, so that opening
+    /// the tenth file of a remote project does not climb for the tenth time.
+    climbed: std::collections::HashSet<String>,
 }
 
 impl Remote {
@@ -2800,10 +2976,31 @@ impl Remote {
             .request(id, op);
     }
 
-    /// `find-file` on a remote name.
-    fn open(&mut self, editor: &mut Editor, path: tramp::RemotePath) {
+    /// `find-file` on a remote name, and the line to land on once it has.
+    fn open(&mut self, editor: &mut Editor, path: tramp::RemotePath, line: Option<usize>) {
         editor.apply(EditorCommand::Message(format!("opening {path}…")));
-        self.request(tramp::Op::Stat(path.clone()), Job::Probe(path));
+        self.request(tramp::Op::Stat(path.clone()), Job::Probe(path, line));
+    }
+
+    /// A remote project's listing, for [`Project::fill_prompt`]'s picker.
+    fn fetch(&mut self, fetch: project::Fetch) {
+        let op = tramp::Op::Files {
+            root: fetch.root.clone(),
+            skip: zemacs_project::SKIP.map(String::from).to_vec(),
+            limit: zemacs_project::FILE_LIMIT,
+        };
+        self.request(op, Job::Files(fetch));
+    }
+
+    /// Put the project above `path` in the switcher's history, once per
+    /// directory: a remote `SPC p p` can only offer where you have been, the
+    /// same chicken-and-egg `project_remember` exists to break locally.
+    /// Queued behind the open, so the file shows first.
+    fn remember(&mut self, dir: tramp::RemotePath) {
+        if self.climbed.insert(dir.to_string()) {
+            let names = zemacs_project::marker_names();
+            self.request(tramp::Op::Probe { path: dir.clone(), names }, Job::Remember(dir));
+        }
     }
 
     /// A directory dired asked for. No message: dired said "listing …" when it
@@ -2860,7 +3057,7 @@ impl Remote {
     /// and one of them is a save. Costs a `try_recv` on an empty channel in a
     /// session that never typed `/ssh:` — and not even that, since there is no
     /// channel until there is a worker.
-    fn poll(&mut self, editor: &mut Editor, dired: &mut Dired) {
+    fn poll(&mut self, editor: &mut Editor, dired: &mut Dired, project: &mut Project) {
         while let Some((id, reply)) = self.worker.as_ref().and_then(tramp::Worker::poll) {
             let Some(job) = self.jobs.remove(&id) else {
                 continue;
@@ -2871,8 +3068,11 @@ impl Remote {
                 // failure goes to its tally rather than to the status line on
                 // its own. Everything below has one answer and one message.
                 Job::Dired(path) => dired.did(editor, &path, reply),
+                // History is a by-product of opening; a climb that failed has
+                // nothing to tell someone who is reading the file it opened.
+                Job::Remember(_) if reply.is_err() => {}
                 job => match reply {
-                    Ok(reply) => self.finish(editor, dired, job, reply),
+                    Ok(reply) => self.finish(editor, dired, project, job, reply),
                     // Errors are values. `tramp::Error`'s own words are better
                     // than anything this layer could write — they distinguish
                     // "add your key to the agent" from "accept the host key"
@@ -2887,25 +3087,49 @@ impl Remote {
         }
     }
 
-    fn finish(&mut self, editor: &mut Editor, dired: &mut Dired, job: Job, reply: tramp::Reply) {
+    fn finish(
+        &mut self,
+        editor: &mut Editor,
+        dired: &mut Dired,
+        project: &mut Project,
+        job: Job,
+        reply: tramp::Reply,
+    ) {
         match (job, reply) {
             // A directory: dired's, and the listing is the second round trip.
-            (Job::Probe(path), tramp::Reply::Stat(Some(meta))) if meta.is_dir => {
+            (Job::Probe(path, _), tramp::Reply::Stat(Some(meta))) if meta.is_dir => {
                 dired.adopt_remote(&path);
-                self.list(path);
+                self.list(path.clone());
+                self.remember(path);
             }
-            (Job::Probe(path), tramp::Reply::Stat(meta @ Some(_))) => {
-                self.request(tramp::Op::Read(path.clone()), Job::Open(path, meta));
+            (Job::Probe(path, line), tramp::Reply::Stat(meta @ Some(_))) => {
+                self.request(tramp::Op::Read(path.clone()), Job::Open(path.clone(), meta, line));
+                if let Some(dir) = path.parent() {
+                    self.remember(dir);
+                }
             }
             // Not there. Emacs visits the name in an empty buffer, and so do we:
             // it is the only way to *create* a remote file, and the save that
             // follows is the same save as any other.
-            (Job::Probe(path), tramp::Reply::Stat(None)) => {
+            (Job::Probe(path, _), tramp::Reply::Stat(None)) => {
                 visit(editor, &path, String::new(), None);
                 editor.apply(EditorCommand::Message(format!("{path} (new file)")));
             }
-            (Job::Open(path, meta), tramp::Reply::Read(bytes)) => match String::from_utf8(bytes) {
-                Ok(text) => visit(editor, &path, text, meta),
+            (Job::Files(fetch), tramp::Reply::Files(files, truncated)) => {
+                project.listed(editor, fetch, files, truncated);
+            }
+            (Job::Remember(_), tramp::Reply::Probe(hits)) => {
+                if let Some(found) = zemacs_project::pick(&hits) {
+                    zemacs_project::remember(&found.root);
+                }
+            }
+            (Job::Open(path, meta, line), tramp::Reply::Read(bytes)) => match String::from_utf8(bytes) {
+                Ok(text) => {
+                    visit(editor, &path, text, meta);
+                    if let Some(line) = line {
+                        goto_hit_line(editor, line);
+                    }
+                }
                 // Same refusal as `tramp::read_to_string`, and for the reason
                 // given there: replacing undecodable bytes with U+FFFD in a
                 // buffer somebody will save destroys the file.
@@ -2953,6 +3177,8 @@ impl Remote {
             }
             // `execute` answers each `Op` with its own `Reply` variant, so this
             // is a bug in this file rather than anything a host can cause.
+            // Nothing to say about a history entry that could not be made.
+            (Job::Remember(_), _) => {}
             (job, reply) => editor.apply(EditorCommand::Message(format!(
                 "tramp: {} answered with {reply:?}",
                 job.path()
@@ -3411,11 +3637,15 @@ const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
 /// present that the digest then discarded, per wakeup, for around 1.6% of a
 /// core doing nothing — all of it this.
 ///
-/// Two seconds costs a quarter of that and gives up nothing the argument above
-/// asked for: a pane that is two seconds stale is still a lag somebody notices
-/// and reports, which is the entire job. It is also off altogether while the
-/// window is not focused — see the `due` line in the loop.
-const DRAW_AT_LEAST: Duration = Duration::from_secs(2);
+/// Two seconds cost a quarter of that, and was still the only thing drawing an
+/// idle, focused window. Thirty is the honest trade: every known writer now
+/// touches the generation or wakes the loop, so this net fires only on a bug —
+/// and a bug that leaves a pane thirty seconds stale is noticed later than one
+/// that leaves it two, but it is still noticed, and the fix is still "find the
+/// writer that forgot to `touch`". What it no longer is, is a quarter of the
+/// idle cost. It is also off altogether while the window is not focused — see
+/// the `due` line in the loop.
+const DRAW_AT_LEAST: Duration = Duration::from_secs(30);
 
 /// The longest the loop will park without being woken, and the floor under
 /// [`App::park_ms`]. See its header for what it is a net against.
@@ -3775,6 +4005,19 @@ fn backup_into(dir: &Path, target: &Path) {
 /// still a rounding error next to a frame.
 const REVERT_EVERY: Duration = Duration::from_millis(250);
 
+/// How long without input before a focused window stops counting as somebody
+/// looking, for the revert sweep. Long enough that reading a diff is not idle.
+const IDLE_AFTER: Duration = Duration::from_secs(10);
+
+/// The revert period for a window that is or is not `focused` and has had no
+/// input for `idle`. See [`App::revert_every`].
+fn revert_period(focused: bool, idle: Duration) -> Duration {
+    match focused && idle < IDLE_AFTER {
+        true => REVERT_EVERY,
+        false => REVERT_EVERY * 4,
+    }
+}
+
 #[derive(Default)]
 struct Revert {
     /// The modification time already accounted for, per file. A path is only
@@ -3783,6 +4026,9 @@ struct Revert {
     /// it. Keyed by path rather than by buffer id so switching away and back
     /// does not re-ask a question that was already answered.
     seen: std::collections::HashMap<PathBuf, std::time::SystemTime>,
+    /// What tells the sweep to run *now*. Inert by default, so the tests of the
+    /// rules below never wait on the filesystem; the app arms a real one.
+    watch: watch::Watch,
 }
 
 impl Revert {
@@ -3805,6 +4051,7 @@ impl Revert {
             // on this one.
             .filter(|(_, p)| tramp::parse(&p.to_string_lossy()).is_none())
             .collect();
+        self.watch.sync(&watched.iter().map(|(_, p)| p.as_path()).collect::<Vec<_>>());
 
         for (id, path) in watched {
             self.check(editor, id, &path);
@@ -4558,6 +4805,38 @@ mod tests {
         let b = autosave_file(Path::new("/b/src/mod.rs")).expect("HOME is set");
         assert_ne!(a, b);
         assert!(a.ends_with("#!a!src!mod.rs#"));
+    }
+
+    /// The revert sweep slows down for nobody looking — unfocused, or focused
+    /// and untouched for [`IDLE_AFTER`] — and only then.
+    #[test]
+    fn the_revert_sweep_backs_off_when_idle() {
+        let fast = REVERT_EVERY;
+        let slow = REVERT_EVERY * 4;
+        assert_eq!(revert_period(true, Duration::ZERO), fast);
+        assert_eq!(revert_period(true, IDLE_AFTER - Duration::from_millis(1)), fast);
+        assert_eq!(revert_period(true, IDLE_AFTER), slow);
+        assert_eq!(revert_period(false, Duration::ZERO), slow);
+    }
+
+    /// A search that finishes after the pattern moved on is not shown: only the
+    /// answer for what the prompt still says lands, whatever order they arrive.
+    #[test]
+    fn a_grep_for_a_pattern_typed_past_is_dropped() {
+        let mut ed = Editor::new();
+        let mut prompt = zemacs_core::Prompt::new(PromptKind::Grep, "Search project: ", Vec::new());
+        prompt.text = "foo".into();
+        ed.prompt = Some(prompt);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = |r: &str| PathBuf::from(r);
+        tx.send(("fo".to_string(), at("/a"), vec!["a.rs:1:fo".to_string()])).unwrap();
+        tx.send(("foo".to_string(), at("/b"), vec!["b.rs:2:foo".to_string()])).unwrap();
+        tx.send(("f".to_string(), at("/c"), vec!["c.rs:3:f".to_string()])).unwrap();
+        let mut root = None;
+        adopt_grep(&mut ed, &rx, &mut root);
+        assert_eq!(ed.prompt.as_ref().unwrap().items, ["b.rs:2:foo"]);
+        // ...and the root that `Enter` joins onto is the one *those* hits had.
+        assert_eq!(root, Some(at("/b")));
     }
 
     #[test]
@@ -5462,7 +5741,7 @@ mod tests {
         assert_eq!(remote.jobs.len(), 1, "nothing was queued");
         assert!(matches!(
             remote.jobs.values().next(),
-            Some(Job::Probe(p)) if p.host == "0.0.0.0" && p.path == "/etc/hosts"
+            Some(Job::Probe(p, _)) if p.host == "0.0.0.0" && p.path == "/etc/hosts"
         ));
         assert!(ed.status.contains("opening"), "{}", ed.status);
     }
@@ -5489,7 +5768,7 @@ mod tests {
         let mut dired = Dired::default();
         let deadline = Instant::now() + Duration::from_secs(30);
         while !remote.jobs.is_empty() && Instant::now() < deadline {
-            remote.poll(&mut ed, &mut dired);
+            remote.poll(&mut ed, &mut dired, &mut Project::default());
             std::thread::yield_now();
         }
 

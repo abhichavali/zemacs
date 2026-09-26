@@ -3643,7 +3643,11 @@ impl Editor {
                     vec![EditorCommand::OpenFile(PathBuf::from(expand_tilde(&path)))]
                 }
             }
-            PromptKind::Buffer | PromptKind::Line => self.candidate_target(&p),
+            PromptKind::Buffer => {
+                self.restore_buffer_order(&p);
+                self.candidate_target(&p)
+            }
+            PromptKind::Line => self.candidate_target(&p),
             // A project file, or a project root — which opens as a directory,
             // and a directory is dired. One prompt, both gestures.
             PromptKind::ProjectFile => match p.current() {
@@ -3707,16 +3711,26 @@ impl Editor {
         self.vim.search_op = None;
         // Back to the buffer you were in *before* the cursor, because the
         // cursor offset means nothing until the right document is live again.
-        let mut out: Vec<EditorCommand> = p
-            .origin_buffer
-            .into_iter()
-            .map(EditorCommand::SwitchBufferId)
-            .chain(p.origin.map(EditorCommand::MoveTo))
-            .collect();
+        // Now rather than as a command, so the order can be put back after it.
+        if let Some(id) = p.origin_buffer {
+            self.switch_buffer_id(id);
+            self.restore_buffer_order(&p);
+        }
+        let mut out: Vec<EditorCommand> = p.origin.map(EditorCommand::MoveTo).into_iter().collect();
         if let PromptKind::Lisp { id, .. } = p.kind {
             out.push(EditorCommand::CallLisp(format!("(%prompt-reply {id} nil)")));
         }
         out
+    }
+
+    /// Put the buffer list back the way the switcher found it. The preview
+    /// *visits* every buffer the highlight passes over, and each visit is a
+    /// switch that moved it to the front — so scrolling down the list and
+    /// back out again reshuffled the most-recently-used order it was showing.
+    fn restore_buffer_order(&mut self, p: &Prompt) {
+        let order = p.origin_buffer.into_iter().chain(p.ids.iter().copied());
+        let rank = |id| order.clone().position(|x| x == id).unwrap_or(usize::MAX);
+        self.others.sort_by_key(|b| rank(b.id));
     }
 
     /// Move the cursor to the highlighted line while the prompt is still open —
@@ -7307,6 +7321,70 @@ mod tests {
         }
         assert_eq!(ed.buffer.text.to_string(), "FIRST\n");
         assert_eq!(ed.buffer_names()[..2], ["a.rs", "b.rs"]);
+    }
+
+    /// Previewing visits each highlighted buffer, and none of those visits
+    /// may count: Esc restores the list as it was, and Enter moves only the
+    /// buffer picked to the front.
+    #[test]
+    fn switcher_previews_do_not_reorder_the_buffer_list() {
+        let mut ed = fresh("");
+        for f in ["a", "b", "c", "d"] {
+            ed.load(f, Some(format!("/tmp/{f}.rs").into()), None);
+        }
+        let run = |ed: &mut Editor, k: Key| {
+            for cmd in ed.handle_key(k) {
+                ed.apply(cmd);
+            }
+        };
+        let start = ed.buffer_names();
+        assert_eq!(start[..4], ["d.rs", "c.rs", "b.rs", "a.rs"]);
+
+        ed.run_action("switch-buffer");
+        run(&mut ed, Key::Ctrl('n'));
+        run(&mut ed, Key::Ctrl('n'));
+        assert_eq!(ed.buffer.text.to_string(), "a", "the preview shows a");
+        run(&mut ed, Key::Esc);
+        assert_eq!(ed.buffer.text.to_string(), "d", "Esc goes back");
+        assert_eq!(ed.buffer_names(), start, "and leaves the order alone");
+
+        ed.run_action("switch-buffer");
+        run(&mut ed, Key::Ctrl('n'));
+        run(&mut ed, Key::Ctrl('n'));
+        run(&mut ed, Key::Enter);
+        assert_eq!(ed.buffer_names()[..4], ["a.rs", "d.rs", "c.rs", "b.rs"]);
+    }
+
+    /// A visual selection in dired — `V`, or a mouse drag — ends back in dired,
+    /// not in a plain Normal buffer that has lost every dired key.
+    #[test]
+    fn leaving_visual_in_dired_stays_dired() {
+        let mut ed = fresh("");
+        ed.show_special(crate::BufferKind::Dired, "a\nb\n");
+        assert_eq!(ed.mode, Mode::Dired);
+        feed(&mut ed, &keys("V"));
+        assert!(ed.mode.is_visual());
+        feed(&mut ed, &[Key::Esc]);
+        assert_eq!(ed.mode, Mode::Dired);
+    }
+
+    /// Killing the buffer in one pane must not fill it with the buffer the
+    /// other pane already shows — two panes on one buffer is `M-o` doing
+    /// nothing visible.
+    #[test]
+    fn killing_a_buffer_in_a_split_does_not_duplicate_the_other_pane() {
+        let mut ed = fresh("");
+        for f in ["a", "b", "c", "d"] {
+            ed.load(f, Some(format!("/tmp/{f}.rs").into()), None);
+        }
+        ed.apply(EditorCommand::SplitWindow(frame::Split::Columns));
+        ed.switch_buffer_id(ed.buffer_ids()[2]); // b.rs in the new pane
+        ed.apply(EditorCommand::FocusNextWindow); // back to d.rs, b.rs now first
+        assert_eq!(ed.buffer_names()[..2], ["d.rs", "b.rs"]);
+        ed.kill_buffer(0);
+        assert_eq!(ed.buffer.text.to_string(), "c");
+        ed.apply(EditorCommand::FocusNextWindow);
+        assert_eq!(ed.buffer.text.to_string(), "b", "the other pane kept b");
     }
 
     #[test]

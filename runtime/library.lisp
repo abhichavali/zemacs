@@ -1716,10 +1716,10 @@ buffer."
 ;;;                   and a place for your answer, all of it ordinary org with
 ;;;                   `#+ZEMACS_*' properties on the headings. The format is
 ;;;                   specified in `docs/curriculum.org'.
-;;;   ai.lisp         coding agents — Claude Code, Cursor, opencode — as ordinary
-;;;                   buffers, on the terminal the editor already has. `C-a' is
-;;;                   the menu. The harness list is *data* in that file, so a
-;;;                   fourth tool is one line and no Rust.
+;;;   ai.lisp         coding agents — Claude Code, Codex, Cursor, opencode — as
+;;;                   ordinary buffers, on the terminal the editor already has.
+;;;                   `C-a' is the menu. The harness list is *data* in that file,
+;;;                   so a fifth tool is one line and no Rust.
 ;;;   tutor.lisp      `SPC h t' — the tutorial, as a buffer that marks your
 ;;;                   homework rather than a page of prose that trusts you.
 ;;;                   After `repl.lisp' (`%eval-source') and `ai.lisp'
@@ -1754,7 +1754,7 @@ buffer."
     "modes/org-structure.lisp" "modes/org-table.lisp"
     ;; ...and the agenda after the table, because it is a scanner over
     ;; `xref-show' and reads `*org-todo-keywords*' out of `org-modern.lisp'.
-    "modes/org-agenda.lisp" "modes/org-frozen.lisp"
+    "modes/org-agenda.lisp" "modes/org-frozen.lisp" "modes/org-export.lisp"
     ;; After `org-modern.lisp', which is where `*org-mode-functions*' is
     ;; declared and therefore where the hook this adds itself to has to exist.
     "modes/mathsync.lisp"

@@ -11,6 +11,11 @@
 //! * **Doing** (this module): [`read`], [`write()`], [`list`], [`stat`],
 //!   [`mkdir`], [`create_file`], [`delete`], [`rename`] and [`copy`], each one
 //!   `ssh` invocation. A [`Worker`] runs the same operations off the UI thread.
+//! * **Projects** ([`probe`], [`files`], [`search`], [`command_argv`]): what a
+//!   remote *project* asks — where its root is, what is in it, what matches,
+//!   and how to run a process in it — so `SPC p f`, the project search, a
+//!   terminal, `:!` and git all work against `/ssh:host:/src/thing` the way
+//!   they do against `~/src/thing`. Still one round trip each.
 //!
 //! Everything shells out to the system `ssh`. No `libssh`, no `russh`: `ssh`
 //! already reads the user's `~/.ssh/config`, talks to the agent, knows the
@@ -341,6 +346,130 @@ pub fn copy(from: &RemotePath, to: &RemotePath) -> Result<()> {
     ssh(from, &copy_script(from, to), &[], "copying").map(drop)
 }
 
+// ------------------------------------------------------- project-scoped reads
+//
+// The three questions a *project* asks of a host, each one round trip. They
+// are here rather than in `zemacs-project` because they are scripts, and the
+// scripts live beside `quote` — see the module docs. What the answers *mean*
+// (which marker makes a root, which directories are noise) is the caller's,
+// and arrives as arguments.
+
+/// Every directory from `p` up to `/` — `p` itself when it is a directory,
+/// else the one holding it — paired with each of `names` present in it,
+/// nearest directory first and `names` order within one.
+///
+/// One climb in one round trip. A project root is a dozen `test -e`s per level,
+/// and a round trip each over a slow link is seconds; this is the latency of
+/// one `stat`. The directories come back as the host spells them after a `cd`
+/// — absolute, with `~` expanded — on `p`'s own login.
+///
+/// ponytail: `pwd` is the *logical* path, so a root reached through a symlink
+/// keeps the symlink's name, and a buffer opened as `~/x` finds its root as
+/// `/home/me/x` — two spellings of one file, which opening a search hit from
+/// the second will show as a second buffer. Mapping `$HOME` back to `~` is the
+/// fix, the day that bites.
+pub fn probe(p: &RemotePath, names: &[String]) -> Result<Vec<(RemotePath, String)>> {
+    let out = ssh(p, &probe_script(p, names), &[], "probing")?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        // A line from somebody's `.bashrc` is not one of ours.
+        .filter(|(name, _)| names.iter().any(|n| n == name))
+        .map(|(name, dir)| {
+            let dir = RemotePath {
+                path: dir.to_string(),
+                ..p.clone()
+            };
+            (dir, name.to_string())
+        })
+        .collect())
+}
+
+/// The files under `root`, relative to it, at most `limit` of them, and
+/// whether there were more — `zemacs-project`'s listing, run over there.
+///
+/// Same two sources in the same order as the local one: `git ls-files` when
+/// `root` is in a work tree, else a walk that prunes every name in `skip`.
+/// The cap is applied *on the host* by `head`, so a repository of a million
+/// files costs `limit` lines on the wire and not a million.
+pub fn files(root: &RemotePath, skip: &[String], limit: usize) -> Result<(Vec<String>, bool)> {
+    let out = ssh(root, &files_script(root, skip, limit), &[], "listing")?;
+    let mut files: Vec<String> = String::from_utf8_lossy(&out)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    // One more than the cap was asked for, and its arrival is the news.
+    let truncated = files.len() > limit;
+    files.truncate(limit);
+    Ok((files, truncated))
+}
+
+/// Lines matching `pattern` under `root`, as `path:line:text` with `path`
+/// relative to `root` — `zemacs_project::search`'s answer, from the host.
+///
+/// ripgrep when the host has it, `grep -rn` when it does not, and in both cases
+/// smart case: insensitive unless the pattern has a capital, decided *here*
+/// so that the choice reaches the script as one of two literal flags rather
+/// than as anything derived from the pattern.
+///
+/// Anything the host said that is not a hit — a pattern that will not compile,
+/// a login banner — is not a hit either. With no hits at all its first line is
+/// the answer, as the local search reports ripgrep's own complaint; with some,
+/// it is dropped.
+pub fn search(root: &RemotePath, pattern: &str, limit: usize) -> Result<Vec<String>> {
+    let out = ssh(root, &search_script(root, pattern, limit), &[], "searching")?;
+    let text = String::from_utf8_lossy(&out);
+    let is_hit = |l: &&str| {
+        let mut f = l.splitn(3, ':');
+        f.next().is_some_and(|p| !p.is_empty()) && f.next().is_some_and(|n| n.parse::<u64>().is_ok())
+    };
+    let hits: Vec<String> = text.lines().filter(is_hit).map(str::to_string).collect();
+    if hits.is_empty() {
+        if let Some(said) = text.lines().map(str::trim).find(|l| !l.is_empty()) {
+            return Err(Error::Refused(said.to_string()));
+        }
+    }
+    Ok(hits)
+}
+
+/// The argument vector — for [`program`] — that runs `argv` in `dir` on its
+/// host, with `env` set. An empty `argv` is the login shell.
+///
+/// This is how a *process* goes remote: a terminal, a `:!`, a compile, a
+/// `git`. Every word of `argv` and every `env` pair is [`quote`]d on its own,
+/// so what arrives is exactly that vector — `:!` asks for `/bin/sh -c LINE`
+/// when it wants a shell line, and gets one because it asked, not because a
+/// line was pasted into ours.
+///
+/// `dir` may name a file, and then its directory is used: a buffer's path is
+/// what callers have, and asking which it is would cost the round trip this
+/// saves. `tty` is `-t`, for a child that will sit on a PTY here.
+pub fn command_argv(
+    dir: &RemotePath,
+    argv: &[String],
+    env: &[(String, String)],
+    tty: bool,
+) -> Vec<String> {
+    let mut out = ssh_argv(dir, control_path(dir).as_deref(), Some(&sh_c(&exec_script(dir, argv, env))));
+    if tty {
+        out.insert(0, "-t".into());
+    }
+    out
+}
+
+/// The ssh client: `$ZEMACS_SSH` when set, else `ssh` from `PATH`.
+///
+/// A seam, and the tests' way in: a stand-in that ignores the host and runs
+/// the last argument with `sh -c` — which is what the far login shell does —
+/// lets everything above be driven end to end on a machine with no ssh server,
+/// which is most of them. See `a_fake_ssh_carries_every_new_operation_end_to_end`.
+pub fn program() -> std::ffi::OsString {
+    std::env::var_os("ZEMACS_SSH")
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "ssh".into())
+}
+
 /// Is `to` inside `from`, or `from` itself?
 ///
 /// `a` into `a/b` copies `b` into `b/b` into `b/b/b` until the disk fills, and
@@ -375,7 +504,7 @@ pub fn disconnect(p: &RemotePath) -> Result<()> {
     let mut argv = ssh_argv(p, control_path(p).as_deref(), None);
     argv.splice(0..0, ["-O".to_string(), "exit".to_string()]);
     // Nothing to report: no master means nothing to close, which is success.
-    let _ = Command::new("ssh").args(&argv).output();
+    let _ = Command::new(program()).args(&argv).output();
     Ok(())
 }
 
@@ -465,6 +594,94 @@ fn copy_script(from: &RemotePath, to: &RemotePath) -> String {
 /// which a `[ -e ]` guard would have left open.
 fn create_script(p: &RemotePath) -> String {
     format!("set -C\n: > {}\n", quote(p.path()))
+}
+
+/// See [`probe`]. The names are [`single`]-quoted rather than [`quote`]d: a
+/// marker is a file *name*, and a leading `~` in one is a character, not a home
+/// directory. `-L` beside `-e` so that a `.git` which is a dangling link still
+/// counts, as it does for `Path::exists`'s cousin in `zemacs-project`.
+fn probe_script(p: &RemotePath, names: &[String]) -> String {
+    let names: Vec<String> = names.iter().map(|n| single(n)).collect();
+    format!(
+        "p={}\n\
+         if [ -d \"$p\" ]; then cd -- \"$p\"; else cd -- \"$(dirname -- \"$p\")\"; fi || exit 1\n\
+         d=$(pwd)\n\
+         while :; do\n\
+         for m in {}; do\n\
+         if [ -e \"$d/$m\" ] || [ -L \"$d/$m\" ]; then printf '%s\\t%s\\n' \"$m\" \"$d\"; fi\n\
+         done\n\
+         n=$(dirname -- \"$d\")\n\
+         [ \"$n\" = \"$d\" ] && break\n\
+         d=$n\n\
+         done\n",
+        quote(p.path()),
+        names.join(" ")
+    )
+}
+
+/// See [`files`]. `-z` and `tr` for git's reason locally: without it a name
+/// holding a quote or a non-ASCII byte comes back C-escaped. `! -type d` rather
+/// than `-type f` so a symlink is listed and never followed, as the local walk
+/// does it. The limit is a number formatted here, not data.
+fn files_script(root: &RemotePath, skip: &[String], limit: usize) -> String {
+    let prune: Vec<String> = skip.iter().map(|s| format!("-name {}", single(s))).collect();
+    format!(
+        "cd -- {} || exit 1\n\
+         {{\n\
+         if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n\
+         GIT_OPTIONAL_LOCKS=0 git ls-files -z --cached --others --exclude-standard | tr '\\000' '\\n'\n\
+         else\n\
+         find . \\( {} \\) -prune -o ! -type d -print | sed 's|^\\./||'\n\
+         fi\n\
+         }} 2>/dev/null | head -n {}\n",
+        quote(root.path()),
+        if prune.is_empty() { "-name ''".to_string() } else { prune.join(" -o ") },
+        limit + 1
+    )
+}
+
+/// See [`search`]. The pattern is a variable so it is spelled once, and `--`
+/// and `-e` so that a pattern of `-i` is a pattern. stdin is `/dev/null`
+/// because ripgrep with no path searches a *piped* stdin instead of the
+/// directory — the same trap `zemacs_project::search` documents — and ssh's
+/// stdin is a pipe. `2>&1` so a pattern that will not compile says why, in the
+/// only channel [`search`] reads.
+fn search_script(root: &RemotePath, pattern: &str, limit: usize) -> String {
+    let case = if pattern.chars().any(char::is_uppercase) { "" } else { " -i" };
+    format!(
+        "cd -- {} || exit 1\n\
+         p={}\n\
+         if command -v rg >/dev/null 2>&1; then\n\
+         rg --line-number --no-heading --color=never --smart-case --no-messages --max-count=50 -- \"$p\"\n\
+         else\n\
+         grep -rnIs{case} --exclude-dir=.git -e \"$p\" . | sed 's|^\\./||'\n\
+         fi </dev/null 2>&1 | head -n {}\n",
+        quote(root.path()),
+        single(pattern),
+        limit
+    )
+}
+
+/// See [`command_argv`]. The `cd` falls back to the parent so that a *file*
+/// can name the directory, and the fallback is the only reason for `$d`.
+fn exec_script(dir: &RemotePath, argv: &[String], env: &[(String, String)]) -> String {
+    let cd = format!(
+        "d={}\n\
+         cd -- \"$d\" 2>/dev/null || cd -- \"$(dirname -- \"$d\")\" || exit 1\n",
+        quote(dir.path())
+    );
+    if argv.is_empty() {
+        // `$SHELL` is the login's own, which sshd sets; `-l` so that its
+        // profile runs and PATH is the one the user sees when they ssh in.
+        return format!("{cd}exec \"${{SHELL:-/bin/sh}}\" -l\n");
+    }
+    let mut words: Vec<String> = Vec::new();
+    if !env.is_empty() {
+        words.push("env".into());
+        words.extend(env.iter().map(|(k, v)| single(&format!("{k}={v}"))));
+    }
+    words.extend(argv.iter().map(|w| single(w)));
+    format!("{cd}exec {}\n", words.join(" "))
 }
 
 /// Ask the remote for `mode size mtime` in one line, from either flavour of
@@ -689,7 +906,7 @@ fn control_dir() -> Option<&'static std::path::Path> {
 /// Run one script on `p`'s host, feeding it `stdin`, and hand back its stdout.
 fn ssh(p: &RemotePath, script: &str, stdin: &[u8], what: &str) -> Result<Vec<u8>> {
     let argv = ssh_argv(p, control_path(p).as_deref(), Some(&sh_c(script)));
-    let mut child = Command::new("ssh")
+    let mut child = Command::new(program())
         .args(&argv)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -808,6 +1025,8 @@ pub enum Op {
     Delete { path: RemotePath, recursive: bool },
     Rename { from: RemotePath, to: RemotePath },
     Copy { from: RemotePath, to: RemotePath },
+    Probe { path: RemotePath, names: Vec<String> },
+    Files { root: RemotePath, skip: Vec<String>, limit: usize },
 }
 
 /// What an [`Op`] produced. `Done` covers everything whose only answer is
@@ -818,6 +1037,9 @@ pub enum Reply {
     List(Vec<RemoteEntry>),
     /// `None` is "no such file", not an error — see [`stat`].
     Stat(Option<RemoteEntry>),
+    Probe(Vec<(RemotePath, String)>),
+    /// The files, and whether the cap cut them short — see [`files`].
+    Files(Vec<String>, bool),
     Done,
 }
 
@@ -834,6 +1056,10 @@ pub fn execute(op: Op) -> Result<Reply> {
         Op::Delete { path, recursive } => delete(&path, recursive).map(|()| Reply::Done),
         Op::Rename { from, to } => rename(&from, &to).map(|()| Reply::Done),
         Op::Copy { from, to } => copy(&from, &to).map(|()| Reply::Done),
+        Op::Probe { path, names } => probe(&path, &names).map(Reply::Probe),
+        Op::Files { root, skip, limit } => {
+            files(&root, &skip, limit).map(|(f, cut)| Reply::Files(f, cut))
+        }
     }
 }
 
@@ -847,6 +1073,16 @@ pub fn execute(op: Op) -> Result<Reply> {
 pub struct Worker {
     jobs: crossbeam_channel::Sender<(u64, Op)>,
     done: crossbeam_channel::Receiver<(u64, Result<Reply>)>,
+}
+
+/// Who to tell when an operation finishes. `zemacs_term::set_waker`'s shape:
+/// this crate knows nothing of the editor, and `None` — every test — means the
+/// reply waits for the next [`Worker::poll`].
+static WAKE: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Install the waker. The second call is ignored.
+pub fn set_waker(f: fn()) {
+    let _ = WAKE.set(f);
 }
 
 /// Spawn the remote IO thread. It exits when the [`Worker`] is dropped.
@@ -864,6 +1100,12 @@ pub fn spawn_worker() -> Worker {
             while let Ok((id, op)) = job_rx.recv() {
                 if done_tx.send((id, execute(op))).is_err() {
                     break;
+                }
+                // The app polls from its main loop, which parks until woken: a
+                // remote file that arrived without this sat unshown until the
+                // next timer happened past.
+                if let Some(f) = WAKE.get() {
+                    f();
                 }
             }
         })
@@ -1188,6 +1430,16 @@ mod tests {
         }
         scripts.push(rename_script(&ugly, &home));
         scripts.push(copy_script(&ugly, &home));
+        let hostile = [HOSTILE.to_string(), "~x".into(), "-n".into()];
+        for target in [&ugly, &home] {
+            scripts.push(probe_script(target, &hostile));
+            scripts.push(probe_script(target, &[]));
+            scripts.push(files_script(target, &hostile, 10));
+            scripts.push(files_script(target, &[], 10));
+            scripts.push(search_script(target, HOSTILE, 10));
+            scripts.push(exec_script(target, &hostile, &[("A".into(), HOSTILE.into())]));
+            scripts.push(exec_script(target, &[], &[]));
+        }
         for script in scripts {
             let out = std::process::Command::new("sh")
                 .args(["-n", "-c", &script])
@@ -1252,6 +1504,126 @@ mod tests {
         run(&rename_script(&file, &moved), b"");
         assert!(dir.join("moved").exists() && !dir.join(name).exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every shape that has ever broken a shell, in one word: a quote, a `;`,
+    /// both kinds of command substitution, a variable and spaces. Each `touch`
+    /// names a file that must never appear.
+    const HOSTILE: &str = "it's; `touch pwned1` $(touch pwned2) $HOME";
+
+    /// The project scripts against a real tree, with a directory, a file name
+    /// and a search pattern each built to look like an injection. They have to
+    /// come back as a root, a file and a hit — data — and nothing may run.
+    #[test]
+    #[cfg(unix)]
+    fn the_project_scripts_treat_hostile_names_and_patterns_as_data() {
+        let base = std::env::temp_dir().join(format!("zemacs-tramp-proj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join(HOSTILE);
+        let deep = root.join("src").join("a b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("Makefile"), "all:\n").unwrap();
+        std::fs::write(root.join("node_modules/junk.js"), "x\n").unwrap();
+        std::fs::write(deep.join(HOSTILE), format!("zero\nsay {HOSTILE} here\n")).unwrap();
+        let at = |p: &std::path::Path| parse(&format!("/ssh:host:{}", p.display())).unwrap();
+
+        // The climb, from a file that exists and from a directory: the root is
+        // the hostile directory, found by name, and a marker called `~x` is a
+        // file name rather than someone's home.
+        let names = ["Makefile".to_string(), "~x".into(), HOSTILE.into()];
+        for from in [deep.join(HOSTILE), deep.clone()] {
+            let out = String::from_utf8(run(&probe_script(&at(&from), &names), b"")).unwrap();
+            let hits: Vec<_> = out.lines().filter_map(|l| l.split_once('\t')).collect();
+            assert!(
+                hits.contains(&("Makefile", root.to_str().unwrap())),
+                "{out}"
+            );
+            // The directory named HOSTILE is a *marker* in `base`, so it is
+            // found one level up, and that is the only other hit.
+            assert!(hits.contains(&(HOSTILE, base.to_str().unwrap())), "{out}");
+        }
+
+        // The listing: relative, the skipped directory pruned, capped with one
+        // extra line as the news that it was.
+        let skip = ["node_modules".to_string()];
+        let out = String::from_utf8(run(&files_script(&at(&root), &skip, 10), b"")).unwrap();
+        let mut listed: Vec<_> = out.lines().collect();
+        listed.sort();
+        assert_eq!(listed, ["Makefile", &format!("src/a b/{HOSTILE}")], "{out}");
+        let capped = String::from_utf8(run(&files_script(&at(&root), &skip, 1), b"")).unwrap();
+        assert_eq!(capped.lines().count(), 2, "{capped}");
+
+        // A pattern that is the hostile text itself, less the `$` that would
+        // make it an anchor: it must find the line that holds it, verbatim.
+        let pattern = "it's; `touch pwned1`";
+        let out = String::from_utf8(run(&search_script(&at(&root), pattern, 10), b"")).unwrap();
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            [format!("src/a b/{HOSTILE}:2:say {HOSTILE} here")],
+            "{out}"
+        );
+        // ...and the whole of it, `$(...)` included, runs nothing.
+        run(&search_script(&at(&root), HOSTILE, 10), b"");
+
+        // An argument vector arrives as exactly those words, in that directory.
+        let argv: Vec<String> = ["printf", "%s|", HOSTILE, "-n", "a\nb"]
+            .map(String::from)
+            .to_vec();
+        let out = run(&exec_script(&at(&deep.join(HOSTILE)), &argv, &[]), b"");
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{HOSTILE}|-n|a\nb|"));
+        let env = [("ZEMACS_T".to_string(), HOSTILE.to_string())];
+        let sh = ["/bin/sh", "-c", "pwd; printf %s \"$ZEMACS_T\""].map(String::from).to_vec();
+        let out = run(&exec_script(&at(&deep), &sh, &env), b"");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{}\n{HOSTILE}", deep.display())
+        );
+
+        for dir in [&base, &root, &deep, &std::env::current_dir().unwrap()] {
+            assert!(!dir.join("pwned1").exists() && !dir.join("pwned2").exists());
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The same operations through the real front door — argv, both layers of
+    /// quoting, the client, the parse — with `$ZEMACS_SSH` pointing at a stand-in
+    /// that does what the far login shell would: take the last argument and
+    /// hand it to `sh -c`. The only piece of the path it skips is the network.
+    #[test]
+    #[cfg(unix)]
+    fn a_fake_ssh_carries_every_new_operation_end_to_end() {
+        let base = std::env::temp_dir().join(format!("zemacs-tramp-fake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("proj it's");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("main.rs"), "fn main() { hello(); }\n").unwrap();
+        let fake = base.join("ssh");
+        std::fs::write(&fake, "#!/bin/sh\nfor a; do last=$a; done\nexec /bin/sh -c \"$last\"\n")
+            .unwrap();
+        std::fs::set_permissions(&fake, perms(0o755)).unwrap();
+        // Process-wide, and nothing else in this crate's tests spawns a client.
+        std::env::set_var("ZEMACS_SSH", &fake);
+
+        let file = parse(&format!("/ssh:u@host#22:{}/main.rs", root.display())).unwrap();
+        let hits = probe(&file, &[".git".into(), "Cargo.toml".into()]).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].0.to_string(), format!("/ssh:u@host#22:{}", root.display()));
+
+        let there = hits[0].0.clone();
+        // Not a work tree — `.git` is an empty directory — so the walk answers.
+        let (listed, cut) = files(&there, &[".git".into()], 100).unwrap();
+        assert_eq!((listed, cut), (vec!["main.rs".to_string()], false));
+        assert_eq!(search(&there, "hello", 10).unwrap(), ["main.rs:1:fn main() { hello(); }"]);
+        assert!(search(&there, "nothing-matches-this", 10).unwrap().is_empty());
+
+        let out = Command::new(program())
+            .args(command_argv(&file, &["pwd".into()], &[], true))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), root.display().to_string());
+        std::env::remove_var("ZEMACS_SSH");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// A script that must *not* succeed, and what it said about why.

@@ -1515,7 +1515,7 @@ none of those pastes text and says there is no image.
 
 * AI mode — coding agents as buffers
 
-Claude Code, Cursor and opencode are terminal programs, so they are terminal
+Claude Code, Codex, Cursor and opencode are terminal programs, so they are terminal
 buffers: =runtime/modes/ai.lisp= is the whole feature, and there is no AI code in
 Rust at all. =C-a= puts up the menu — pick a harness, then =new= or =resume=.
 
@@ -1528,7 +1528,7 @@ Rust at all. =C-a= puts up the menu — pick a harness, then =new= or =resume=.
 | =(ai-find-file-at-point)=                         | H | Open the path under the cursor, at its line number if it has one. |
 | =*ai-harnesses*=                                  |   | The list itself: =(NAME PROGRAM NEW-ARGS RESUME-ARGS)=. |
 
-** Adding a fourth is one line
+** Adding a fifth is one line
 
 That is the whole point of the list being data:
 
@@ -1542,16 +1542,17 @@ immediately, marked =(not installed)= if its binary is not on =$PATH= — offere
 anyway and refused with a reason, because a harness silently missing from the
 menu is indistinguishable from one you spelled wrong.
 
-The three shipped entries use each tool's own flags, read out of its =--help=:
+The four shipped entries use each tool's own flags, read out of its =--help=:
 
 | Harness  | Binary         | Resume           | What that does                          |
 |----------+----------------+------------------+-----------------------------------------|
 | claude   | =claude=         | =-r=               | Claude Code's own session picker.        |
+| codex    | =codex=          | =resume=           | Codex's own session picker — a subcommand, not a flag. |
 | cursor   | =cursor-agent=   | =--resume=         | Cursor's own session picker.             |
 | opencode | =opencode=       | =--continue=       | The last session — opencode has no interactive resume flag. |
 
-=cursor-agent= is the CLI; =cursor= is the GUI. =claude -c= and =cursor-agent
---continue= are the no-picker variants if you prefer them.
+=cursor-agent= is the CLI; =cursor= is the GUI. =claude -c=, =codex resume --last=
+and =cursor-agent --continue= are the no-picker variants if you prefer them.
 
 ** The mode
 

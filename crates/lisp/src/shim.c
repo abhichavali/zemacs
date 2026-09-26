@@ -74,6 +74,8 @@ extern long rs_latex_preview(const char *source, long scale);
 extern long rs_image_file(const char *path, long ems);
 /* Returns Rust-owned memory, like rs_query: rs_free_string, never free(3). */
 extern char *rs_highlight(const char *lang, const char *text);
+/* Same ownership. Blocks for one ssh round trip; see rs_remote_probe. */
+extern char *rs_remote_probe(const char *start, const char *names);
 /* --- JSON-RPC subprocesses (see the block near the bottom of this file) --- */
 extern long rs_rpc_start(const char *program, const char *args, const char *cwd);
 extern long rs_rpc_send(long conn, const char *method, const char *params,
@@ -674,6 +676,23 @@ static cl_object f_highlight(cl_object lang, cl_object text) {
   char *src = rs_highlight(l, t);
   free(l);
   free(t);
+  if (!src)
+    return ECL_NIL;
+  cl_object form = read_utf8(src);
+  rs_free_string(src);
+  return form;
+}
+
+/* Which project markers sit above a remote file: `((DIR NAME) ...)', or the
+ * host's reason as a string. f_highlight's shape exactly — two strings in,
+ * Lisp source out through READ — and here for the same reason: `%QUERY' takes
+ * integers. */
+static cl_object f_remote_probe(cl_object start, cl_object names) {
+  char *s = dup_utf8_or_empty(start);
+  char *n = dup_utf8_or_empty(names);
+  char *src = rs_remote_probe(s, n);
+  free(s);
+  free(n);
   if (!src)
     return ECL_NIL;
   cl_object form = read_utf8(src);
@@ -1804,6 +1823,9 @@ void zemacs_boot(void) {
    * why it sits with them rather than with the readers: `%QUERY' takes two
    * integers and this takes two strings. */
   defprim("HIGHLIGHT", (cl_objectfn_fixed)f_highlight, 2);
+  /* Internal, like the `%RPC-' ones: `%project-at' is the caller a config
+   * sees, in `runtime/plugins/project.lisp'. */
+  defprim("%REMOTE-PROBE", (cl_objectfn_fixed)f_remote_probe, 2);
   /* --- end of the overlay defprims --- */
 
   cl_safe_eval(ecl_read_from_cstring(HELPERS_FORM), ECL_NIL, ECL_NIL);

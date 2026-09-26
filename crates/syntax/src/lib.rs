@@ -39,11 +39,13 @@ mod org;
 
 pub use org::{bullets, latex_fragment_at, latex_fragments, Bullet, BulletKind, LatexFragment};
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
+use ropey::Rope;
 use tree_sitter::{
     InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
 };
@@ -503,20 +505,17 @@ struct Parsed {
 
 /// How many documents keep a tree.
 ///
-/// It used to be one, on the argument that only the live buffer is ever
-/// highlighted. That stopped being true the moment a parked buffer could be
-/// reverted under the editor and want colour back: a single slot meant the
-/// parked file's parse evicted the tree of the buffer being typed into, so an
-/// agent rewriting six files bought six full reparses of the file in front of
-/// you — the one path a user actually feels.
+/// One: the live buffer's. A tree is only ever reused with edits relative to
+/// it, and the app only sends edits for the buffer it last told — the live one;
+/// a switch sends `None` and costs a full parse whatever is cached. So every
+/// other slot was a tree and a copy of its file that nothing would read.
 ///
-/// ponytail: a hard cap and a `Vec`, not a `HashMap` with a real LRU. Four is
-/// the live buffer plus the couple you are switching between, a linear scan of
-/// four is cheaper than hashing, and the seventh open file costs one full parse
-/// when it is next looked at. The upgrade, if a big project ever makes that
-/// felt, is a *byte* budget rather than a count — what this holds is the text,
-/// so four small files and four large ones are not the same amount of memory.
-const TREES: usize = 4;
+/// It was four for a while, because a parked buffer reverted under the editor
+/// was parsed through the same door and evicted the live tree — an agent
+/// rewriting six files bought six full reparses of the file in front of you.
+/// Parked parses are now not kept at all ([`Request::keep`]), which answers
+/// that without holding three dead trees.
+const TREES: usize = 1;
 
 /// A parser that remembers, so a keystroke costs a reparse of what changed
 /// rather than of the file.
@@ -557,13 +556,18 @@ impl Session {
     /// a buffer switch, after a language change, or when the reader fell behind
     /// core's change log. It costs a full parse, which is what every parse used
     /// to cost.
-    pub fn highlight(
+    ///
+    /// `text` is taken owned or borrowed: a kept tree keeps its text, and an
+    /// owner hands it over rather than paying for a second copy of the file.
+    pub fn highlight<'t>(
         &mut self,
         buffer: Option<BufferId>,
         lang: &str,
-        text: &str,
+        text: impl Into<Cow<'t, str>>,
         edits: Option<&[Change]>,
     ) -> Vec<Span> {
+        let owned = text.into();
+        let text: &str = &owned;
         // This document's own entry, lifted out at the top so that every way
         // out below — org, an unknown language, a grammar that will not load, a
         // parse that fails — leaves behind no tree claiming to describe text it
@@ -631,7 +635,7 @@ impl Session {
             self.parsed.push(Parsed {
                 buffer,
                 lang: lang.to_string(),
-                text: text.to_string(),
+                text: owned.into_owned(),
                 tree,
                 spans: bytes,
             });
@@ -900,10 +904,18 @@ pub struct Request {
     /// are about when they come back.
     pub buffer: BufferId,
     pub lang: String,
-    pub text: String,
+    /// The buffer's rope, not a `String` of it: cloning a rope shares its
+    /// chunks, so the snapshot costs the main thread nothing per keystroke and
+    /// the one full copy tree-sitter needs is made here, off it.
+    pub text: Rope,
     /// Every edit between the *previous* request's text and this one, oldest
     /// first, or `None` for "assume nothing".
     pub edits: Option<Vec<Change>>,
+    /// Whether to keep the tree for the next request to build on. Only the live
+    /// buffer's requests are ever followed by edits relative to them — see
+    /// `told_syntax` in the app — so a parked buffer's parse is coloured and
+    /// forgotten rather than holding a tree nothing will reuse.
+    pub keep: bool,
 }
 
 /// A finished parse, and enough to tell whether it still describes its buffer.
@@ -928,8 +940,14 @@ pub struct Done {
 /// never took. A list with a hole in it is worse than no list, so a run that
 /// cannot be joined end to end — a different language, or either side already
 /// resigned — collapses to `None` and a full parse.
+///
+/// Only requests with the same [`Request::keep`] fold. A kept request is the
+/// tree the app's watermark already counts as told, so letting a parked parse
+/// swallow it would leave the tree behind the edits that arrive next; and a
+/// parked parse touches no tree, so a kept request behind it owes it nothing.
+/// Both run, and the older answer is dropped on arrival by its change count.
 fn queue(pending: &mut Vec<Request>, mut req: Request) {
-    if let Some(i) = pending.iter().position(|p| p.buffer == req.buffer) {
+    if let Some(i) = pending.iter().position(|p| p.buffer == req.buffer && p.keep == req.keep) {
         let old = pending.remove(i);
         req.edits = match (old.edits, req.edits) {
             (Some(mut before), Some(after)) if old.lang == req.lang => {
@@ -950,7 +968,9 @@ pub fn spawn_worker() -> Worker {
         .name("zemacs-syntax".into())
         .spawn(move || {
             let mut session = Session::new();
-            // At most one pending parse per buffer. ponytail: the ceiling is
+            // At most one pending parse per buffer — two, for the moment a
+            // buffer is parked with a live parse still queued; see [`queue`].
+            // ponytail: the ceiling is
             // therefore the number of open buffers — a whole directory
             // reverting at once is that many parses and no more, because a
             // second request for a file folds into the first rather than
@@ -978,8 +998,12 @@ pub fn spawn_worker() -> Worker {
                 // the right way round — they stay colourless while you are
                 // busy, and are coloured the moment you pause.
                 let req = pending.pop().expect("filled just above");
-                let spans =
-                    session.highlight(Some(req.buffer), &req.lang, &req.text, req.edits.as_deref());
+                let spans = session.highlight(
+                    req.keep.then_some(req.buffer),
+                    &req.lang,
+                    req.text.to_string(),
+                    req.edits.as_deref(),
+                );
                 let done = Done {
                     buffer: req.buffer,
                     seen: req.seen,
@@ -1579,6 +1603,36 @@ mod tests {
     /// A run of edits arrives as a run — the worker coalesces requests and
     /// hands over everything since the tree it holds. Feeding tree-sitter the
     /// folded record has to land in the same place as feeding it each one.
+    /// A parked buffer's parse is coloured and forgotten: it neither keeps a
+    /// tree of its own nor evicts the live one, and in the queue it never
+    /// swallows a live request whose edits the kept tree still needs.
+    #[test]
+    fn a_parked_parse_keeps_no_tree_and_swallows_no_live_one() {
+        let mut session = Session::new();
+        session.highlight(Some(1), "rust", "fn live() {}", None);
+        session.highlight(None, "rust", "fn parked() {}", None);
+        assert_eq!(session.parsed.len(), 1);
+        assert_eq!(session.parsed[0].text, "fn live() {}");
+
+        let req = |keep, text: &str, edits: Option<Vec<Change>>| Request {
+            seen: 0,
+            buffer: 7,
+            lang: "rust".into(),
+            text: Rope::from_str(text),
+            edits,
+            keep,
+        };
+        let typed = Change { start: 0, old_end: 0, new_end: 1 };
+        let mut pending = Vec::new();
+        queue(&mut pending, req(true, "a", Some(vec![typed])));
+        queue(&mut pending, req(false, "b", None));
+        assert_eq!(pending.len(), 2, "the live request survives the parked one");
+        assert_eq!(pending[0].edits, Some(vec![typed]));
+        queue(&mut pending, req(false, "c", None));
+        assert_eq!(pending.len(), 2, "two parked parses of one buffer still fold");
+        assert_eq!(pending[1].text.to_string(), "c");
+    }
+
     #[test]
     fn a_run_of_edits_lands_where_the_edits_themselves_would() {
         let src = "fn main() {\n    let x = 1;\n}\n";
@@ -1891,6 +1945,17 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(fragments("  \\begin{align}a\\end{align}\n").len(), 1);
+    }
+
+    #[test]
+    fn an_environment_must_close_its_own_line_too() {
+        // What a charwise paste of a display block in front of a heading
+        // produces. Reading it as math put the heading inside the preview.
+        assert_eq!(
+            fragments("\\begin{align}\na\n\\end{align}* Heading\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(fragments("\\begin{align}\na\n\\end{align}  \n* Heading\n").len(), 1);
     }
 
     #[test]

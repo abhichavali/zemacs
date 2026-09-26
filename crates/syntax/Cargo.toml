@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 crossbeam-channel.workspace = true
+ropey.workspace = true
 tree-sitter = "0.26"
 tree-sitter-c = "0.24"
 tree-sitter-commonlisp = "0.4"

@@ -3393,8 +3393,19 @@ impl Editor {
         }
         let gone = if index == 0 {
             // Killing the live one: the most recently visited other takes its
-            // place, which is where `switch_buffer` would have gone anyway.
-            let incoming = self.others.remove(0);
+            // place — unless another pane is already showing it. That buffer is
+            // usually first, since `M-o` into this pane is what put it there,
+            // and taking it left both panes on one buffer and `M-o` apparently
+            // doing nothing. Emacs' `other-buffer` skips visible ones for this.
+            let frame = self.frame();
+            let elsewhere: Vec<BufferId> = frame
+                .windows
+                .iter()
+                .filter(|w| w.id != frame.current)
+                .map(|w| w.buffer)
+                .collect();
+            let i = self.others.iter().position(|b| !elsewhere.contains(&b.id)).unwrap_or(0);
+            let incoming = self.others.remove(i);
             let outgoing = std::mem::replace(&mut self.buffer, incoming);
             self.scroll = self.buffer.saved_scroll;
             self.mode = self.buffer.kind.mode();
@@ -3402,14 +3413,27 @@ impl Editor {
         } else {
             self.others.remove(index - 1)
         };
-        let (live, cursor, scroll) = (self.buffer.id, self.buffer.cursor, self.scroll);
-        for frame in &mut self.frames {
-            for w in &mut frame.windows {
-                if w.buffer == gone.id {
-                    w.buffer = live;
-                    w.cursor = cursor;
-                    w.scroll = scroll;
+        // Every other pane that was showing it gets the same rule: the most
+        // recent buffer not already on screen in its frame, the live one only
+        // when there is nothing else to show.
+        let live = (self.buffer.id, self.buffer.cursor, self.scroll);
+        let focused = self.focus_frame;
+        for (f, frame) in self.frames.iter_mut().enumerate() {
+            for i in 0..frame.windows.len() {
+                if frame.windows[i].buffer != gone.id {
+                    continue;
                 }
+                let shown: Vec<BufferId> = frame.windows.iter().map(|w| w.buffer).collect();
+                let pick = if f == focused && frame.windows[i].id == frame.current {
+                    live
+                } else {
+                    std::iter::once(live)
+                        .chain(self.others.iter().map(|b| (b.id, b.cursor, b.saved_scroll)))
+                        .find(|(id, ..)| !shown.contains(id))
+                        .unwrap_or(live)
+                };
+                let w = &mut frame.windows[i];
+                (w.buffer, w.cursor, w.scroll) = pick;
             }
         }
         self.revision += 1;
@@ -4002,6 +4026,12 @@ impl Editor {
     }
 
     fn set_mode(&mut self, m: Mode) {
+        // Normal means "no state on top", and in a dired, magit or dashboard
+        // buffer that is the buffer's own keymap — which layers over Normal
+        // anyway. Every way out of Visual or Insert asks for Normal, so a drag,
+        // a `v`, or an Esc in dired used to leave it a plain text buffer.
+        let home = self.buffer.kind.mode();
+        let m = if m == Mode::Normal && home.layers_over_normal() { home } else { m };
         match m {
             // Switching *between* visual modes keeps the anchor, so `v` then
             // `C-v` reshapes the same selection rather than restarting it.

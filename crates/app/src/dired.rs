@@ -120,6 +120,7 @@ impl Dired {
     /// covers all three and cannot be forgotten by whoever adds the fourth.
     /// `crates/app/src/magit.rs` guards the same way for the same reason.
     pub fn run(&mut self, editor: &mut Editor, verb: &str) {
+        self.follow(editor);
         if let Some(question) = self.confirm_question(editor, verb) {
             editor.confirm(
                 &question,
@@ -133,8 +134,31 @@ impl Dired {
     /// The far side of a `yes`, and the entry point for every verb that never
     /// had to ask.
     pub fn run_confirmed(&mut self, editor: &mut Editor, verb: &str) {
+        self.follow(editor);
         if let Err(e) = self.try_run(editor, verb) {
             editor.apply(EditorCommand::Message(format!("dired: {e:#}")));
+        }
+    }
+
+    /// Point the state at the dired buffer that is live, if it is not already.
+    ///
+    /// There is one `Dired` and, since a listing is a buffer per directory,
+    /// possibly several dired buffers — one per frame is the usual way to get
+    /// two. The state follows whichever one the verb was typed into.
+    ///
+    /// ponytail: marks live on the state, not the buffer, so bouncing between
+    /// two listings drops them. Per-buffer marks if that bites.
+    fn follow(&mut self, editor: &mut Editor) {
+        if editor.buffer.kind != BufferKind::Dired {
+            return;
+        }
+        let Some(dir) = editor.buffer.path.clone() else {
+            return;
+        };
+        if self.dir.as_deref() != Some(dir.as_path()) {
+            if let Err(e) = self.go(editor, dir) {
+                editor.apply(EditorCommand::Message(format!("dired: {e:#}")));
+            }
         }
     }
 
@@ -624,9 +648,12 @@ impl Dired {
     /// Show `dir`, wherever it is. The single place `dir` and `remote` are set,
     /// so the two can never disagree about which machine the listing is from.
     ///
-    /// A remote directory renders nothing yet: there is nothing to render until
+    /// A remote directory renders only `..` for now: the entries arrive when
     /// the reply lands, and the alternative is an ssh round trip on the main
-    /// thread. `want_list` is the ask; [`Dired::listed`] is the answer.
+    /// thread. `want_list` is the ask; [`Dired::listed`] is the answer. It
+    /// still renders *something*, so the buffer on screen names the directory
+    /// the state is on — [`Dired::follow`] reads the buffer, and a buffer left
+    /// on the old directory would send it straight back there.
     fn go(&mut self, editor: &mut Editor, dir: PathBuf) -> anyhow::Result<()> {
         self.remote = tramp::parse(&dir.to_string_lossy());
         self.dir = Some(dir);
@@ -638,7 +665,6 @@ impl Dired {
             self.remote_entries.clear();
             editor.apply(EditorCommand::Message(format!("listing {remote}…")));
             self.want_list = Some(remote);
-            return Ok(());
         }
         self.refresh(editor)
     }
@@ -696,7 +722,10 @@ impl Dired {
         let line = editor.buffer.cursor_line_col().0;
         self.listing = Some(listing);
         self.lines = lines;
-        editor.show_special(BufferKind::Dired, &text);
+        // One buffer *per directory*, named after it: `show_special` would
+        // find any dired buffer and overwrite it, which is how listing a second
+        // directory in a second frame replaced the first frame's listing.
+        editor.show_named(BufferKind::Dired, Some(&dir.to_string_lossy()), &text);
         // A listing has no language for the syntax thread to parse, so it hands
         // over its own spans. Same faces as everything else, so a theme reaches
         // dired without knowing dired exists.
@@ -959,6 +988,38 @@ mod tests {
             })
             .expect("the listing has a real entry");
         editor.buffer.cursor = editor.buffer.line_start(line);
+    }
+
+    /// The bug as reported: a second frame, a dired in it, and switching
+    /// back to the first frame finds its listing gone — because there was
+    /// only ever one dired buffer, and the second listing was written into it.
+    #[test]
+    fn a_second_directory_is_a_second_buffer_and_verbs_follow_the_live_one() {
+        let (mut dired, mut editor, first) = listing_of_three("zemacs_dired_two_frames");
+        let second = first.join("sub");
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(second.join("only.txt"), "x").unwrap();
+
+        dired.go(&mut editor, second.clone()).unwrap();
+        assert_eq!(editor.buffer.path.as_deref(), Some(second.as_path()));
+        let listings = |editor: &Editor| {
+            editor.buffer_names().iter().filter(|n| !n.starts_with('*')).count()
+        };
+        assert_eq!(listings(&editor), 2, "two directories, two buffers: {:?}", editor.buffer_names());
+
+        // Back to the first listing, the way a frame switch would do it. Its
+        // text is still its own: a.txt, not only.txt.
+        editor.switch_buffer(1);
+        assert_eq!(editor.buffer.path.as_deref(), Some(first.as_path()));
+        assert!(editor.buffer.slice_string(0, editor.buffer.len_chars()).contains("a.txt"));
+        assert!(!editor.buffer.slice_string(0, editor.buffer.len_chars()).contains("only.txt"));
+
+        // ...and a verb typed into it acts on *its* directory.
+        dired.run(&mut editor, "refresh");
+        assert_eq!(dired.dir.as_deref(), Some(first.as_path()));
+        assert_eq!(listings(&editor), 2, "following made no third buffer");
+
+        let _ = std::fs::remove_dir_all(&first);
     }
 
     /// The rule `D` lives or dies by. Deleting is not undoable here, so

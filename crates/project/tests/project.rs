@@ -480,3 +480,38 @@ fn a_pattern_that_looks_like_a_flag_is_still_a_pattern() {
     let hits = zemacs_project::search(temp.path(), "-count").unwrap();
     assert_eq!(hits, ["src/lib.rs:1:let x = -count;"]);
 }
+
+// ------------------------------------------------------------------ remote
+
+/// A remote climb comes back as `(directory, marker)` pairs and is decided by
+/// the same rule as a local walk — asserted here without a host, straight on
+/// the pairs, since the probe itself is `zemacs-tramp`'s to test.
+#[test]
+fn a_remote_climb_is_decided_by_the_local_rule() {
+    let at = |dir: &str, marker: &str| {
+        (zemacs_tramp::parse(&format!("/ssh:box:{dir}")).unwrap(), marker.to_string())
+    };
+    // The workspace member's manifest loses to the repository above it.
+    let found = zemacs_project::pick(&[
+        at("/src/app/crates/x", "Cargo.toml"),
+        at("/src/app", ".git"),
+        at("/src/app", "Cargo.toml"),
+    ])
+    .unwrap();
+    assert_eq!((found.root, found.marker), (PathBuf::from("/ssh:box:/src/app"), Marker::Git));
+    // ...unless someone dropped a `.project` in it.
+    let found = zemacs_project::pick(&[
+        at("/src/app/crates/x", ".project"),
+        at("/src/app", ".git"),
+    ])
+    .unwrap();
+    assert_eq!(found.root, PathBuf::from("/ssh:box:/src/app/crates/x"));
+    assert_eq!(found.name(), "x");
+    // No repository anywhere: the deepest build file.
+    let found = zemacs_project::pick(&[at("/srv/a/b", "Makefile"), at("/srv", "go.mod")]).unwrap();
+    assert_eq!((found.root, found.marker), (PathBuf::from("/ssh:box:/srv/a/b"), Marker::Make));
+    assert!(zemacs_project::pick(&[]).is_none());
+    // Everything the rule reads is something the climb asks about.
+    let names = zemacs_project::marker_names();
+    assert!(names.iter().any(|n| n == ".git") && names.iter().any(|n| n == "Makefile"));
+}

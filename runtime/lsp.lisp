@@ -805,7 +805,15 @@ with a server, and on nothing else: a buffer with no file, a generated buffer,
 and a mode with no server registered all fall out on the first test."
   (let ((path (buffer-file-name))
         (mode (major-mode)))
-    (when (and path (not (buffer-read-only-p)) (gethash mode *lsp-servers*))
+    (when (and path (not (buffer-read-only-p)) (gethash mode *lsp-servers*)
+               ;; Not a file on another machine. A server started *here* for
+               ;; `/ssh:host:/src/main.rs' is a local rust-analyzer indexing a
+               ;; directory that does not exist, sent URIs that name nothing.
+               ;; ponytail: the server wants running on the host — `%rpc-start'
+               ;; on `ssh' with the argv `zemacs_tramp::command_argv' builds —
+               ;; and every URI mapped between `file:///src' and `/ssh:host:/src'
+               ;; both ways, which is the larger half.
+               (not (and (> (length path) 5) (string= "/ssh:" path :end2 5))))
       (let* ((root (%lsp-root-for path))
              (key (%lsp-key mode root)))
         (unless (gethash key *lsp-sessions*)

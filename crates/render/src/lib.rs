@@ -4234,11 +4234,12 @@ fn offset_at(
             cell_w,
         );
         let cells = line_cells(buf, line, set.tab_width);
-        let visual = if wrap {
-            wrap_breaks(&cells, b.cols).len()
+        let breaks = if wrap {
+            wrap_breaks(&cells, b.cols)
         } else {
-            1
+            vec![0]
         };
+        let visual = breaks.len();
         let height = (visual * b.tall).max(image_tall(m, buf, line));
         if want_row < row + height {
             // Clamped at `cols` on the right, and it is the margin outside a
@@ -4261,12 +4262,21 @@ fn offset_at(
             // white space beside a display equation belongs on the row the
             // equation's own source is on rather than one line past it.
             let vr = ((want_row - row) / b.tall.max(1)).min(visual - 1);
-            let cell = vr * b.cols + want_col;
+            // The row's own range, as the draw loop has it, and not `vr * cols`:
+            // word wrap moves a word down whole, so a row can end short of the
+            // edge, and counting in whole rows put every click on a
+            // continuation row late by the slack of the rows above — a word or
+            // two into the paragraph.
+            let (rs, re) = wrap_row_range(&breaks, vr, cells.len());
+            let cell = rs + want_col;
             let src = match cells.get(cell) {
-                Some(&(_, i)) => i,
+                Some(&(_, i)) if cell < re => i,
+                // In the empty end of a row the paragraph continues past: that
+                // row's last character, not the next row's cell in the column.
+                _ if re < cells.len() && re > rs => cells[re - 1].1,
                 // Past the end of the line: the position after the last
                 // character, which is where the cursor may sit and no further.
-                None => cells.last().map_or(0, |&(_, i)| i + 1),
+                _ => cells.last().map_or(0, |&(_, i)| i + 1),
             };
             return start + src;
         }
@@ -5549,7 +5559,14 @@ fn image_tall(m: Metrics, buf: &Buffer, l: usize) -> usize {
             continue; // no bitmap yet — the `display` string has the say, and it
                       // is text, so `line_cells` has already counted it
         };
-        let blanked = buf.text.char_to_line(o.end.saturating_sub(1)).saturating_sub(l);
+        // The continuation rows the source lines became — but only the ones
+        // still *drawn*. A preview of a `\begin{align}` folds its own rows
+        // away, and a hidden row buys no height: counting it here is what let
+        // the equation's lower half paint over the heading beneath it.
+        let last = buf.text.char_to_line(o.end.saturating_sub(1));
+        let blanked = (l + 1..=last)
+            .filter(|&k| fold_hiding(buf.overlays(), buf.line_start(k)).is_none())
+            .count();
         let want = image_rows(img.height, img.depth, m.line_h, m.ascent);
         tall = tall.max(want.saturating_sub(blanked).max(1));
     }
@@ -6824,6 +6841,16 @@ mod tests {
         // belongs to the line it starts on.
         assert_eq!(image_tall(m, &eq.buffer, 2), 1);
         assert_eq!(image_tall(m, &eq.buffer, 3), 1);
+        // ...unless those rows are folded away, as `org-latex` does to a display
+        // fragment's source. A hidden row buys nothing, so the first line pays
+        // for the whole picture — or the equation's lower rows land on the
+        // line after the fold, which was a heading in the report.
+        let mut folded = eq;
+        let ov = folded.buffer.overlays()[0].id;
+        folded.apply(zemacs_core::EditorCommand::Overlay(zemacs_core::OverlayEdit::Fold(ov, true)));
+        let m = pane_metrics(&folded, 1);
+        assert_eq!(image_tall(m, &folded.buffer, 1), 3, "folded rows are not bought rows");
+        assert_eq!(line_rows(m, &folded.buffer, 2, 40, false, 4), 0, "the source rows are hidden");
 
         // No bitmap yet — the fragment has been marked and not rasterised — is a
         // line of ordinary text, which is what `display_subs` in core already
@@ -7849,6 +7876,45 @@ mod tests {
         assert_eq!(hit(2, 0), buf.line_start(1));
     }
 
+    /// Word wrap moves a word down whole, so a row can end short of the edge
+    /// and the next one starts wherever `wrap_breaks` put it — not at
+    /// `row * cols`. Counting it the second way put every click on a
+    /// continuation row late by the slack of the rows above it: a word or two.
+    #[test]
+    fn a_click_on_a_word_wrapped_row_lands_on_the_word_under_it() {
+        let set = Settings {
+            line_overflow: LineOverflow::Wrap,
+            line_numbers: false,
+            ..Settings::default()
+        };
+        let pane = Area { x: 0, y: 0, w: 10 * CW + 2 * PAD, h: 9 * LH + 2 * PAD };
+        // "aaaa " fills five of ten cells; "bbbbbb" does not fit in the other
+        // five, so it starts the second row.
+        let buf = Buffer::from_str("aaaa bbbbbb cc");
+        let win = Window {
+            id: 0,
+            buffer: buf.id,
+            cursor: 0,
+            scroll: 0,
+            viewport_lines: 8,
+            wrap_cols: 10,
+            zoom: 100,
+        };
+        let doc = doc_rect(pane, STATUS, 0);
+        let ed = Editor::new();
+        let m = click_metrics(&ed);
+        let hit = |row: i32, col: i32| {
+            offset_at(m, &buf, &win, &set, pane, STATUS,
+                      doc.x + col * CW + CW / 2, doc.y + row * LH + LH / 2)
+        };
+
+        assert_eq!(hit(1, 0), 5, "the first b, where the second row starts");
+        assert_eq!(hit(1, 7), 12, "the first c");
+        // The empty end of a short row belongs to that row's last character,
+        // not to whatever the next row has in that column.
+        assert_eq!(hit(0, 8), 4);
+    }
+
     /// The bug: focus a terminal in a split and the org document beside it
     /// stops being centred.
     ///
@@ -7894,9 +7960,12 @@ mod tests {
         // A 60-column pane holding a 20-column measure: 20 columns of margin on
         // each side, which is a large enough offset that an un-inset hit test
         // could not accidentally pass.
+        // Truncated, because the right-margin case below is about the marker;
+        // the wrapped version of it is `..._on_a_word_wrapped_row_...`.
         let set = Settings {
             line_numbers: false, // no gutter, so a column is a column
             text_width: 20,
+            line_overflow: LineOverflow::Truncate,
             ..Settings::default()
         };
         let pane = Area { x: 0, y: 0, w: 60 * CW + 2 * PAD, h: 9 * LH + 2 * PAD };

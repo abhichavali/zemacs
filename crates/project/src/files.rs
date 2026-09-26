@@ -40,7 +40,7 @@ pub const FILE_LIMIT: usize = 50_000;
 /// negative-patterns, `**`, per-directory files and precedence rules — a crate
 /// on its own — and the case it would fix is a non-git project with a large
 /// ignored directory not named below. The upgrade path is to add a name here.
-const SKIP: [&str; 13] = [
+pub const SKIP: [&str; 13] = [
     ".git",
     ".hg",
     ".svn",
@@ -148,6 +148,24 @@ impl Cache {
                 .insert(root.to_path_buf(), (listed, Instant::now()));
         }
         Ok(&self.entries[root].0)
+    }
+
+    /// The listing for `root` if it is fresh, without walking anything —
+    /// what a caller that cannot afford the walk on this thread asks first.
+    pub fn cached(&self, root: &Path) -> Option<&Files> {
+        self.entries
+            .get(root)
+            .filter(|(_, at)| at.elapsed() < TTL)
+            .map(|(files, _)| files)
+    }
+
+    /// Adopt a listing made somewhere else — on another thread, or another
+    /// machine — as of now. Sorted and deduplicated here, as [`files`] does.
+    pub fn put(&mut self, mut listed: Files) {
+        listed.files.sort();
+        listed.files.dedup();
+        self.entries
+            .insert(listed.root.clone(), (listed, Instant::now()));
     }
 
     /// [`directories`], through the cache.

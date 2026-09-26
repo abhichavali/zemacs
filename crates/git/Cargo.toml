@@ -6,3 +6,5 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# A repository at `/ssh:host:/src/app` runs its `git` there — see `run_with`.
+zemacs-tramp.workspace = true

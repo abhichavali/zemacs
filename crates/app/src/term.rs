@@ -29,6 +29,7 @@ use std::path::PathBuf;
 
 use zemacs_core::{BufferId, BufferKind, Editor, EditorCommand, Key, Mode};
 use zemacs_term::{Command, Input, Mouse, Run, Screen, Select, Terminal};
+use zemacs_tramp as tramp;
 
 /// Rows and columns to start with, before the renderer has measured a pane.
 /// Replaced on the first frame; the child only sees the real size.
@@ -69,6 +70,10 @@ struct Session {
     /// never freezes. `q` closes the window over it — see `terminal-output-mode`
     /// in `runtime/init.lisp`, which is the keymap this flag exists to select.
     output: bool,
+    /// A login shell rather than a program. Not `command().is_none()`, which
+    /// is what it used to be read from: a shell on another machine is a
+    /// *program* here — `ssh` — and is still the shell `SPC o t` should find.
+    shell: bool,
 }
 
 #[derive(Default)]
@@ -80,6 +85,12 @@ pub struct Term {
     /// is a PTY and a buffer, and the whole point of the bang is that it leaves
     /// neither behind — see [`Term::shell`].
     bangs: Vec<(std::process::Child, std::sync::mpsc::Receiver<String>)>,
+    /// Where the next child starts, set by `cd:DIR` and spent by the verb
+    /// after it — Emacs' `(let ((default-directory root)) …)`, which is how
+    /// `project-shell` and `project-compile` say "at the root" without every
+    /// verb growing a directory field. Cleared after any other verb, so a `cd:`
+    /// nobody spent cannot leak into a terminal opened an hour later.
+    next_cwd: Option<PathBuf>,
 }
 
 /// Hang up on every `:!` that is still running, which is the difference
@@ -164,6 +175,15 @@ impl Term {
     /// program path with a colon in it is unsupported and a flag with one is
     /// fine.
     pub fn run(&mut self, editor: &mut Editor, verb: &str) {
+        if let Some(dir) = verb.strip_prefix("cd:") {
+            self.next_cwd = (!dir.is_empty()).then(|| PathBuf::from(dir));
+            return;
+        }
+        self.run_verb(editor, verb);
+        self.next_cwd = None;
+    }
+
+    fn run_verb(&mut self, editor: &mut Editor, verb: &str) {
         match verb {
             // The old spelling, and still what `SPC o t` means: show the shell
             // session if there is one, start it if there is not.
@@ -257,12 +277,17 @@ impl Term {
         // pane is as wide as the editor and the code above it keeps the shape
         // you were reading it in.
         if start == Start::Output {
-            let onscreen = existing.is_some_and(|i| {
+            // On screen means *go to that window*, not merely "do not split":
+            // pressed from the code window, `show` below would otherwise put
+            // the output in the window you pressed it from, and the build is
+            // then on screen twice with your file gone from under you.
+            let pane = existing.and_then(|i| {
                 let id = self.sessions[i].buffer;
-                (editor.frames.iter()).any(|f| f.windows.iter().any(|w| w.buffer == id))
+                (editor.frame().windows.iter()).find(|w| w.buffer == id).map(|w| w.id)
             });
-            if !onscreen {
-                editor.apply(EditorCommand::SplitWindow(zemacs_core::frame::Split::Rows));
+            match pane {
+                Some(id) => editor.apply(EditorCommand::FocusWindow(id)),
+                None => editor.apply(EditorCommand::SplitWindow(zemacs_core::frame::Split::Rows)),
             }
         }
 
@@ -273,7 +298,13 @@ impl Term {
         if start != Start::New {
             if let Some(i) = existing {
                 self.show(editor, i);
-                self.sessions[i].inner.set_command(command);
+                // A `cd:` moves the rerun too: pressing compile in a second
+                // project must not build the first one in the reused pane.
+                if let Some(dir) = self.next_cwd.take() {
+                    self.sessions[i].cwd = Some(dir);
+                }
+                let (_, placed) = placed(self.sessions[i].cwd.clone(), Some(command));
+                self.sessions[i].inner.set_command(placed.expect("a command stays a command"));
                 self.restart(editor);
                 return;
             }
@@ -307,15 +338,40 @@ impl Term {
     /// have to wait out. The echo area holds one line, so the second report to
     /// land is the one on screen; both are in `*Messages*`, which is what that
     /// log is for.
+    ///
+    /// On a remote buffer it runs *there*, in the file's directory — Emacs'
+    /// `shell-command` under TRAMP — and after a `cd:` in that directory,
+    /// wherever it is. A plain local `:!` keeps running where the editor was
+    /// started, which is vim's answer and the one muscle memory expects.
     fn shell(&mut self, editor: &mut Editor, line: &str) {
         let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let dir = self.next_cwd.take().or_else(|| {
+            (editor.buffer.path.clone()).filter(|p| tramp::parse(&p.to_string_lossy()).is_some())
+        });
+        let mut command = match dir.as_deref().and_then(|d| tramp::parse(&d.to_string_lossy())) {
+            // `/bin/sh -c LINE` as three words, each quoted by tramp — the
+            // line is a shell line because the user typed one, and it reaches
+            // the far shell as exactly that and nothing more.
+            Some(there) => {
+                let argv = ["/bin/sh", "-c", line].map(String::from);
+                let mut c = std::process::Command::new(tramp::program());
+                c.args(tramp::command_argv(&there, &argv, &[], false));
+                c
+            }
+            None => {
+                let mut c = std::process::Command::new(sh);
+                c.arg("-c").arg(line);
+                if let Some(dir) = dir {
+                    c.current_dir(dir);
+                }
+                c
+            }
+        };
         // Said before the command has said anything, because the frame comes
         // back instantly now and a `:!make` that answered with nothing at all
         // would look like a bang that did not fire.
         editor.apply(EditorCommand::Message(format!("running {line}…")));
-        let mut child = match std::process::Command::new(sh)
-            .arg("-c")
-            .arg(line)
+        let mut child = match command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -393,11 +449,40 @@ impl Term {
     fn open(&mut self, editor: &mut Editor) {
         // An existing shell session is shown rather than duplicated, which is
         // what `SPC o t` has always meant. `new` is how you ask for a second.
-        if let Some(i) = self.sessions.iter().position(|s| s.inner.command().is_none()) {
+        //
+        // *On the same machine*: from a remote file, the local shell is the
+        // wrong one to show, and so is a shell on a third host. After a `cd:`
+        // — `project-shell` — it has to be the shell started *there*, or the
+        // project's key would show whichever shell you opened first.
+        let here = self.here(editor);
+        let wanted = |s: &Session| match &self.next_cwd {
+            Some(dir) => s.cwd.as_ref() == Some(dir),
+            None => host(&s.cwd) == host(&here),
+        };
+        if let Some(i) = self.sessions.iter().position(|s| s.shell && wanted(s)) {
             self.show(editor, i);
             return;
         }
         self.spawn(editor, "*terminal*", None, Start::New);
+    }
+
+    /// Where a child started from here would start: the live session's own
+    /// directory, else the current file's, else the editor's.
+    fn here(&self, editor: &Editor) -> Option<PathBuf> {
+        self.current(editor)
+            .and_then(|i| self.sessions[i].cwd.clone())
+            .or_else(|| {
+                let p = editor.buffer.path.as_deref()?;
+                // A remote name cannot be asked whether it is a directory
+                // without a round trip; it goes as it is, and the far side's
+                // `cd` falls back to the parent — see `tramp::command_argv`.
+                if tramp::parse(&p.to_string_lossy()).is_some() || p.is_dir() {
+                    Some(p.to_path_buf())
+                } else {
+                    p.parent().map(PathBuf::from)
+                }
+            })
+            .or_else(|| std::env::current_dir().ok())
     }
 
     /// Start a child, give it a buffer, and hand over the keyboard — to the
@@ -420,19 +505,16 @@ impl Term {
         // of `zemacs-term` and a per-platform lookup (`proc_pidinfo` on macOS,
         // `/proc/PID/cwd` on Linux); worth it the first time following `cd` is
         // what someone actually asks for.
-        let cwd = self
-            .current(editor)
-            .and_then(|i| self.sessions[i].cwd.clone())
-            .or_else(|| {
-                editor
-                    .buffer
-                    .path
-                    .as_deref()
-                    .and_then(|p| if p.is_dir() { Some(p) } else { p.parent() })
-                    .map(PathBuf::from)
-            })
-            .or_else(|| std::env::current_dir().ok());
-        let inner = match Terminal::spawn_command(INITIAL.0, INITIAL.1, cwd.clone(), command) {
+        let cwd = self.next_cwd.take().or_else(|| self.here(editor));
+        let shell = command.is_none();
+        // A shell on another machine says which in its name, so the switcher
+        // tells it from the local one at a glance.
+        let name = match (shell, cwd.as_deref().and_then(|d| tramp::parse(&d.to_string_lossy()))) {
+            (true, Some(there)) => format!("*terminal {}*", there.host),
+            _ => name.to_string(),
+        };
+        let (dir, command) = placed(cwd.clone(), command);
+        let inner = match Terminal::spawn_command(INITIAL.0, INITIAL.1, dir, command) {
             Ok(term) => term,
             Err(e) => {
                 // The message a missing harness produces. Loud and specific,
@@ -441,7 +523,7 @@ impl Term {
                 return;
             }
         };
-        let name = self.unique_name(name);
+        let name = self.unique_name(&name);
         let buffer = editor.show_named(BufferKind::Terminal, Some(&name), "");
         let output = start == Start::Output;
         self.sessions.push(Session {
@@ -451,6 +533,7 @@ impl Term {
             inner,
             frozen: false,
             output,
+            shell,
         });
         // Explicitly, both ways: `show_named` takes the mode from the buffer
         // *kind*, and a `Terminal` buffer means `Mode::Terminal`. An output
@@ -554,6 +637,9 @@ impl Term {
             )
         };
         let (cols, rows) = self.sessions[i].inner.size();
+        // The stored command is already `ssh` for a remote session, so only
+        // the directory needs keeping off this machine.
+        let cwd = cwd.filter(|d| tramp::parse(&d.to_string_lossy()).is_none());
         match Terminal::spawn_command(cols, rows, cwd, command) {
             Ok(fresh) => {
                 self.sessions[i].inner = fresh;
@@ -877,7 +963,7 @@ impl Term {
         // frame of the agent's output.
         let want = if self.sessions[i].output {
             "terminal-output-mode"
-        } else if self.sessions[i].inner.command().is_some() {
+        } else if !self.sessions[i].shell {
             "ai-mode"
         } else {
             "terminal-mode"
@@ -1152,6 +1238,33 @@ fn words(line: &str) -> Vec<String> {
     out
 }
 
+/// The child to start for `cwd`: itself, here, when `cwd` is on this machine;
+/// and `ssh` to the host when it is a tramp name, running `command` — or the
+/// login shell — in that directory, with no local directory at all.
+///
+/// Every child a terminal starts goes through here, which is the whole of
+/// "a terminal on a remote buffer is a terminal on the remote": the PTY, the
+/// grid, the keys and the scrollback are all local and unchanged, and the one
+/// program on the other end of them is `ssh -t`.
+fn placed(cwd: Option<PathBuf>, command: Option<Command>) -> (Option<PathBuf>, Option<Command>) {
+    let Some(there) = cwd.as_deref().and_then(|d| tramp::parse(&d.to_string_lossy())) else {
+        return (cwd, command);
+    };
+    let argv: Vec<String> = match command {
+        Some(c) => std::iter::once(c.program).chain(c.args).collect(),
+        None => Vec::new(),
+    };
+    let ssh = tramp::program().to_string_lossy().into_owned();
+    (None, Some(Command::new(ssh, tramp::command_argv(&there, &argv, &[], true))))
+}
+
+/// `/ssh:user@host#port:` for a remote directory, `None` for a local one: the
+/// question "same machine?" as something `==` can answer.
+fn host(dir: &Option<PathBuf>) -> Option<String> {
+    let there = tramp::parse(&dir.as_deref()?.to_string_lossy())?;
+    Some(tramp::RemotePath { path: String::new(), ..there }.to_string())
+}
+
 /// One of a bang's two pipes, drained to the end.
 ///
 /// Lossy, the way `wait_with_output` is lossy once you ask it for a `String`:
@@ -1321,6 +1434,59 @@ mod tests {
         // No buffer, no window, no session — the point of the bang.
         assert!(term.sessions.is_empty());
         assert_eq!(ed.buffer_names(), Editor::new().buffer_names());
+    }
+
+    /// `cd:` is `default-directory` for exactly one verb: the next `:!` runs
+    /// there, and a `cd:` that no verb spent is gone by the verb after.
+    #[test]
+    fn a_cd_places_the_next_child_and_only_the_next() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("zemacs-term-cd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+
+        let mut ed = Editor::new();
+        let mut term = Term::default();
+        term.run(&mut ed, &format!("cd:{}", dir.display()));
+        term.run(&mut ed, "shell:pwd -P");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while term.is_live() {
+            assert!(Instant::now() < deadline, "the bang never reported");
+            term.sync(&mut ed, &[]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(ed.status, dir.display().to_string(), "{:?}", ed.messages);
+
+        term.run(&mut ed, "cd:/nowhere");
+        term.run(&mut ed, "next");
+        assert_eq!(term.next_cwd, None, "an unspent cd leaked past its verb");
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// A remote directory turns any child into `ssh -t` running it *there*,
+    /// a word at a time; a local one leaves the child alone.
+    #[test]
+    fn a_child_for_a_remote_directory_is_ssh_running_it_there() {
+        let (dir, cmd) = placed(Some(PathBuf::from("/ssh:me@box:/srv/app")), Some(cat()));
+        assert_eq!(dir, None, "no local directory for a remote child");
+        let cmd = cmd.unwrap();
+        assert_eq!(cmd.program, tramp::program().to_string_lossy());
+        assert_eq!(cmd.args.first().map(String::as_str), Some("-t"));
+        // The script is quoted twice — once per word, once whole — so the
+        // single quotes around `cat` arrive as `'\''`.
+        let script = cmd.args.last().unwrap();
+        assert!(script.contains(r"exec '\''cat'\''"), "{script}");
+        assert!(script.contains(r"d='\''/srv/app'\''"), "{script}");
+
+        // No command at all is the login shell on the far side.
+        let (_, shell) = placed(Some(PathBuf::from("/ssh:box:~")), None);
+        assert!(shell.unwrap().args.last().unwrap().contains(r#"exec "${SHELL:-/bin/sh}" -l"#));
+
+        // Here is here.
+        let here = Some(PathBuf::from("/tmp"));
+        assert_eq!(placed(here.clone(), Some(cat())), (here, Some(cat())));
+        assert_eq!(host(&Some(PathBuf::from("/ssh:me@box#22:/a"))), Some("/ssh:me@box#22:".into()));
+        assert_eq!(host(&Some(PathBuf::from("/a"))), None);
     }
 
     /// Whether a pid is still a process, zombie included.
@@ -1550,6 +1716,16 @@ mod tests {
         assert_eq!(term.sessions[0].buffer, first);
         assert_eq!(ed.frame().windows.len(), 2);
         assert_eq!(ed.mode, Mode::Normal);
+
+        // Pressed from the *other* window — where you actually are when you
+        // rebuild — it goes to the pane rather than taking this window too.
+        ed.apply(EditorCommand::FocusNextWindow);
+        assert_ne!(ed.buffer.id, first);
+        term.run(&mut ed, "output:make:cat");
+        assert_eq!(term.sessions.len(), 1);
+        assert_eq!(ed.frame().windows.len(), 2);
+        let showing = (ed.frame().windows.iter()).filter(|w| w.buffer == first).count();
+        assert_eq!(showing, 1, "the build must not be on screen twice");
 
         // Dismissed with `q` — the window goes, the session stays — and the
         // next press has to build a new window rather than taking over the one

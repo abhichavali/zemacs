@@ -808,10 +808,13 @@ app performs" channel =pending_hooks= uses. =request_pending_parses= in
 the live buffer because the revision path already asks with the change log in
 hand. The worker keeps one pending =Request= *per buffer* and parses the newest
 first, so a directory reverting at once cannot get in front of the character you
-just typed. =Session= keeps up to four trees keyed by =BufferId= rather than
-one, so a parked file's parse no longer evicts the tree of the buffer being
-typed into — which also closes the "switching between two large files reparses
-each time" ceiling that sat in that crate.
+just typed. A parked file's parse is not kept (=Request::keep= is false), so it
+no longer evicts the tree of the buffer being typed into, and =Session= holds
+exactly one tree: the live buffer's. It held four for a while, on the belief that
+this also closed the "switching between two large files reparses each time"
+ceiling; it did not — a switch sends no edits, and no edits is a full parse
+whatever is cached — so the other three were a tree and a copy of the file each
+that nothing read.
 
 The staleness guard the revision compare gave is kept and made per-buffer, which
 is what it should always have been: spans are adopted only if the buffer's own
@@ -898,6 +901,35 @@ invisible to all of them, because it never reaches a listing at all (=entry= in
 directory above such a file works, deleting the file does not, since there is no
 line to put the cursor on.
 
+** A remote *project* is the local one, with a round trip where a =stat= was
+
+A buffer on =/ssh:host:/src/app/…= is in the project at =/ssh:host:/src/app/=,
+and =SPC p f=, =SPC p D=, =SPC p d=, =SPC p r=, =SPC p c=/=t=, =SPC p s=
+(=project-shell=), =SPC p != (=project-shell-command=), =SPC s p=/=C-g=, =:!=,
+=SPC o t= and =SPC g g= all run against it. The split follows the rule above:
+
+- *The climb* is Lisp's, from the same two tables, so a builder row pushed from
+  an init counts over ssh too. The one thing it could not do was ask a remote
+  host about a dozen names at once, and that is =%remote-probe= — a C primitive,
+  for =highlight='s reason: two strings do not fit =%query=. It *parks the Lisp
+  thread* for one round trip, as =run-process= does for its child; the answer
+  is kept per file in =*remote-projects*=.
+- *The listing and the search* are the app's, off the frame: the file list is a
+  =tramp::Op= on the IO thread and pours into the picker that asked, and the
+  search prompt's thread finds the remote root and runs =rg= (or =grep -rn=)
+  on the host. Every script is a literal with quoted holes, like the rest of
+  =tramp=.
+- *Processes* go remote at two seams: =placed= in =app/term.rs= turns any
+  terminal child whose directory is remote into =ssh -t= running it there, and
+  =run_with= in =git/lib.rs= does the same for every =git=. =cd:DIR= is the
+  terminal's one-verb =default-directory=, which is how a verb says "at the
+  root" without a directory being spliced into a shell line.
+
+What is still local only: =project-grep='s listing (its =r= edits with local
+file IO, so a remote root says to use =SPC s p=), magit's rebase and
+in-progress markers (=git_dir= refuses a remote repository rather than hand a
+host's path to this filesystem), and language servers.
+
 * Every =ponytail:= in the tree
 
 A snapshot, and a stale one the moment somebody commits. Regenerate it with:
@@ -940,6 +972,7 @@ that show up as behaviour rather than as API.
 |   | =latex/lib.rs=                 | =\begin{equation}= typesets at the article =\textwidth=; =DefaultHasher= for the preview cache key. |
 |   | =project/*=                    | =--cached= lists deleted-but-staged files; a fixed ignore list rather than =.gitignore=; lossy path display; a hardcoded constant that is wrong off Apple Silicon. |
 |   | =tramp/lib.rs=                 | One worker thread, so operations are strictly ordered; =cp -p= before truncating; a remote =copy= takes no =-p=, so times and owner are not preserved; filenames containing newlines are lost; one timeout constant; remote-shell unquoting. |
+| ● | =plugins/project.lisp=, =git/lib.rs=, =tramp/lib.rs= | A remote project's root is remembered per file for the session; magit over ssh runs each =git= on the frame, a round trip apiece; =pwd= spells a remote root logically, so =~/x= and =/home/me/x= can be two buffers. |
 | ● | =app/main.rs= (=Remote=), =app/dired.rs= | A =/ssh:= buffer gets no auto-revert, no numbered backups and no changed-on-disk guard; auto-save is local and is the only crash protection. Remote dired's write verbs are one round trip per marked file, leave the listing stale until the re-read behind them lands, and show no symlink targets; the file prompt does not complete remote paths. |
 |   | =rpc/frame.rs=, =rpc/lib.rs=     | Unrecognised header lines are skipped rather than resynchronised past; a stopped child is killed rather than given a grace period. |
 

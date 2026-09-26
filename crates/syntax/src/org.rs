@@ -525,7 +525,16 @@ fn environment_at(c: &[char], i: usize) -> Option<usize> {
     if name.is_empty() || c.get(open + name.len()) != Some(&'}') {
         return None;
     }
-    find(c, open + name.len() + 1, &format!("\\end{{{name}}}"))
+    // ...and closes one: org's `\end{name}[ \t]*$'. Without this,
+    // `\end{align}* Heading' — a display block pasted charwise in front of a
+    // heading — read as one fragment on the heading's line, and the preview's
+    // fold took the heading with it.
+    let end = find(c, open + name.len() + 1, &format!("\\end{{{name}}}"))?;
+    c[end..]
+        .iter()
+        .take_while(|&&ch| ch != '\n')
+        .all(|ch| ch.is_whitespace())
+        .then_some(end)
 }
 
 /// One past the next `needle` at or after `from`.

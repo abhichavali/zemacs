@@ -738,6 +738,9 @@
 ;;; `g' for aGenda and not `a', which `org-modern-appear' has: every letter that
 ;;; says "agenda" is taken in org buffers, and a binding that quietly replaced
 ;;; another mode's is worse than one you have to learn.
+;;; The buffer as LaTeX, in `*org-latex*'. `X' because `x' is taken.
+(define-key "org-mode" "SPC m X" "org-export-latex")
+
 (define-key "org-mode" "SPC m g" "org-todo-list")
 (define-key "org-mode" "SPC m G" "org-agenda-tags")
 

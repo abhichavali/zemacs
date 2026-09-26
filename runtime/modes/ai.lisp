@@ -8,7 +8,7 @@
 ;;;; *how* each one spells "resume", and a menu to pick between them.
 ;;;;
 ;;;; That is the standing rule — Rust provides fast primitives, features get
-;;;; written in Lisp — and this is as clean a case as it gets. A fourth harness
+;;;; written in Lisp — and this is as clean a case as it gets. A fifth harness
 ;;;; is one line at the bottom of `*ai-harnesses*'; it is not a match arm, a
 ;;;; recompile, or anything anybody has to read Rust to add.
 ;;;;
@@ -35,7 +35,7 @@
 ;;;   RESUME-ARGS  how to pick up an old one.
 ;;;
 ;;; The resume flags below were read out of each tool's own `--help' rather
-;;; than remembered, because all three have changed them at least once:
+;;; than remembered, because most of them have changed them at least once:
 ;;;
 ;;;   claude -r            "Resume a conversation by session ID, or open
 ;;;                        interactive picker with optional search term". With
@@ -54,6 +54,12 @@
 ;;;                        listed by `opencode session list' and picked inside
 ;;;                        the TUI, so `-c' is the closest thing it has and
 ;;;                        `-s ID' is the exact form.
+;;;   codex resume         "Resume a previous interactive session (picker by
+;;;                        default; use --last to continue the most recent)".
+;;;                        A subcommand rather than a flag, which costs nothing
+;;;                        here: the argument list is words, and `resume' is a
+;;;                        word. `--last' is the no-picker form, and the
+;;;                        one-shot is `codex exec PROMPT'.
 ;;;
 ;;; Arguments are split the way a shell splits them on the way through the verb
 ;;; — see `words' in `crates/app/src/term.rs' — so a flag whose value contains a
@@ -63,6 +69,7 @@
 
 (defvar *ai-harnesses*
   (list (list "claude"   "claude"       '()   '("-r"))
+        (list "codex"    "codex"        '()   '("resume"))
         (list "cursor"   "cursor-agent" '()   '("--resume"))
         (list "opencode" "opencode"     '()   '("--continue")))
   "The coding agents `ai' offers, as (NAME PROGRAM NEW-ARGS RESUME-ARGS).
@@ -182,8 +189,10 @@ one round — a rule you can predict beats one that picks a pane by size."
 `*ai-harnesses*', so pointing this at another entry is all it takes.")
 
 (defparameter *ai-prompt-flag* "-p"
-  "The one-shot flag. `claude -p PROMPT' prints an answer and exits; the other
-two spell it differently, which is why this is a variable and not a literal.")
+  "The one-shot flag. `claude -p PROMPT' prints an answer and exits; the others
+spell it differently, which is why this is a variable and not a literal. It is
+only the word before the prompt, so codex's `exec' subcommand fits as well as a
+flag does: `\"codex\"' and `\"exec\"' here give `codex exec PROMPT'.")
 
 (defun %ai-quote (string)
   "STRING as one shell-style argument: wrapped in double quotes, with the two

@@ -18,6 +18,11 @@
 //! * **Where have I been** ([`recent`], [`remember`]): a persisted list so that
 //!   "switch project" is a prompt over real history rather than a path to type.
 //! * **What is in it, textually** ([`search`]): ripgrep, scoped to the root.
+//! * **On another machine** ([`find_remote`], [`pick`], and a tramp root given
+//!   to [`search`] or [`remember`]): the same rule and the same answers for a
+//!   root named `/ssh:host:/src/app`, asked of the host in one round trip each
+//!   through `zemacs-tramp`. Those block, and say so; the app calls them from
+//!   threads that may wait.
 //!
 //! **How it is built is no longer here.** `Marker::commands` was a `match`
 //! saying `cargo build` for a `Cargo.toml`, which meant a config could not
@@ -31,9 +36,9 @@
 //! "Nothing found" is an empty result; only a genuinely broken world (a root
 //! that is not a directory, a ripgrep that is not installed) is an `Err`.
 //!
-//! ponytail: no project-wide replace, no `project-shell`, no per-project
-//! variables, no `.projectile`-style ignore file. Each is additive and none is
-//! needed to open a file in a repository.
+//! ponytail: no project-wide replace, no per-project variables, no
+//! `.projectile`-style ignore file. Each is additive and none is needed to open
+//! a file in a repository. (`project-shell` exists now, in Lisp.)
 
 use std::path::{Path, PathBuf};
 
@@ -41,7 +46,7 @@ mod files;
 mod recent;
 mod search;
 
-pub use files::{directories, files, Cache, Files, FILE_LIMIT};
+pub use files::{directories, files, Cache, Files, FILE_LIMIT, SKIP};
 pub use recent::{recent, recents_file, remember};
 pub use search::{search, SEARCH_LIMIT};
 
@@ -151,9 +156,65 @@ pub fn find(start: &Path) -> Option<Project> {
         start.parent()?
     };
 
+    // `exists` rather than `symlink_metadata`, because `.git` is a *file* in a
+    // submodule and in a linked worktree, and both are real repositories.
+    climb(from.ancestors(), |dir, m| dir.join(m.file_name()).exists())
+}
+
+/// [`find`] for a file on another machine: one [`zemacs_tramp::probe`] for
+/// every marker in every directory above `start`, and then the same
+/// precedence, applied by the same code, to what came back.
+///
+/// The root is the tramp name of the directory, so it opens, joins and prints
+/// like any other root. **Blocks for a round trip** — call it from a thread
+/// that may wait, never from the frame.
+pub fn find_remote(start: &zemacs_tramp::RemotePath) -> zemacs_tramp::Result<Option<Project>> {
+    let hits = zemacs_tramp::probe(start, &marker_names())?;
+    Ok(pick(&hits))
+}
+
+/// Every marker's file name, in precedence order — what a remote climb has to
+/// ask about, since it cannot ask one at a time.
+pub fn marker_names() -> Vec<String> {
+    EXPLICIT
+        .iter()
+        .chain(&VCS)
+        .chain(&BUILD)
+        .map(|m| m.file_name().to_string())
+        .collect()
+}
+
+/// The project a remote climb's answer describes: [`find`]'s rule over the
+/// `(directory, marker file)` pairs [`zemacs_tramp::probe`] reports, nearest
+/// directory first. Separate from [`find_remote`] so the app can run the probe
+/// on its IO thread and decide here.
+pub fn pick(hits: &[(zemacs_tramp::RemotePath, String)]) -> Option<Project> {
+    // Directories as they came, nearest first, each once. Only directories
+    // holding *some* marker are listed, and those are the only ones the
+    // precedence can stop at.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for (dir, _) in hits {
+        let dir = PathBuf::from(dir.to_string());
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    climb(dirs.iter().map(PathBuf::as_path), |dir, m| {
+        hits.iter()
+            .any(|(d, name)| name == m.file_name() && Path::new(&d.to_string()) == dir)
+    })
+}
+
+/// The precedence itself, over any walk and any notion of "exists": the
+/// deepest explicit or VCS marker wins; a build file only when there is none.
+fn climb<'a>(
+    dirs: impl Iterator<Item = &'a Path>,
+    has: impl Fn(&Path, Marker) -> bool,
+) -> Option<Project> {
+    let first = |dir: &Path, tier: &[Marker]| tier.iter().copied().find(|m| has(dir, *m));
     let mut build: Option<Project> = None;
-    for dir in from.ancestors() {
-        if let Some(marker) = marker_in(dir, &EXPLICIT).or_else(|| marker_in(dir, &VCS)) {
+    for dir in dirs {
+        if let Some(marker) = first(dir, &EXPLICIT).or_else(|| first(dir, &VCS)) {
             return Some(Project {
                 root: dir.to_path_buf(),
                 marker,
@@ -163,7 +224,7 @@ pub fn find(start: &Path) -> Option<Project> {
         // first one found is kept, so the *deepest* build file wins among
         // themselves — a workspace member is a better answer than nothing.
         if build.is_none() {
-            if let Some(marker) = marker_in(dir, &BUILD) {
+            if let Some(marker) = first(dir, &BUILD) {
                 build = Some(Project {
                     root: dir.to_path_buf(),
                     marker,
@@ -172,16 +233,6 @@ pub fn find(start: &Path) -> Option<Project> {
         }
     }
     build
-}
-
-/// The first marker of `tier` present in `dir`.
-///
-/// `exists` rather than `symlink_metadata`, because `.git` is a *file* in a
-/// submodule and in a linked worktree, and both are real repositories.
-fn marker_in(dir: &Path, tier: &[Marker]) -> Option<Marker> {
-    tier.iter()
-        .copied()
-        .find(|m| dir.join(m.file_name()).exists())
 }
 
 /// Absolute and symlink-free, so that `ancestors()` walks real parents: without

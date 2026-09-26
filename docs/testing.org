@@ -1,0 +1,133 @@
+#+TITLE: Testing
+#+SUBTITLE: where the tests are, how the Lisp ones boot an image, and how they lie
+
+Tests are the executable half of this documentation: when a doc and a test
+disagree, the test is right ([[file:README.org][README.org]]). This file says how the suites are
+laid out, how to run one piece of them, and how to write a new Lisp integration
+test without it passing for the wrong reason.
+
+* Running them
+
+| What                                   | Command                                                        |
+|----------------------------------------+----------------------------------------------------------------|
+| One Lisp integration file (the norm)   | =cargo test -p zemacs-lisp --test pdf_mode=                      |
+| One crate's unit tests                 | =cargo test -p zemacs-core --lib=                                |
+| Unit tests matching a name             | =cargo test -p zemacs-core --lib -- navigation_block=            |
+| One crate, unit and integration        | =cargo test -p zemacs-git=                                       |
+| The control protocol end to end        | =cargo test -p zemacs-app --test control=                        |
+| Everything                             | =cargo test --workspace= — 10+ minutes on an 8 GB machine; leave it to the end, or to someone with the RAM |
+
+A Lisp integration file compiles once and then runs in seconds. Every
+=cargo test= prints a harmless =-Wsign-compare= warning from ECL's own headers
+while building =zemacs-lisp=.
+
+Build prerequisites are the same as for the editor (ECL, SDL3, SDL3_ttf,
+pkg-config); =zemacs-render= and =zemacs-app= link SDL3 even in tests. Some tests
+need an external program and *skip themselves* when it is missing, printing
+=skipped: ...= and passing — =pdf_mode.rs= without =mutool=, for example. A green
+run on a machine without the tool proves nothing about that feature.
+=crates/tramp/tests/live.rs= runs only when ~ZEMACS_TRAMP_TEST_HOST=user@host~ or
+~ZEMACS_TRAMP_TEST_LOCALHOST=1~ is set.
+
+* Where they are
+
+| Place                                        | What it pins                                                              |
+|----------------------------------------------+---------------------------------------------------------------------------|
+| =#[cfg(test)] mod tests= inside =crates/*/src= | Unit tests. =crates/core/src/evil.rs= holds most of the vim grammar's; =crates/gui/src/layout.rs= measures text with a fake =len() * 8= font so layout runs with no window. |
+| =crates/lisp/tests/*.rs=                     | About fifty files, each booting a real ECL image against a real =Editor= and driving it through Lisp — one feature or runtime module per file. |
+| =crates/app/tests/control.rs=                | Spawns the built =zemacs --control= and talks the protocol over a pipe.   |
+| =crates/dired/tests/dir.rs=, =crates/git/tests/repo.rs=, =remote.rs=, =crates/project/tests/project.rs=, =crates/term/tests/pty.rs=, =crates/tramp/tests/live.rs= | The crate against a real filesystem, repository, PTY or host. |
+
+=crates/core/tests/= and =crates/figure/tests/= exist and are empty.
+
+* How a Lisp integration test boots an image
+
+=crates/lisp/tests/image_mode.rs= and =pdf_mode.rs= (under 150 lines each) are
+the short, clean ones to copy. The shape:
+
+1. *Write an init file* into a temp directory. Either load just the runtime
+   files the feature needs, by absolute path through a =runtime(file)= helper
+   (=modes/modes.lisp= first, since it defines the mode machinery), and end with
+   a unique =(message "... init loaded")=; or load the shipped
+   =runtime/init.lisp= itself, which brings the whole library and every module in
+   =*runtime-modules*= in the real order (=org_plan.rs= does, and waits for the
+   message the shipped config prints).
+2. *Boot*: =let shared: Shared = Default::default();= then
+   =zemacs_lisp::spawn(tx, shared.clone(), init)=. =tx= is the sending half of a
+   =crossbeam_channel::unbounded()= for the commands that need the app layer.
+3. *Wait, never sleep-and-assume.* =wait(&shared, "what", |ed| ...)= polls the
+   locked =Editor= every 5 ms until the closure answers =Some=, and on timeout
+   (=PATIENCE=, 20 s) panics with the status line and the last eight messages.
+   Wait for the init's message before doing anything else.
+4. *Stand in for the main loop* where the feature needs it — nothing else will:
+   - =pump(shared, lisp)= (a thread) drains =Editor::pending_hooks= and evaluates
+     each hook through =fboundp=, as =App::tell_readers= does. Without it no mode
+     hook ever runs.
+   - =feed(shared, lisp, keys)= in =prompt.rs= is =handle_key= plus the dispatch:
+     apply what core can, hand =CallLisp= forms to the image.
+   - Commands with =needs_app()= arrive on the receiver. Drain it (=wait_for= in
+     =prompt.rs=) if the test cares; otherwise they are silently dropped — a
+     =find-file= in a test opens nothing. Do what the app would have done
+     instead: =image_mode.rs= calls =ed.load(name, Some(path), None)= under the
+     lock, which is what =open_file= does.
+5. *Drive it* with =lisp.eval("(some-command)".into())= and assert on the
+   =Editor= through =wait=, or on a value through =says= (below).
+
+** One =#[test]= per file
+
+=cl_boot= initialises a process-wide image and =zemacs_lisp::spawn= installs the
+host once per process (=HOST=, a =OnceLock=), so a second =#[test]= in the same
+binary gets no image of its own: boot is skipped, and every primitive still
+reaches the first test's =Editor=. A
+new test is a new file under =crates/lisp/tests/=, and each file's =//!= header
+says what it pins and repeats that rule. Sequence several scenarios inside the
+one test instead.
+
+** Reading a value back: =says=
+
+Most files define =says(shared, lisp, form, want)=: evaluate
+=(message (format nil "~a" FORM))= and wait until *some* message equals =want=.
+
+* Pitfalls
+
+- *=says= can pass vacuously.* =Editor::messages= accumulates for the whole
+  test, and the untagged helper matches any line equal to =want= — including one
+  an earlier step left there. So an assertion whose form never ran (or ran and
+  errored) still passes. Use the tagged version from =org_latex.rs= or
+  =org_plan.rs=, =says(shared, lisp, tag, form, want)=, which prints ~TAG=VALUE~
+  and matches that, with a tag unique to the call site. And check that a new
+  assertion *fails* with the fix reverted before trusting it.
+- *=tutor.rs= flakes under load.* Its init sets =*tutor-timeout*= to 3 seconds —
+  the time each answer's child =ecl= gets — because it deliberately submits a
+  =(loop)= and expects the "infinite loop" report. Under a parallel suite or a
+  concurrent build an ordinary answer can take longer than that too, and the
+  failure then reads like an infinite loop. Re-run it alone
+  (=cargo test -p zemacs-lisp --test tutor=) before believing it.
+- *Waiting on the wrong thing.* =lisp.eval= only queues a form. Everything after
+  it must =wait= for an observable result; reading the =Editor= on the next line
+  races the Lisp thread.
+- *Holding the =Editor= guard while the image works.* Every primitive takes the
+  same mutex, so a guard kept alive across the Lisp thread's work stalls it, and
+  calling =wait= while holding one deadlocks (=std::sync::Mutex= is not
+  re-entrant). Scope the guard in a block, as the tests do around =ed.load=;
+  =feed= collects forms under the lock and evaluates them after releasing it.
+- *=control.rs= reads your config.* It spawns the binary with no =ZEMACS_INIT=,
+  so it loads =~/.zemacs.d/init.lisp= like the real app. It also has several
+  =#[test]=s — each is its own process, so the one-test rule does not apply.
+- *Temp paths collide* between concurrent runs unless they carry the process id,
+  as the existing tests' =std::process::id()= suffixes do.
+
+* Writing a new one
+
+1. Copy =crates/lisp/tests/image_mode.rs= to =crates/lisp/tests/<feature>.rs=.
+2. Rewrite the =//!= header: what behaviour is pinned, and why it matters.
+3. Load only the runtime files the feature needs, in =*runtime-modules*= order —
+   or the shipped =runtime/init.lisp= if it needs the whole library.
+4. Keep =wait=, =pump= and =runtime=; add the tagged =says= if you read values.
+5. Name the test function as a sentence stating the behaviour
+   (=a_pdf_opens_as_pages_that_scroll_into_one_another=).
+6. Run it alone; then revert the change under test and confirm it fails.
+
+Every new primitive, reader or verb gets a test like this ([[file:boundary.org][boundary.org]], "Where
+to add things"); a Rust-only change (grammar, layout, a crate's parser) gets a
+unit test next to the code instead.

@@ -97,7 +97,7 @@ what looked like "the Lisp API needs a way in" was, every time, one arm of
 | Seed a prompt with text or candidates core owns | =(%do "prompt-text" …)=, =(%do "prompt-label" …)= and =(%do "prompt-source" "SOURCE ARGUMENT")=. The first two set fields; the third is the interesting one — Lisp *names* a list the app owns and the app pours it straight into the open prompt, so a repository's fifty thousand paths never become Lisp objects. This is what let every =project-= picker move to =runtime/plugins/project.lisp=; see the entry below. |
 | Hand a long candidate list to =completing-read= | =(%do "prompt-items" …)=, one newline-joined string. It used to be one =%do= per candidate, which =shim.c= said outright was fine for a few hundred and wanted another route past that. |
 | Say what the modeline says              | =(clear-modeline)= and =(modeline-segment SIDE TEMPLATE …)=, verbs ="modeline-clear"= and ="modeline-segment"=. A *format* rather than a callback — see below. |
-| Group several edits into one undo step | *Nothing, deliberately.* See below. |
+| Group several edits into one undo step | First closed by argument, then by =with-undo-group= (=runtime/modes/modes.lisp=) for the commands that write in many places. See below. |
 
 ** The prompt continuation, and why it is not a blocking read
 
@@ -147,6 +147,20 @@ the standard library is exactly this, and it is why =replace-region= exists next
 to =delete-region= and =insert=.
 
 The table in [[file:threading.org][threading.org]] is the documentation this row wanted.
+
+*Later: the mechanism landed anyway, for the case the argument did not cover.*
+Org's structure commands write in many places at once — ticking a checkbox
+rewrites the box and then every statistics cookie above it, demoting a subtree
+rewrites a headline per line — and building the whole buffer's text for one
+=replace-region= is the wrong shape for a scan like that. So =with-undo-group= in
+=runtime/modes/modes.lisp= is a macro over =%undo-group-begin= and
+=%undo-group-end= (=shim.c=, =rs_undo_group_begin= in =crates/lisp/src/lib.rs=),
+and it answers both objections above: it is a *depth*, not a flag, so groups
+nest; and it closes in an =unwind-protect=, so an error in the body cannot leave
+checkpoints switched off. What it still does not do is close the gap — a
+keystroke can land between its writes — so the one-=replace-region= answer
+remains the right one wherever the edit is in one place (=org-table.lisp= is
+built that way).
 
 ** A destructive verb's guard cannot move to Lisp
 
@@ -981,9 +995,9 @@ that show up as behaviour rather than as API.
 | You want to add            | Touch                                                        |
 |----------------------------+--------------------------------------------------------------|
 | A convenience function      | =LIBRARY_FORM= in =crates/lisp/src/shim.c=, or your own config.  |
-| A reader                    | =crates/core/src/query.rs= (one =match= arm) + =QUERIES_FORM=.    |
+| A reader                    | =crates/core/src/query.rs= (one =match= arm) + =QUERIES_FORM=, or a =defun= over =%query= in a runtime file (=window-pixel-size= in =runtime/gui.lisp=). |
 | A reader whose answer needs a crate *downstream* of core | =ask_here= in =crates/lisp/src/lib.rs= + =QUERIES_FORM=. =latex-fragments= and =fold-ranges= are both there: =zemacs-syntax= depends on core, so =query.rs= can never call it. |
-| A command verb              | =command_for= in =crates/lisp/src/lib.rs= + a =DEFUN= in =shim.c=. |
+| A command verb              | =command_for= in =crates/lisp/src/lib.rs= + a =DEFUN= in =shim.c= or a runtime file (=scene-scroll= in =runtime/gui.lisp=); a new =EditorCommand= needs its arm in =Editor::apply= too. |
 | A primitive with an odd shape | =shim.c= (=f_*= + =defprim= + =PACKAGE_FORM=) and =lib.rs= (=rs_*=). |
 | A built-in verb             | =run_action= and =BUILTIN_COMMANDS= in =crates/core/src/evil.rs=. |
 | A new =EditorCommand=         | =crates/core/src/lib.rs= — and then =needs_app= if the app has to carry it out. |

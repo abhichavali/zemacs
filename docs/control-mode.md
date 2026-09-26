@@ -29,12 +29,12 @@ independently and interleaved with responses — a slow `eval` doesn't block a
 | `keys` | `{"keys": "SPC p m"}` | `{"fed": <int>}` | key sequence in the editor's token vocabulary: `SPC`, `<ret>`, `<tab>`, `<esc>`, `C-c`, `M-x`, `C-M-p`, bare chars |
 | `action` | `{"name": "project-make"}` | `{"ok": true}` | run a named command, same door a keybinding or M-x uses |
 | `eval` | `{"form": "(+ 1 2)"}` | `{"queued": true}` | **asynchronous** — the value or error arrives later as a `message` event, never in this response |
-| `state` | — | `{"mode","buffer","path","major_mode","line","col","lines","modified","status","frames","windows"}` | |
+| `state` | — | `{"mode","buffer","path","major_mode","line","col","lines","modified","status","frames","windows"}` | `mode` is upper-case (`"NORMAL"`, `"DASHBOARD"`); `status` is the status line, which is where a `message` lands |
 | `text` | `{"buffer": "<name>"}` optional | `{"text": "..."}` | defaults to current buffer |
 | `messages` | `{"since": <int>}` optional, default 0 | `{"messages": [...], "total": <int>}` | the *Messages* log; Lisp errors and init.lisp load failures show up here as `"lisp error: ..."` / `"init.lisp error: ..."` |
 | `mouse` | `{"x": <px>, "y": <px>}` | `{"x","y","line","tooltip"}` | move the pointer, in **pixels of the focused frame**. `line` is the 1-based buffer line under it (`null` outside a pane), `tooltip` is what hovering there put on screen (`null` for nothing) |
 | `screen` | — | `{"screen": "<text rendering of the visible panes>"}` | cheap inspection path; works even when screenshots don't |
-| `screenshot` | `{"path": "/tmp/shot.png"}` | `{"path","w","h"}` | may fail with an error response if the headless backend can't read pixels back — expected, not a crash |
+| `screenshot` | `{"path": "/tmp/shot.png"}` | `{"path","w","h"}` | works headless on macOS with the dummy driver; an error response on a backend that can't read pixels back is expected, not a crash |
 | `quit` | — | — | editor exits |
 
 ### Events
@@ -135,9 +135,28 @@ without a window ever appearing, and all scriptable from an agent loop.
 - **Always wait for `ready`** before sending anything — `Zemacs.start()` /
   the `with` block does this for you; don't skip it if you're talking to the
   process directly.
-- **`screenshot` can legitimately fail headless** if the backend can't read
-  pixels back from a dummy video driver. Treat an error response as expected,
-  not a crash — fall back to `screen`, which always works.
+- **`screenshot` works headless** on macOS (checked Sept 2026), but a backend
+  that can't read pixels back from the dummy video driver answers with an error.
+  Treat that as expected, not a crash — fall back to `screen`, which always
+  works.
+- **How `keys` splits a string** (`normalize_keys` in `crates/core/src/lib.rs`):
+  with spaces, every word must be exactly one token — `"i h i <esc>"` works,
+  while `"i hi <esc>"` is refused as an unknown token and nothing is fed. With
+  no spaces, the string is split into single characters unless it is bracketed,
+  a chord containing `-`, or `SPC` — so `"gg"` is `g g`, and a bare `"ESC"` is
+  the three letters `E`, `S`, `C`. Write named keys as `<esc>`, `<ret>`,
+  `<tab>`. To type a word, `eval` an `(insert "...")` instead.
+- **The editor starts on the dashboard**, where single letters run dashboard
+  items (`q` is Quit). Give it a buffer first — `z.eval('(create-buffer
+  "*probe*")')` or `z.eval('(find-file "/path")')` — before typing text.
+- **It loads your real config**, `~/.zemacs.d/init.lisp`, and records recent
+  files as usual. To test against the shipped defaults instead, set
+  `ZEMACS_INIT=/path/to/checkout/runtime/init.lisp` in the environment before
+  starting it (the `ready` event's `init` field says which file loaded).
+- **Bare `--control` is for behaviour, not timing.** It runs SDL's dummy video
+  driver, whose idle loop does not behave like a real window's. Measure
+  performance with `--control --show` (or the real app) with the window
+  frontmost, and `ZEMACS_PERF=1` for frame timings on stderr.
 - **`mouse` takes pixels, not a line and column**, and that is the point of it:
   everything interesting about a pointer is the arithmetic between a pixel and a
   character (a gutter's width comes from the font, a wrapped line spends several

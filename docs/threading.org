@@ -6,13 +6,18 @@ you write commands. Read it before writing anything longer than a one-liner.
 
 * The threads
 
-Three, and none of them waits on another for long:
+Three that a Lisp author meets, and none of them waits on another for long:
 
 | Thread     | Owns                                                        |
 |------------+-------------------------------------------------------------|
-| main       | SDL2 input, the renderer, and the =Editor=                     |
+| main       | SDL3 input, the renderer, and the =Editor=                     |
 | lisp       | the ECL image and its conservative GC                       |
 | syntax     | tree-sitter; answers with highlight spans                   |
+
+The editor starts more — one set per JSON-RPC child, one per terminal, remote
+IO, project search, file watching, auto-save — and none of them runs Lisp or
+holds the editor: they hand results over a channel and wake the main loop. The
+full list is in [[file:architecture.org][architecture.org]].
 
 ECL wants a thread it can register with its GC, so it gets a dedicated one. The
 editor can call *into* the image (a key binding firing =CallLisp=, =M-x=, the =C-c=
@@ -131,9 +136,14 @@ one =u= takes back:
 | =(paste)=                      |          1 |
 | =(insert "a") (insert "b")=    |          2 |
 
-There is no "begin an undo group" primitive, and adding one would not help,
-because the checkpoint is inside each mutator. If you want N changes to undo as
-one, compute the final text and make one call.
+If you want N changes to undo as one, compute the final text and make one call
+where you can. Where you cannot — a command whose writes are scattered across a
+buffer scan, like ticking a checkbox and then every statistics cookie above it —
+wrap them in =(with-undo-group ...)= (a macro in =runtime/modes/modes.lisp= over
+=%undo-group-begin= / =%undo-group-end=): the group takes one checkpoint at its
+start and the writers inside take none. It groups the *undo*, and nothing else —
+a keystroke can still land between two of its writes, so it is not a substitute
+for one =replace-region= when the edit must also be atomic.
 
 * Commands that land a frame later
 

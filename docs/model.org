@@ -126,8 +126,18 @@ claims are global in the editor, so without it they followed the last mode
 *entered* rather than the buffer on screen — visit a =.rs= file and your org
 buffers lost their wrapping until you re-entered org mode.
 
-That is the entire hook contract — there is no =add-hook= in core, and no
-=before-save-hook=.
+Two more arrived the same way. =point-moved-hook= (list =*point-moved-functions*=)
+fires when point lands somewhere it has not been reported from — a different
+offset or a different buffer — and is what org's reveal-on-cursor and
+show-paren hang off. =after-edit-hook= is the one that carries arguments:
+=(after-edit-hook START OLD-END NEW-END TEXT)=, built by =after_edit_form= in
+=crates/app/src/main.rs=. It names no buffer, which is why the LSP client does not
+use it; see "A change notification carries no delta" in [[file:boundary.org][boundary.org]]. The change,
+edit and point-moved hooks are not sent for generated buffers (terminals, dired,
+magit, the dashboard).
+
+That is the entire hook contract — there is no =add-hook= in core (the one
+=runtime/modes/modes.lisp= defines is Lisp), and no =before-save-hook=.
 
 Everything else you would expect from Emacs' mode system is built *in Lisp*, on
 top of that one event, in =runtime/modes/modes.lisp=: exit hooks, inheritance,
@@ -150,10 +160,11 @@ Two consequences worth knowing before you write a hook:
    ...)= after it replaces the generated one and silently detaches the machinery
    for that mode. Put your code in the mode's body, or in =X-exit-hook=, which is
    yours.
-2. Switching *buffers* fires no hook, because the editor reports none. Settings
-   claimed by a mode therefore follow the last mode *entered*, not the buffer you
-   are looking at. Two org buffers are fine; flipping between an org buffer and a
-   rust one is not. This is recorded as a ceiling in [[file:boundary.org][boundary.org]].
+2. Switching *buffers* enters no mode, so it runs no mode body and no exit
+   hook; =buffer-switch-hook= only re-resolves the settings modes claim, for the
+   buffer now on screen. The settings themselves are still *global*: a split
+   showing an org buffer beside a rust one can only be right about the focused
+   pane. See "Switching buffers fires no hook — closed" in [[file:boundary.org][boundary.org]].
 
 * Modal state
 
@@ -208,9 +219,11 @@ A binding on a bare key in ="terminal"= is taken away from *every* session and
 from the shell, and you are typing English at an agent — =runtime/modes/ai.lisp=
 therefore claims =C-M-n=, =C-M-b=, =C-M-r=, =C-M-w= and =C-M-a=, none of which any
 terminal program has ever been able to see, and leaves =C-a= itself to readline.
-Note that ="terminal"= consults only its own keymap and *not* the buffer's
-major-mode map, unlike Normal — so =(define-key "ai-mode" ...)= would silently
-never fire inside a session. That is recorded as a ceiling in [[file:boundary.org][boundary.org]].
+A terminal buffer's minor and major modes *are* consulted before the
+="terminal"= keymap (=terminal_key= asks =mode_binding= first), so
+=(define-key "ai-mode" "C-M-r" ...)= works inside a session — but only for a
+single chord: a terminal takes exact bindings only and never waits on a prefix.
+See "A terminal consults only the =terminal= keymap — closed" in [[file:boundary.org][boundary.org]].
 
 * Selections
 

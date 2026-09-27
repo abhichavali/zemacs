@@ -421,6 +421,11 @@ descends, and a leading `/' starts again from the root. Seeded at an *expanded*
 home rather than a literal `~/', because those completions come back as absolute
 paths and the fuzzy filter would match none of them against a tilde.
 
+Another machine is the same prompt: type `/ssh:' and it offers the hosts in
+`~/.ssh/config', and past the host's colon it lists that host's directories the
+way it lists this one's — asked off the frame, so a slow host never stalls a
+keystroke.
+
 Accepting a directory opens dired on it *and* records it as a project, because
 the app remembers every directory it opens — so this prompt is only ever needed
 for the first visit and `project-switch' covers the rest."

@@ -2160,7 +2160,7 @@ impl App {
         }
         self.remote.take_from(&mut self.dired);
 
-        refresh_file_completions(editor, &mut self.last_file_query);
+        refresh_file_completions(editor, &mut self.last_file_query, &mut self.remote);
         refresh_grep(editor, &mut self.grep);
 
         adopt_highlights(editor, highlighter);
@@ -2911,6 +2911,9 @@ enum Job {
     /// The climb above something just opened, for the project switcher's
     /// history — the remote half of `project_remember`.
     Remember(tramp::RemotePath),
+    /// A directory the file prompt is typing into, under its `remote_query`
+    /// key — `SPC p o` browsing a host the way it browses this machine.
+    Complete(tramp::RemotePath, String),
 }
 
 impl Job {
@@ -2924,7 +2927,8 @@ impl Job {
             | Job::Save { path: p, .. }
             | Job::Dired(p)
             | Job::Files(project::Fetch { root: p, .. })
-            | Job::Remember(p) => p,
+            | Job::Remember(p)
+            | Job::Complete(p, _) => p,
         }
     }
 }
@@ -3007,6 +3011,11 @@ impl Remote {
     /// decided to move, and this is the same event.
     fn list(&mut self, path: tramp::RemotePath) {
         self.request(tramp::Op::List(path.clone()), Job::List(path));
+    }
+
+    /// A directory the file prompt wants listed, for [`refresh_file_completions`].
+    fn complete(&mut self, dir: tramp::RemotePath, key: String) {
+        self.request(tramp::Op::List(dir.clone()), Job::Complete(dir, key));
     }
 
     /// Everything dired has queued this frame, in the order it queued it.
@@ -3138,6 +3147,23 @@ impl Remote {
                 ))),
             },
             (Job::List(path), tramp::Reply::List(entries)) => dired.listed(editor, &path, entries),
+            (Job::Complete(dir, key), tramp::Reply::List(entries)) => {
+                let Some(prompt) = editor.prompt.as_mut() else {
+                    return;
+                };
+                // Typed on past it, or closed and opened again: not the question.
+                let hidden = match remote_query(&prompt.text) {
+                    Some((now, _, hidden)) if now == key && prompt.kind == PromptKind::File => hidden,
+                    _ => return,
+                };
+                let mut items: Vec<String> = entries
+                    .into_iter()
+                    .filter(|e| hidden || !e.name.starts_with('.'))
+                    .map(|e| format!("{dir}{}{}", e.name, if e.is_dir { "/" } else { "" }))
+                    .collect();
+                items.sort();
+                prompt.set_items(items);
+            }
             (
                 Job::Save {
                     buffer,
@@ -3267,13 +3293,43 @@ fn highlight_completion_doc(editor: &mut Editor) {
 /// whole bug those two had: `Prompt::value` answers with the highlighted
 /// candidate, so `+` typed `notes` and submitted a path, which
 /// `zemacs_dired::child` then refused for having a separator in it.
-fn refresh_file_completions(editor: &mut Editor, last_query: &mut Option<String>) {
+fn refresh_file_completions(editor: &mut Editor, last_query: &mut Option<String>, remote: &mut Remote) {
     let Some(prompt) = editor.prompt.as_mut() else {
         *last_query = None;
         return;
     };
     if prompt.kind != PromptKind::File || prompt.bare {
         *last_query = None;
+        return;
+    }
+    // Another machine: its hosts, then its directories. Never the local
+    // listing, which for `/ssh:box` would be the contents of `/`.
+    if prompt.text.starts_with("/ssh:") {
+        let query = remote_query(&prompt.text);
+        let key = match &query {
+            Some((key, ..)) => key.clone(),
+            // Still typing the host, perhaps behind a login and its `@` — or a
+            // name `parse` refuses, which has no directory to ask about either.
+            None => match prompt.text["/ssh:".len()..].split_once('@') {
+                Some((user, _)) => format!("/ssh:{user}@"),
+                None => "/ssh:".to_string(),
+            },
+        };
+        if last_query.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        *last_query = Some(key.clone());
+        match query {
+            // The listing lands frames later, in `Remote::finish`; until then
+            // the prompt offers nothing rather than the last directory's names.
+            Some((key, dir, _)) => {
+                prompt.set_items(Vec::new());
+                remote.complete(dir, key);
+            }
+            None => prompt.set_items(
+                tramp::config_hosts().into_iter().map(|h| format!("{key}{h}:")).collect(),
+            ),
+        }
         return;
     }
     let typed = expand_tilde(&prompt.text);
@@ -3331,6 +3387,22 @@ fn refresh_file_completions(editor: &mut Editor, last_query: &mut Option<String>
         .collect();
     entries.sort();
     prompt.set_items(entries);
+}
+
+/// What a file prompt's `/ssh:` text asks the host to list: the key the
+/// listing is cached under, the directory, and whether dotfiles are wanted —
+/// the local rule, a name that starts with one. `None` while there is no host.
+///
+/// One function for both ends of the round trip, so a reply is kept only when
+/// the prompt still asks what it was the answer to.
+fn remote_query(typed: &str) -> Option<(String, tramp::RemotePath, bool)> {
+    let there = tramp::parse(typed)?;
+    // After the last `/`, or the whole path when there is none: `/ssh:box:`
+    // and `/ssh:box:proj` both list the login's home.
+    let cut = there.path.rfind('/').map_or(0, |i| i + 1);
+    let hidden = there.path[cut..].starts_with('.');
+    let dir = tramp::RemotePath { path: there.path[..cut].to_string(), ..there };
+    Some((format!("{}{dir}", if hidden { "." } else { "" }), dir, hidden))
 }
 
 /// `~/x` -> `/Users/you/x`. Mirrors the core-side expansion so what the user
@@ -5077,7 +5149,7 @@ mod tests {
         ed.open_prompt(PromptKind::File);
         ed.prompt.as_mut().unwrap().text = format!("{}/", dir.display());
         let mut last = None;
-        refresh_file_completions(&mut ed, &mut last);
+        refresh_file_completions(&mut ed, &mut last, &mut Remote::default());
 
         let items = &ed.prompt.as_ref().unwrap().items;
         assert!(items.iter().any(|i| i.ends_with("alpha.rs")));
@@ -5108,7 +5180,7 @@ mod tests {
         let mut last = None;
 
         ed.prompt.as_mut().unwrap().text = format!("{}/", dir.display());
-        refresh_file_completions(&mut ed, &mut last);
+        refresh_file_completions(&mut ed, &mut last, &mut Remote::default());
         let items = &ed.prompt.as_ref().unwrap().items;
         assert!(items.iter().any(|i| i.ends_with("plain.txt")));
         assert!(!items.iter().any(|i| i.ends_with(".config/")));
@@ -5116,7 +5188,7 @@ mod tests {
         // ...and the dot re-lists the same directory rather than being filtered
         // out of the answer it already had.
         ed.prompt.as_mut().unwrap().text = format!("{}/.", dir.display());
-        refresh_file_completions(&mut ed, &mut last);
+        refresh_file_completions(&mut ed, &mut last, &mut Remote::default());
         let items = &ed.prompt.as_ref().unwrap().items;
         assert!(items.iter().any(|i| i.ends_with(".config/")));
         assert!(items.iter().any(|i| i.ends_with("plain.txt")));
@@ -5746,6 +5818,61 @@ mod tests {
         assert!(ed.status.contains("opening"), "{}", ed.status);
     }
 
+    /// `SPC p o` on another machine: while the host is being typed the prompt
+    /// offers hosts and never this machine's `/`; once there is one, the
+    /// directory is asked of it off the frame, and the answer is poured in
+    /// only while the prompt is still typing into that directory.
+    #[test]
+    fn the_file_prompt_browses_a_host_without_blocking() {
+        let entry = |name: &str, is_dir| tramp::RemoteEntry {
+            name: name.into(),
+            is_dir,
+            is_symlink: false,
+            len: 0,
+            mode: 0o644,
+            modified: None,
+        };
+        let listing = || vec![entry("app", true), entry("notes.org", false), entry(".git", true)];
+        let mut remote = Remote::default();
+        let mut ed = Editor::new();
+        let mut last = None;
+        ed.open_prompt(PromptKind::File);
+
+        ed.prompt.as_mut().unwrap().text = "/ssh:me@bo".into();
+        refresh_file_completions(&mut ed, &mut last, &mut remote);
+        let items = &ed.prompt.as_ref().unwrap().items;
+        assert!(items.iter().all(|i| i.starts_with("/ssh:me@")), "{items:?}");
+        assert!(remote.jobs.is_empty(), "no host yet, and a round trip went out");
+
+        ed.prompt.as_mut().unwrap().text = "/ssh:me@0.0.0.0#1:/srv/ap".into();
+        refresh_file_completions(&mut ed, &mut last, &mut remote);
+        assert!(ed.prompt.as_ref().unwrap().items.is_empty());
+        let (&id, _) = remote.jobs.iter().next().expect("the directory was not asked for");
+        let Some(Job::Complete(dir, key)) = remote.jobs.remove(&id) else {
+            panic!("queued something other than a listing");
+        };
+        assert_eq!(dir.path, "/srv/");
+        // The same directory again is the same question: nothing more goes out.
+        ed.prompt.as_mut().unwrap().text = "/ssh:me@0.0.0.0#1:/srv/app".into();
+        refresh_file_completions(&mut ed, &mut last, &mut remote);
+        assert!(remote.jobs.is_empty());
+
+        let (mut dired, mut project) = (Dired::default(), Project::default());
+        let job = Job::Complete(dir.clone(), key.clone());
+        remote.finish(&mut ed, &mut dired, &mut project, job, tramp::Reply::List(listing()));
+        assert_eq!(
+            ed.prompt.as_ref().unwrap().items,
+            ["/ssh:me@0.0.0.0#1:/srv/app/", "/ssh:me@0.0.0.0#1:/srv/notes.org"]
+        );
+
+        // Typed on into `app/` before the answer came: it is not this prompt's.
+        ed.prompt.as_mut().unwrap().text = "/ssh:me@0.0.0.0#1:/srv/app/".into();
+        refresh_file_completions(&mut ed, &mut last, &mut remote);
+        let job = Job::Complete(dir, key);
+        remote.finish(&mut ed, &mut dired, &mut project, job, tramp::Reply::List(listing()));
+        assert!(ed.prompt.as_ref().unwrap().items.is_empty());
+    }
+
     /// The promise a remote save is entirely about: **sent is not written**.
     /// The connection is refused, so this needs no server — only a socket that
     /// says no — and the buffer has to come out of it still dirty.
@@ -5978,7 +6105,7 @@ mod tests {
     fn completions_are_dropped_when_the_prompt_closes() {
         let mut ed = Editor::new();
         let mut last = Some("/somewhere".to_string());
-        refresh_file_completions(&mut ed, &mut last);
+        refresh_file_completions(&mut ed, &mut last, &mut Remote::default());
         assert_eq!(last, None);
     }
 

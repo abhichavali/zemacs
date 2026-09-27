@@ -655,6 +655,20 @@ impl Dired {
     /// the state is on — [`Dired::follow`] reads the buffer, and a buffer left
     /// on the old directory would send it straight back there.
     fn go(&mut self, editor: &mut Editor, dir: PathBuf) -> anyhow::Result<()> {
+        // Moving from a listing moves the listing, rather than stacking another
+        // beside it: Emacs' `dired-kill-when-opening-new-dired-buffer`. A buffer
+        // per directory walked through was a switcher full of listings after
+        // browsing one tree, and the one you left is a `^` away. Renamed so the
+        // `show_named` in `refresh` finds it live; the scroll goes back to the
+        // top, as a new buffer's would. Not when another buffer already lists
+        // `dir` — that one is shown, since two buffers must not answer to one
+        // name.
+        let name = dir.to_string_lossy().into_owned();
+        let named = |b: &zemacs_core::Buffer| b.kind == BufferKind::Dired && b.given_name.as_deref() == Some(&name);
+        if editor.buffer.kind == BufferKind::Dired && !named(&editor.buffer) && !editor.others.iter().any(named) {
+            editor.buffer.given_name = Some(name);
+            editor.scroll = 0;
+        }
         self.remote = tramp::parse(&dir.to_string_lossy());
         self.dir = Some(dir);
         self.marks.clear();
@@ -990,26 +1004,49 @@ mod tests {
         editor.buffer.cursor = editor.buffer.line_start(line);
     }
 
-    /// The bug as reported: a second frame, a dired in it, and switching
-    /// back to the first frame finds its listing gone — because there was
-    /// only ever one dired buffer, and the second listing was written into it.
+    /// Walking a tree in a listing moves that listing — into `sub` and back is
+    /// one buffer, not three. And the bug as once reported still holds: a
+    /// second frame, a dired opened in it from a file, and switching back to
+    /// the first frame finds its listing gone, because the second one was
+    /// written into it.
     #[test]
-    fn a_second_directory_is_a_second_buffer_and_verbs_follow_the_live_one() {
+    fn a_listing_walks_in_place_and_a_second_one_is_a_second_buffer() {
         let (mut dired, mut editor, first) = listing_of_three("zemacs_dired_two_frames");
         let second = first.join("sub");
         std::fs::create_dir_all(&second).unwrap();
         std::fs::write(second.join("only.txt"), "x").unwrap();
-
-        dired.go(&mut editor, second.clone()).unwrap();
-        assert_eq!(editor.buffer.path.as_deref(), Some(second.as_path()));
         let listings = |editor: &Editor| {
             editor.buffer_names().iter().filter(|n| !n.starts_with('*')).count()
         };
+        let text = |editor: &Editor| editor.buffer.slice_string(0, editor.buffer.len_chars());
+        let listing = editor.buffer.id;
+
+        dired.go(&mut editor, second.clone()).unwrap();
+        assert_eq!(editor.buffer.id, listing, "walking opened another buffer");
+        assert_eq!(editor.buffer.path.as_deref(), Some(second.as_path()));
+        assert_eq!(editor.buffer.name(), second.to_string_lossy());
+        assert!(text(&editor).contains("only.txt"));
+        dired.run(&mut editor, "up");
+        assert_eq!(editor.buffer.id, listing);
+        assert_eq!(editor.buffer.path.as_deref(), Some(first.as_path()));
+        assert_eq!(listings(&editor), 1, "{:?}", editor.buffer_names());
+
+        // The second frame: dired from a buffer that is not a listing.
+        editor.switch_buffer(1);
+        assert_ne!(editor.buffer.kind, BufferKind::Dired);
+        dired.go(&mut editor, second.clone()).unwrap();
         assert_eq!(listings(&editor), 2, "two directories, two buffers: {:?}", editor.buffer_names());
+        // Walking the first listing into a directory the second already shows
+        // goes to that one rather than naming two buffers alike.
+        let other = editor.buffer.id;
+        editor.switch_buffer_id(listing);
+        dired.go(&mut editor, second.clone()).unwrap();
+        assert_eq!(editor.buffer.id, other);
+        assert_eq!(listings(&editor), 2, "{:?}", editor.buffer_names());
 
         // Back to the first listing, the way a frame switch would do it. Its
         // text is still its own: a.txt, not only.txt.
-        editor.switch_buffer(1);
+        editor.switch_buffer_id(listing);
         assert_eq!(editor.buffer.path.as_deref(), Some(first.as_path()));
         assert!(editor.buffer.slice_string(0, editor.buffer.len_chars()).contains("a.txt"));
         assert!(!editor.buffer.slice_string(0, editor.buffer.len_chars()).contains("only.txt"));

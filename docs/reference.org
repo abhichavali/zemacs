@@ -1476,6 +1476,13 @@ app layer, which does the work and feeds the result back as buffer text.
 The same verbs are reachable as command strings (=magit-status=, =dired-enter=,
 =terminal-close=), which is what the shipped bindings use.
 
+A listing is a buffer named after its directory. Moving from one — ="enter"= on
+a directory, ="up"=, or a directory named from inside it — renames that buffer
+and lists the new directory in it, rather than opening another: Emacs'
+=dired-kill-when-opening-new-dired-buffer=. Only when another buffer already
+lists that directory is it shown instead. Dired opened from anywhere that is not
+a listing is a buffer of its own, so each frame keeps its own.
+
 A git verb may carry *one argument* after a space — =(magit "checkout main")=,
 =(magit "stash a message with spaces")= — which is how a question whose answer
 is data stays in the image: =runtime/modes/magit.lisp= is a dozen =read-string=

@@ -451,7 +451,7 @@ pub fn command_argv(
     env: &[(String, String)],
     tty: bool,
 ) -> Vec<String> {
-    let mut out = ssh_argv(dir, control_path(dir).as_deref(), Some(&sh_c(&exec_script(dir, argv, env))));
+    let mut out = ssh_argv(dir, control_path(dir).as_deref(), Some(&sh_c(&exec_script(dir, argv, env, tty))));
     if tty {
         out.insert(0, "-t".into());
     }
@@ -468,6 +468,35 @@ pub fn program() -> std::ffi::OsString {
     std::env::var_os("ZEMACS_SSH")
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| "ssh".into())
+}
+
+/// The hosts `~/.ssh/config` names, in the order it names them: what the file
+/// prompt offers after `/ssh:`. Patterns are left out — `*` is not a machine.
+///
+/// ponytail: one file, read as written. `Include`d files are not followed and
+/// `known_hosts` is not read; a host from either is typed rather than picked.
+pub fn config_hosts() -> Vec<String> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let text = std::fs::read_to_string(std::path::Path::new(&home).join(".ssh/config"));
+    hosts_in(&text.unwrap_or_default())
+}
+
+fn hosts_in(config: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for line in config.lines() {
+        let mut words = line.split_whitespace();
+        if !words.next().is_some_and(|w| w.eq_ignore_ascii_case("host")) {
+            continue;
+        }
+        for host in words.take_while(|w| !w.starts_with('#')) {
+            if !host.contains(['*', '?', '!']) && !hosts.iter().any(|h| h == host) {
+                hosts.push(host.to_string());
+            }
+        }
+    }
+    hosts
 }
 
 /// Is `to` inside `from`, or `from` itself?
@@ -664,7 +693,16 @@ fn search_script(root: &RemotePath, pattern: &str, limit: usize) -> String {
 
 /// See [`command_argv`]. The `cd` falls back to the parent so that a *file*
 /// can name the directory, and the fallback is the only reason for `$d`.
-fn exec_script(dir: &RemotePath, argv: &[String], env: &[(String, String)]) -> String {
+///
+/// `login` runs `argv` through the login shell rather than straight from
+/// `sh -c`: a program on a PTY is one you would have typed at the far prompt,
+/// and `claude` in `~/.local/bin` is on the PATH that prompt has and not on the
+/// bare one `sh -c` inherits, which read no profile at all.
+///
+/// ponytail: `-l`, as the shell session above has — a PATH set only in
+/// `.zshrc`, or in a `.bashrc` past its interactive guard, is still missed.
+/// `-i` beside it reaches those, and runs every interactive rc hook with it.
+fn exec_script(dir: &RemotePath, argv: &[String], env: &[(String, String)], login: bool) -> String {
     let cd = format!(
         "d={}\n\
          cd -- \"$d\" 2>/dev/null || cd -- \"$(dirname -- \"$d\")\" || exit 1\n",
@@ -681,7 +719,11 @@ fn exec_script(dir: &RemotePath, argv: &[String], env: &[(String, String)]) -> S
         words.extend(env.iter().map(|(k, v)| single(&format!("{k}={v}"))));
     }
     words.extend(argv.iter().map(|w| single(w)));
-    format!("{cd}exec {}\n", words.join(" "))
+    let line = format!("exec {}", words.join(" "));
+    match login {
+        true => format!("{cd}exec \"${{SHELL:-/bin/sh}}\" -l -c {}\n", single(&line)),
+        false => format!("{cd}{line}\n"),
+    }
 }
 
 /// Ask the remote for `mode size mtime` in one line, from either flavour of
@@ -1138,6 +1180,20 @@ mod tests {
         parse(name).unwrap()
     }
 
+    /// What `/ssh:` offers: every named host once, in file order, and no
+    /// pattern — case-blind keyword, trailing comment and all.
+    #[test]
+    fn the_config_names_its_hosts() {
+        let config = "Host *\n  ForwardAgent no\n\
+                      Host box gpu # the lab\n  HostName 10.0.0.2\n\
+                      host dev-? !bad Box2\n\
+                      Match host box\n\
+                      HostName nothere\n\
+                      Host gpu\n";
+        assert_eq!(hosts_in(config), ["box", "gpu", "Box2"]);
+        assert!(hosts_in("").is_empty());
+    }
+
     /// The property the whole crate rests on: whatever goes in, the remote `sh`
     /// sees one word, and it is the original bytes.
     #[test]
@@ -1437,8 +1493,9 @@ mod tests {
             scripts.push(files_script(target, &hostile, 10));
             scripts.push(files_script(target, &[], 10));
             scripts.push(search_script(target, HOSTILE, 10));
-            scripts.push(exec_script(target, &hostile, &[("A".into(), HOSTILE.into())]));
-            scripts.push(exec_script(target, &[], &[]));
+            scripts.push(exec_script(target, &hostile, &[("A".into(), HOSTILE.into())], false));
+            scripts.push(exec_script(target, &hostile, &[("A".into(), HOSTILE.into())], true));
+            scripts.push(exec_script(target, &[], &[], true));
         }
         for script in scripts {
             let out = std::process::Command::new("sh")
@@ -1570,11 +1627,17 @@ mod tests {
         let argv: Vec<String> = ["printf", "%s|", HOSTILE, "-n", "a\nb"]
             .map(String::from)
             .to_vec();
-        let out = run(&exec_script(&at(&deep.join(HOSTILE)), &argv, &[]), b"");
+        let out = run(&exec_script(&at(&deep.join(HOSTILE)), &argv, &[], false), b"");
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{HOSTILE}|-n|a\nb|"));
+        // ...and the same words through the login shell, a second layer of
+        // quoting deep. `/bin/sh` rather than whatever `$SHELL` this machine has,
+        // whose profile is not this test's to run.
+        let login = exec_script(&at(&deep.join(HOSTILE)), &argv, &[], true);
+        let out = run(&format!("SHELL=/bin/sh\n{login}"), b"");
         assert_eq!(String::from_utf8(out).unwrap(), format!("{HOSTILE}|-n|a\nb|"));
         let env = [("ZEMACS_T".to_string(), HOSTILE.to_string())];
         let sh = ["/bin/sh", "-c", "pwd; printf %s \"$ZEMACS_T\""].map(String::from).to_vec();
-        let out = run(&exec_script(&at(&deep), &sh, &env), b"");
+        let out = run(&exec_script(&at(&deep), &sh, &env, false), b"");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!("{}\n{HOSTILE}", deep.display())

@@ -1472,10 +1472,12 @@ mod tests {
         let cmd = cmd.unwrap();
         assert_eq!(cmd.program, tramp::program().to_string_lossy());
         assert_eq!(cmd.args.first().map(String::as_str), Some("-t"));
-        // The script is quoted twice — once per word, once whole — so the
-        // single quotes around `cat` arrive as `'\''`.
+        // Through the far login shell, so it has the PATH a prompt there has.
+        // The quoting that survives the extra layer is `tramp`'s to test, and
+        // it runs it rather than reading it.
         let script = cmd.args.last().unwrap();
-        assert!(script.contains(r"exec '\''cat'\''"), "{script}");
+        assert!(script.contains(r#"exec "${SHELL:-/bin/sh}" -l -c '\''exec "#), "{script}");
+        assert!(script.contains("cat"), "{script}");
         assert!(script.contains(r"d='\''/srv/app'\''"), "{script}");
 
         // No command at all is the login shell on the far side.

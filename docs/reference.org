@@ -1584,6 +1584,21 @@ The four shipped entries use each tool's own flags, read out of its =--help=:
 =cursor-agent= is the CLI; =cursor= is the GUI. =claude -c=, =codex resume --last=
 and =cursor-agent --continue= are the no-picker variants if you prefer them.
 
+** On another machine
+
+From a =/ssh:host:/…= buffer the agent runs on the host, at the project root
+there, over =ssh -t= — the harness has to be on the host's =$PATH=, not this
+one's, so the menu does not mark it =(not installed)=.
+
+If the host has =tmux=, the agent runs inside a new tmux session there
+(=zemacs-HARNESS-TIME-N=, status line off), so it keeps working when the
+connection drops or the editor quits. =C-M-r= reconnects to it rather than starting
+another, and closing the buffer only detaches: =tmux attach -t NAME= on the host
+gets it back. Without tmux it runs bare, and dies with the connection. The host
+decides, each time the session starts. The scrollback is then tmux's (=C-b [=),
+not the buffer's — =C-M-t= shows one screenful. =ai-send-prompt= never uses tmux:
+its answer would vanish with the session.
+
 ** The mode
 
 A session running a harness reports =(major-mode)= = ="ai-mode"=; a plain shell

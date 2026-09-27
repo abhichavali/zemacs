@@ -118,21 +118,50 @@ not double the list.
 (defun %ai-label (harness)
   (destructuring-bind (name program new resume) harness
     (declare (ignore new resume))
-    (if (executable-find program)
+    ;; A remote buffer's agent runs on its host, whose $PATH is not this one's.
+    (if (or (executable-find program) (%remote-p (buffer-file-name)))
         name
         ;; Offered anyway, and refused with a reason. A harness silently
         ;; missing from the menu is indistinguishable from one you spelled
         ;; wrong in your config.
         (format nil "~a  (not installed: ~a)" name program))))
 
-(defun %ai-verb (harness resume)
-  "The editor verb that starts HARNESS. RESUME picks its argument list.
-Separate from `%ai-start' so the string can be read without forking anything —
-which is what makes it testable and what makes it obvious that this file's
-entire contribution is one line of text."
+(defun %ai-verb (harness resume &optional tmux)
+  "The editor verb that starts HARNESS. RESUME picks its argument list, and TMUX,
+a session name, runs it in that tmux session when the host has tmux — see
+`%ai-tmux'. Separate from `%ai-start' so the string can be read without forking
+anything — which is what makes it testable and what makes it obvious that this
+file's entire contribution is one line of text."
   (destructuring-bind (name program new-args resume-args) harness
-    (format nil "terminal-run:~a:~a~{ ~a~}"
-            name program (if resume resume-args new-args))))
+    (let ((argv (cons program (if resume resume-args new-args))))
+      (format nil "terminal-run:~a:~{~a~^ ~}"
+              name (if tmux (%ai-tmux tmux argv) argv)))))
+
+(defvar *ai-tmux-count* 0
+  "Agents this editor has put in tmux: the tail of the next one's session name.")
+
+(defun %ai-tmux (session argv)
+  "ARGV as the words that run it in tmux session SESSION, when `tmux' is on the
+PATH it runs with, and as itself when it is not.
+
+For an agent on another machine, which should outlive the connection it was
+started over: the laptop sleeps, the wifi drops, the editor quits, and the agent
+keeps working on the host. `-A' attaches to SESSION when it is still there, so
+`C-M-r' after a dropped connection is a reconnect, not a second agent; closing
+the buffer only detaches. The status line is off so the pane looks like a local
+agent's.
+
+Asked by the far shell rather than from here, because asking from here is a
+round trip on the Lisp thread for the one thing the command can decide itself —
+and a restart runs the line again, so tmux installed later is used then.
+
+ponytail: tmux draws on the alternate screen, so the frozen view (`C-M-t') holds
+one screenful and the history is tmux's own (`C-b ['). Keeping it here needs
+`terminal-overrides' without `smcup', a server-wide option on someone else's
+tmux."
+  (list* "sh" "-c"
+         (%ai-quote "command -v tmux >/dev/null 2>&1 || exec \"$@\"; exec tmux new-session -A -s \"$0\" \"$@\" ';' set status off")
+         session argv))
 
 (defun %ai-pane ()
   "Stand in a window that is not the one you are reading, making one if need be.
@@ -156,18 +185,55 @@ one round — a rule you can predict beats one that picks a pane by size."
       (other-window))
   nil)
 
+(defun %ai-root ()
+  "Where an agent started from this buffer runs: its project's root, or NIL to
+leave it to the terminal, which starts beside the file.
+
+The root and not the file's directory, because an agent reads the tree it is
+started in and a subdirectory of the repository is the wrong tree. On a remote
+project the root is a `/ssh:host:/path' name, and `cd:' to one is what puts the
+agent on the host — `ssh -t', in that directory, the same way `project-shell'
+gets there. A remote file outside any project goes as itself, so its agent is
+still on its own machine rather than on this one.
+
+Only from a buffer visiting something: a session or the dashboard has no file to
+climb from, and the terminal's own rule — start where the neighbouring session
+started — is the better answer there. Read before `%ai-pane', which may leave a
+different buffer current."
+  (let* ((file (buffer-file-name))
+         (found (and file (%project-at))))
+    (cond (found (%root-name (first found)))
+          ((%remote-p file) file))))
+
+(defun %ai-installed-for (harness root)
+  "Whether HARNESS can start at ROOT. On a remote ROOT that is the host's
+question, and asking it is a round trip for an answer the session gives anyway:
+`not found' from the far shell, on screen."
+  (or (%remote-p root) (executable-find (second harness))))
+
 (defun %ai-start (harness resume)
-  "Fork HARNESS beside the current window. RESUME picks its argument lists."
-  (if (null (executable-find (second harness)))
-      ;; The editor refuses this too, before it forks. Saying it here as well
-      ;; means the answer comes from the thing you picked rather than from a
-      ;; buffer that appeared and vanished.
-      (message (format nil "~a is not installed — no ~a on $PATH"
-                       (first harness) (second harness)))
-      ;; Both verbs travel the same queue, so the session lands in whichever
-      ;; pane `%ai-pane' left us standing in.
-      (progn (%ai-pane)
-             (call-command (%ai-verb harness resume)))))
+  "Fork HARNESS beside the current window, at the project root — on the project's
+host, when it is remote, and in tmux there when the host has it. RESUME picks
+its argument lists."
+  (let ((root (%ai-root)))
+    (if (not (%ai-installed-for harness root))
+        ;; The editor refuses this too, before it forks. Saying it here as well
+        ;; means the answer comes from the thing you picked rather than from a
+        ;; buffer that appeared and vanished.
+        (message (format nil "~a is not installed — no ~a on $PATH"
+                         (first harness) (second harness)))
+        ;; All three travel the same queue, so the session lands in whichever
+        ;; pane `%ai-pane' left us standing in, in ROOT.
+        (progn (%ai-pane)
+               (when root (terminal (format nil "cd:~a" root)))
+               ;; The time as well as the count: the count starts again with
+               ;; the editor, and a name left running from last time would be
+               ;; attached to when you asked for a new agent.
+               (call-command
+                (%ai-verb harness resume
+                          (and (%remote-p root)
+                               (format nil "zemacs-~a-~a-~a" (first harness)
+                                       (get-universal-time) (incf *ai-tmux-count*)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; One question, no session
@@ -214,11 +280,12 @@ a prompt is text, and quoting is only about where the argument ends."
 For the things that are not worth a conversation: what a flag does, what a
 stack trace means, a one-line rewrite. `M-x ai-send-prompt', or `send prompt'
 in the `C-a' menu."
-  (let ((harness (assoc *ai-prompt-harness* *ai-harnesses* :test #'string=)))
+  (let ((harness (assoc *ai-prompt-harness* *ai-harnesses* :test #'string=))
+        (root (%ai-root)))
     (cond
       ((null harness)
        (message (format nil "no such agent: ~a" *ai-prompt-harness*)))
-      ((null (executable-find (second harness)))
+      ((not (%ai-installed-for harness root))
        (message (format nil "~a is not installed — no ~a on $PATH"
                         (first harness) (second harness))))
       (t
@@ -231,6 +298,9 @@ in the `C-a' menu."
              ;; one-shot answer is still a thing you read beside your code, and
              ;; still not a reason to cut the frame into three.
              (%ai-pane)
+             ;; ...and the same place: the question is about this project, on
+             ;; whichever machine it is on. `rerun:' moves with the `cd:'.
+             (when root (terminal (format nil "cd:~a" root)))
              (call-command
               (format nil "terminal-rerun:~a-p:~a ~a ~a"
                       (first harness) (second harness) *ai-prompt-flag*

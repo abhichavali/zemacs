@@ -78,7 +78,7 @@ fn a_remote_file_finds_its_project_by_the_same_tables() {
         ),
     )
     .unwrap();
-    let (tx, _rx) = crossbeam_channel::unbounded();
+    let (tx, rx) = crossbeam_channel::unbounded();
     let shared: Shared = Default::default();
     let lisp = zemacs_lisp::spawn(tx, shared.clone(), init);
     wait(&shared, "the init file", |ed| {
@@ -116,6 +116,58 @@ fn a_remote_file_finds_its_project_by_the_same_tables() {
 
     // A local name never reaches the primitive at all.
     says(&shared, &lisp, "r6", "(%remote-probe \"/tmp\" \".git\")", "NIL");
+
+    // An agent opened from the remote file runs at the root on the host: a
+    // `cd:` to the tramp root, then the harness, which the terminal turns into
+    // `ssh -t`. Not installed *here* is no reason to refuse — it is the host's
+    // PATH that matters, and the far shell says so if it is not there either.
+    shared.lock().unwrap().load("", Some(file.clone().into()), None);
+    says(&shared, &lisp, "a1", "(%ai-root)", &root);
+    while rx.try_recv().is_ok() {}
+    lisp.eval(
+        "(progn (ai-add-harness \"far\" \"zemacs-not-on-this-machine-9f3c\") \
+                (%ai-start (assoc \"far\" *ai-harnesses* :test #'string=) nil))"
+            .into(),
+    );
+    let mut verbs = Vec::new();
+    while verbs.len() < 2 {
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(zemacs_core::EditorCommand::Term(verb)) => verbs.push(verb),
+            Ok(_) => {}
+            Err(e) => panic!("the agent sent {verbs:?} and then nothing: {e}"),
+        }
+    }
+    assert_eq!(verbs[0], format!("cd:{root}"));
+
+    // ...inside tmux when the host has it, and as itself when it does not. The
+    // host decides, so its half is run here: the script out of the verb, under
+    // a PATH with and without a `tmux` that prints what it was asked.
+    let line = verbs[1].strip_prefix("run:far:sh -c \"").expect(&verbs[1]);
+    let (script, rest) = line.split_once("\" zemacs-far-").expect(line);
+    let script = script.replace("\\\"", "\"");
+    let (session, program) = rest.split_once(' ').unwrap();
+    assert_eq!(program, "zemacs-not-on-this-machine-9f3c");
+    let bin = base.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let tool = |name: &str, body: &str| {
+        std::fs::write(bin.join(name), format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    tool(program, "echo agent");
+    let host = || {
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", &script, &format!("zemacs-far-{session}"), program])
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(host(), "agent\n", "no tmux on the host, and the agent did not start bare");
+    tool("tmux", r#"printf '%s|' "$@""#);
+    assert_eq!(
+        host(),
+        format!("new-session|-A|-s|zemacs-far-{session}|{program}|;|set|status|off|")
+    );
 
     std::env::remove_var("ZEMACS_SSH");
     let _ = std::fs::remove_dir_all(&base);

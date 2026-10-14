@@ -170,7 +170,8 @@ that actually differ:
 
 =*dashboard*= and =*scratch*= are ordinary buffers, so they appear in the buffer
 switcher and can be put in any window. =M-x new-frame= opens another OS window
-on the dashboard.
+on the dashboard; each one is titled with the project it is showing, or the
+file outside a project.
 
 Layout is a binary tree, and the arithmetic that turns it into rectangles is a
 pure function in =zemacs-core=. That is deliberate: the renderer and the mouse

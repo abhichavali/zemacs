@@ -90,6 +90,13 @@ An OS window, holding a tree of windows. =(frame-count)= is how many there are,
 =(frame-index)= which one has focus, =select-frame= moves focus, =new-frame= opens
 one on the dashboard.
 
+The OS knows a frame by the project of the buffer it is showing — the dock, the
+Window menu, ⌘` — or by that buffer's file name outside any project. A buffer
+with no file (a terminal, magit, the dashboard) leaves the name as it was, so a
+frame running an agent still says which project it is in. Over ssh the project
+is the one found when the file was opened; until that answers, the file's name.
+The app sets it (=frame_title= in =crates/app/src/main.rs=), and Lisp has no say.
+
 =delete-frame= is the one window command that needs the application: core removes
 the frame from its list, but only the app layer can take the OS window down with
 it. It therefore lands a frame later — see [[file:threading.org][threading.org]].

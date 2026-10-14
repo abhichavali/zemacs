@@ -1035,6 +1035,12 @@ struct App {
     /// Reads, writes and listings on other machines. Inert — no thread, no
     /// socket — until the first `/ssh:` name of the session.
     remote: Remote,
+    /// Each path's OS window title, so the project climb runs once per path
+    /// and not once per frame. See [`frame_title`].
+    ///
+    /// ponytail: never evicted, so a `git init` under an open file renames its
+    /// frame after a restart. A session titles tens of paths, not thousands.
+    titles: std::collections::HashMap<PathBuf, String>,
 }
 
 /// What one turn of the event pump produced.
@@ -1106,6 +1112,7 @@ impl App {
             hovered: Default::default(),
             cursors: Cursors::new(),
             clipboard: Clipboard::new(video),
+            titles: Default::default(),
             text_input,
             text_input_on: false,
             last_revision: u64::MAX,
@@ -2191,6 +2198,24 @@ impl App {
             self.apply_text_input(self.text_input_on);
         }
 
+        // Each OS window named for what its frame is showing. A buffer with no
+        // path — a terminal, magit, the dashboard — leaves the name as it was,
+        // so an agent's frame still says which project it is working in.
+        for (i, renderer) in self.renderers.iter_mut().enumerate() {
+            let Some(path) = frame_path(editor, i) else {
+                continue;
+            };
+            if let Some(title) = self.titles.get(path) {
+                renderer.set_title(title);
+                continue;
+            }
+            let (title, settled) = frame_title(path, &self.remote.roots);
+            renderer.set_title(&title);
+            if settled {
+                self.titles.insert(path.to_path_buf(), title);
+            }
+        }
+
         // Size each session to the pane it is actually shown in, then let them
         // all catch up. `sync` is also what answers a child's queries, so it has
         // to run every frame whether or not the terminal is on screen — a
@@ -2972,6 +2997,9 @@ struct Remote {
     /// Directories whose project has already been asked for, so that opening
     /// the tenth file of a remote project does not climb for the tenth time.
     climbed: std::collections::HashSet<String>,
+    /// What those climbs found, by the directory asked from: the project's
+    /// name, or `None` for none. A frame's title reads it, and never asks.
+    roots: std::collections::HashMap<String, Option<String>>,
 }
 
 impl Remote {
@@ -3131,10 +3159,12 @@ impl Remote {
             (Job::Files(fetch), tramp::Reply::Files(files, truncated)) => {
                 project.listed(editor, fetch, files, truncated);
             }
-            (Job::Remember(_), tramp::Reply::Probe(hits)) => {
-                if let Some(found) = zemacs_project::pick(&hits) {
+            (Job::Remember(dir), tramp::Reply::Probe(hits)) => {
+                let found = zemacs_project::pick(&hits);
+                if let Some(found) = &found {
                     zemacs_project::remember(&found.root);
                 }
+                self.roots.insert(dir.to_string(), found.map(|f| f.name()));
             }
             (Job::Open(path, meta, line), tramp::Reply::Read(bytes)) => match String::from_utf8(bytes) {
                 Ok(text) => {
@@ -3407,6 +3437,42 @@ fn remote_query(typed: &str) -> Option<(String, tramp::RemotePath, bool)> {
     let hidden = there.path[cut..].starts_with('.');
     let dir = tramp::RemotePath { path: there.path[..cut].to_string(), ..there };
     Some((format!("{}{dir}", if hidden { "." } else { "" }), dir, hidden))
+}
+
+/// The path of the buffer frame `i` is showing, if it has one.
+fn frame_path(editor: &Editor, i: usize) -> Option<&Path> {
+    let buffer = match i == editor.focus_frame {
+        // The live buffer, whose window id can lag it within a frame.
+        true => &editor.buffer,
+        false => {
+            let id = editor.frames.get(i)?.current_window().buffer;
+            editor.buffers().find(|b| b.id == id)?
+        }
+    };
+    buffer.path.as_deref()
+}
+
+/// What the OS calls a frame showing `path`: its project's name, else its own
+/// name — and whether that is final, which a remote path's is not until the
+/// climb [`Remote::remember`] sent off when it opened has answered.
+fn frame_title(path: &Path, roots: &std::collections::HashMap<String, Option<String>>) -> (String, bool) {
+    let own = || {
+        path.file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let Some(there) = tramp::parse(&path.to_string_lossy()) else {
+        return (zemacs_project::find(path).map_or_else(own, |p| p.name()), true);
+    };
+    // Asked from the directory itself for a listing, from the parent for a file.
+    let known = roots
+        .get(&there.to_string())
+        .or_else(|| roots.get(&there.parent()?.to_string()));
+    match known {
+        Some(name) => (name.clone().unwrap_or_else(own), true),
+        None => (own(), false),
+    }
 }
 
 /// `~/x` -> `/Users/you/x`. Mirrors the core-side expansion so what the user
@@ -5820,6 +5886,31 @@ mod tests {
             Some(Job::Probe(p, _)) if p.host == "0.0.0.0" && p.path == "/etc/hosts"
         ));
         assert!(ed.status.contains("opening"), "{}", ed.status);
+    }
+
+    /// A frame is called after its project, or its file outside one. Over ssh
+    /// the project is whatever the climb sent off at open said, and until it
+    /// answers the file's name stands in and is not kept.
+    #[test]
+    fn a_frame_is_named_for_its_project_else_its_file() {
+        let base = std::env::temp_dir().join(format!("zemacs_title-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("app/.git")).unwrap();
+        std::fs::create_dir_all(base.join("app/src")).unwrap();
+        let mut roots = std::collections::HashMap::new();
+
+        assert_eq!(frame_title(&base.join("app/src/main.rs"), &roots), ("app".into(), true));
+        assert_eq!(frame_title(&base.join("loose.txt"), &roots), ("loose.txt".into(), true));
+
+        let far = Path::new("/ssh:box:/srv/app/src/main.rs");
+        assert_eq!(frame_title(far, &roots), ("main.rs".into(), false));
+        roots.insert("/ssh:box:/srv/app/src".to_string(), Some("app".to_string()));
+        assert_eq!(frame_title(far, &roots), ("app".into(), true));
+        // A listing asks from itself, and no project is an answer too.
+        roots.insert("/ssh:box:/tmp".to_string(), None);
+        assert_eq!(frame_title(Path::new("/ssh:box:/tmp"), &roots), ("tmp".into(), true));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// `SPC p o` on another machine: while the host is being typed the prompt

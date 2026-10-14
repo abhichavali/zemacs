@@ -572,6 +572,14 @@ impl Renderer {
         self.canvas.window().id()
     }
 
+    /// Name the OS window: the dock, the Window menu, ⌘`. Called every frame,
+    /// so it goes through to the window server only when the name changes.
+    pub fn set_title(&mut self, title: &str) {
+        if self.canvas.window().title() != title {
+            let _ = self.canvas.window_mut().set_title(title);
+        }
+    }
+
     /// The rectangle the window tree is laid out in — exactly what gets handed
     /// to [`zemacs_core::Frame::panes`], and what the app hit-tests dividers
     /// against. The whole drawable: every pane carries its own modeline, so

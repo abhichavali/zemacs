@@ -519,3 +519,44 @@ fn hovering_a_diagnostic_mark_shows_what_is_wrong() {
     z.until("the exit event", |f| (f["event"] == "exit").then_some(()));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `find-file` on a directory lists it and leaves the buffer it was typed from
+/// alone. It used to write the directory into that buffer's path for dired to
+/// find, which renamed `notes.txt` after the directory — so it could no longer
+/// be switched to by name, and its next save went to the directory.
+#[test]
+fn opening_a_directory_leaves_the_file_you_were_in_alone() {
+    let dir = std::env::temp_dir().join(format!("zemacs_open_dir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("sub")).expect("a scratch directory");
+    let path = dir.join("notes.txt");
+    std::fs::write(&path, "one\n").expect("write");
+
+    let mut z = Zemacs::start();
+    z.until("ready", |f| (f["event"] == "ready").then_some(()));
+
+    let mut id = 0;
+    let mut req = |z: &mut Zemacs, op: &str, args: &str| {
+        id += 1;
+        z.send(&format!(r#"{{"id":{id},"op":"{op}"{args}}}"#));
+        z.until("a reply", |f| (f["id"] == id).then(|| f["result"].clone()))
+    };
+    let mut visit = |z: &mut Zemacs, form: String, suffix: &str| {
+        req(z, "eval", &format!(r#","form":"{}""#, form.replace('"', "\\\"")));
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let path = req(z, "state", "")["path"].as_str().unwrap_or_default().to_string();
+            if path.ends_with(suffix) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "after {form} the live buffer is {path:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    visit(&mut z, format!(r#"(find-file "{}")"#, path.display()), "notes.txt");
+    visit(&mut z, format!(r#"(find-file "{}")"#, dir.join("sub").display()), "/sub");
+    visit(&mut z, r#"(switch-to-buffer "notes.txt")"#.into(), "notes.txt");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

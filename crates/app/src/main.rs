@@ -1288,8 +1288,12 @@ impl App {
                 // the chicken-and-egg behind "there is no select project" — the
                 // switcher could only ever offer somewhere you had already been.
                 project_remember(&path);
-                editor.buffer.path = Some(path);
-                self.dired.run(editor, "open");
+                // Named to dired, not written into the live buffer's path for
+                // `open` to find: that renamed the file you were in after the
+                // directory, and its next save went there. Absolute, so a
+                // directory called `up` is not the verb.
+                let dir = std::path::absolute(&path).unwrap_or(path);
+                self.dired.run(editor, &dir.to_string_lossy());
             }
             // A remote name reaches here rather than the arm above, because
             // `/ssh:host:/etc` is not a directory *on this machine* — which is
